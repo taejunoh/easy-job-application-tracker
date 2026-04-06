@@ -1,36 +1,93 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# JobTracker
 
-## Getting Started
+A local-first job application tracker that auto-extracts job details from URLs. Paste a job posting URL or use the Chrome extension to capture job title, company, location, and description automatically.
 
-First, run the development server:
+## Features
+
+- **Auto-extract from URLs** -- paste any job posting URL and get title + company extracted via meta tags or AI
+- **Chrome extension** -- extract job data directly from LinkedIn, Indeed, and Glassdoor while logged in
+- **Text paste mode** -- copy/paste job description text for AI-powered extraction
+- **Multi-LLM support** -- choose OpenAI, Google Gemini, or Anthropic Claude for AI extraction
+- **Dashboard** -- stats, status breakdown chart, and recent applications
+- **Full CRUD** -- search, filter, sort, edit, and delete applications
+- **Local SQLite database** -- your data stays on your machine
+
+## Tech Stack
+
+- Next.js 15 (App Router)
+- Tailwind CSS
+- Prisma + SQLite
+- Cheerio (HTML parsing)
+- OpenAI / Google Gemini / Anthropic SDKs
+
+## Quick Start
 
 ```bash
+# Clone the repo
+git clone https://github.com/YOUR_USERNAME/record-application.git
+cd record-application
+
+# Install dependencies
+npm install
+
+# Set up environment
+cp .env.example .env
+# Edit .env and set a random ENCRYPTION_SECRET (any 32+ character string)
+
+# Set up the database
+npx prisma generate
+npx prisma db push
+
+# Start the app
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Configure AI Extraction
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Go to **Settings** in the app
+2. Select your LLM provider (OpenAI, Google Gemini, or Anthropic)
+3. Enter your API key
+4. Click **Save Settings**
 
-## Learn More
+AI extraction is optional -- meta tag parsing works without it. AI is only used as a fallback when meta tags don't provide enough info.
 
-To learn more about Next.js, take a look at the following resources:
+## Chrome Extension
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+The extension lets you extract job data directly from pages that require login (LinkedIn, Indeed, Glassdoor).
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### Install
 
-## Deploy on Vercel
+1. Open Chrome and go to `chrome://extensions`
+2. Enable **Developer mode** (top right toggle)
+3. Click **Load unpacked**
+4. Select the `extension/` folder from this project
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+### Usage
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+1. Make sure the app is running (`npm run dev`)
+2. Navigate to a job posting on LinkedIn, Indeed, or Glassdoor
+3. Click the JobTracker extension icon
+4. Review the extracted data (title, company, location, description)
+5. Click **Save Application**
+
+## Input Modes
+
+The app has two input modes (toggle with tabs at the top):
+
+- **URL** -- paste a job posting URL. Works best with company career pages and public job boards. Auth-walled sites (LinkedIn) will prompt you to use other methods.
+- **Paste Text** -- copy the job description text from any page, paste it, and the AI extracts the title and company.
+
+## Upgrading to PostgreSQL
+
+The app uses SQLite by default. To switch to PostgreSQL:
+
+1. Update `prisma/schema.prisma` -- change `provider = "sqlite"` to `provider = "postgresql"`
+2. Update `.env` -- set `DATABASE_URL` to your PostgreSQL connection string
+3. Update `src/lib/prisma.ts` -- swap the adapter from `PrismaBetterSqlite3` to a PostgreSQL adapter
+4. Run `npx prisma db push`
+
+## License
+
+MIT
