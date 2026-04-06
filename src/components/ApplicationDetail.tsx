@@ -42,15 +42,21 @@ export default function ApplicationDetail({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
+  const [saved, setSaved] = useState(false);
+
   async function handleSave() {
     setSaving(true);
-    await fetch(`/api/applications/${application.id}`, {
+    setSaved(false);
+    const res = await fetch(`/api/applications/${application.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(form),
     });
     setSaving(false);
-    router.refresh();
+    if (res.ok) {
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    }
   }
 
   async function handleDelete() {
@@ -188,13 +194,18 @@ export default function ApplicationDetail({
       </div>
 
       <div className="flex items-center justify-between">
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50"
-        >
-          {saving ? "Saving..." : "Save Changes"}
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50"
+          >
+            {saving ? "Saving..." : "Save Changes"}
+          </button>
+          {saved && (
+            <span className="text-green-400 text-sm">Saved</span>
+          )}
+        </div>
 
         {showDeleteConfirm ? (
           <div className="flex items-center gap-2">
