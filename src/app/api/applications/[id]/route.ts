@@ -32,6 +32,7 @@ export async function PATCH(
         ...(body.jobTitle !== undefined && { jobTitle: body.jobTitle }),
         ...(body.company !== undefined && { company: body.company }),
         ...(body.status !== undefined && { status: body.status }),
+        ...(body.description !== undefined && { description: body.description || null }),
         ...(body.notes !== undefined && { notes: body.notes || null }),
         ...(body.salary !== undefined && { salary: body.salary || null }),
         ...(body.location !== undefined && { location: body.location || null }),

@@ -58,6 +58,7 @@ export async function POST(request: NextRequest) {
         company: body.company,
         status: body.status || "Applied",
         appliedDate: body.appliedDate ? new Date(body.appliedDate) : new Date(),
+        description: body.description || null,
         notes: body.notes || null,
         salary: body.salary || null,
         location: body.location || null,

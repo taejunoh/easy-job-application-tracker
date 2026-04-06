@@ -13,6 +13,7 @@ model Application {
   company     String
   status      String   @default("Applied")
   appliedDate DateTime @default(now())
+  description String?
   notes       String?
   salary      String?
   location    String?

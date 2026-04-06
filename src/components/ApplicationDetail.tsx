@@ -10,6 +10,7 @@ interface Application {
   company: string;
   status: string;
   appliedDate: string;
+  description: string | null;
   notes: string | null;
   salary: string | null;
   location: string | null;
@@ -31,6 +32,7 @@ export default function ApplicationDetail({
     jobTitle: application.jobTitle,
     company: application.company,
     status: application.status,
+    description: application.description || "",
     notes: application.notes || "",
     salary: application.salary || "",
     location: application.location || "",
@@ -143,6 +145,19 @@ export default function ApplicationDetail({
             ))}
           </select>
         </div>
+      </div>
+
+      <div className="mb-6">
+        <label className="text-xs text-gray-500 uppercase block mb-1">
+          Job Description
+        </label>
+        <textarea
+          value={form.description}
+          onChange={(e) => updateField("description", e.target.value)}
+          placeholder="Paste the job description here..."
+          rows={6}
+          className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 w-full focus:outline-none focus:border-blue-500 resize-y"
+        />
       </div>
 
       <div className="mb-6">

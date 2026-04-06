@@ -10,6 +10,7 @@ interface Application {
   company: string;
   status: string;
   appliedDate: string;
+  description: string | null;
   notes: string | null;
   salary: string | null;
   location: string | null;
