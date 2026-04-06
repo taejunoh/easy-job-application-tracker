@@ -4,12 +4,47 @@ import { createProvider } from "@/lib/extract/llm-provider";
 import { prisma } from "@/lib/prisma";
 import { decrypt } from "@/lib/crypto";
 
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+}
+
+export async function OPTIONS() {
+  return NextResponse.json(null, { headers: corsHeaders() });
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const { url } = await request.json();
+    const body = await request.json();
+    const { url, text } = body;
 
+    // Mode 1: Text paste — send directly to LLM
+    if (text && typeof text === "string" && text.trim()) {
+      const settings = await prisma.settings.findFirst();
+      if (!settings || !settings.apiKey) {
+        return NextResponse.json(
+          { error: "No LLM provider configured. Go to Settings to add an API key." },
+          { status: 400, headers: corsHeaders() }
+        );
+      }
+
+      const apiKey = decrypt(settings.apiKey);
+      const provider = createProvider(settings.llmProvider, apiKey);
+      const llmResult = await provider.extract(text.slice(0, 8000));
+
+      return NextResponse.json({
+        jobTitle: llmResult.jobTitle,
+        company: llmResult.company,
+        url: url || "",
+      }, { headers: corsHeaders() });
+    }
+
+    // Mode 2: URL extraction
     if (!url || typeof url !== "string") {
-      return NextResponse.json({ error: "URL is required" }, { status: 400 });
+      return NextResponse.json({ error: "URL or text is required" }, { status: 400, headers: corsHeaders() });
     }
 
     // Fetch the page
@@ -22,7 +57,7 @@ export async function POST(request: NextRequest) {
     if (!response.ok) {
       return NextResponse.json(
         { error: "Failed to fetch URL" },
-        { status: 422 }
+        { status: 422, headers: corsHeaders() }
       );
     }
 
@@ -47,8 +82,8 @@ export async function POST(request: NextRequest) {
         jobTitle: "",
         company: "",
         url,
-        warning: "This site requires login. Could not extract job details. Please enter them manually.",
-      });
+        warning: "This site requires login. Try using the 'Paste Text' tab or the Chrome extension instead.",
+      }, { headers: corsHeaders() });
     }
 
     // Step 1: Try meta tag parsing
@@ -60,18 +95,17 @@ export async function POST(request: NextRequest) {
         jobTitle: metaResult.jobTitle,
         company: metaResult.company,
         url,
-      });
+      }, { headers: corsHeaders() });
     }
 
     // Step 3: LLM fallback
     const settings = await prisma.settings.findFirst();
     if (!settings || !settings.apiKey) {
-      // Return what we have without LLM
       return NextResponse.json({
         jobTitle: metaResult.jobTitle || "",
         company: metaResult.company || "",
         url,
-      });
+      }, { headers: corsHeaders() });
     }
 
     const apiKey = decrypt(settings.apiKey);
@@ -91,12 +125,12 @@ export async function POST(request: NextRequest) {
       jobTitle: metaResult.jobTitle || llmResult.jobTitle,
       company: metaResult.company || llmResult.company,
       url,
-    });
+    }, { headers: corsHeaders() });
   } catch (error) {
     console.error("Extract error:", error);
     return NextResponse.json(
       { error: "Failed to extract job data" },
-      { status: 500 }
+      { status: 500, headers: corsHeaders() }
     );
   }
 }

@@ -4,6 +4,16 @@ import { prisma } from "@/lib/prisma";
 const VALID_STATUSES = ["Applied", "Interview", "Offer", "Rejected"];
 const VALID_JOB_TYPES = ["Remote", "Hybrid", "Onsite"];
 
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+export async function OPTIONS() {
+  return NextResponse.json(null, { headers: corsHeaders });
+}
+
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const status = searchParams.get("status");
@@ -55,12 +65,12 @@ export async function POST(request: NextRequest) {
       },
     });
 
-    return NextResponse.json(application, { status: 201 });
+    return NextResponse.json(application, { status: 201, headers: corsHeaders });
   } catch (error) {
     console.error("Create application error:", error);
     return NextResponse.json(
       { error: "Failed to create application" },
-      { status: 500 }
+      { status: 500, headers: corsHeaders }
     );
   }
 }

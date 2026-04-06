@@ -3,6 +3,8 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
+type InputMode = "url" | "text";
+
 interface ExtractedData {
   url: string;
   jobTitle: string;
@@ -11,7 +13,10 @@ interface ExtractedData {
 }
 
 export default function UrlInput() {
+  const [mode, setMode] = useState<InputMode>("url");
   const [url, setUrl] = useState("");
+  const [text, setText] = useState("");
+  const [textUrl, setTextUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [extracted, setExtracted] = useState<ExtractedData | null>(null);
@@ -19,7 +24,7 @@ export default function UrlInput() {
   const [editCompany, setEditCompany] = useState("");
   const router = useRouter();
 
-  async function handleExtract(e: React.FormEvent) {
+  async function handleExtractUrl(e: React.FormEvent) {
     e.preventDefault();
     if (!url.trim()) return;
 
@@ -35,7 +40,39 @@ export default function UrlInput() {
       });
 
       if (!res.ok) {
-        throw new Error("Failed to extract job data");
+        const data = await res.json();
+        throw new Error(data.error || "Failed to extract job data");
+      }
+
+      const data = await res.json();
+      setExtracted(data);
+      setEditTitle(data.jobTitle || "");
+      setEditCompany(data.company || "");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleExtractText(e: React.FormEvent) {
+    e.preventDefault();
+    if (!text.trim()) return;
+
+    setLoading(true);
+    setError("");
+    setExtracted(null);
+
+    try {
+      const res = await fetch("/api/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text.trim(), url: textUrl.trim() || undefined }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || "Failed to extract job data");
       }
 
       const data = await res.json();
@@ -63,7 +100,7 @@ export default function UrlInput() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          url: extracted?.url || url.trim(),
+          url: extracted?.url || textUrl.trim() || url.trim() || "",
           jobTitle: editTitle.trim(),
           company: editCompany.trim(),
         }),
@@ -74,6 +111,8 @@ export default function UrlInput() {
       }
 
       setUrl("");
+      setText("");
+      setTextUrl("");
       setExtracted(null);
       setEditTitle("");
       setEditCompany("");
@@ -94,16 +133,41 @@ export default function UrlInput() {
 
   return (
     <div>
-      <form onSubmit={handleExtract} className="flex items-center gap-2">
-        <input
-          type="url"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          placeholder="Paste job URL here..."
-          className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
-          disabled={loading || extracted !== null}
-        />
-        {!extracted ? (
+      {/* Mode tabs */}
+      <div className="flex gap-1 mb-2">
+        <button
+          onClick={() => { setMode("url"); setError(""); setExtracted(null); }}
+          className={`px-3 py-1 text-xs rounded ${
+            mode === "url"
+              ? "bg-gray-700 text-white"
+              : "text-gray-400 hover:text-gray-200"
+          }`}
+        >
+          URL
+        </button>
+        <button
+          onClick={() => { setMode("text"); setError(""); setExtracted(null); }}
+          className={`px-3 py-1 text-xs rounded ${
+            mode === "text"
+              ? "bg-gray-700 text-white"
+              : "text-gray-400 hover:text-gray-200"
+          }`}
+        >
+          Paste Text
+        </button>
+      </div>
+
+      {/* URL mode */}
+      {mode === "url" && !extracted && (
+        <form onSubmit={handleExtractUrl} className="flex items-center gap-2">
+          <input
+            type="url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="Paste job URL here..."
+            className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+            disabled={loading}
+          />
           <button
             type="submit"
             disabled={loading || !url.trim()}
@@ -111,9 +175,41 @@ export default function UrlInput() {
           >
             {loading ? "Extracting..." : "+ Add"}
           </button>
-        ) : null}
-      </form>
+        </form>
+      )}
 
+      {/* Text paste mode */}
+      {mode === "text" && !extracted && (
+        <form onSubmit={handleExtractText} className="space-y-2">
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="Paste the job description text here (copy from LinkedIn, Indeed, etc.)..."
+            rows={4}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-none"
+            disabled={loading}
+          />
+          <div className="flex items-center gap-2">
+            <input
+              type="url"
+              value={textUrl}
+              onChange={(e) => setTextUrl(e.target.value)}
+              placeholder="Job URL (optional, for reference)"
+              className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+              disabled={loading}
+            />
+            <button
+              type="submit"
+              disabled={loading || !text.trim()}
+              className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {loading ? "Extracting..." : "Extract"}
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* Confirmation form */}
       {extracted && (
         <div className="mt-3 bg-gray-900 border border-gray-700 rounded-lg p-4">
           {extracted.warning && (
