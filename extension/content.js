@@ -18,20 +18,25 @@ function extractLinkedIn() {
   // Location: LinkedIn puts it in various places — try multiple strategies
   let location = "";
 
-  // Strategy 1: Look for the primary/secondary description span that contains location text
+  // Noise patterns to reject
+  const noisePattern = /applicant|promoted|review|repost|hiring|click|apply|ago|week|day|hour|minute/i;
+
+  // Strategy 1: Look for spans inside the primary description that contain location-like text
   const primaryDesc = document.querySelector(".job-details-jobs-unified-top-card__primary-description-container");
   if (primaryDesc) {
-    // Location is typically the first text segment (before the interpunct or dot separator)
-    const text = primaryDesc.textContent || "";
-    const parts = text.split(/\s*·\s*|\s*•\s*/);
-    if (parts.length > 0) {
-      // Find the part that looks like a location (contains comma, state abbreviation, or "Remote")
-      for (const part of parts) {
-        const trimmed = part.trim();
-        if (/,|\b[A-Z]{2}\b|remote|hybrid|on-?site/i.test(trimmed) && trimmed.length < 100) {
-          location = trimmed;
-          break;
-        }
+    const spans = primaryDesc.querySelectorAll("span");
+    for (const span of spans) {
+      const text = span.textContent?.trim() || "";
+      if (!text || text.length > 80 || text.length < 3) continue;
+      if (noisePattern.test(text)) continue;
+      // Match "City, State", "City Metropolitan Area", "Remote", "United States"
+      if (/metropolitan|area/i.test(text) ||
+          /^[A-Z][a-z]+,\s*[A-Z]/.test(text) ||
+          /^(remote|hybrid|on-?site)$/i.test(text) ||
+          /^[A-Z][a-z]+\s+(state|county|city)/i.test(text) ||
+          /united states|canada|united kingdom/i.test(text)) {
+        location = text;
+        break;
       }
     }
   }
@@ -41,17 +46,14 @@ function extractLinkedIn() {
     const locationEl =
       document.querySelector(".job-details-jobs-unified-top-card__bullet") ||
       document.querySelector(".jobs-unified-top-card__bullet") ||
-      document.querySelector(".job-details-jobs-unified-top-card__workplace-type") ||
-      document.querySelector(".top-card-layout__card .topcard__flavor--bullet") ||
-      document.querySelector("[class*='top-card'] [class*='bullet']") ||
-      document.querySelector("[class*='top-card'] [class*='location']") ||
-      document.querySelector("[class*='top-card'] [class*='workplace']");
+      document.querySelector(".top-card-layout__card .topcard__flavor--bullet");
     if (locationEl) {
-      location = locationEl.textContent?.trim() || "";
+      const text = locationEl.textContent?.trim() || "";
+      if (!noisePattern.test(text)) location = text;
     }
   }
 
-  // Strategy 3: Search all spans in the top card area for location-like text
+  // Strategy 3: Search all spans in the top card for location patterns
   if (!location) {
     const topCard = document.querySelector("[class*='jobs-unified-top-card']") ||
       document.querySelector("[class*='job-details-jobs-unified-top-card']");
@@ -59,12 +61,13 @@ function extractLinkedIn() {
       const spans = topCard.querySelectorAll("span");
       for (const span of spans) {
         const text = span.textContent?.trim() || "";
-        // Match patterns like "City, ST", "Remote", "City, State (On-site)"
-        if (/^[A-Z][a-z]+.*,\s*[A-Z]/.test(text) || /^(remote|hybrid)/i.test(text)) {
-          if (text.length < 80) {
-            location = text;
-            break;
-          }
+        if (!text || text.length > 60 || text.length < 3) continue;
+        if (noisePattern.test(text)) continue;
+        if (/^[A-Z][a-z]+.*,\s*[A-Z]/.test(text) ||
+            /metropolitan|area/i.test(text) ||
+            /^(remote|hybrid)/i.test(text)) {
+          location = text;
+          break;
         }
       }
     }
