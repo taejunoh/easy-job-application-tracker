@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import Sidebar from "@/components/Sidebar";
-import UrlInput from "@/components/UrlInput";
+import UrlInputWrapper from "@/components/UrlInputWrapper";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -34,7 +34,7 @@ export default function RootLayout({
           <Sidebar />
           <main className="flex-1 p-6">
             <div className="mb-6">
-              <UrlInput />
+              <UrlInputWrapper />
             </div>
             {children}
           </main>
