@@ -51,6 +51,33 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Check if an application with a matching URL already exists (match by currentJobId param)
+    let existing = null;
+    const jobIdMatch = body.url.match(/currentJobId=(\d+)/);
+    if (jobIdMatch) {
+      const apps = await prisma.application.findMany({
+        where: { url: { contains: `currentJobId=${jobIdMatch[1]}` } },
+      });
+      if (apps.length > 0) existing = apps[0];
+    }
+
+    if (existing) {
+      // Update existing application with new data (fill in missing fields)
+      const application = await prisma.application.update({
+        where: { id: existing.id },
+        data: {
+          jobTitle: body.jobTitle || existing.jobTitle,
+          company: body.company || existing.company,
+          ...(body.description && { description: body.description }),
+          ...(body.location && { location: body.location }),
+          ...(body.jobType && { jobType: body.jobType }),
+          ...(body.salary && { salary: body.salary }),
+          ...(body.notes && !existing.notes ? { notes: body.notes } : {}),
+        },
+      });
+      return NextResponse.json({ ...application, updated: true }, { status: 200, headers: corsHeaders });
+    }
+
     const application = await prisma.application.create({
       data: {
         url: body.url,

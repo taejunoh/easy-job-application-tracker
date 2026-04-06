@@ -100,7 +100,12 @@ saveBtn.addEventListener("click", async () => {
       throw new Error("Server returned " + res.status);
     }
 
-    showStatus("Application saved to JobTracker!", "success");
+    const result = await res.json();
+    if (result.updated) {
+      showStatus("Existing application updated with full details!", "success");
+    } else {
+      showStatus("Application saved to JobTracker!", "success");
+    }
     saveBtn.textContent = "Saved!";
   } catch (err) {
     showStatus(
