@@ -44,6 +44,7 @@ async function extractFromPage() {
     document.getElementById("jobTitle").value = response.jobTitle || "";
     document.getElementById("company").value = response.company || "";
     document.getElementById("location").value = response.location || "";
+    document.getElementById("description").value = response.description || "";
     document.getElementById("jobUrl").value = response.url || tab.url;
 
     extractingEl.style.display = "none";
@@ -71,6 +72,7 @@ saveBtn.addEventListener("click", async () => {
   const jobTitle = document.getElementById("jobTitle").value.trim();
   const company = document.getElementById("company").value.trim();
   const location = document.getElementById("location").value.trim();
+  const description = document.getElementById("description").value.trim();
   const url = document.getElementById("jobUrl").value.trim();
 
   if (!jobTitle || !company) {
@@ -90,6 +92,7 @@ saveBtn.addEventListener("click", async () => {
         jobTitle,
         company,
         location: location || null,
+        description: description || null,
       }),
     });
 

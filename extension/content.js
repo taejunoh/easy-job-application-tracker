@@ -70,10 +70,19 @@ function extractLinkedIn() {
     }
   }
 
+  // Job description
+  const descEl =
+    document.querySelector(".jobs-description__content") ||
+    document.querySelector(".jobs-description-content__text") ||
+    document.querySelector("[class*='jobs-description']") ||
+    document.querySelector("#job-details") ||
+    document.querySelector("[class*='description__text']");
+
   return {
     jobTitle: titleEl?.textContent?.trim() || "",
     company: companyEl?.textContent?.trim() || "",
     location,
+    description: descEl?.innerText?.trim() || "",
   };
 }
 
@@ -92,10 +101,16 @@ function extractIndeed() {
     document.querySelector("[data-testid='job-location']") ||
     document.querySelector(".jobsearch-JobInfoHeader-subtitle .icl-u-xs-mt--xs");
 
+  const descEl =
+    document.querySelector("#jobDescriptionText") ||
+    document.querySelector(".jobsearch-JobComponent-description") ||
+    document.querySelector("[id*='jobDescription']");
+
   return {
     jobTitle: titleEl?.textContent?.trim() || "",
     company: companyEl?.textContent?.trim() || "",
     location: locationEl?.textContent?.trim() || "",
+    description: descEl?.innerText?.trim() || "",
   };
 }
 
@@ -114,10 +129,16 @@ function extractGlassdoor() {
     document.querySelector("[data-test='location']") ||
     document.querySelector(".css-56kyx5");
 
+  const descEl =
+    document.querySelector("[data-test='jobDescriptionContent']") ||
+    document.querySelector(".jobDescriptionContent") ||
+    document.querySelector("[class*='jobDescription']");
+
   return {
     jobTitle: titleEl?.textContent?.trim() || "",
     company: companyEl?.textContent?.trim() || "",
     location: locationEl?.textContent?.trim() || "",
+    description: descEl?.innerText?.trim() || "",
   };
 }
 
@@ -127,10 +148,15 @@ function extractGeneric() {
   const ogTitle = document.querySelector('meta[property="og:title"]');
   const ogSiteName = document.querySelector('meta[property="og:site_name"]');
 
+  const descEl = document.querySelector("[class*='description']") ||
+    document.querySelector("article") ||
+    document.querySelector("[role='main']");
+
   return {
     jobTitle: h1?.textContent?.trim() || ogTitle?.getAttribute("content") || "",
     company: ogSiteName?.getAttribute("content") || "",
     location: "",
+    description: descEl?.innerText?.trim() || "",
   };
 }
 
