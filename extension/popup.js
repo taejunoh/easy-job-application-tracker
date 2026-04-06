@@ -114,5 +114,11 @@ refreshBtn.addEventListener("click", () => {
   extractFromPage();
 });
 
+document.getElementById("openTracker").addEventListener("click", (e) => {
+  e.preventDefault();
+  const serverUrl = document.getElementById("serverUrl").value.replace(/\/$/, "");
+  chrome.tabs.create({ url: serverUrl });
+});
+
 // Auto-extract on popup open
 extractFromPage();
