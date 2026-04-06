@@ -118,6 +118,17 @@ export default function SettingsPage() {
           </div>
         </div>
 
+        {/* Current status */}
+        {hasExistingKey && (
+          <div className="mb-4 bg-gray-800 border border-gray-700 rounded p-3">
+            <div className="text-xs text-gray-500 uppercase mb-1">Current Configuration</div>
+            <div className="text-sm text-gray-200">
+              {PROVIDERS.find((p) => p.value === provider)?.label || provider}
+              <span className="ml-2 text-green-400 text-xs">-- API key configured</span>
+            </div>
+          </div>
+        )}
+
         <div className="flex items-center gap-3">
           <button
             onClick={handleSave}
