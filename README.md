@@ -24,8 +24,8 @@ A local-first job application tracker that auto-extracts job details from URLs. 
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/record-application.git
-cd record-application
+git clone https://github.com/taejunoh/easy-job-application-tracker.git
+cd easy-job-application-tracker
 
 # Install dependencies
 npm install
