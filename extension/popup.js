@@ -101,12 +101,19 @@ saveBtn.addEventListener("click", async () => {
     }
 
     const result = await res.json();
+    const appUrl = `${serverUrl}/applications/${result.id}`;
+
     if (result.updated) {
       showStatus("Existing application updated with full details!", "success");
     } else {
       showStatus("Application saved to JobTracker!", "success");
     }
     saveBtn.textContent = "Saved!";
+
+    // Replace "Open" link to go directly to this application
+    const openLink = document.getElementById("openTracker");
+    openLink.textContent = "View";
+    openLink.dataset.appUrl = appUrl;
   } catch (err) {
     showStatus(
       `Failed to save. Is JobTracker running at ${serverUrl}?`,
@@ -124,8 +131,9 @@ refreshBtn.addEventListener("click", () => {
 
 document.getElementById("openTracker").addEventListener("click", (e) => {
   e.preventDefault();
-  const serverUrl = document.getElementById("serverUrl").value.replace(/\/$/, "");
-  chrome.tabs.create({ url: serverUrl });
+  const openLink = document.getElementById("openTracker");
+  const targetUrl = openLink.dataset.appUrl || document.getElementById("serverUrl").value.replace(/\/$/, "");
+  chrome.tabs.create({ url: targetUrl });
 });
 
 // Auto-extract on popup open
