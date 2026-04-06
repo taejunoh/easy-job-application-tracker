@@ -28,6 +28,29 @@ export async function POST(request: NextRequest) {
 
     const html = await response.text();
 
+    // Detect login/auth walls
+    const loginPatterns = [
+      /sign\s*in/i,
+      /log\s*in/i,
+      /authentication/i,
+    ];
+    const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+    const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+    const isLoginWall = loginPatterns.some((p) => p.test(pageTitle)) &&
+      !pageTitle.toLowerCase().includes("engineer") &&
+      !pageTitle.toLowerCase().includes("manager") &&
+      !pageTitle.toLowerCase().includes("developer") &&
+      !pageTitle.toLowerCase().includes("analyst");
+
+    if (isLoginWall) {
+      return NextResponse.json({
+        jobTitle: "",
+        company: "",
+        url,
+        warning: "This site requires login. Could not extract job details. Please enter them manually.",
+      });
+    }
+
     // Step 1: Try meta tag parsing
     const metaResult = parseMetaTags(html);
 
