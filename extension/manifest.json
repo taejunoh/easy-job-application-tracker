@@ -13,7 +13,10 @@
         "https://www.linkedin.com/jobs/*",
         "https://www.indeed.com/*",
         "https://www.glassdoor.com/job-listing/*",
-        "https://www.glassdoor.com/Job/*"
+        "https://www.glassdoor.com/Job/*",
+        "https://boards.greenhouse.io/*",
+        "https://jobs.lever.co/*",
+        "https://*.myworkdayjobs.com/*"
       ],
       "js": ["content.js"]
     }

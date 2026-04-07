@@ -142,5 +142,55 @@ document.getElementById("openTracker").addEventListener("click", (e) => {
   chrome.tabs.create({ url: targetUrl });
 });
 
+// Auto-fill profile URLs on application forms
+async function fillProfiles() {
+  const serverUrl = document.getElementById("serverUrl").value.replace(/\/$/, "");
+  const fillBtn = document.getElementById("fillProfilesBtn");
+
+  try {
+    const res = await fetch(`${serverUrl}/api/settings`);
+    if (!res.ok) return;
+    const settings = await res.json();
+
+    if (!settings.linkedinUrl && !settings.githubUrl) {
+      if (fillBtn) fillBtn.style.display = "none";
+      return;
+    }
+
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) return;
+
+    // Inject content script if needed
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["content.js"],
+      });
+    } catch {
+      // Already injected
+    }
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const response = await chrome.tabs.sendMessage(tab.id, {
+      action: "autoFillProfiles",
+      profiles: {
+        linkedinUrl: settings.linkedinUrl,
+        githubUrl: settings.githubUrl,
+      },
+    });
+
+    if (response?.filled?.length > 0) {
+      showStatus(`Auto-filled: ${response.filled.join(", ")}`, "success");
+    }
+  } catch {
+    // Silently fail — not on an application form
+  }
+}
+
+document.getElementById("fillProfilesBtn")?.addEventListener("click", () => {
+  fillProfiles();
+});
+
 // Auto-extract on popup open
 extractFromPage();

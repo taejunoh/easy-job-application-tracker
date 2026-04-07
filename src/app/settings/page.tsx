@@ -13,6 +13,8 @@ export default function SettingsPage() {
   const [apiKey, setApiKey] = useState("");
   const [hasExistingKey, setHasExistingKey] = useState(false);
   const [showKey, setShowKey] = useState(false);
+  const [linkedinUrl, setLinkedinUrl] = useState("");
+  const [githubUrl, setGithubUrl] = useState("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState("");
@@ -23,6 +25,8 @@ export default function SettingsPage() {
       .then((data) => {
         setProvider(data.llmProvider);
         setHasExistingKey(data.hasApiKey);
+        setLinkedinUrl(data.linkedinUrl || "");
+        setGithubUrl(data.githubUrl || "");
       });
   }, []);
 
@@ -30,7 +34,11 @@ export default function SettingsPage() {
     setSaving(true);
     setMessage("");
 
-    const body: Record<string, string> = { llmProvider: provider };
+    const body: Record<string, string> = {
+      llmProvider: provider,
+      linkedinUrl,
+      githubUrl,
+    };
     if (apiKey) body.apiKey = apiKey;
 
     const res = await fetch("/api/settings", {
@@ -128,6 +136,37 @@ export default function SettingsPage() {
             </div>
           </div>
         )}
+
+        <hr className="border-gray-700 my-6" />
+
+        <h2 className="text-sm font-medium text-gray-400 uppercase mb-4">
+          Profile URLs
+        </h2>
+        <p className="text-xs text-gray-500 mb-3">
+          Used by the extension to auto-fill application forms.
+        </p>
+
+        <div className="mb-4">
+          <label className="text-xs text-gray-500 block mb-1">LinkedIn Profile</label>
+          <input
+            type="url"
+            value={linkedinUrl}
+            onChange={(e) => setLinkedinUrl(e.target.value)}
+            placeholder="https://linkedin.com/in/yourprofile"
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+          />
+        </div>
+
+        <div className="mb-4">
+          <label className="text-xs text-gray-500 block mb-1">GitHub Profile</label>
+          <input
+            type="url"
+            value={githubUrl}
+            onChange={(e) => setGithubUrl(e.target.value)}
+            placeholder="https://github.com/yourusername"
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+          />
+        </div>
 
         <div className="flex items-center gap-3">
           <button

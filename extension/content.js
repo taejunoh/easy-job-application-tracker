@@ -16,14 +16,24 @@ function extractLinkedIn() {
     document.querySelector("h1.t-24");
   jobTitle = titleEl?.textContent?.trim() || "";
 
-  // Search results: find via currentJobId link
+  // Search results: find the job title from the right detail panel
   if (!jobTitle) {
     const jobId = new URL(window.location.href).searchParams.get("currentJobId");
+    // Strategy A: find a /jobs/view/{jobId} link with short text (title only, not card-wrapper)
     if (jobId) {
-      const skip = /^(more|less|show|hide|save|apply|share|close|view|see)$/i;
-      for (const link of document.querySelectorAll(`a[href*='${jobId}']`)) {
+      for (const link of document.querySelectorAll(`a[href*='/jobs/view/${jobId}']`)) {
         const text = link.textContent?.trim() || "";
-        if (text.length > 5 && !skip.test(text)) {
+        if (text.length > 3 && text.length < 80) {
+          jobTitle = text;
+          break;
+        }
+      }
+    }
+    // Strategy B: any /jobs/view/ link with short text
+    if (!jobTitle) {
+      for (const link of document.querySelectorAll("a[href*='/jobs/view/']")) {
+        const text = link.textContent?.trim() || "";
+        if (text.length > 5 && text.length < 80) {
           jobTitle = text;
           break;
         }
@@ -246,12 +256,93 @@ function extractJobData() {
   return extractGeneric();
 }
 
+// Auto-fill profile URLs on job application forms
+function autoFillProfiles(profiles) {
+  const { linkedinUrl, githubUrl } = profiles;
+  let filled = [];
+
+  // Find all input fields and textareas on the page
+  const inputs = document.querySelectorAll("input[type='text'], input[type='url'], input:not([type]), textarea");
+
+  for (const input of inputs) {
+    const label = findLabelFor(input);
+    const name = (input.name || "").toLowerCase();
+    const id = (input.id || "").toLowerCase();
+    const placeholder = (input.placeholder || "").toLowerCase();
+    const hint = `${label} ${name} ${id} ${placeholder}`;
+
+    // LinkedIn field
+    if (linkedinUrl && !input.value && /linkedin/i.test(hint)) {
+      setInputValue(input, linkedinUrl);
+      filled.push("LinkedIn");
+    }
+
+    // GitHub field
+    if (githubUrl && !input.value && /github/i.test(hint)) {
+      setInputValue(input, githubUrl);
+      filled.push("GitHub");
+    }
+  }
+
+  return filled;
+}
+
+// Find the label text associated with an input
+function findLabelFor(input) {
+  // Check for <label for="id">
+  if (input.id) {
+    const label = document.querySelector(`label[for="${input.id}"]`);
+    if (label) return label.textContent || "";
+  }
+  // Check for parent <label>
+  const parentLabel = input.closest("label");
+  if (parentLabel) return parentLabel.textContent || "";
+  // Check for preceding label sibling
+  const prev = input.previousElementSibling;
+  if (prev && prev.tagName === "LABEL") return prev.textContent || "";
+  // Check parent's preceding sibling or parent's label-like child
+  const parent = input.parentElement;
+  if (parent) {
+    const prevSibling = parent.previousElementSibling;
+    if (prevSibling) return prevSibling.textContent || "";
+    // Look for a label-like element in the parent's parent
+    const grandparent = parent.parentElement;
+    if (grandparent) {
+      const labelEl = grandparent.querySelector("label, [class*='label'], [class*='Label']");
+      if (labelEl && labelEl !== input) return labelEl.textContent || "";
+    }
+  }
+  return "";
+}
+
+// Set input value and trigger React/framework change events
+function setInputValue(input, value) {
+  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLInputElement.prototype, "value"
+  )?.set || Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype, "value"
+  )?.set;
+
+  if (nativeInputValueSetter) {
+    nativeInputValueSetter.call(input, value);
+  } else {
+    input.value = value;
+  }
+
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
 // Listen for messages from the popup
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "extractJob") {
     const data = extractJobData();
     data.url = window.location.href;
     sendResponse(data);
+  }
+  if (request.action === "autoFillProfiles") {
+    const filled = autoFillProfiles(request.profiles);
+    sendResponse({ filled });
   }
   return true;
 });

@@ -26,4 +26,6 @@ model Settings {
   id          String @id @default("singleton")
   llmProvider String @default("openai")
   apiKey      String @default("")
+  linkedinUrl String @default("")
+  githubUrl   String @default("")
 }
