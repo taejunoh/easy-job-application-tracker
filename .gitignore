@@ -48,5 +48,8 @@ next-env.d.ts
 prisma/dev.db
 prisma/dev.db-journal
 
+# handover
+handover.md
+
 # superpowers
 .superpowers/

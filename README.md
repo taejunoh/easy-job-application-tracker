@@ -14,7 +14,7 @@ A local-first job application tracker that auto-extracts job details from URLs. 
 
 ## Tech Stack
 
-- Next.js 15 (App Router)
+- Next.js 16 (App Router)
 - Tailwind CSS
 - Prisma + SQLite
 - Cheerio (HTML parsing)
