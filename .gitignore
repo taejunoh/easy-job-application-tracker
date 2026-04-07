@@ -48,7 +48,9 @@ next-env.d.ts
 prisma/dev.db
 prisma/dev.db-journal
 
-# handover
+# AI agent config
+CLAUDE.md
+AGENTS.md
 handover.md
 
 # superpowers
