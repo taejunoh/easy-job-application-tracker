@@ -11,6 +11,41 @@ function showStatus(message, type) {
   statusMsg.style.display = "block";
 }
 
+function populateForm(data, tabUrl) {
+  document.getElementById("jobTitle").value = data.jobTitle || "";
+  document.getElementById("company").value = data.company || "";
+  document.getElementById("location").value = data.location || "";
+  document.getElementById("description").value = data.description || "";
+  document.getElementById("salary").value = data.salary || "";
+  document.getElementById("jobType").value = data.jobType || "";
+  document.getElementById("jobUrl").value = data.url || tabUrl || "";
+
+  extractingEl.style.display = "none";
+  formEl.style.display = "block";
+
+  if (!data.jobTitle && !data.company) {
+    showStatus("Could not auto-detect job data. Please fill in manually.", "info");
+  } else if (data.warning) {
+    showStatus(data.warning, "info");
+  }
+}
+
+async function serverExtract(url) {
+  if (!url || url.startsWith("chrome://")) return null;
+  const serverUrl = document.getElementById("serverUrl").value.replace(/\/$/, "");
+  try {
+    const res = await fetch(`${serverUrl}/api/extract`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 async function extractFromPage() {
   extractingEl.style.display = "block";
   formEl.style.display = "none";
@@ -41,31 +76,37 @@ async function extractFromPage() {
 
     const response = await chrome.tabs.sendMessage(tab.id, { action: "extractJob" });
 
-    document.getElementById("jobTitle").value = response.jobTitle || "";
-    document.getElementById("company").value = response.company || "";
-    document.getElementById("location").value = response.location || "";
-    document.getElementById("description").value = response.description || "";
-    document.getElementById("salary").value = response.salary || "";
-    document.getElementById("jobType").value = response.jobType || "";
-    document.getElementById("jobUrl").value = response.url || tab.url;
+    let result = response;
 
-    extractingEl.style.display = "none";
-    formEl.style.display = "block";
-
+    // If content script couldn't extract, fall back to server-side extraction
     if (!response.jobTitle && !response.company) {
-      showStatus("Could not auto-detect job data. Please fill in manually.", "info");
+      const serverResult = await serverExtract(tab.url);
+      if (serverResult && (serverResult.jobTitle || serverResult.company)) {
+        // Merge: keep content script's location/description if server didn't provide them
+        result = {
+          ...response,
+          ...serverResult,
+          location: response.location || serverResult.location || "",
+          description: response.description || serverResult.description || "",
+        };
+      }
     }
+
+    populateForm(result, tab.url);
   } catch (err) {
-    extractingEl.style.display = "none";
-    formEl.style.display = "block";
-    document.getElementById("jobUrl").value = "";
-
+    // Content script failed entirely — try server-side extraction
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.url) {
-      document.getElementById("jobUrl").value = tab.url;
-    }
+    const pageUrl = tab?.url || "";
 
-    showStatus("Could not extract from this page. Enter details manually.", "info");
+    const serverResult = await serverExtract(pageUrl);
+    if (serverResult && (serverResult.jobTitle || serverResult.company)) {
+      populateForm(serverResult, pageUrl);
+    } else {
+      extractingEl.style.display = "none";
+      formEl.style.display = "block";
+      document.getElementById("jobUrl").value = pageUrl;
+      showStatus("Could not extract from this page. Enter details manually.", "info");
+    }
   }
 }
 

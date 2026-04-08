@@ -94,6 +94,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         jobTitle: metaResult.jobTitle,
         company: metaResult.company,
+        location: metaResult.location || "",
         url,
       }, { headers: corsHeaders() });
     }
@@ -104,6 +105,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         jobTitle: metaResult.jobTitle || "",
         company: metaResult.company || "",
+        location: metaResult.location || "",
         url,
       }, { headers: corsHeaders() });
     }
@@ -124,6 +126,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       jobTitle: metaResult.jobTitle || llmResult.jobTitle,
       company: metaResult.company || llmResult.company,
+      location: metaResult.location || "",
       url,
     }, { headers: corsHeaders() });
   } catch (error) {
