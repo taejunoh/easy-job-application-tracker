@@ -231,18 +231,103 @@ function extractGlassdoor() {
 }
 
 function extractGeneric() {
-  const h1 = document.querySelector("h1");
-  const ogTitle = document.querySelector('meta[property="og:title"]');
-  const ogSiteName = document.querySelector('meta[property="og:site_name"]');
+  const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "";
+  const ogSiteName = document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "";
 
+  // Find job title from multiple strategies
+  let jobTitle = "";
+
+  // Strategy 1: Common ATS field-value selectors (Avature, etc.)
+  const fieldSelectors = [
+    ".article__content__view__field__value",
+    "[class*='job-title']",
+    "[class*='jobTitle']",
+    "[class*='posting-headline']",
+    "[data-automation-id='jobPostingHeader']",
+  ];
+  for (const sel of fieldSelectors) {
+    const el = document.querySelector(sel);
+    const text = el?.textContent?.trim() || "";
+    if (text.length > 5 && text.length < 120) {
+      jobTitle = text;
+      break;
+    }
+  }
+
+  // Strategy 2: Visible h1 that isn't just the company name
+  if (!jobTitle) {
+    const h1 = document.querySelector("h1");
+    if (h1) {
+      const text = h1.textContent?.trim() || "";
+      const isHidden = h1.className?.includes("hidden") || h1.offsetHeight === 0;
+      if (text.length > 3 && !isHidden &&
+          text.toLowerCase() !== ogSiteName.toLowerCase() &&
+          text.toLowerCase() !== company.toLowerCase()) {
+        jobTitle = text;
+      }
+    }
+  }
+
+  // Strategy 3: h2 that looks like a job title (not a section header)
+  if (!jobTitle) {
+    const sectionHeaders = /description|requirement|accommodation|equal opportunity|privacy|about|benefit|overview|apply|similar/i;
+    for (const h2 of document.querySelectorAll("h2")) {
+      const text = h2.textContent?.trim() || "";
+      if (text.length > 5 && text.length < 120 && !sectionHeaders.test(text)) {
+        jobTitle = text;
+        break;
+      }
+    }
+  }
+
+  // Strategy 4: og:title fallback
+  if (!jobTitle) {
+    jobTitle = ogTitle;
+  }
+
+  // Company: og:site_name, or try the page domain
+  let company = ogSiteName;
+  if (!company) {
+    const domain = window.location.hostname.replace(/^www\./, "").split(".")[0];
+    company = domain.charAt(0).toUpperCase() + domain.slice(1);
+  }
+
+  // Location: check dedicated elements, then scan for "Location:" labels
+  let location = "";
+  const locationEl = document.querySelector("[class*='location'], [data-testid*='location'], [itemprop='jobLocation']");
+  if (locationEl) location = locationEl.textContent?.trim() || "";
+
+  if (!location) {
+    // Find elements with text "Location" and grab the next sibling or value
+    for (const el of document.querySelectorAll("*")) {
+      const text = el.textContent?.trim() || "";
+      if (text === "Location:" || text === "Location") {
+        // Check next sibling
+        const next = el.nextElementSibling;
+        if (next) {
+          const val = next.textContent?.trim() || "";
+          if (val.length > 1 && val.length < 60) { location = val; break; }
+        }
+        // Check parent's next sibling
+        const parentNext = el.parentElement?.nextElementSibling;
+        if (!location && parentNext) {
+          const val = parentNext.textContent?.trim() || "";
+          if (val.length > 1 && val.length < 60) { location = val; break; }
+        }
+      }
+    }
+  }
+
+  // Description
   const descEl = document.querySelector("[class*='description']") ||
+    document.querySelector("[class*='job-detail']") ||
     document.querySelector("article") ||
     document.querySelector("[role='main']");
 
   return {
-    jobTitle: h1?.textContent?.trim() || ogTitle?.getAttribute("content") || "",
-    company: ogSiteName?.getAttribute("content") || "",
-    location: "",
+    jobTitle,
+    company,
+    location,
     description: descEl?.innerText?.trim() || "",
   };
 }
