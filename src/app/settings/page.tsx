@@ -21,7 +21,7 @@ export default function SettingsPage() {
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    fetch("/api/settings")
+    fetch("/api/settings?includeResume=true")
       .then((res) => res.json())
       .then((data) => {
         setProvider(data.llmProvider);

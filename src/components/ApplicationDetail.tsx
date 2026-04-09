@@ -46,18 +46,24 @@ export default function ApplicationDetail({
   const [saved, setSaved] = useState(false);
   const [resumeText, setResumeText] = useState<string | null>(null);
   const [showAnalysis, setShowAnalysis] = useState(false);
+  const [debouncedDescription, setDebouncedDescription] = useState(form.description);
 
   useEffect(() => {
-    fetch("/api/settings")
+    fetch("/api/settings?includeResume=true")
       .then((res) => res.json())
       .then((data) => setResumeText(data.resumeText || ""))
       .catch(() => setResumeText(""));
   }, []);
 
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedDescription(form.description), 300);
+    return () => clearTimeout(timer);
+  }, [form.description]);
+
   const keywordAnalysis = useMemo(() => {
-    if (!form.description || !resumeText) return null;
-    return analyzeKeywordMatch(form.description, resumeText);
-  }, [form.description, resumeText]);
+    if (!debouncedDescription || !resumeText) return null;
+    return analyzeKeywordMatch(debouncedDescription, resumeText);
+  }, [debouncedDescription, resumeText]);
 
   async function handleSave() {
     setSaving(true);

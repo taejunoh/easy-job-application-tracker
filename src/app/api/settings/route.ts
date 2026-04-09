@@ -12,20 +12,28 @@ export async function OPTIONS() {
   return NextResponse.json(null, { headers: corsHeaders });
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   let settings = await prisma.settings.findFirst();
 
   if (!settings) {
     settings = await prisma.settings.create({ data: {} });
   }
 
-  return NextResponse.json({
+  const { searchParams } = new URL(request.url);
+  const includeResume = searchParams.get("includeResume") === "true";
+
+  const response: Record<string, unknown> = {
     llmProvider: settings.llmProvider,
     hasApiKey: settings.apiKey !== "",
     linkedinUrl: settings.linkedinUrl,
     githubUrl: settings.githubUrl,
-    resumeText: settings.resumeText,
-  }, { headers: corsHeaders });
+  };
+
+  if (includeResume) {
+    response.resumeText = settings.resumeText;
+  }
+
+  return NextResponse.json(response, { headers: corsHeaders });
 }
 
 export async function PUT(request: NextRequest) {

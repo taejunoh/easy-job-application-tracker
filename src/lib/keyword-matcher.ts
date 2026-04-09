@@ -10,7 +10,7 @@ const SKILLS_DICTIONARY: Record<string, string[][]> = {
     ["Rust"],
     ["Ruby"],
     ["PHP"],
-    ["Swift"],
+    ["Swift", "Swift programming", "Swift language", "Swift/SwiftUI"],
     ["Kotlin"],
     ["Scala"],
     ["SQL"],
@@ -38,11 +38,11 @@ const SKILLS_DICTIONARY: Record<string, string[][]> = {
   ],
   "Backend Frameworks": [
     ["Node.js", "NodeJS"],
-    ["Express", "Express.js", "ExpressJS"],
+    ["Express", "Express.js", "ExpressJS", "Express framework"],
     ["Django"],
     ["Flask"],
     ["FastAPI"],
-    ["Spring", "Spring Boot", "SpringBoot"],
+    ["Spring", "Spring Boot", "SpringBoot", "Spring Framework", "Spring MVC"],
     ["Rails", "Ruby on Rails"],
     ["Laravel"],
     ["ASP.NET"],
@@ -94,7 +94,7 @@ const SKILLS_DICTIONARY: Record<string, string[][]> = {
     ["Jira"],
     ["Confluence"],
     ["Figma"],
-    ["REST", "RESTful", "REST API"],
+    ["REST", "RESTful", "REST API", "REST APIs", "RESTful API", "RESTful APIs"],
     ["GraphQL"],
     ["gRPC"],
     ["Agile"],
@@ -133,7 +133,7 @@ const SKILLS_DICTIONARY: Record<string, string[][]> = {
     ["Computer Vision"],
     ["LLM", "Large Language Model"],
     ["RAG", "Retrieval Augmented Generation"],
-    ["Spark", "Apache Spark"],
+    ["Spark", "Apache Spark", "PySpark", "Spark SQL"],
     ["Hadoop"],
     ["Tableau"],
     ["Power BI"],
@@ -157,7 +157,15 @@ function escapeRegex(str: string): string {
 const HAS_SPECIAL_CHARS = /[.\-\/#+]/;
 
 // Terms that are common English words — skip standalone matching, rely on their aliases
-const AMBIGUOUS_TERMS = new Set(["go", "r"]);
+const AMBIGUOUS_TERMS = new Set([
+  "go",        // "go to market" — use Golang, Go language
+  "r",         // too short — would need R language alias
+  "rest",      // "the rest of the team" — use RESTful, REST API
+  "express",   // "express interest" — use Express.js, ExpressJS
+  "swift",     // "swift response" — use Swift programming, SwiftUI
+  "spring",    // "this spring" — use Spring Boot, Spring Framework
+  "spark",     // "spark innovation" — use Apache Spark
+]);
 
 function textContainsTerm(
   normalizedText: string,
