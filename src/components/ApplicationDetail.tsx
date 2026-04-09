@@ -201,7 +201,7 @@ export default function ApplicationDetail({
         <div className="mb-6 bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
           <button
             onClick={() => setShowAnalysis(!showAnalysis)}
-            className="w-full flex items-center justify-between px-4 py-3 hover:bg-gray-750 transition-colors"
+            className="w-full flex items-center justify-between px-4 py-3 hover:bg-gray-700/50 transition-colors"
           >
             <div className="flex items-center gap-3">
               <span className="text-sm font-medium text-gray-200">

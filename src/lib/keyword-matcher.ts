@@ -6,7 +6,7 @@ const SKILLS_DICTIONARY: Record<string, string[][]> = {
     ["Java"],
     ["C++", "CPP", "C Plus Plus"],
     ["C#", "CSharp", "C Sharp"],
-    ["Go", "Golang"],
+    ["Go", "Golang", "Go language"],
     ["Rust"],
     ["Ruby"],
     ["PHP"],
@@ -154,6 +154,11 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const HAS_SPECIAL_CHARS = /[.\-\/#+]/;
+
+// Terms that are common English words — skip standalone matching, rely on their aliases
+const AMBIGUOUS_TERMS = new Set(["go", "r"]);
+
 function textContainsTerm(
   normalizedText: string,
   originalTextLower: string,
@@ -161,22 +166,30 @@ function textContainsTerm(
 ): boolean {
   const termLower = term.toLowerCase();
 
-  // First try exact match on original text (handles "Node.js", "CI/CD", "C#", "C++")
-  if (originalTextLower.includes(termLower)) {
-    // For short terms (1-2 chars), verify it's a standalone word
-    if (termLower.length <= 2) {
-      const regex = new RegExp(`\\b${escapeRegex(termLower)}\\b`, "i");
-      return regex.test(originalTextLower);
+  // Terms with special chars (e.g. "Node.js", "C++", "C#", "CI/CD"):
+  // check exact substring match on original text, then verify word boundary
+  if (HAS_SPECIAL_CHARS.test(termLower)) {
+    if (originalTextLower.includes(termLower)) {
+      return true;
     }
-    return true;
+    // Also try normalized form with word boundaries
+    const normalizedTerm = termLower.replace(/[.\-\/#+]/g, " ").replace(/\s+/g, " ").trim();
+    if (normalizedTerm.length === 0) return false;
+    const regex = new RegExp(`\\b${escapeRegex(normalizedTerm)}\\b`, "i");
+    return regex.test(normalizedText);
   }
 
-  // Then try word-boundary match on normalized text
-  const normalizedTerm = termLower.replace(/[.\-\/#+]/g, " ").replace(/\s+/g, " ").trim();
-  if (normalizedTerm.length === 0) return false;
+  // Plain terms: always use word-boundary regex to avoid substring false positives
+  // (e.g. "Java" must not match "JavaScript", "Git" must not match "digital")
 
-  const regex = new RegExp(`\\b${escapeRegex(normalizedTerm)}\\b`, "i");
-  return regex.test(normalizedText);
+  // Skip ambiguous short terms that are common English words
+  // (e.g. "Go" matches "go to market" — rely on aliases like "Golang" instead)
+  if (AMBIGUOUS_TERMS.has(termLower)) {
+    return false;
+  }
+
+  const regex = new RegExp(`\\b${escapeRegex(termLower)}\\b`, "i");
+  return regex.test(originalTextLower);
 }
 
 export interface KeywordMatchResult {
