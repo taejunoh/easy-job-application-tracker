@@ -15,6 +15,7 @@ export default function SettingsPage() {
   const [showKey, setShowKey] = useState(false);
   const [linkedinUrl, setLinkedinUrl] = useState("");
   const [githubUrl, setGithubUrl] = useState("");
+  const [resumeText, setResumeText] = useState("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState("");
@@ -27,6 +28,7 @@ export default function SettingsPage() {
         setHasExistingKey(data.hasApiKey);
         setLinkedinUrl(data.linkedinUrl || "");
         setGithubUrl(data.githubUrl || "");
+        setResumeText(data.resumeText || "");
       });
   }, []);
 
@@ -38,6 +40,7 @@ export default function SettingsPage() {
       llmProvider: provider,
       linkedinUrl,
       githubUrl,
+      resumeText,
     };
     if (apiKey) body.apiKey = apiKey;
 
@@ -165,6 +168,25 @@ export default function SettingsPage() {
             onChange={(e) => setGithubUrl(e.target.value)}
             placeholder="https://github.com/yourusername"
             className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+          />
+        </div>
+
+        <hr className="border-gray-700 my-6" />
+
+        <h2 className="text-sm font-medium text-gray-400 uppercase mb-4">
+          Resume
+        </h2>
+        <p className="text-xs text-gray-500 mb-3">
+          Paste your resume text to compare keywords against job descriptions.
+        </p>
+
+        <div className="mb-4">
+          <textarea
+            value={resumeText}
+            onChange={(e) => setResumeText(e.target.value)}
+            placeholder="Paste your resume text here..."
+            rows={10}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500 resize-y"
           />
         </div>
 

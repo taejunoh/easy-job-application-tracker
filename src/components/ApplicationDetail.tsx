@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
+import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
 
 interface Application {
   id: string;
@@ -43,6 +44,20 @@ export default function ApplicationDetail({
   const [deleting, setDeleting] = useState(false);
 
   const [saved, setSaved] = useState(false);
+  const [resumeText, setResumeText] = useState<string | null>(null);
+  const [showAnalysis, setShowAnalysis] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/settings")
+      .then((res) => res.json())
+      .then((data) => setResumeText(data.resumeText || ""))
+      .catch(() => setResumeText(""));
+  }, []);
+
+  const keywordAnalysis = useMemo(() => {
+    if (!form.description || !resumeText) return null;
+    return analyzeKeywordMatch(form.description, resumeText);
+  }, [form.description, resumeText]);
 
   async function handleSave() {
     setSaving(true);
@@ -165,6 +180,113 @@ export default function ApplicationDetail({
           className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 w-full focus:outline-none focus:border-blue-500 resize-y"
         />
       </div>
+
+      {/* Keyword Match Analysis */}
+      {form.description && resumeText === "" && (
+        <div className="mb-6 bg-gray-800 border border-gray-700 rounded-lg p-4">
+          <p className="text-sm text-gray-400">
+            Add your resume in{" "}
+            <button
+              onClick={() => router.push("/settings")}
+              className="text-blue-400 hover:underline"
+            >
+              Settings
+            </button>{" "}
+            to see keyword match analysis.
+          </p>
+        </div>
+      )}
+
+      {keywordAnalysis && keywordAnalysis.totalJobKeywords > 0 && (
+        <div className="mb-6 bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
+          <button
+            onClick={() => setShowAnalysis(!showAnalysis)}
+            className="w-full flex items-center justify-between px-4 py-3 hover:bg-gray-750 transition-colors"
+          >
+            <div className="flex items-center gap-3">
+              <span className="text-sm font-medium text-gray-200">
+                Keyword Match Analysis
+              </span>
+              <span
+                className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                  keywordAnalysis.matchPercentage >= 70
+                    ? "bg-green-900/50 text-green-400"
+                    : keywordAnalysis.matchPercentage >= 40
+                      ? "bg-yellow-900/50 text-yellow-400"
+                      : "bg-red-900/50 text-red-400"
+                }`}
+              >
+                {keywordAnalysis.matchPercentage}%
+              </span>
+            </div>
+            <span className="text-gray-500 text-sm">
+              {showAnalysis ? "▲" : "▼"}
+            </span>
+          </button>
+
+          {showAnalysis && (
+            <div className="px-4 pb-4 border-t border-gray-700">
+              {/* Progress bar */}
+              <div className="mt-3 mb-2">
+                <div className="w-full bg-gray-700 rounded-full h-2">
+                  <div
+                    className={`h-2 rounded-full transition-all ${
+                      keywordAnalysis.matchPercentage >= 70
+                        ? "bg-green-500"
+                        : keywordAnalysis.matchPercentage >= 40
+                          ? "bg-yellow-500"
+                          : "bg-red-500"
+                    }`}
+                    style={{ width: `${keywordAnalysis.matchPercentage}%` }}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-gray-400 mb-4">
+                {keywordAnalysis.matchedKeywords.length} of{" "}
+                {keywordAnalysis.totalJobKeywords} keywords matched
+              </p>
+
+              {/* Matched Keywords */}
+              {keywordAnalysis.matchedKeywords.length > 0 && (
+                <div className="mb-3">
+                  <h4 className="text-xs text-green-400 font-medium uppercase mb-2">
+                    Matched
+                  </h4>
+                  <div className="flex flex-wrap gap-1.5">
+                    {keywordAnalysis.matchedKeywords.map((k) => (
+                      <span
+                        key={k.keyword}
+                        className="text-xs px-2 py-1 rounded bg-green-900/30 text-green-300 border border-green-800/50"
+                      >
+                        {k.keyword}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Missing Keywords */}
+              {keywordAnalysis.missingKeywords.length > 0 && (
+                <div>
+                  <h4 className="text-xs text-red-400 font-medium uppercase mb-2">
+                    Missing
+                  </h4>
+                  <div className="flex flex-wrap gap-1.5">
+                    {keywordAnalysis.missingKeywords.map((k) => (
+                      <span
+                        key={k.keyword}
+                        className="text-xs px-2 py-1 rounded bg-red-900/30 text-red-300 border border-red-800/50"
+                      >
+                        {k.keyword}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="mb-6">
         <label className="text-xs text-gray-500 uppercase block mb-1">

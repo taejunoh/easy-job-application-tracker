@@ -28,4 +28,5 @@ model Settings {
   apiKey      String @default("")
   linkedinUrl String @default("")
   githubUrl   String @default("")
+  resumeText  String @default("")
 }

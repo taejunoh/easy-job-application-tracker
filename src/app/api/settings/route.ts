@@ -24,6 +24,7 @@ export async function GET() {
     hasApiKey: settings.apiKey !== "",
     linkedinUrl: settings.linkedinUrl,
     githubUrl: settings.githubUrl,
+    resumeText: settings.resumeText,
   }, { headers: corsHeaders });
 }
 
@@ -37,6 +38,7 @@ export async function PUT(request: NextRequest) {
   }
   if (body.linkedinUrl !== undefined) data.linkedinUrl = body.linkedinUrl;
   if (body.githubUrl !== undefined) data.githubUrl = body.githubUrl;
+  if (body.resumeText !== undefined) data.resumeText = body.resumeText;
 
   let settings = await prisma.settings.findFirst();
 
@@ -56,5 +58,6 @@ export async function PUT(request: NextRequest) {
     hasApiKey: settings.apiKey !== "",
     linkedinUrl: settings.linkedinUrl,
     githubUrl: settings.githubUrl,
+    resumeText: settings.resumeText,
   }, { headers: corsHeaders });
 }
