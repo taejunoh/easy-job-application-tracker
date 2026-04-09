@@ -1,131 +1,106 @@
 # JobTracker
 
-A local-first job application tracker that auto-extracts job details from URLs. Paste a job posting URL or use the Chrome extension to capture job title, company, location, and description automatically.
+A job application tracker that auto-extracts job details from URLs. Use the Chrome extension to capture job title, company, location, and description from LinkedIn, Indeed, Glassdoor, and any career page.
+
+**Live app:** [easy-job-application-tracker.vercel.app](https://easy-job-application-tracker.vercel.app)
 
 ## Features
 
-- **Auto-extract from URLs** -- paste any job posting URL and get title + company extracted via meta tags or AI
-- **Chrome extension** -- extract job data directly from LinkedIn, Indeed, and Glassdoor while logged in
-- **Auto-fill profiles** -- automatically fill LinkedIn and GitHub profile URLs on application forms (Greenhouse, Lever, Workday)
+- **Chrome extension** -- save jobs directly from LinkedIn, Indeed, Glassdoor, and any career site
+- **Auto-extract from URLs** -- paste any job posting URL and get title + company extracted automatically
+- **Auto-fill profiles** -- fill LinkedIn and GitHub profile URLs on application forms (Greenhouse, Lever, Workday)
 - **Text paste mode** -- copy/paste job description text for AI-powered extraction
 - **Multi-LLM support** -- choose OpenAI, Google Gemini, or Anthropic Claude for AI extraction
 - **Dashboard** -- stats, status breakdown chart, and recent applications
 - **Full CRUD** -- search, filter, sort, edit, and delete applications
-- **Local SQLite database** -- your data stays on your machine
-
-## What You'll Need
-
-Before starting, make sure you have these installed:
-
-- **Node.js** (version 18 or newer) -- download from [nodejs.org](https://nodejs.org/). Pick the LTS version.
-- **Git** -- download from [git-scm.com](https://git-scm.com/) (or use `brew install git` on Mac)
-- **Google Chrome** -- for the browser extension
-
-To check if you already have them, open Terminal (Mac) or Command Prompt (Windows) and run:
-
-```bash
-node -v    # should show v18 or higher
-git -v     # should show a version number
-```
 
 ## Quick Start
 
-Open your terminal and run these commands one at a time:
+### 1. Install the Chrome Extension
 
-```bash
-# 1. Download the project
-git clone https://github.com/taejunoh/easy-job-application-tracker.git
-cd easy-job-application-tracker
+1. Download or clone this project:
+   ```bash
+   git clone https://github.com/taejunoh/easy-job-application-tracker.git
+   ```
+2. Open Google Chrome and go to `chrome://extensions`
+3. Turn on **Developer mode** (top-right toggle)
+4. Click **Load unpacked**
+5. Select the `extension/` folder inside the project
 
-# 2. Install dependencies (this may take a minute)
-npm install
+You should see "JobTracker" in your extensions list.
 
-# 3. Set up the config file
-cp .env.example .env
-```
+### 2. Save a Job
 
-Now open the `.env` file in any text editor and replace the placeholder with a random string. You can use this one or make your own (any 32+ characters will work):
+1. Go to any job posting on LinkedIn, Indeed, Glassdoor, or any career page
+2. Click the JobTracker extension icon in Chrome
+3. Review the extracted data (title, company, location)
+4. Click **Save Application**
+5. Click **Open** to view it in the app
 
-```
-DATABASE_URL="file:./dev.db"
-ENCRYPTION_SECRET="change-me-to-any-random-string-at-least-32-chars"
-```
+### 3. Auto-Fill Application Forms (Optional)
 
-Then continue in the terminal:
+The extension can fill your LinkedIn and GitHub URLs on job application forms automatically.
 
-```bash
-# 4. Set up the database
-npx prisma generate
-npx prisma db push
+1. Open the app and go to **Settings**
+2. Add your profile URLs under **Profile URLs**
+3. Navigate to any job application form (Greenhouse, Lever, Workday, etc.)
+4. Click the extension and press **Fill Profiles**
 
-# 5. Start the app
-npm run dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) in your browser. You should see the JobTracker dashboard.
-
-## Configure AI Extraction (Optional)
+### 4. Configure AI Extraction (Optional)
 
 AI extraction helps when job postings don't have standard meta tags. It's not required -- basic extraction works without it.
 
 1. Go to **Settings** in the app
 2. Select your LLM provider (OpenAI, Google Gemini, or Anthropic)
-3. Enter your API key (you'll need an account with one of these providers)
+3. Enter your API key
 4. Click **Save Settings**
 
-## Chrome Extension
+## Run Locally (Optional)
 
-The extension lets you save jobs directly from LinkedIn, Indeed, and Glassdoor with one click.
+If you prefer to self-host instead of using the live app:
 
-### Install the Extension
+### What You'll Need
 
-1. Open Google Chrome
-2. Type `chrome://extensions` in the address bar and press Enter
-3. Turn on **Developer mode** using the toggle in the top-right corner
-4. Click **Load unpacked**
-5. Navigate to the `extension/` folder inside the project and select it
+- **Node.js** 18+ -- [nodejs.org](https://nodejs.org/)
+- **PostgreSQL** database -- [Neon](https://neon.tech) (free) or any PostgreSQL provider
 
-You should see "JobTracker" appear in your extensions list.
+### Setup
 
-### Save a Job
+```bash
+git clone https://github.com/taejunoh/easy-job-application-tracker.git
+cd easy-job-application-tracker
+npm install
+cp .env.example .env
+```
 
-1. Make sure the app is running (`npm run dev` in your terminal)
-2. Go to any job posting on LinkedIn, Indeed, or Glassdoor
-3. Click the JobTracker extension icon (puzzle piece icon in Chrome toolbar)
-4. Review the extracted data (title, company, location)
-5. Click **Save Application**
+Edit `.env` with your PostgreSQL connection string:
 
-### Auto-Fill Application Forms
+```
+DATABASE_URL="postgresql://user:password@host:5432/dbname?sslmode=require"
+ENCRYPTION_SECRET="any-random-string-at-least-32-characters-long"
+```
 
-The extension can automatically fill your LinkedIn and GitHub profile URLs on job application forms (Greenhouse, Lever, Workday).
+Then:
 
-1. Go to **Settings** in the app and add your profile URLs under **Profile URLs**
-2. Navigate to any job application form
-3. Click the extension and press **Fill Profiles**
+```bash
+npx prisma generate
+npx prisma db push
+npm run dev
+```
 
-## Input Modes
-
-The app has two input modes (toggle with tabs at the top):
-
-- **URL** -- paste a job posting URL. Works best with company career pages and public job boards.
-- **Paste Text** -- copy/paste job description text from any page, and the AI extracts the title and company.
+Open [http://localhost:3000](http://localhost:3000). Update the extension's server URL in the popup to `http://localhost:3000`.
 
 ## Troubleshooting
 
-**The app won't start / shows an error:**
-- Make sure you've completed all setup steps (especially `npx prisma generate` and `npx prisma db push`)
-- Check that your `.env` file exists and has both `DATABASE_URL` and `ENCRYPTION_SECRET` set
-
-**Port 3000 is already in use:**
-- Start on a different port: `npm run dev -- -p 3001`
-- Then update the server URL in the extension popup to match
-
 **Extension says "Could not extract":**
-- Make sure the app is running
-- Try clicking **Re-extract** in the extension popup
-- Some pages may need you to scroll down first so the job details load
+- Try clicking **Re-extract** -- some pages load content dynamically
+- The extension will automatically fall back to server-side extraction
 
-**Pages keep refreshing:**
+**Extension can't connect to the app:**
+- Check the server URL in the extension popup matches your app URL
+- If self-hosting, make sure the app is running
+
+**Pages keep refreshing (local only):**
 - Stop the app, delete the `.next` folder, and restart:
   ```bash
   rm -rf .next
