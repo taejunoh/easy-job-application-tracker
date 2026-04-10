@@ -152,6 +152,20 @@
     }
     .pill-green { background: rgba(34,197,94,0.12); color: #86efac; border: 1px solid rgba(34,197,94,0.2); }
     .pill-red { background: rgba(239,68,68,0.12); color: #fca5a5; border: 1px solid rgba(239,68,68,0.2); }
+    .btn-analyze {
+      width: 100%;
+      margin-top: 10px;
+      padding: 7px 0;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 4px;
+      color: #94a3b8;
+      font-size: 11px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-analyze:hover { background: #334155; color: #e2e8f0; }
+    .btn-analyze:disabled { opacity: 0.5; cursor: not-allowed; }
     .analysis-prompt {
       font-size: 10px;
       color: #64748b;
@@ -201,13 +215,15 @@
         <button class="btn-secondary" id="fillProfilesBtn" title="Auto-fill LinkedIn & GitHub on application forms">Fill Profiles</button>
       </div>
 
+      <button class="btn-analyze" id="analyzeBtn" style="display:none">Analyze Keywords</button>
+
       <div id="analysisSection" style="display:none">
         <div class="analysis">
           <div class="analysis-header" id="analysisToggle">
             <span class="analysis-title">Keyword Match</span>
             <span class="analysis-badge" id="analysisBadge">0%</span>
           </div>
-          <div class="analysis-body" id="analysisBody" style="display:none">
+          <div class="analysis-body" id="analysisBody">
             <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
             <div class="analysis-summary" id="analysisSummary"></div>
             <div class="keywords-section" id="matchedSection" style="display:none">

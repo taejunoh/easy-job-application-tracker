@@ -29,16 +29,24 @@ function populateForm(data, tabUrl) {
     showStatus(data.warning, "info");
   }
 
-  // Run keyword analysis if we have a description
-  if (data.description) {
-    runKeywordAnalysis(data.description);
+  // Show analyze button if we have a description
+  const analyzeBtn = document.getElementById("analyzeBtn");
+  if (data.description && analyzeBtn) {
+    analyzeBtn.style.display = "block";
   }
 }
 
-async function runKeywordAnalysis(description) {
+async function runKeywordAnalysis() {
+  const description = document.getElementById("description").value.trim();
+  if (!description) return;
+
   const serverUrl = document.getElementById("serverUrl").value.replace(/\/$/, "");
   const section = document.getElementById("analysisSection");
   const prompt = document.getElementById("analysisPrompt");
+  const analyzeBtn = document.getElementById("analyzeBtn");
+
+  analyzeBtn.disabled = true;
+  analyzeBtn.textContent = "Analyzing...";
 
   try {
     const res = await fetch(`${serverUrl}/api/keyword-analysis`, {
@@ -46,13 +54,18 @@ async function runKeywordAnalysis(description) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ description }),
     });
-    if (!res.ok) return;
+    if (!res.ok) {
+      analyzeBtn.textContent = "Analyze Keywords";
+      analyzeBtn.disabled = false;
+      return;
+    }
 
     const data = await res.json();
 
     if (data.error === "no_resume") {
       prompt.innerHTML = 'Add your resume in <a href="#" id="openSettings">Settings</a> to see keyword match.';
       prompt.style.display = "block";
+      analyzeBtn.style.display = "none";
       document.getElementById("openSettings")?.addEventListener("click", (e) => {
         e.preventDefault();
         chrome.tabs.create({ url: `${serverUrl}/settings` });
@@ -60,7 +73,13 @@ async function runKeywordAnalysis(description) {
       return;
     }
 
-    if (!data.totalJobKeywords || data.totalJobKeywords === 0) return;
+    if (!data.totalJobKeywords || data.totalJobKeywords === 0) {
+      analyzeBtn.textContent = "No keywords found";
+      return;
+    }
+
+    // Hide button, show results
+    analyzeBtn.style.display = "none";
 
     // Show analysis
     const pct = data.matchPercentage;
@@ -105,9 +124,15 @@ async function runKeywordAnalysis(description) {
 
     section.style.display = "block";
   } catch {
-    // Silently fail — analysis is non-critical
+    analyzeBtn.textContent = "Analyze Keywords";
+    analyzeBtn.disabled = false;
   }
 }
+
+// Analyze button click
+document.getElementById("analyzeBtn")?.addEventListener("click", () => {
+  runKeywordAnalysis();
+});
 
 // Toggle analysis body
 document.getElementById("analysisToggle")?.addEventListener("click", () => {
