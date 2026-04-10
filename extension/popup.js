@@ -29,16 +29,36 @@ function populateForm(data, tabUrl) {
     showStatus(data.warning, "info");
   }
 
-  // Show analyze button if we have a description
+  // Always show analyze button
   const analyzeBtn = document.getElementById("analyzeBtn");
-  if (data.description && analyzeBtn) {
+  if (analyzeBtn) {
     analyzeBtn.style.display = "block";
   }
 }
 
 async function runKeywordAnalysis() {
-  const description = document.getElementById("description").value.trim();
-  if (!description) return;
+  let description = document.getElementById("description").value.trim();
+
+  // If no description extracted, try to get it from the page
+  if (!description) {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) {
+        const response = await chrome.tabs.sendMessage(tab.id, { action: "extractJob" });
+        if (response?.description) {
+          description = response.description;
+          document.getElementById("description").value = description;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!description) {
+    showStatus("No job description found on this page.", "info");
+    return;
+  }
 
   const serverUrl = document.getElementById("serverUrl").value.replace(/\/$/, "");
   const section = document.getElementById("analysisSection");
