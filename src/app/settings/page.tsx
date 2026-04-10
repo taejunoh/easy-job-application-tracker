@@ -16,6 +16,7 @@ export default function SettingsPage() {
   const [linkedinUrl, setLinkedinUrl] = useState("");
   const [githubUrl, setGithubUrl] = useState("");
   const [resumeText, setResumeText] = useState("");
+  const [uploading, setUploading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState("");
@@ -177,14 +178,50 @@ export default function SettingsPage() {
           Resume
         </h2>
         <p className="text-xs text-gray-500 mb-3">
-          Paste your resume text to compare keywords against job descriptions.
+          Upload your resume file or paste text to compare keywords against job descriptions.
         </p>
+
+        <div className="mb-3">
+          <label className="inline-flex items-center gap-2 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 hover:bg-gray-700 cursor-pointer">
+            <span>{uploading ? "Parsing..." : "Upload Resume (.pdf, .txt)"}</span>
+            <input
+              type="file"
+              accept=".pdf,.txt"
+              className="hidden"
+              disabled={uploading}
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                setUploading(true);
+                try {
+                  const formData = new FormData();
+                  formData.append("file", file);
+                  const res = await fetch("/api/parse-resume", {
+                    method: "POST",
+                    body: formData,
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    setResumeText(data.text);
+                    setMessage("Resume parsed. Click Save Settings to keep it.");
+                  } else {
+                    setMessage("Failed to parse resume file.");
+                  }
+                } catch {
+                  setMessage("Failed to parse resume file.");
+                }
+                setUploading(false);
+                e.target.value = "";
+              }}
+            />
+          </label>
+        </div>
 
         <div className="mb-4">
           <textarea
             value={resumeText}
             onChange={(e) => setResumeText(e.target.value)}
-            placeholder="Paste your resume text here..."
+            placeholder="Or paste your resume text here..."
             rows={10}
             className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500 resize-y"
           />
