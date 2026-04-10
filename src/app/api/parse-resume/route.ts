@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { PDFParse } from "pdf-parse";
+import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs";
+
+// Point to the worker file for server-side usage
+GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/legacy/build/pdf.worker.mjs",
+  import.meta.url
+).toString();
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -27,10 +33,21 @@ export async function POST(request: NextRequest) {
   let text = "";
 
   if (file.type === "application/pdf" || file.name.endsWith(".pdf")) {
-    const parser = new PDFParse({ data: new Uint8Array(arrayBuffer) });
-    const result = await parser.getText();
-    text = result.text;
-    await parser.destroy();
+    const data = new Uint8Array(arrayBuffer);
+    const doc = await getDocument({ data, useWorkerFetch: false, isEvalSupported: false, useSystemFonts: true }).promise;
+    const pages: string[] = [];
+
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items
+        .map((item) => ("str" in item ? item.str : ""))
+        .join(" ");
+      pages.push(pageText);
+    }
+
+    text = pages.join("\n");
+    await doc.destroy();
   } else {
     text = Buffer.from(arrayBuffer).toString("utf-8");
   }
