@@ -75,6 +75,90 @@
     .status.success { background: #064e3b; color: #6ee7b7; }
     .status.error { background: #450a0a; color: #fca5a5; }
     .status.info { background: #172554; color: #93c5fd; }
+    /* Keyword Analysis */
+    .analysis {
+      margin-top: 10px;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .analysis-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      cursor: pointer;
+      background: #111827;
+    }
+    .analysis-header:hover { background: #1a2332; }
+    .analysis-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #cbd5e1;
+    }
+    .analysis-badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 7px;
+      border-radius: 9999px;
+    }
+    .badge-green { background: rgba(34,197,94,0.15); color: #4ade80; }
+    .badge-yellow { background: rgba(234,179,8,0.15); color: #facc15; }
+    .badge-red { background: rgba(239,68,68,0.15); color: #f87171; }
+    .analysis-body {
+      padding: 8px 10px;
+      border-top: 1px solid #1e293b;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 5px;
+      background: #334155;
+      border-radius: 3px;
+      margin-bottom: 6px;
+    }
+    .progress-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.3s;
+    }
+    .fill-green { background: #22c55e; }
+    .fill-yellow { background: #eab308; }
+    .fill-red { background: #ef4444; }
+    .analysis-summary {
+      font-size: 10px;
+      color: #64748b;
+      margin-bottom: 6px;
+    }
+    .keywords-section {
+      margin-bottom: 6px;
+    }
+    .keywords-label {
+      font-size: 9px;
+      font-weight: 600;
+      text-transform: uppercase;
+      margin-bottom: 3px;
+    }
+    .keywords-label.matched { color: #4ade80; }
+    .keywords-label.missing { color: #f87171; }
+    .pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 3px;
+    }
+    .pill {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 3px;
+    }
+    .pill-green { background: rgba(34,197,94,0.12); color: #86efac; border: 1px solid rgba(34,197,94,0.2); }
+    .pill-red { background: rgba(239,68,68,0.12); color: #fca5a5; border: 1px solid rgba(239,68,68,0.2); }
+    .analysis-prompt {
+      font-size: 10px;
+      color: #64748b;
+      margin-top: 8px;
+    }
+    .analysis-prompt a { color: #60a5fa; text-decoration: none; }
+    .analysis-prompt a:hover { text-decoration: underline; }
     .settings {
       padding: 12px 16px;
       border-top: 1px solid #1e293b;
@@ -116,6 +200,28 @@
         <button class="btn-secondary" id="refreshBtn">Re-extract</button>
         <button class="btn-secondary" id="fillProfilesBtn" title="Auto-fill LinkedIn & GitHub on application forms">Fill Profiles</button>
       </div>
+
+      <div id="analysisSection" style="display:none">
+        <div class="analysis">
+          <div class="analysis-header" id="analysisToggle">
+            <span class="analysis-title">Keyword Match</span>
+            <span class="analysis-badge" id="analysisBadge">0%</span>
+          </div>
+          <div class="analysis-body" id="analysisBody" style="display:none">
+            <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+            <div class="analysis-summary" id="analysisSummary"></div>
+            <div class="keywords-section" id="matchedSection" style="display:none">
+              <div class="keywords-label matched">Matched</div>
+              <div class="pills" id="matchedPills"></div>
+            </div>
+            <div class="keywords-section" id="missingSection" style="display:none">
+              <div class="keywords-label missing">Missing</div>
+              <div class="pills" id="missingPills"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="analysisPrompt" class="analysis-prompt" style="display:none"></div>
 
       <div id="statusMsg" class="status" style="display:none"></div>
     </div>

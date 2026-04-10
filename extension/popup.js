@@ -28,7 +28,92 @@ function populateForm(data, tabUrl) {
   } else if (data.warning) {
     showStatus(data.warning, "info");
   }
+
+  // Run keyword analysis if we have a description
+  if (data.description) {
+    runKeywordAnalysis(data.description);
+  }
 }
+
+async function runKeywordAnalysis(description) {
+  const serverUrl = document.getElementById("serverUrl").value.replace(/\/$/, "");
+  const section = document.getElementById("analysisSection");
+  const prompt = document.getElementById("analysisPrompt");
+
+  try {
+    const res = await fetch(`${serverUrl}/api/keyword-analysis`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ description }),
+    });
+    if (!res.ok) return;
+
+    const data = await res.json();
+
+    if (data.error === "no_resume") {
+      prompt.innerHTML = 'Add your resume in <a href="#" id="openSettings">Settings</a> to see keyword match.';
+      prompt.style.display = "block";
+      document.getElementById("openSettings")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        chrome.tabs.create({ url: `${serverUrl}/settings` });
+      });
+      return;
+    }
+
+    if (!data.totalJobKeywords || data.totalJobKeywords === 0) return;
+
+    // Show analysis
+    const pct = data.matchPercentage;
+    const badge = document.getElementById("analysisBadge");
+    const fill = document.getElementById("progressFill");
+
+    badge.textContent = `${pct}%`;
+    badge.className = `analysis-badge ${pct >= 70 ? "badge-green" : pct >= 40 ? "badge-yellow" : "badge-red"}`;
+    fill.style.width = `${pct}%`;
+    fill.className = `progress-fill ${pct >= 70 ? "fill-green" : pct >= 40 ? "fill-yellow" : "fill-red"}`;
+
+    document.getElementById("analysisSummary").textContent =
+      `${data.matchedKeywords.length} of ${data.totalJobKeywords} keywords matched`;
+
+    // Matched pills
+    const matchedPills = document.getElementById("matchedPills");
+    const matchedSection = document.getElementById("matchedSection");
+    matchedPills.innerHTML = "";
+    if (data.matchedKeywords.length > 0) {
+      matchedSection.style.display = "block";
+      for (const k of data.matchedKeywords) {
+        const pill = document.createElement("span");
+        pill.className = "pill pill-green";
+        pill.textContent = k.keyword;
+        matchedPills.appendChild(pill);
+      }
+    }
+
+    // Missing pills
+    const missingPills = document.getElementById("missingPills");
+    const missingSection = document.getElementById("missingSection");
+    missingPills.innerHTML = "";
+    if (data.missingKeywords.length > 0) {
+      missingSection.style.display = "block";
+      for (const k of data.missingKeywords) {
+        const pill = document.createElement("span");
+        pill.className = "pill pill-red";
+        pill.textContent = k.keyword;
+        missingPills.appendChild(pill);
+      }
+    }
+
+    section.style.display = "block";
+  } catch {
+    // Silently fail — analysis is non-critical
+  }
+}
+
+// Toggle analysis body
+document.getElementById("analysisToggle")?.addEventListener("click", () => {
+  const body = document.getElementById("analysisBody");
+  body.style.display = body.style.display === "none" ? "block" : "none";
+});
 
 async function serverExtract(url) {
   if (!url || url.startsWith("chrome://")) return null;
