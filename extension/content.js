@@ -230,6 +230,53 @@ function extractGlassdoor() {
   };
 }
 
+function extractLever() {
+  const headlineEl = document.querySelector(".posting-headline h2");
+  const jobTitle = headlineEl?.textContent?.trim() || "";
+
+  const companyEl = document.querySelector(".main-header-logo img");
+  const ogSiteName = document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "";
+  const company = ogSiteName || companyEl?.alt || "";
+
+  let location = "";
+  const locationEl = document.querySelector(".posting-categories .sort-by-time.location .posting-category");
+  if (locationEl) {
+    location = locationEl.textContent?.trim() || "";
+  }
+  if (!location) {
+    const locEl = document.querySelector(".location.posting-category");
+    if (locEl) location = locEl.textContent?.trim() || "";
+  }
+
+  // Lever puts job description in multiple .section.page-centered divs
+  // between posting-header and last-section-apply
+  let description = "";
+  const sections = document.querySelectorAll(".section.page-centered");
+  const descParts = [];
+  for (const section of sections) {
+    if (section.classList.contains("posting-header")) continue;
+    if (section.classList.contains("last-section-apply")) continue;
+    const text = section.innerText?.trim();
+    if (text) descParts.push(text);
+  }
+  description = descParts.join("\n\n");
+
+  let salary = "";
+  let jobType = "";
+  const categories = document.querySelectorAll(".posting-category");
+  for (const cat of categories) {
+    const text = cat.textContent?.trim() || "";
+    if (/On-?site|Remote|Hybrid/i.test(text)) {
+      jobType = text.replace(/On-?site/i, "Onsite");
+    }
+    if (/\$[\d,]+/.test(text)) {
+      salary = text;
+    }
+  }
+
+  return { jobTitle, company, location, description, salary, jobType };
+}
+
 function extractGeneric() {
   const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "";
   const ogSiteName = document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "";
@@ -321,8 +368,12 @@ function extractGeneric() {
   // Description
   const descEl = document.querySelector("[class*='description']") ||
     document.querySelector("[class*='job-detail']") ||
+    document.querySelector("[class*='posting-page']") ||
+    document.querySelector("[class*='job-content']") ||
+    document.querySelector("[class*='jobContent']") ||
     document.querySelector("article") ||
-    document.querySelector("[role='main']");
+    document.querySelector("[role='main']") ||
+    document.querySelector(".content");
 
   return {
     jobTitle,
@@ -338,6 +389,7 @@ function extractJobData() {
   if (hostname.includes("linkedin.com")) return extractLinkedIn();
   if (hostname.includes("indeed.com")) return extractIndeed();
   if (hostname.includes("glassdoor.com")) return extractGlassdoor();
+  if (hostname.includes("lever.co")) return extractLever();
   return extractGeneric();
 }
 

@@ -191,7 +191,7 @@ async function extractFromPage() {
     }
 
     // Inject content script if not on a matched page
-    const isJobSite = /linkedin\.com\/jobs|indeed\.com|glassdoor\.com\/job|glassdoor\.com\/Job/.test(tab.url);
+    const isJobSite = /linkedin\.com\/jobs|indeed\.com|glassdoor\.com\/job|glassdoor\.com\/Job|lever\.co\//.test(tab.url);
 
     if (!isJobSite) {
       // Try injecting content script for generic pages
