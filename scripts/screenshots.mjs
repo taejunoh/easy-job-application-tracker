@@ -232,6 +232,59 @@ async function captureKeywordAnalysis(context) {
   console.log("✓ 04-keyword-analysis.png");
 }
 
+async function captureSettingsLlm(context) {
+  const page = await context.newPage();
+  let settingsHit = false;
+
+  await page.route(/\/api\/settings/, async (route) => {
+    settingsHit = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(settingsFixture),
+    });
+  });
+
+  try {
+    await page.goto(BASE_URL + "/settings");
+    await page.waitForSelector("text=API key configured");
+
+    if (!settingsHit) {
+      throw new Error(
+        "Settings page did not request /api/settings — page structure may have changed."
+      );
+    }
+
+    const clip = await page.evaluate(() => {
+      const llmH2 = [...document.querySelectorAll("h2")]
+        .find((h) => h.textContent.trim() === "LLM Provider");
+      const card = llmH2.closest("div.bg-gray-900");
+      const cardBox = card.getBoundingClientRect();
+      const h2Box = llmH2.getBoundingClientRect();
+      // find the next h2 (Profile URLs) — stop the clip just above it
+      const profileH2 = [...document.querySelectorAll("h2")]
+        .find((h) => h.textContent.trim() === "Profile URLs");
+      const profileBox = profileH2.getBoundingClientRect();
+      const pad = 24;
+      return {
+        x: Math.max(0, cardBox.left - pad),
+        y: Math.max(0, h2Box.top + window.scrollY - pad),
+        width: cardBox.width + pad * 2,
+        height: (profileBox.top - h2Box.top) + pad,
+      };
+    });
+
+    await page.screenshot({
+      path: path.join(OUT_DIR, "05-settings-llm.png"),
+      fullPage: true,
+      clip,
+    });
+  } finally {
+    await page.close();
+  }
+  console.log("✓ 05-settings-llm.png");
+}
+
 async function main() {
   await assertDevServerUp();
   await mkdir(OUT_DIR, { recursive: true });
@@ -247,6 +300,7 @@ async function main() {
     await captureSettingsResume(context);
     await captureExtensionPopup(context);
     await captureKeywordAnalysis(context);
+    await captureSettingsLlm(context);
   } finally {
     await context.close();
     await browser.close();
