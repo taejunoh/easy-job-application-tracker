@@ -158,6 +158,9 @@ async function captureExtensionPopup(context) {
       document.getElementById("company").value = fx.company;
       document.getElementById("location").value = fx.location;
       document.getElementById("analyzeBtn").style.display = "block";
+      const serverUrl = document.getElementById("serverUrl");
+      serverUrl.value = "http://localhost:3000";
+      serverUrl.placeholder = "http://localhost:3000";
     }, popupFormFixture);
 
     await page.locator("body").screenshot({
@@ -182,6 +185,9 @@ async function captureKeywordAnalysis(context) {
         document.getElementById("company").value = form.company;
         document.getElementById("location").value = form.location;
         document.getElementById("analyzeBtn").style.display = "block";
+        const serverUrl = document.getElementById("serverUrl");
+        serverUrl.value = "http://localhost:3000";
+        serverUrl.placeholder = "http://localhost:3000";
 
         const section = document.getElementById("analysisSection");
         section.style.display = "block";
