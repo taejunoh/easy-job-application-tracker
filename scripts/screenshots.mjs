@@ -81,6 +81,62 @@ async function captureDashboard(context) {
   console.log("✓ 01-dashboard.png");
 }
 
+async function captureSettingsResume(context) {
+  const page = await context.newPage();
+  let settingsHit = false;
+
+  await page.route(/\/api\/settings/, async (route) => {
+    settingsHit = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(settingsFixture),
+    });
+  });
+
+  try {
+    await page.goto(BASE_URL + "/settings");
+    // "API key configured" only renders after fetch resolves and
+    // hasExistingKey is set to true.
+    await page.waitForSelector("text=API key configured");
+
+    const resumeHeading = page.locator("h2:has-text('Resume')");
+    await resumeHeading.waitFor();
+
+    if (!settingsHit) {
+      throw new Error(
+        "Settings page did not request /api/settings — page structure may have changed."
+      );
+    }
+
+    const clip = await page.evaluate(() => {
+      const resumeH2 = [...document.querySelectorAll("h2")]
+        .find((h) => h.textContent.trim() === "Resume");
+      const card = resumeH2.closest("div.bg-gray-900");
+      const cardBox = card.getBoundingClientRect();
+      const h2Box = resumeH2.getBoundingClientRect();
+      const pad = 24;
+      const topInPage = h2Box.top + window.scrollY - pad;
+      const cardBottomInPage = cardBox.bottom + window.scrollY + pad;
+      return {
+        x: Math.max(0, cardBox.left - pad),
+        y: Math.max(0, topInPage),
+        width: cardBox.width + pad * 2,
+        height: cardBottomInPage - topInPage,
+      };
+    });
+
+    await page.screenshot({
+      path: path.join(OUT_DIR, "02-settings-resume.png"),
+      fullPage: true,
+      clip,
+    });
+  } finally {
+    await page.close();
+  }
+  console.log("✓ 02-settings-resume.png");
+}
+
 async function main() {
   await assertDevServerUp();
   await mkdir(OUT_DIR, { recursive: true });
@@ -93,6 +149,7 @@ async function main() {
 
   try {
     await captureDashboard(context);
+    await captureSettingsResume(context);
   } finally {
     await context.close();
     await browser.close();
