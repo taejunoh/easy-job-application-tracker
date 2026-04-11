@@ -29,8 +29,6 @@ A job application tracker that auto-extracts job details from URLs. Use the Chro
 4. Click **Load unpacked**
 5. Select the `extension/` folder inside the project
 
-![Install extension](docs/screenshots/02-install-extension.png)
-
 ### 2. Set Up Your Resume
 
 1. Open the app and go to **Settings**
@@ -39,7 +37,7 @@ A job application tracker that auto-extracts job details from URLs. Use the Chro
 
 Now keyword analysis works automatically in both the extension and the app.
 
-![Settings — Resume upload](docs/screenshots/03-settings-resume.png)
+![Settings — Resume upload](docs/screenshots/02-settings-resume.png)
 
 ### 3. Save and Analyze Jobs
 
@@ -48,9 +46,9 @@ Now keyword analysis works automatically in both the extension and the app.
 3. Click **Save Application** to track it
 4. Click **Analyze Keywords** to see your resume match
 
-![Extension popup on a job posting](docs/screenshots/04-extension-popup.png)
+![Extension popup on a job posting](docs/screenshots/03-extension-popup.png)
 
-![Keyword match analysis](docs/screenshots/05-keyword-analysis.png)
+![Keyword match analysis](docs/screenshots/04-keyword-analysis.png)
 
 ### 4. Auto-Fill Application Forms (Optional)
 
@@ -64,7 +62,7 @@ AI extraction helps when job postings don't have standard meta tags. Not require
 1. Go to **Settings**, select your LLM provider, enter your API key
 2. Click **Save Settings**
 
-![Settings — LLM provider](docs/screenshots/06-settings-llm.png)
+![Settings — LLM provider](docs/screenshots/05-settings-llm.png)
 
 ## Run Locally
 
