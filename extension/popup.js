@@ -363,5 +363,19 @@ document.getElementById("fillProfilesBtn")?.addEventListener("click", () => {
   fillProfiles();
 });
 
-// Auto-extract on popup open
-extractFromPage();
+// Persist serverUrl across popup opens via chrome.storage.local.
+// Without this, the input resets to the HTML default ("http://localhost:3000")
+// every time the popup opens, since the popup has no other state.
+const serverUrlInput = document.getElementById("serverUrl");
+serverUrlInput.addEventListener("change", (e) => {
+  chrome.storage.local.set({ serverUrl: e.target.value });
+});
+
+// Load the saved URL (if any) BEFORE auto-extracting — extractFromPage
+// reads the input value internally, so it must run after the restore.
+chrome.storage.local.get(["serverUrl"], (result) => {
+  if (result.serverUrl) {
+    serverUrlInput.value = result.serverUrl;
+  }
+  extractFromPage();
+});
