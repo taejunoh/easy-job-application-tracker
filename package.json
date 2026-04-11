@@ -7,7 +7,8 @@
     "build": "prisma generate && next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "jest"
+    "test": "jest",
+    "screenshots": "node scripts/screenshots.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.82.0",
@@ -36,6 +37,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.2",
     "jest": "^30.3.0",
+    "playwright": "^1.59.1",
     "tailwindcss": "^4",
     "ts-jest": "^29.4.9",
     "typescript": "^5"
