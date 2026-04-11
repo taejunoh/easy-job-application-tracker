@@ -17,15 +17,20 @@ const POPUP_HTML_PATH = path.join(REPO_ROOT, "extension", "popup.html");
 const BASE_URL = "http://localhost:3000";
 
 async function assertDevServerUp() {
+  let res;
   try {
-    const res = await fetch(BASE_URL, { signal: AbortSignal.timeout(3000) });
-    if (res.status >= 500) {
-      throw new Error(`dev server returned ${res.status}`);
-    }
+    res = await fetch(BASE_URL, { signal: AbortSignal.timeout(3000) });
   } catch (err) {
     console.error(
       "\n✗ Next.js dev server not reachable at " + BASE_URL + "\n" +
       "  Run `npm run dev` in another terminal first.\n"
+    );
+    process.exit(1);
+  }
+  if (res.status >= 500) {
+    console.error(
+      "\n✗ Next.js dev server at " + BASE_URL + " returned " + res.status + "\n" +
+      "  The server is up but failing. Check the dev server logs.\n"
     );
     process.exit(1);
   }
@@ -53,6 +58,34 @@ async function loadPopupPage(context) {
   const rawHtml = await readFile(POPUP_HTML_PATH, "utf8");
   const sanitized = stripPopupScript(rawHtml);
   await page.setContent(sanitized, { waitUntil: "domcontentloaded" });
+  return page;
+}
+
+async function loadSettingsPage(context) {
+  const page = await context.newPage();
+  let settingsHit = false;
+
+  await page.route(/\/api\/settings/, async (route) => {
+    settingsHit = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(settingsFixture),
+    });
+  });
+
+  await page.goto(BASE_URL + "/settings");
+  // "API key configured" only renders after fetch resolves and
+  // hasExistingKey is set to true — a reliable signal both that
+  // the route mock fired and that the page is hydrated.
+  await page.waitForSelector("text=API key configured");
+
+  if (!settingsHit) {
+    throw new Error(
+      "Settings page did not request /api/settings — page structure may have changed."
+    );
+  }
+
   return page;
 }
 
@@ -91,33 +124,9 @@ async function captureDashboard(context) {
 }
 
 async function captureSettingsResume(context) {
-  const page = await context.newPage();
-  let settingsHit = false;
-
-  await page.route(/\/api\/settings/, async (route) => {
-    settingsHit = true;
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(settingsFixture),
-    });
-  });
+  const page = await loadSettingsPage(context);
 
   try {
-    await page.goto(BASE_URL + "/settings");
-    // "API key configured" only renders after fetch resolves and
-    // hasExistingKey is set to true.
-    await page.waitForSelector("text=API key configured");
-
-    const resumeHeading = page.locator("h2:has-text('Resume')");
-    await resumeHeading.waitFor();
-
-    if (!settingsHit) {
-      throw new Error(
-        "Settings page did not request /api/settings — page structure may have changed."
-      );
-    }
-
     const clip = await page.evaluate(() => {
       const resumeH2 = [...document.querySelectorAll("h2")]
         .find((h) => h.textContent.trim() === "Resume");
@@ -233,28 +242,9 @@ async function captureKeywordAnalysis(context) {
 }
 
 async function captureSettingsLlm(context) {
-  const page = await context.newPage();
-  let settingsHit = false;
-
-  await page.route(/\/api\/settings/, async (route) => {
-    settingsHit = true;
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(settingsFixture),
-    });
-  });
+  const page = await loadSettingsPage(context);
 
   try {
-    await page.goto(BASE_URL + "/settings");
-    await page.waitForSelector("text=API key configured");
-
-    if (!settingsHit) {
-      throw new Error(
-        "Settings page did not request /api/settings — page structure may have changed."
-      );
-    }
-
     const clip = await page.evaluate(() => {
       const llmH2 = [...document.querySelectorAll("h2")]
         .find((h) => h.textContent.trim() === "LLM Provider");
