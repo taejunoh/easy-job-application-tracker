@@ -60,23 +60,24 @@ async function captureDashboard(context) {
     });
   });
 
-  await page.goto(BASE_URL + "/");
-  // Dashboard shows "Loading..." until stats resolves; wait for the H1
-  // which only renders after the fetch completes.
-  await page.waitForSelector("h1:has-text('Dashboard')");
-  await page.waitForSelector("text=Total Applied");
+  try {
+    await page.goto(BASE_URL + "/");
+    await page.waitForSelector("h1:has-text('Dashboard')");
+    await page.waitForSelector("text=Total Applied");
 
-  if (!statsHit) {
-    throw new Error(
-      "Dashboard did not request /api/stats — page structure may have changed."
-    );
+    if (!statsHit) {
+      throw new Error(
+        "Dashboard did not request /api/stats — page structure may have changed."
+      );
+    }
+
+    await page.screenshot({
+      path: path.join(OUT_DIR, "01-dashboard.png"),
+      fullPage: true,
+    });
+  } finally {
+    await page.close();
   }
-
-  await page.screenshot({
-    path: path.join(OUT_DIR, "01-dashboard.png"),
-    fullPage: false,
-  });
-  await page.close();
   console.log("✓ 01-dashboard.png");
 }
 
