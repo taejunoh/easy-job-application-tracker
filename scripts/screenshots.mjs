@@ -47,6 +47,39 @@ function stripPopupScript(html) {
   return html.replace(/<script[^>]*src="popup\.js"[^>]*>\s*<\/script>/g, "");
 }
 
+async function captureDashboard(context) {
+  const page = await context.newPage();
+  let statsHit = false;
+
+  await page.route(/\/api\/stats/, async (route) => {
+    statsHit = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(statsFixture),
+    });
+  });
+
+  await page.goto(BASE_URL + "/");
+  // Dashboard shows "Loading..." until stats resolves; wait for the H1
+  // which only renders after the fetch completes.
+  await page.waitForSelector("h1:has-text('Dashboard')");
+  await page.waitForSelector("text=Total Applied");
+
+  if (!statsHit) {
+    throw new Error(
+      "Dashboard did not request /api/stats — page structure may have changed."
+    );
+  }
+
+  await page.screenshot({
+    path: path.join(OUT_DIR, "01-dashboard.png"),
+    fullPage: false,
+  });
+  await page.close();
+  console.log("✓ 01-dashboard.png");
+}
+
 async function main() {
   await assertDevServerUp();
   await mkdir(OUT_DIR, { recursive: true });
@@ -58,13 +91,7 @@ async function main() {
   });
 
   try {
-    console.log("Preflight OK. (Capture functions will be added task-by-task.)");
-    // Shots wired in below in later tasks:
-    // await captureDashboard(context);
-    // await captureSettingsResume(context);
-    // await captureExtensionPopup(context);
-    // await captureKeywordAnalysis(context);
-    // await captureSettingsLlm(context);
+    await captureDashboard(context);
   } finally {
     await context.close();
     await browser.close();
