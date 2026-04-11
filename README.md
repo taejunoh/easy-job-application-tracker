@@ -2,7 +2,7 @@
 
 A job application tracker that auto-extracts job details from URLs. Use the Chrome extension to capture job title, company, location, and description from LinkedIn, Indeed, Glassdoor, Lever, and any career page.
 
-**Live app:** [easy-job-application-tracker.vercel.app](https://easy-job-application-tracker.vercel.app)
+![Dashboard](docs/screenshots/01-dashboard.png)
 
 ## Features
 
@@ -29,6 +29,8 @@ A job application tracker that auto-extracts job details from URLs. Use the Chro
 4. Click **Load unpacked**
 5. Select the `extension/` folder inside the project
 
+![Install extension](docs/screenshots/02-install-extension.png)
+
 ### 2. Set Up Your Resume
 
 1. Open the app and go to **Settings**
@@ -37,12 +39,18 @@ A job application tracker that auto-extracts job details from URLs. Use the Chro
 
 Now keyword analysis works automatically in both the extension and the app.
 
+![Settings — Resume upload](docs/screenshots/03-settings-resume.png)
+
 ### 3. Save and Analyze Jobs
 
 1. Go to any job posting (LinkedIn, Indeed, Glassdoor, Lever, etc.)
 2. Click the JobTracker extension icon
 3. Click **Save Application** to track it
 4. Click **Analyze Keywords** to see your resume match
+
+![Extension popup on a job posting](docs/screenshots/04-extension-popup.png)
+
+![Keyword match analysis](docs/screenshots/05-keyword-analysis.png)
 
 ### 4. Auto-Fill Application Forms (Optional)
 
@@ -56,9 +64,11 @@ AI extraction helps when job postings don't have standard meta tags. Not require
 1. Go to **Settings**, select your LLM provider, enter your API key
 2. Click **Save Settings**
 
+![Settings — LLM provider](docs/screenshots/06-settings-llm.png)
+
 ## Run Locally
 
-If you prefer to self-host instead of using the live app:
+JobTracker is designed to be self-hosted so your job data and API keys stay on your machine.
 
 ```bash
 git clone https://github.com/taejunoh/easy-job-application-tracker.git
