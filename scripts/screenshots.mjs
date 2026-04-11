@@ -47,6 +47,15 @@ function stripPopupScript(html) {
   return html.replace(/<script[^>]*src="popup\.js"[^>]*>\s*<\/script>/g, "");
 }
 
+async function loadPopupPage(context) {
+  const page = await context.newPage();
+  await page.setViewportSize({ width: 400, height: 800 });
+  const rawHtml = await readFile(POPUP_HTML_PATH, "utf8");
+  const sanitized = stripPopupScript(rawHtml);
+  await page.setContent(sanitized, { waitUntil: "domcontentloaded" });
+  return page;
+}
+
 async function captureDashboard(context) {
   const page = await context.newPage();
   let statsHit = false;
@@ -137,6 +146,86 @@ async function captureSettingsResume(context) {
   console.log("✓ 02-settings-resume.png");
 }
 
+async function captureExtensionPopup(context) {
+  const page = await loadPopupPage(context);
+
+  try {
+    await page.evaluate((fx) => {
+      document.getElementById("form").style.display = "block";
+      document.getElementById("extracting").style.display = "none";
+      document.getElementById("noPage").style.display = "none";
+      document.getElementById("jobTitle").value = fx.jobTitle;
+      document.getElementById("company").value = fx.company;
+      document.getElementById("location").value = fx.location;
+      document.getElementById("analyzeBtn").style.display = "block";
+    }, popupFormFixture);
+
+    await page.locator("body").screenshot({
+      path: path.join(OUT_DIR, "03-extension-popup.png"),
+    });
+  } finally {
+    await page.close();
+  }
+  console.log("✓ 03-extension-popup.png");
+}
+
+async function captureKeywordAnalysis(context) {
+  const page = await loadPopupPage(context);
+
+  try {
+    await page.evaluate(
+      ({ form, analysis }) => {
+        document.getElementById("form").style.display = "block";
+        document.getElementById("extracting").style.display = "none";
+        document.getElementById("noPage").style.display = "none";
+        document.getElementById("jobTitle").value = form.jobTitle;
+        document.getElementById("company").value = form.company;
+        document.getElementById("location").value = form.location;
+        document.getElementById("analyzeBtn").style.display = "block";
+
+        const section = document.getElementById("analysisSection");
+        section.style.display = "block";
+
+        const badge = document.getElementById("analysisBadge");
+        badge.textContent = analysis.percentage + "%";
+        badge.classList.add(analysis.badgeClass);
+
+        const fill = document.getElementById("progressFill");
+        fill.style.width = analysis.percentage + "%";
+        fill.classList.add(analysis.fillClass);
+
+        const total = analysis.matched.length + analysis.missing.length;
+        document.getElementById("analysisSummary").textContent =
+          analysis.matched.length + " matched, " +
+          analysis.missing.length + " missing out of " +
+          total + " keywords";
+
+        const matchedSection = document.getElementById("matchedSection");
+        matchedSection.style.display = "block";
+        document.getElementById("matchedPills").innerHTML =
+          analysis.matched
+            .map((k) => '<span class="pill pill-green">' + k + "</span>")
+            .join("");
+
+        const missingSection = document.getElementById("missingSection");
+        missingSection.style.display = "block";
+        document.getElementById("missingPills").innerHTML =
+          analysis.missing
+            .map((k) => '<span class="pill pill-red">' + k + "</span>")
+            .join("");
+      },
+      { form: popupFormFixture, analysis: keywordAnalysisFixture }
+    );
+
+    await page.locator("body").screenshot({
+      path: path.join(OUT_DIR, "04-keyword-analysis.png"),
+    });
+  } finally {
+    await page.close();
+  }
+  console.log("✓ 04-keyword-analysis.png");
+}
+
 async function main() {
   await assertDevServerUp();
   await mkdir(OUT_DIR, { recursive: true });
@@ -150,6 +239,8 @@ async function main() {
   try {
     await captureDashboard(context);
     await captureSettingsResume(context);
+    await captureExtensionPopup(context);
+    await captureKeywordAnalysis(context);
   } finally {
     await context.close();
     await browser.close();
