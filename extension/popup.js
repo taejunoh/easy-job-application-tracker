@@ -101,11 +101,32 @@ function clearApplicationTarget() {
   openTracker.textContent = "Open tracker";
 }
 
+function resetAnalysisUi() {
+  const analyzeBtn = document.getElementById("analyzeBtn");
+  analyzeBtn.style.display = "block";
+  analyzeBtn.disabled = false;
+  analyzeBtn.textContent = "Analyze Keywords";
+
+  document.getElementById("analysisSection").style.display = "none";
+  const prompt = document.getElementById("analysisPrompt");
+  prompt.style.display = "none";
+  prompt.innerHTML = "";
+  document.getElementById("analysisBadge").textContent = "";
+  document.getElementById("analysisSummary").textContent = "";
+  document.getElementById("progressFill").style.width = "";
+
+  for (const prefix of ["matched", "missing"]) {
+    document.getElementById(`${prefix}Section`).style.display = "none";
+    document.getElementById(`${prefix}Pills`).innerHTML = "";
+  }
+}
+
 function replaceCurrentConnection(connection) {
   connectionGeneration += 1;
   currentConnection = connection
     ? { ...connection, generation: connectionGeneration }
     : null;
+  resetAnalysisUi();
 }
 
 function isCurrentGeneration(generation) {
@@ -818,6 +839,7 @@ async function runKeywordAnalysis() {
   const section = document.getElementById("analysisSection");
   const prompt = document.getElementById("analysisPrompt");
   const analyzeBtn = document.getElementById("analyzeBtn");
+  const analysisGeneration = connectionGeneration;
 
   analyzeBtn.disabled = true;
   analyzeBtn.textContent = "Analyzing...";
@@ -901,6 +923,7 @@ async function runKeywordAnalysis() {
 
     section.style.display = "block";
   } catch {
+    if (!isCurrentGeneration(analysisGeneration)) return;
     analyzeBtn.textContent = "Analyze Keywords";
     analyzeBtn.disabled = false;
   }

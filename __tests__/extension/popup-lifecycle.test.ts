@@ -625,16 +625,41 @@ describe("connection generations", () => {
     await harness.ready();
     harness.establish("https://a.example.com", TOKEN_A);
     harness.getElement("description").value = "TypeScript and security";
+    harness.getElement("analysisSection").style.display = "block";
+    harness.getElement("analysisPrompt").style.display = "block";
+    harness.getElement("analysisPrompt").innerHTML = "A prompt";
+    harness.getElement("analysisBadge").textContent = "80%";
+    harness.getElement("analysisSummary").textContent = "A result";
+    harness.getElement("progressFill").style.width = "80%";
+    harness.getElement("matchedSection").style.display = "block";
+    harness.getElement("matchedPills").innerHTML = "A matched";
+    harness.getElement("missingSection").style.display = "block";
+    harness.getElement("missingPills").innerHTML = "A missing";
     const analysisResponse = deferred<Response>();
     harness.fetchMock
       .mockReturnValueOnce(analysisResponse.promise)
       .mockResolvedValueOnce({ ok: true, status: 200 });
 
     const analysis = harness.api.runKeywordAnalysis();
+    expect(harness.getElement("analyzeBtn").textContent).toBe("Analyzing...");
+    expect(harness.getElement("analyzeBtn").disabled).toBe(true);
     harness.enterPair("https://b.example.com");
     await harness.api.connectServer();
-    harness.getElement("analyzeBtn").textContent = "B ready";
-    harness.getElement("analyzeBtn").disabled = false;
+
+    expect(harness.getElement("analysisSection").style.display).toBe("none");
+    expect(harness.getElement("analysisPrompt").style.display).toBe("none");
+    expect(harness.getElement("analysisPrompt").innerHTML).toBe("");
+    expect(harness.getElement("analysisBadge").textContent).toBe("");
+    expect(harness.getElement("analysisSummary").textContent).toBe("");
+    expect(harness.getElement("progressFill").style.width).toBe("");
+    expect(harness.getElement("matchedSection").style.display).toBe("none");
+    expect(harness.getElement("matchedPills").innerHTML).toBe("");
+    expect(harness.getElement("missingSection").style.display).toBe("none");
+    expect(harness.getElement("missingPills").innerHTML).toBe("");
+    expect(harness.getElement("analyzeBtn").style.display).toBe("block");
+    expect(harness.getElement("analyzeBtn").textContent).toBe("Analyze Keywords");
+    expect(harness.getElement("analyzeBtn").disabled).toBe(false);
+
     analysisResponse.resolve({
       ok: true,
       status: 200,
@@ -650,9 +675,51 @@ describe("connection generations", () => {
     expect(harness.getElement("analysisSection").style.display).not.toBe("block");
     expect(harness.getElement("analysisBadge").textContent).toBe("");
     expect(harness.getElement("analysisPrompt").innerHTML).toBe("");
-    expect(harness.getElement("analyzeBtn").textContent).toBe("B ready");
+    expect(harness.getElement("analyzeBtn").textContent).toBe("Analyze Keywords");
     expect(harness.getElement("analyzeBtn").disabled).toBe(false);
   });
+
+  it.each(["request", "json"] as const)(
+    "does not let a rejected A keyword %s mutate B UI",
+    async (failure) => {
+      const harness = loadLifecyclePopup();
+      await harness.ready();
+      harness.establish("https://a.example.com", TOKEN_A);
+      harness.getElement("description").value = "TypeScript and security";
+      const requestResponse = deferred<Response>();
+      const jsonResponse = deferred<Record<string, unknown>>();
+      if (failure === "request") {
+        harness.fetchMock.mockReturnValueOnce(requestResponse.promise);
+      } else {
+        harness.fetchMock.mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: () => jsonResponse.promise,
+        });
+      }
+      harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+
+      const analysis = harness.api.runKeywordAnalysis();
+      harness.enterPair("https://b.example.com");
+      await harness.api.connectServer();
+      const statusForB = harness.getElement("connectionStatus").textContent;
+      harness.getElement("analyzeBtn").textContent = "B owned";
+      harness.getElement("analyzeBtn").disabled = true;
+      harness.getElement("analysisPrompt").innerHTML = "B prompt";
+
+      if (failure === "request") {
+        requestResponse.reject(new Error("A request failed"));
+      } else {
+        jsonResponse.reject(new Error("A JSON parse failed"));
+      }
+      await analysis;
+
+      expect(harness.getElement("connectionStatus").textContent).toBe(statusForB);
+      expect(harness.getElement("analyzeBtn").textContent).toBe("B owned");
+      expect(harness.getElement("analyzeBtn").disabled).toBe(true);
+      expect(harness.getElement("analysisPrompt").innerHTML).toBe("B prompt");
+    }
+  );
 });
 
 describe("connection teardown", () => {
