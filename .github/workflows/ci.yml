@@ -39,13 +39,14 @@ jobs:
       APP_BASE_URL: https://jobtracker.test
       CORS_ALLOWED_ORIGINS: https://jobtracker.test,chrome-extension://abcdefghijklmnopabcdefghijklmnop
       RUN_DATABASE_INTEGRATION: "1"
+      ALLOW_DESTRUCTIVE_DATABASE_TESTS: jobtracker-ci-delete-all
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "22.12.0"
           cache: npm

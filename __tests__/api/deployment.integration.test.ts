@@ -1,20 +1,52 @@
 import type { PrismaClient } from "@prisma/client";
 import { NextRequest } from "next/server";
+import { assertDatabaseTestSafety } from "./database-test-guard";
 
-const RUN_DATABASE_INTEGRATION =
-  process.env.RUN_DATABASE_INTEGRATION === "1";
-const describeDatabase = RUN_DATABASE_INTEGRATION ? describe : describe.skip;
+jest.mock("@/lib/security/safe-fetch", () => {
+  const actual = jest.requireActual<
+    typeof import("@/lib/security/safe-fetch")
+  >("@/lib/security/safe-fetch");
+
+  return {
+    ...actual,
+    safeFetchJobUrl: jest.fn(async (rawUrl: string) => {
+      if (rawUrl === "https://jobs.example.test/open-role") {
+        return {
+          finalUrl: rawUrl,
+          html: `
+            <html><head>
+              <meta property="og:title" content="Platform Engineer" />
+              <meta property="og:site_name" content="Fixture Careers" />
+            </head><body>offline fixture</body></html>
+          `,
+        };
+      }
+
+      actual.validateJobUrl(rawUrl);
+      throw new Error(`Unexpected external fetch in integration test: ${rawUrl}`);
+    }),
+  };
+});
+
+const DATABASE_INTEGRATION_REQUESTED =
+  process.env.RUN_DATABASE_INTEGRATION !== undefined;
+if (DATABASE_INTEGRATION_REQUESTED) {
+  assertDatabaseTestSafety(process.env);
+}
+const describeDatabase = DATABASE_INTEGRATION_REQUESTED
+  ? describe
+  : describe.skip;
 
 const APP_ORIGIN = "https://jobtracker.test";
 const EXTENSION_ORIGIN =
   "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
-const ACCESS_TOKEN = "ci-access-token-" + "a".repeat(32);
 
 type ApplicationsRoute = typeof import("@/app/api/applications/route");
 type ApplicationDetailRoute =
   typeof import("@/app/api/applications/[id]/route");
 type AuthSessionRoute = typeof import("@/app/api/auth/session/route");
 type ExtractRoute = typeof import("@/app/api/extract/route");
+type KeywordAnalysisRoute = typeof import("@/app/api/keyword-analysis/route");
 type ParseResumeRoute = typeof import("@/app/api/parse-resume/route");
 type SettingsRoute = typeof import("@/app/api/settings/route");
 type StatsRoute = typeof import("@/app/api/stats/route");
@@ -25,6 +57,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
   let applicationDetail: ApplicationDetailRoute;
   let authSession: AuthSessionRoute;
   let extract: ExtractRoute;
+  let keywordAnalysis: KeywordAnalysisRoute;
   let parseResume: ParseResumeRoute;
   let settings: SettingsRoute;
   let stats: StatsRoute;
@@ -35,7 +68,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
     expect(process.env.CORS_ALLOWED_ORIGINS?.split(",")).toEqual(
       expect.arrayContaining([APP_ORIGIN, EXTENSION_ORIGIN]),
     );
-    expect(process.env.APP_ACCESS_TOKEN).toBe(ACCESS_TOKEN);
+    expect(Buffer.byteLength(accessToken(), "utf8")).toBeGreaterThanOrEqual(32);
 
     ({ prisma } = await import("@/lib/prisma"));
     [
@@ -43,6 +76,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       applicationDetail,
       authSession,
       extract,
+      keywordAnalysis,
       parseResume,
       settings,
       stats,
@@ -51,6 +85,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       import("@/app/api/applications/[id]/route"),
       import("@/app/api/auth/session/route"),
       import("@/app/api/extract/route"),
+      import("@/app/api/keyword-analysis/route"),
       import("@/app/api/parse-resume/route"),
       import("@/app/api/settings/route"),
       import("@/app/api/stats/route"),
@@ -175,7 +210,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request("/api/auth/session", {
         method: "POST",
         origin: APP_ORIGIN,
-        json: { token: ACCESS_TOKEN },
+        json: { token: accessToken() },
       }),
     );
     expect(loginResponse.status).toBe(200);
@@ -190,6 +225,84 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       hasApiKey: true,
       linkedinUrl: "https://www.linkedin.com/in/ci-fixture",
       resumeText: "TypeScript PostgreSQL security",
+    });
+  });
+
+  it("extracts a deterministic fetched job through the real route parser", async () => {
+    const response = await extract.POST(
+      request("/api/extract", {
+        method: "POST",
+        origin: EXTENSION_ORIGIN,
+        bearer: true,
+        json: { url: "https://jobs.example.test/open-role" },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("access-control-allow-origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+    await expect(response.json()).resolves.toEqual({
+      jobTitle: "Platform Engineer",
+      company: "Fixture Careers",
+      location: "",
+      url: "https://jobs.example.test/open-role",
+    });
+  });
+
+  it("matches keywords from resume text stored in the real database", async () => {
+    await prisma.settings.upsert({
+      where: { id: "singleton" },
+      update: { resumeText: "TypeScript PostgreSQL security" },
+      create: {
+        id: "singleton",
+        resumeText: "TypeScript PostgreSQL security",
+      },
+    });
+
+    const response = await keywordAnalysis.POST(
+      request("/api/keyword-analysis", {
+        method: "POST",
+        origin: APP_ORIGIN,
+        bearer: true,
+        json: { description: "TypeScript PostgreSQL AWS" },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      matchPercentage: 67,
+      totalJobKeywords: 3,
+      matchedKeywords: [
+        { keyword: "TypeScript", category: "Programming Languages" },
+        { keyword: "PostgreSQL", category: "Databases" },
+      ],
+      missingKeywords: [{ keyword: "AWS", category: "Cloud & DevOps" }],
+    });
+  });
+
+  it("parses a real small text multipart upload", async () => {
+    const form = new FormData();
+    form.append(
+      "resume",
+      new Blob(["TypeScript\nPostgreSQL\nSecurity"], { type: "text/plain" }),
+      "resume.txt",
+    );
+
+    const response = await parseResume.POST(
+      new NextRequest(`${APP_ORIGIN}/api/parse-resume`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken()}`,
+          Origin: APP_ORIGIN,
+        },
+        body: form,
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      text: "TypeScript\nPostgreSQL\nSecurity",
     });
   });
 
@@ -211,7 +324,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       new NextRequest(`${APP_ORIGIN}/api/parse-resume`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          Authorization: `Bearer ${accessToken()}`,
           Origin: APP_ORIGIN,
           "Content-Type": "multipart/form-data; boundary=ci-boundary",
           "Content-Length": String(6 * 1024 * 1024 + 1),
@@ -239,7 +352,7 @@ function request(
   const headers = new Headers();
   if (options.origin) headers.set("Origin", options.origin);
   if (options.bearer) {
-    headers.set("Authorization", `Bearer ${ACCESS_TOKEN}`);
+    headers.set("Authorization", `Bearer ${accessToken()}`);
   }
   if (options.cookie) headers.set("Cookie", options.cookie);
   if (options.json !== undefined) {
@@ -252,6 +365,10 @@ function request(
     body:
       options.json === undefined ? undefined : JSON.stringify(options.json),
   });
+}
+
+function accessToken(): string {
+  return process.env.APP_ACCESS_TOKEN ?? "";
 }
 
 function detailContext(id: string): { params: Promise<{ id: string }> } {

@@ -171,20 +171,38 @@ typechecks with `next typegen`, and creates a production build. All credentials
 in the workflow are fixed test-only values; the workflow does not require
 repository secrets or contact external application services.
 
-The database integration suite runs only when `RUN_DATABASE_INTEGRATION=1`.
-For a local run, create a uniquely named temporary PostgreSQL database and set
-the same disposable HTTPS `.test` application environment used by CI. Never
-point the suite at a development, staging, or production database because it
-deletes its fixture rows before and after the run.
+The database integration suite runs only when every destructive-test guard is
+satisfied: `RUN_DATABASE_INTEGRATION=1`,
+`ALLOW_DESTRUCTIVE_DATABASE_TESTS=jobtracker-ci-delete-all`, a database host of
+`localhost` or `127.0.0.1`, and a decoded database name ending in `_ci` or
+`_test`. An integration run fails before Prisma is imported if any guard is
+missing. Never point the suite at a development, staging, or production
+database because it deletes every application and settings row before and
+after the run.
+
+The following reproduces the CI database gate with a uniquely named temporary
+local database. It does not read or modify the database configured in `.env`:
 
 ```bash
-RUN_DATABASE_INTEGRATION=1 npm run test:ci
+DB="jobtracker_$(date +%s)_ci"
+createdb -h 127.0.0.1 -U postgres "$DB"
+trap 'dropdb -h 127.0.0.1 -U postgres --if-exists "$DB"' EXIT
+
+export DATABASE_URL="postgresql://postgres@127.0.0.1:5432/$DB"
+export ENCRYPTION_SECRET="ci-encryption-secret-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+export APP_ACCESS_TOKEN="ci-access-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+export APP_BASE_URL="https://jobtracker.test"
+export CORS_ALLOWED_ORIGINS="https://jobtracker.test,chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+export RUN_DATABASE_INTEGRATION=1
+export ALLOW_DESTRUCTIVE_DATABASE_TESTS=jobtracker-ci-delete-all
+
+npx prisma migrate deploy
+npm run test:ci
 ```
 
-The required environment variables are `DATABASE_URL`, `ENCRYPTION_SECRET`,
-`APP_ACCESS_TOKEN`, `APP_BASE_URL`, and `CORS_ALLOWED_ORIGINS`. Use
-`https://jobtracker.test` for the application origin and include it exactly in
-the CORS list when reproducing CI locally.
+The fixed credentials above are disposable test values. The application origin
+must remain `https://jobtracker.test` and appear exactly in the CORS list when
+reproducing the integration contract.
 
 ## Troubleshooting
 
