@@ -66,7 +66,10 @@ AI extraction helps when job postings don't have standard meta tags. Not require
 
 ## Run Locally
 
-JobTracker is designed to be self-hosted so your job data and API keys stay on your machine.
+JobTracker supports both local self-hosting and hosted production operation. A
+local instance stores data in the PostgreSQL database you configure. A hosted
+Vercel instance stores application data in its configured PostgreSQL service,
+such as Neon; provider credentials are encrypted before they are persisted.
 
 ```bash
 git clone https://github.com/taejunoh/easy-job-application-tracker.git
@@ -130,20 +133,20 @@ Confirm that the `Application`, `Settings`, and `_prisma_migrations` tables are
 present before starting the application. The Settings row is created lazily on
 the first authenticated Settings request, so no database seed is required.
 
-Start a production deployment with:
+Start a self-hosted Node production deployment with:
 
 ```bash
 npm start
 ```
 
-`npm start` and `npm run dev` are the only supported application launch
-contracts. Direct `next start` and `npx next` invocations are unsupported, as
-are standalone output and hosting platforms that replace the package scripts,
-unless they execute `scripts/validate-startup-env-development.mjs` or
-`scripts/validate-startup-env-production.mjs`, as appropriate, before opening
-a listener. The instrumentation hook remains a request-blocking defense in depth;
-Next.js 16 can print `Ready` before that hook finishes, so instrumentation alone
-does not provide startup fail-fast behavior.
+For self-hosted Node, `npm start` and `npm run dev` are the only supported
+application launch contracts. Direct `next start` and `npx next` invocations
+are unsupported because they bypass the pre-listen environment preloaders.
+Those contracts use `scripts/validate-startup-env-production.mjs` and
+`scripts/validate-startup-env-development.mjs`, respectively.
+`src/instrumentation.ts` remains request-blocking defense in depth across
+supported deployments. Hosted platforms use their own lifecycle hooks; the
+Vercel contract is documented below.
 
 If an existing PostgreSQL database was previously created with
 `prisma db push`, do not apply the initial migration directly. Back up the
@@ -171,24 +174,88 @@ npx prisma migrate diff \
   --exit-code
 ```
 
-These migration commands operate only on PostgreSQL. They do not import or
-convert an older `prisma/dev.db` SQLite file. Preserve that file and perform a
-separate, reviewed data export/import if its records are still needed.
+These migration commands operate only on PostgreSQL and do not import another
+database automatically. Any legacy data import requires a separate, reviewed
+export/import process.
 
-Use `prisma db push` only for disposable development databases. Never use
-`prisma migrate reset`, `db push --force-reset`, or `--accept-data-loss` on a
-database containing records you need to keep. Rollback for the initial
-baseline is a tested database restore, not a destructive down migration.
+Use `prisma db push` only for disposable development databases. Never run a
+destructive reset or accept data loss on a database containing records you need
+to keep. Rollback for the initial baseline is a tested database restore, not a
+destructive down migration.
+
+### Hosted Production
+
+The supported hosted topology is Vercel for the application and Neon (or
+another managed PostgreSQL provider) for the database. Production requires all
+five server variables shown above, and Vercel Production must use Node 22. The
+Vercel Next.js preset runs `npm run build`; Vercel does not run `npm start`.
+When the build loads `next.config.ts`, the complete server environment is
+validated at build time. At request-serving runtime, `src/instrumentation.ts`
+validates it again before a new Node.js server instance handles requests.
+`npm start` pre-listen validation applies to self-hosted Node only. Preview must
+never receive Production database credentials. Because Preview also runs the
+build-time validation, configure the same five variable names with an inert
+loopback database URL, Preview-only credentials, and the stable Preview HTTPS
+alias for both URL/origin fields. Use a separately provisioned disposable
+database if database-backed Preview routes are required.
+
+Open `/connect` on the canonical HTTPS origin and enter the application access
+credential to create a secure browser session. For Chrome extension pairing,
+enter the same canonical server origin and access credential in the extension
+popup, then select **Connect**. The extension origin must appear exactly in
+`CORS_ALLOWED_ORIGINS`; wildcard origins are rejected.
+
+Deployment, verification, backup, restore, incident response, and rollback
+procedures are maintained in the
+[production operations runbook](docs/operations/production-runbook.md). The
+[2026-07-14 cutover record](docs/operations/production-cutover-2026-07-14.md)
+contains sanitized release evidence.
+
+### Chrome Extension E2E
+
+Run the isolated extension journey locally with:
+
+```bash
+npm run test:extension:e2e:local
+```
+
+The wrapper requires a local PostgreSQL 17 server listening on the explicit
+loopback address `127.0.0.1:5432`. It connects to the `postgres` maintenance
+database as the `postgres` role by default; set
+`EXTENSION_E2E_POSTGRES_ADMIN_URL` only when credentials or the explicit port
+must differ. The hostname must remain canonical `127.0.0.1`, and the wrapper
+requires PostgreSQL to report that exact server address before it creates the
+database. The wrapper refuses to proceed if the exact disposable database
+`jobtracker_extension_e2e_test` already exists. Otherwise, it creates that
+database, builds the app with fixed non-production values, runs the E2E suite,
+and force-drops the disposable database in its cleanup path. `SIGINT` and
+`SIGTERM` stop the complete child process group before database cleanup.
+
+The suite uses Playwright's bundled Chromium and a temporary browser profile;
+it never launches or modifies system Chrome. It drives the actual extension
+action popup through invalid and valid pairing, extraction, save, database
+verification, popup reopen, disconnect, and server-`401` cleanup journeys.
+The lower-level CI command is `npm run test:extension:e2e`; do not run it
+directly unless its destructive-test sentinels, exact disposable database,
+server identity, migration, build, and browser prerequisites are already in
+place.
+
+The automated scope and the required manual production verification are
+documented in the
+[Chrome extension smoke runbook](docs/operations/chrome-extension-smoke.md).
 
 ### Continuous Integration
 
-The GitHub Actions workflow runs on Node.js 22.22.2 with a disposable PostgreSQL
-16 service. It installs the checked-in dependency graph, validates and applies
-the Prisma migration history, verifies schema parity, checks the extension's
-static assets, runs the full unit and database integration suite, lints,
-typechecks with `next typegen`, and creates a production build. All credentials
-in the workflow are fixed test-only values; the workflow does not require
-repository secrets or contact external application services.
+The primary GitHub Actions verification job runs on Node.js 22.22.2 with a
+disposable PostgreSQL 16 service. It installs the checked-in dependency graph,
+validates and applies the Prisma migration history, verifies schema parity,
+checks the extension's static assets, runs the full unit and database
+integration suite, lints, typechecks with `next typegen`, and creates a
+production build. A separate extension E2E job uses a digest-pinned PostgreSQL
+17 service, installs Playwright's bundled Chromium, builds the app, and runs
+`npm run test:extension:e2e`. All credentials in both jobs are fixed test-only
+values; neither job requires repository secrets or contacts external
+application services.
 
 The database integration suite runs only when every destructive-test guard is
 satisfied: `RUN_DATABASE_INTEGRATION=1`,

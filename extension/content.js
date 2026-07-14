@@ -5,7 +5,6 @@ function extractLinkedIn() {
   let company = "";
   let location = "";
   let description = "";
-  let _debug = "";
 
   // --- Job Title ---
   // Full detail page selectors

@@ -61,6 +61,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Enforce dependency audit policy
+        run: npm run check:audit
+
       - name: Generate Prisma client
         run: npx prisma generate
 
@@ -97,3 +100,69 @@ jobs:
 
       - name: Verify invalid deployment fails before ready
         run: npm run check:startup-env
+
+  extension-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193 # 17.10-alpine3.24
+        env:
+          POSTGRES_USER: jobtracker
+          POSTGRES_PASSWORD: jobtracker
+          POSTGRES_DB: jobtracker_extension_e2e_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobtracker -d jobtracker_extension_e2e_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://jobtracker:jobtracker@127.0.0.1:5432/jobtracker_extension_e2e_test
+      ENCRYPTION_SECRET: extension-e2e-encryption-secret-cccccccccccc
+      APP_ACCESS_TOKEN: extension-e2e-access-token-aaaaaaaaaaaaaaaa
+      APP_BASE_URL: https://127.0.0.1:3100
+      CORS_ALLOWED_ORIGINS: https://127.0.0.1:3100,chrome-extension://abcdefghijklmnopabcdefghijklmnop
+      RUN_EXTENSION_E2E: "1"
+      ALLOW_DESTRUCTIVE_EXTENSION_E2E: jobtracker-extension-e2e-delete-all
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.2"
+          cache: npm
+
+      - name: Capture PostgreSQL service address
+        env:
+          POSTGRES_SERVICE_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          address="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$POSTGRES_SERVICE_CONTAINER_ID")"
+          printf 'EXPECTED_DATABASE_SERVER_ADDRESS=%s\n' "$address" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install bundled Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build production application
+        run: npm run build
+
+      - name: Run extension end-to-end journeys
+        run: npm run test:extension:e2e
+
+      - name: Upload sanitized extension diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: extension-e2e-diagnostics
+          path: .artifacts/extension-e2e/
+          if-no-files-found: ignore
+          retention-days: 7

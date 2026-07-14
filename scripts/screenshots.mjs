@@ -20,7 +20,7 @@ async function assertDevServerUp() {
   let res;
   try {
     res = await fetch(BASE_URL, { signal: AbortSignal.timeout(3000) });
-  } catch (err) {
+  } catch {
     console.error(
       "\n✗ Next.js dev server not reachable at " + BASE_URL + "\n" +
       "  Run `npm run dev` in another terminal first.\n"
@@ -39,7 +39,7 @@ async function assertDevServerUp() {
 async function launchBrowser() {
   try {
     return await chromium.launch({ headless: true });
-  } catch (err) {
+  } catch {
     console.error(
       "\n✗ Chromium not installed for Playwright.\n" +
       "  Run `npx playwright install chromium` first.\n"
