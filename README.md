@@ -104,11 +104,62 @@ origins, URL paths, and copied placeholder values.
 
 ```bash
 npx prisma generate
-npx prisma db push
+npx prisma migrate deploy
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). Update the extension's server URL to `http://localhost:3000`.
+
+### Database Deployment
+
+For a new hosted instance, create an empty PostgreSQL database, set
+`DATABASE_URL` to that database, and apply the checked-in migration history:
+
+```bash
+npx prisma validate
+npx prisma generate
+npx prisma migrate deploy
+npx prisma migrate status
+```
+
+Confirm that the `Application`, `Settings`, and `_prisma_migrations` tables are
+present before starting the application. The Settings row is created lazily on
+the first authenticated Settings request, so no database seed is required.
+
+If an existing PostgreSQL database was previously created with
+`prisma db push`, do not apply the initial migration directly. Back up the
+database and verify that its Prisma-managed schema exactly matches the current
+schema first:
+
+```bash
+npx prisma migrate diff \
+  --from-config-datasource \
+  --to-schema prisma/schema.prisma \
+  --exit-code
+```
+
+An empty diff exits with status `0`. Stop and resolve every reported difference
+before continuing. Once the backup is complete and the diff is empty, record
+the initial migration as already applied, then verify migration state again:
+
+```bash
+npx prisma migrate resolve --applied 20260713000000_init
+npx prisma migrate deploy
+npx prisma migrate status
+npx prisma migrate diff \
+  --from-config-datasource \
+  --to-schema prisma/schema.prisma \
+  --exit-code
+```
+
+These migration commands operate only on PostgreSQL. They do not import or
+convert an older `prisma/dev.db` SQLite file. Preserve that file and perform a
+separate, reviewed data export/import if its records are still needed.
+
+Use `prisma db push` only for disposable development databases. Never use
+`prisma migrate reset`, `db push --force-reset`, or `--accept-data-loss` on a
+database containing records you need to keep. Rollback for the initial
+baseline is a tested database restore, not a destructive down migration.
 
 ## Troubleshooting
 
