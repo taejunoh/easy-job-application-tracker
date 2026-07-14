@@ -13,7 +13,7 @@ export type ServerEnv = Readonly<{
   corsAllowedOrigins: readonly string[];
 }>;
 
-const SECRET_PLACEHOLDERS = new Set([
+const SECRET_PLACEHOLDER_PHRASES = [
   "any-random-string-at-least-32-characters-long",
   "example-encryption-secret-value-1234",
   "generate-a-random-32-char-string-here",
@@ -23,7 +23,7 @@ const SECRET_PLACEHOLDERS = new Set([
   "replace-with-your-application-token-now",
   "replace-with-your-encryption-secret-now",
   "sample-app-access-token-value-12345",
-]);
+];
 
 const DATABASE_URL_PLACEHOLDERS = new Set([
   "postgresql://user:password@host:5432/dbname?sslmode=require",
@@ -109,11 +109,17 @@ function parseDatabaseUrl(value: string): string {
 }
 
 function parseSecret(name: string, value: string): string {
+  const hasInvalidWhitespace =
+    name === "ENCRYPTION_SECRET" ? value !== value.trim() : /\s/u.test(value);
+  const normalizedValue = value.toLowerCase();
+  const hasPlaceholderPhrase = SECRET_PLACEHOLDER_PHRASES.some((phrase) =>
+    normalizedValue.includes(phrase),
+  );
+
   if (
     Buffer.byteLength(value, "utf8") < 32 ||
-    /\s/u.test(value) ||
-    SECRET_PLACEHOLDERS.has(value.toLowerCase()) ||
-    TEMPLATE_MARKER_PATTERN.test(value)
+    hasInvalidWhitespace ||
+    hasPlaceholderPhrase
   ) {
     invalid(name, "must be a non-placeholder secret of at least 32 bytes");
   }
@@ -201,6 +207,9 @@ function parseCorsOrigin(value: string, nodeEnv: ServerNodeEnv): string {
   }
 
   if (url.protocol === "chrome-extension:") {
+    if (url.port || !/^[a-p]{32}$/u.test(url.hostname)) {
+      invalid(name, "must contain only allowed exact origins");
+    }
     return `${url.protocol}//${url.host}`;
   }
 

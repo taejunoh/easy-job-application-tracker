@@ -190,6 +190,58 @@ describe("parseServerEnv", () => {
   });
 
   it.each(["ENCRYPTION_SECRET", "APP_ACCESS_TOKEN"] as const)(
+    "rejects known placeholder phrases embedded in %s",
+    (name) => {
+      for (const value of [
+        "GENERATE_WITH_OPENSSL_RAND_BASE64_32!",
+        "prefix-any-random-string-at-least-32-characters-long-1",
+      ]) {
+        expectInvalidWithoutValue(name, value, { [name]: value });
+      }
+    },
+  );
+
+  it("accepts a long ENCRYPTION_SECRET with internal spaces", () => {
+    const encryptionSecret = "valid encryption secret with spaces 1234567890";
+
+    const config = parseServerEnv(
+      { ...productionSource, ENCRYPTION_SECRET: encryptionSecret },
+      "production",
+    );
+
+    expect(config.encryptionSecret).toBe(encryptionSecret);
+  });
+
+  it.each(["ENCRYPTION_SECRET", "APP_ACCESS_TOKEN"] as const)(
+    "accepts an unrelated angle-bracket segment in %s",
+    (name) => {
+      const value = "valid-<segment>-secret-material-1234567890";
+
+      const config = parseServerEnv(
+        { ...productionSource, [name]: value },
+        "production",
+      );
+
+      const configKey =
+        name === "ENCRYPTION_SECRET" ? "encryptionSecret" : "appAccessToken";
+      expect(config[configKey]).toBe(value);
+    },
+  );
+
+  it.each(["ENCRYPTION_SECRET", "APP_ACCESS_TOKEN"] as const)(
+    "rejects leading, trailing, and whitespace-only %s values",
+    (name) => {
+      for (const value of [
+        ` ${"x".repeat(32)}`,
+        `${"x".repeat(32)} `,
+        " ".repeat(32),
+      ]) {
+        expectInvalidWithoutValue(name, value, { [name]: value });
+      }
+    },
+  );
+
+  it.each(["ENCRYPTION_SECRET", "APP_ACCESS_TOKEN"] as const)(
     "rejects a 31-byte %s and accepts a 32-byte multibyte value",
     (name) => {
       const thirtyOneBytes = "é".repeat(15) + "a";
@@ -271,6 +323,21 @@ describe("parseServerEnv", () => {
       });
     },
   );
+
+  it.each([
+    "chrome-extension://example.com",
+    `chrome-extension://${"a".repeat(32)}:123`,
+    `chrome-extension://${"a".repeat(31)}`,
+    `chrome-extension://${"a".repeat(33)}`,
+    `chrome-extension://${"a".repeat(31)}q`,
+    `chrome-extension://${"A".repeat(32)}`,
+  ])("rejects malformed Chrome extension origin %s", (extensionOrigin) => {
+    const origins = `https://jobs.example.com,${extensionOrigin}`;
+
+    expectInvalidWithoutValue("CORS_ALLOWED_ORIGINS", origins, {
+      CORS_ALLOWED_ORIGINS: origins,
+    });
+  });
 
   it("requires CORS_ALLOWED_ORIGINS to contain the app origin", () => {
     const origins = "https://other.example.com";
