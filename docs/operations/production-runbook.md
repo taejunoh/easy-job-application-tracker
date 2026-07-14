@@ -145,8 +145,13 @@ Keep it outside Git and cloud artifacts with mode `0600`; never print or upload
 it. Back it up through the approved private credential channel. After download,
 verify the encrypted checksum, decrypt with `age --decrypt --identity`, verify
 the decrypted dump against `dumpSha256` in the manifest, and follow the scratch
-restore rehearsal below. Workflow dispatch is a post-merge validation and
-remains pending until these workflow files exist on the default branch.
+restore rehearsal below. Set `TZ=UTC` when running
+`scripts/fingerprint-database.mjs` during a local restore comparison; otherwise
+local timezone parsing of timestamp-without-time-zone fields can produce a
+false Application digest mismatch. The scheduled workflow already runs in UTC.
+Manual dispatch remains a post-merge validation: dispatch both operations
+workflows after changing their definitions and require successful runs from the
+default branch.
 
 Before a migration or risky release, create a PostgreSQL custom-format dump in
 an access-controlled location outside the repository:
