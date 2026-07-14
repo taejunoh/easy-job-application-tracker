@@ -2,6 +2,7 @@ import "server-only";
 
 import { lookup } from "node:dns/promises";
 import { isIP, type LookupFunction } from "node:net";
+import { types as utilTypes } from "node:util";
 
 import {
   Agent,
@@ -42,6 +43,7 @@ const NETWORK_ERROR_CODES = new Set([
   "EAI_NODATA",
   "EAI_NONAME",
   "EAI_ADDRFAMILY",
+  "ERR_TLS_CERT_ALTNAME_FORMAT",
   "ERR_TLS_CERT_ALTNAME_INVALID",
   "ERR_TLS_CERT_SIGNATURE_ALGORITHM_UNSUPPORTED",
 ]);
@@ -62,7 +64,6 @@ const X509_VERIFICATION_ERROR_CODES = new Set([
   "ERROR_IN_CERT_NOT_AFTER_FIELD",
   "ERROR_IN_CRL_LAST_UPDATE_FIELD",
   "ERROR_IN_CRL_NEXT_UPDATE_FIELD",
-  "OUT_OF_MEM",
   "DEPTH_ZERO_SELF_SIGNED_CERT",
   "SELF_SIGNED_CERT_IN_CHAIN",
   "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
@@ -75,6 +76,39 @@ const X509_VERIFICATION_ERROR_CODES = new Set([
   "CERT_UNTRUSTED",
   "CERT_REJECTED",
   "HOSTNAME_MISMATCH",
+]);
+// Remote protocol and alert reasons emitted by Node's bundled OpenSSL.
+const REMOTE_TLS_ERROR_CODES = new Set([
+  "ERR_SSL_WRONG_VERSION_NUMBER",
+  "ERR_SSL_UNSUPPORTED_PROTOCOL",
+  "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE",
+  "ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC",
+  "ERR_SSL_SSLV3_ALERT_CERTIFICATE_EXPIRED",
+  "ERR_SSL_SSLV3_ALERT_CERTIFICATE_REVOKED",
+  "ERR_SSL_SSLV3_ALERT_CERTIFICATE_UNKNOWN",
+  "ERR_SSL_SSLV3_ALERT_DECOMPRESSION_FAILURE",
+  "ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE",
+  "ERR_SSL_SSLV3_ALERT_ILLEGAL_PARAMETER",
+  "ERR_SSL_SSLV3_ALERT_NO_CERTIFICATE",
+  "ERR_SSL_SSLV3_ALERT_UNEXPECTED_MESSAGE",
+  "ERR_SSL_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE",
+  "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
+  "ERR_SSL_TLSV13_ALERT_MISSING_EXTENSION",
+  "ERR_SSL_TLSV1_ALERT_ACCESS_DENIED",
+  "ERR_SSL_TLSV1_ALERT_DECODE_ERROR",
+  "ERR_SSL_TLSV1_ALERT_DECRYPTION_FAILED",
+  "ERR_SSL_TLSV1_ALERT_DECRYPT_ERROR",
+  "ERR_SSL_TLSV1_ALERT_EXPORT_RESTRICTION",
+  "ERR_SSL_TLSV1_ALERT_INAPPROPRIATE_FALLBACK",
+  "ERR_SSL_TLSV1_ALERT_INSUFFICIENT_SECURITY",
+  "ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR",
+  "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL",
+  "ERR_SSL_TLSV1_ALERT_NO_RENEGOTIATION",
+  "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
+  "ERR_SSL_TLSV1_ALERT_RECORD_OVERFLOW",
+  "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA",
+  "ERR_SSL_TLSV1_ALERT_UNKNOWN_PSK_IDENTITY",
+  "ERR_SSL_TLSV1_ALERT_USER_CANCELLED",
 ]);
 
 export type SafeFetchErrorCode =
@@ -549,7 +583,7 @@ function classifyTransportFailure(
   if (signal?.aborted) return "timeout";
 
   let current = error;
-  for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
+  for (let depth = 0; depth < 4 && isErrorObject(current); depth += 1) {
     const code = (current as Error & { code?: unknown }).code;
     if (typeof code === "string" && TIMEOUT_ERROR_CODES.has(code)) {
       return "timeout";
@@ -558,6 +592,10 @@ function classifyTransportFailure(
     current = (current as Error & { cause?: unknown }).cause;
   }
   return null;
+}
+
+function isErrorObject(value: unknown): value is Error {
+  return value instanceof Error || utilTypes.isNativeError(value);
 }
 
 function isKnownNetworkFailure(error: Error, code: unknown): boolean {
@@ -574,6 +612,7 @@ function isKnownNetworkFailure(error: Error, code: unknown): boolean {
     typeof code === "string" &&
     (NETWORK_ERROR_CODES.has(code) ||
       X509_VERIFICATION_ERROR_CODES.has(code) ||
+      REMOTE_TLS_ERROR_CODES.has(code) ||
       code.startsWith("HPE_"))
   );
 }

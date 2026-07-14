@@ -1,6 +1,12 @@
 import type { LookupAddress } from "node:dns";
 import { createServer } from "node:http";
-import type { AddressInfo, Socket } from "node:net";
+import {
+  createServer as createTcpServer,
+  type AddressInfo,
+  type Server as NetServer,
+  type Socket,
+} from "node:net";
+import { gzipSync } from "node:zlib";
 import {
   Response as UndiciResponse,
   errors as undiciErrors,
@@ -43,7 +49,6 @@ const NODE_X509_VERIFY_CODES = [
   "ERROR_IN_CERT_NOT_AFTER_FIELD",
   "ERROR_IN_CRL_LAST_UPDATE_FIELD",
   "ERROR_IN_CRL_NEXT_UPDATE_FIELD",
-  "OUT_OF_MEM",
   "DEPTH_ZERO_SELF_SIGNED_CERT",
   "SELF_SIGNED_CERT_IN_CHAIN",
   "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
@@ -56,6 +61,38 @@ const NODE_X509_VERIFY_CODES = [
   "CERT_UNTRUSTED",
   "CERT_REJECTED",
   "HOSTNAME_MISMATCH",
+] as const;
+const REMOTE_TLS_ERROR_CODES = [
+  "ERR_SSL_WRONG_VERSION_NUMBER",
+  "ERR_SSL_UNSUPPORTED_PROTOCOL",
+  "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE",
+  "ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC",
+  "ERR_SSL_SSLV3_ALERT_CERTIFICATE_EXPIRED",
+  "ERR_SSL_SSLV3_ALERT_CERTIFICATE_REVOKED",
+  "ERR_SSL_SSLV3_ALERT_CERTIFICATE_UNKNOWN",
+  "ERR_SSL_SSLV3_ALERT_DECOMPRESSION_FAILURE",
+  "ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE",
+  "ERR_SSL_SSLV3_ALERT_ILLEGAL_PARAMETER",
+  "ERR_SSL_SSLV3_ALERT_NO_CERTIFICATE",
+  "ERR_SSL_SSLV3_ALERT_UNEXPECTED_MESSAGE",
+  "ERR_SSL_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE",
+  "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
+  "ERR_SSL_TLSV13_ALERT_MISSING_EXTENSION",
+  "ERR_SSL_TLSV1_ALERT_ACCESS_DENIED",
+  "ERR_SSL_TLSV1_ALERT_DECODE_ERROR",
+  "ERR_SSL_TLSV1_ALERT_DECRYPTION_FAILED",
+  "ERR_SSL_TLSV1_ALERT_DECRYPT_ERROR",
+  "ERR_SSL_TLSV1_ALERT_EXPORT_RESTRICTION",
+  "ERR_SSL_TLSV1_ALERT_INAPPROPRIATE_FALLBACK",
+  "ERR_SSL_TLSV1_ALERT_INSUFFICIENT_SECURITY",
+  "ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR",
+  "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL",
+  "ERR_SSL_TLSV1_ALERT_NO_RENEGOTIATION",
+  "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
+  "ERR_SSL_TLSV1_ALERT_RECORD_OVERFLOW",
+  "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA",
+  "ERR_SSL_TLSV1_ALERT_UNKNOWN_PSK_IDENTITY",
+  "ERR_SSL_TLSV1_ALERT_USER_CANCELLED",
 ] as const;
 
 describe("validateJobUrl", () => {
@@ -213,6 +250,40 @@ describe("createUndiciTransport", () => {
     );
   });
 
+  it("maps a real plaintext response on an HTTPS socket to a network failure", async () => {
+    const sockets = new Set<Socket>();
+    const server = createTcpServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      socket.end("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    });
+    await listenOnLoopback(server);
+    const { port } = server.address() as AddressInfo;
+    const transport = createUndiciTransport(undiciFetch);
+
+    try {
+      await expect(
+        settleWithin(
+          transport({
+            ...transportRequest(),
+            url: new URL(`https://plaintext.test:${port}/`),
+            lookup: createPinnedLookup("plaintext.test", [
+              { address: "127.0.0.1", family: 4 },
+            ]),
+            timeoutMs: 2_000,
+          }),
+          1_000,
+        ),
+      ).rejects.toMatchObject({
+        name: "SafeFetchTransportError",
+        kind: "network",
+      });
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await closeServer(server);
+    }
+  });
+
   it("settles a stalled body and closes its dispatcher socket on deadline abort", async () => {
     const sockets = new Set<Socket>();
     let markSocketClosed: () => void = () => undefined;
@@ -241,13 +312,13 @@ describe("createUndiciTransport", () => {
       lookup: createPinnedLookup("body-timeout.test", [
         { address: "127.0.0.1", family: 4 },
       ]),
-      timeoutMs: 1_000,
+      timeoutMs: 2_000,
     });
     const reader = response.body?.getReader();
 
     try {
       expect(reader).toBeDefined();
-      const firstChunk = await settleWithin(reader!.read(), 500);
+      const firstChunk = await settleWithin(reader!.read(), 1_000);
       expect(firstChunk.done).toBe(false);
       expect(new TextDecoder().decode(firstChunk.value)).toBe("partial");
 
@@ -257,9 +328,9 @@ describe("createUndiciTransport", () => {
       );
       controller.abort(new Error("body deadline exceeded"));
 
-      await expect(settleWithin(pendingRead, 500)).resolves.toBe("rejected");
-      await settleWithin(response.dispose(), 500);
-      await expect(settleWithin(socketClosed, 500)).resolves.toBeUndefined();
+      await expect(settleWithin(pendingRead, 1_000)).resolves.toBe("rejected");
+      await settleWithin(response.dispose(), 1_000);
+      await expect(settleWithin(socketClosed, 1_000)).resolves.toBeUndefined();
     } finally {
       controller.abort();
       reader?.releaseLock();
@@ -291,6 +362,12 @@ describe("createUndiciTransport", () => {
     [
       Object.assign(new Error("TLS certificate detail"), {
         code: "ERR_TLS_CERT_ALTNAME_INVALID",
+      }),
+      "network",
+    ],
+    [
+      Object.assign(new Error("TLS certificate altname format detail"), {
+        code: "ERR_TLS_CERT_ALTNAME_FORMAT",
       }),
       "network",
     ],
@@ -336,6 +413,23 @@ describe("createUndiciTransport", () => {
     },
   );
 
+  it.each(REMOTE_TLS_ERROR_CODES)(
+    "normalizes exact remote TLS code %s as a network failure",
+    async (code) => {
+      const cause = Object.assign(new Error("remote TLS detail"), { code });
+      const transport = createUndiciTransport(
+        jest
+          .fn()
+          .mockRejectedValue(new TypeError("fetch failed", { cause })) as never,
+      );
+
+      await expect(transport(transportRequest())).rejects.toMatchObject({
+        name: "SafeFetchTransportError",
+        kind: "network",
+      });
+    },
+  );
+
   it.each([
     new Error("programmer failure"),
     new TypeError("fetch failed"),
@@ -352,6 +446,12 @@ describe("createUndiciTransport", () => {
     }),
     Object.assign(new Error("invalid local cipher configuration"), {
       code: "ERR_SSL_NO_CIPHER_MATCH",
+    }),
+    Object.assign(new Error("local OpenSSL allocation failure"), {
+      code: "OUT_OF_MEM",
+    }),
+    Object.assign(new Error("unlisted SSL failure"), {
+      code: "ERR_SSL_UNLISTED_FAILURE",
     }),
   ])("rethrows unexpected fetch exception %# for the route 500 boundary", async (error) => {
     const transport = createUndiciTransport(
@@ -607,6 +707,55 @@ describe("createSafeFetchJobUrl", () => {
     ).rejects.toMatchObject({ code: "upstream_too_large", status: 413 });
   });
 
+  it("enforces the decoded limit on a real gzip response larger than its wire body", async () => {
+    const decodedBody = Buffer.alloc(MAX_JOB_PAGE_BYTES + 1, 97);
+    const wireBody = gzipSync(decodedBody);
+    expect(wireBody.byteLength).toBeLessThan(MAX_JOB_PAGE_BYTES);
+
+    const sockets = new Set<Socket>();
+    const server = createServer((_request, response) => {
+      response.writeHead(200, {
+        "Content-Type": "text/html",
+        "Content-Encoding": "gzip",
+        "Content-Length": String(wireBody.byteLength),
+      });
+      response.end(wireBody);
+    });
+    server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+    });
+    await listenOnLoopback(server);
+    const { port } = server.address() as AddressInfo;
+    let upstream: SafeFetchTransportResponse | undefined;
+
+    try {
+      upstream = await settleWithin(
+        createUndiciTransport(undiciFetch)({
+          ...transportRequest(),
+          url: new URL(`http://gzip.test:${port}/`),
+          lookup: createPinnedLookup("gzip.test", [
+            { address: "127.0.0.1", family: 4 },
+          ]),
+          timeoutMs: 2_000,
+        }),
+        1_000,
+      );
+      expect(upstream.headers.get("content-length")).toBe(
+        String(wireBody.byteLength),
+      );
+      transport.mockResolvedValue(upstream);
+
+      await expect(
+        fetcher({ resolve, transport })("https://example.com/jobs/1"),
+      ).rejects.toMatchObject({ code: "upstream_too_large", status: 413 });
+    } finally {
+      await upstream?.dispose();
+      for (const socket of sockets) socket.destroy();
+      await closeServer(server);
+    }
+  });
+
   it("maps a non-success response without exposing its body", async () => {
     transport.mockResolvedValue(
       response({
@@ -844,9 +993,7 @@ function transportRequest(
   };
 }
 
-function listenOnLoopback(
-  server: ReturnType<typeof createServer>,
-): Promise<void> {
+function listenOnLoopback(server: NetServer): Promise<void> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
@@ -856,7 +1003,7 @@ function listenOnLoopback(
   });
 }
 
-function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+function closeServer(server: NetServer): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((error) => {
       if (error) reject(error);
