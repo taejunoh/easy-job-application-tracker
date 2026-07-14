@@ -2,6 +2,8 @@
 
 import { useEffect, useState, useCallback } from "react";
 import ApplicationTable from "@/components/ApplicationTable";
+import { useClientApi } from "@/hooks/use-client-api";
+import type { ClientApi } from "@/lib/client-api";
 
 interface Application {
   id: string;
@@ -17,33 +19,50 @@ const STATUSES = ["All", "Applied", "Interview", "Offer", "Rejected"];
 const JOB_TYPES = ["All", "Remote", "Hybrid", "Onsite"];
 
 export default function ApplicationsPage() {
+  const api = useClientApi();
   const [applications, setApplications] = useState<Application[]>([]);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
   const [jobTypeFilter, setJobTypeFilter] = useState("All");
+  const [error, setError] = useState("");
 
-  const fetchApplications = useCallback(() => {
+  const loadApplications = useCallback(() => {
     const params = new URLSearchParams();
     if (search) params.set("search", search);
     if (statusFilter !== "All") params.set("status", statusFilter);
     if (jobTypeFilter !== "All") params.set("jobType", jobTypeFilter);
 
-    fetch(`/api/applications?${params}`)
-      .then((res) => res.json())
-      .then(setApplications);
-  }, [search, statusFilter, jobTypeFilter]);
+    return api<Application[]>(`/api/applications?${params}`);
+  }, [api, search, statusFilter, jobTypeFilter]);
+
+  const refreshApplications = useCallback(async () => {
+    try {
+      const data = await loadApplications();
+      setApplications(data);
+      setError("");
+    } catch (failure) {
+      setError(errorMessage(failure, "Failed to load applications."));
+    }
+  }, [loadApplications]);
 
   useEffect(() => {
-    fetchApplications();
-  }, [fetchApplications]);
+    loadApplications()
+      .then((data) => {
+        setApplications(data);
+        setError("");
+      })
+      .catch((failure: unknown) => {
+        setError(errorMessage(failure, "Failed to load applications."));
+      });
+  }, [loadApplications]);
 
   async function handleStatusChange(id: string, status: string) {
-    await fetch(`/api/applications/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status }),
-    });
-    fetchApplications();
+    setError("");
+    try {
+      await updateApplicationStatus(api, refreshApplications, id, status);
+    } catch (failure) {
+      setError(errorMessage(failure, "Failed to update application status."));
+    }
   }
 
   return (
@@ -82,10 +101,34 @@ export default function ApplicationsPage() {
         </select>
       </div>
 
+      {error && (
+        <div role="alert" className="mb-4 text-sm text-red-400">
+          {error}
+        </div>
+      )}
+
       <ApplicationTable
         applications={applications}
         onStatusChange={handleStatusChange}
       />
     </div>
   );
+}
+
+export async function updateApplicationStatus(
+  api: ClientApi,
+  refresh: () => void | Promise<void>,
+  id: string,
+  status: string,
+): Promise<void> {
+  await api(`/api/applications/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  await refresh();
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }

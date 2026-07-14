@@ -4,13 +4,16 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import { sanitizeReturnPath } from "@/lib/return-path";
+import { resetClientApiSessionRedirect } from "@/lib/client-api";
 
 export async function connectWithAccessToken(token: string): Promise<Response> {
-  return fetch("/api/auth/session", {
+  const response = await fetch("/api/auth/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ token }),
   });
+  if (response.ok) resetClientApiSessionRedirect();
+  return response;
 }
 
 export function connectDestination(search: string): string {

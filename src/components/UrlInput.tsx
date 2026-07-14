@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { useClientApi } from "@/hooks/use-client-api";
+import type { ClientApi } from "@/lib/client-api";
 
 type InputMode = "url" | "text";
 
@@ -13,6 +15,7 @@ interface ExtractedData {
 }
 
 export default function UrlInput() {
+  const api = useClientApi();
   const [mode, setMode] = useState<InputMode>("url");
   const [url, setUrl] = useState("");
   const [text, setText] = useState("");
@@ -33,18 +36,11 @@ export default function UrlInput() {
     setExtracted(null);
 
     try {
-      const res = await fetch("/api/extract", {
+      const data = await api<ExtractedData>("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: url.trim() }),
       });
-
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Failed to extract job data");
-      }
-
-      const data = await res.json();
       setExtracted(data);
       setEditTitle(data.jobTitle || "");
       setEditCompany(data.company || "");
@@ -64,18 +60,11 @@ export default function UrlInput() {
     setExtracted(null);
 
     try {
-      const res = await fetch("/api/extract", {
+      const data = await api<ExtractedData>("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: text.trim(), url: textUrl.trim() || undefined }),
       });
-
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Failed to extract job data");
-      }
-
-      const data = await res.json();
       setExtracted(data);
       setEditTitle(data.jobTitle || "");
       setEditCompany(data.company || "");
@@ -96,27 +85,23 @@ export default function UrlInput() {
     setError("");
 
     try {
-      const res = await fetch("/api/applications", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      await saveNewApplication(
+        api,
+        () => {
+          setUrl("");
+          setText("");
+          setTextUrl("");
+          setExtracted(null);
+          setEditTitle("");
+          setEditCompany("");
+          router.refresh();
+        },
+        {
           url: extracted?.url || textUrl.trim() || url.trim() || "",
           jobTitle: editTitle.trim(),
           company: editCompany.trim(),
-        }),
-      });
-
-      if (!res.ok) {
-        throw new Error("Failed to save application");
-      }
-
-      setUrl("");
-      setText("");
-      setTextUrl("");
-      setExtracted(null);
-      setEditTitle("");
-      setEditCompany("");
-      router.refresh();
+        },
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -260,8 +245,27 @@ export default function UrlInput() {
       )}
 
       {error && (
-        <div className="mt-2 text-red-400 text-xs">{error}</div>
+        <div role="alert" className="mt-2 text-red-400 text-xs">{error}</div>
       )}
     </div>
   );
+}
+
+interface NewApplication {
+  url: string;
+  jobTitle: string;
+  company: string;
+}
+
+export async function saveNewApplication(
+  api: ClientApi,
+  clearForm: () => void,
+  application: NewApplication,
+): Promise<void> {
+  await api("/api/applications", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(application),
+  });
+  clearForm();
 }
