@@ -66,7 +66,10 @@ AI extraction helps when job postings don't have standard meta tags. Not require
 
 ## Run Locally
 
-JobTracker is designed to be self-hosted so your job data and API keys stay on your machine.
+JobTracker supports both local self-hosting and hosted production operation. A
+local instance stores data in the PostgreSQL database you configure. A hosted
+Vercel instance stores application data in its configured PostgreSQL service,
+such as Neon; provider credentials are encrypted before they are persisted.
 
 ```bash
 git clone https://github.com/taejunoh/easy-job-application-tracker.git
@@ -171,14 +174,34 @@ npx prisma migrate diff \
   --exit-code
 ```
 
-These migration commands operate only on PostgreSQL. They do not import or
-convert an older `prisma/dev.db` SQLite file. Preserve that file and perform a
-separate, reviewed data export/import if its records are still needed.
+These migration commands operate only on PostgreSQL and do not import another
+database automatically. Any legacy data import requires a separate, reviewed
+export/import process.
 
-Use `prisma db push` only for disposable development databases. Never use
-`prisma migrate reset`, `db push --force-reset`, or `--accept-data-loss` on a
-database containing records you need to keep. Rollback for the initial
-baseline is a tested database restore, not a destructive down migration.
+Use `prisma db push` only for disposable development databases. Never run a
+destructive reset or accept data loss on a database containing records you need
+to keep. Rollback for the initial baseline is a tested database restore, not a
+destructive down migration.
+
+### Hosted Production
+
+The supported hosted topology is Vercel for the application and Neon (or
+another managed PostgreSQL provider) for the database. Production requires all
+five server variables shown above. Vercel Production must use Node 22 and run
+the checked-in `npm start` contract; Preview must never receive Production
+database credentials.
+
+Open `/connect` on the canonical HTTPS origin and enter the application access
+credential to create a secure browser session. For Chrome extension pairing,
+enter the same canonical server origin and access credential in the extension
+popup, then select **Connect**. The extension origin must appear exactly in
+`CORS_ALLOWED_ORIGINS`; wildcard origins are rejected.
+
+Deployment, verification, backup, restore, incident response, and rollback
+procedures are maintained in the
+[production operations runbook](docs/operations/production-runbook.md). The
+[2026-07-14 cutover record](docs/operations/production-cutover-2026-07-14.md)
+contains sanitized release evidence.
 
 ### Continuous Integration
 
