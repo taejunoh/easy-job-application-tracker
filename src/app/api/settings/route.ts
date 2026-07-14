@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { encrypt } from "@/lib/crypto";
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import { readJsonBody } from "@/lib/security/request-body";
 
 const route = createProtectedRoute(["GET", "PUT"]);
 
@@ -32,7 +33,7 @@ export const GET = route.handler(async function GET(request: NextRequest) {
 });
 
 export const PUT = route.handler(async function PUT(request: NextRequest) {
-  const body = await request.json();
+  const body = await readJsonBody(request);
 
   const data: Record<string, string> = {};
   if (body.llmProvider !== undefined) data.llmProvider = body.llmProvider;

@@ -164,7 +164,7 @@ describe("corsHeaders", () => {
 });
 
 describe("decorateCorsResponse", () => {
-  it("adds allowed-origin headers while merging Vary without duplicates", () => {
+  it("adds allowed-origin headers on a new response without mutating the handler response", async () => {
     const allowed = expectAllowed(
       corsHeaders(actualRequest(APP_ORIGIN), ["GET"]),
     );
@@ -174,7 +174,8 @@ describe("decorateCorsResponse", () => {
 
     const decorated = decorateCorsResponse(response, allowed);
 
-    expect(decorated).toBe(response);
+    expect(decorated).not.toBe(response);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
     expect(decorated.headers.get("Vary")).toBe("Accept-Encoding, origin");
     expect(decorated.headers.get("Access-Control-Allow-Origin")).toBe(
       APP_ORIGIN,
@@ -183,6 +184,7 @@ describe("decorateCorsResponse", () => {
       "true",
     );
     expect(decorated.headers.get("X-Result")).toBe("preserved");
+    await expect(decorated.text()).resolves.toBe("ok");
   });
 
   it("preserves CORS headers on an allowed-origin error response", async () => {
@@ -194,14 +196,15 @@ describe("decorateCorsResponse", () => {
       { status: 422 },
     );
 
-    decorateCorsResponse(response, allowed);
+    const decorated = decorateCorsResponse(response, allowed);
 
-    expect(response.status).toBe(422);
-    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+    expect(decorated.status).toBe(422);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(decorated.headers.get("Access-Control-Allow-Origin")).toBe(
       EXTENSION_ORIGIN,
     );
-    expect(response.headers.get("Vary")).toBe("Origin");
-    await expect(response.json()).resolves.toEqual({
+    expect(decorated.headers.get("Vary")).toBe("Origin");
+    await expect(decorated.json()).resolves.toEqual({
       error: "Invalid request",
       code: "invalid_request",
     });
@@ -215,9 +218,9 @@ describe("decorateCorsResponse", () => {
       headers: { Vary: "Accept-Encoding" },
     });
 
-    decorateCorsResponse(response, allowed);
+    const decorated = decorateCorsResponse(response, allowed);
 
-    expect(response.headers.get("Vary")).toBe("Accept-Encoding, Origin");
+    expect(decorated.headers.get("Vary")).toBe("Accept-Encoding, Origin");
   });
 
   it.each([
@@ -238,17 +241,20 @@ describe("decorateCorsResponse", () => {
         },
       });
 
-      decorateCorsResponse(response, allowed);
+      const decorated = decorateCorsResponse(response, allowed);
 
-      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      expect(decorated.headers.get("Access-Control-Allow-Origin")).toBe(
         expectedOrigin,
       );
-      expect(response.headers.get("Access-Control-Allow-Credentials")).toBe(
+      expect(decorated.headers.get("Access-Control-Allow-Credentials")).toBe(
         expectedCredentials,
       );
-      expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
-      expect(response.headers.get("Access-Control-Allow-Headers")).toBeNull();
-      expect(response.headers.get("Access-Control-Max-Age")).toBeNull();
+      expect(decorated.headers.get("Access-Control-Allow-Methods")).toBeNull();
+      expect(decorated.headers.get("Access-Control-Allow-Headers")).toBeNull();
+      expect(decorated.headers.get("Access-Control-Max-Age")).toBeNull();
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        "https://stale.example.com",
+      );
     },
   );
 
@@ -258,9 +264,74 @@ describe("decorateCorsResponse", () => {
     );
     const response = new Response(null, { headers: { Vary: "Accept, *" } });
 
-    decorateCorsResponse(response, allowed);
+    const decorated = decorateCorsResponse(response, allowed);
 
-    expect(response.headers.get("Vary")).toBe("*");
+    expect(decorated.headers.get("Vary")).toBe("*");
+  });
+
+  it("decorates a native immutable redirect while preserving redirect metadata", () => {
+    const allowed = expectAllowed(
+      corsHeaders(actualRequest(EXTENSION_ORIGIN), ["GET"]),
+    );
+    const response = Response.redirect("https://jobs.example.com/connect", 307);
+
+    const decorated = decorateCorsResponse(response, allowed);
+
+    expect(decorated).not.toBe(response);
+    expect(decorated.status).toBe(307);
+    expect(decorated.statusText).toBe(response.statusText);
+    expect(decorated.headers.get("Location")).toBe(
+      "https://jobs.example.com/connect",
+    );
+    expect(decorated.headers.get("Access-Control-Allow-Origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it("decorates an immutable fetched response while preserving its body and headers", async () => {
+    const allowed = expectAllowed(
+      corsHeaders(actualRequest(EXTENSION_ORIGIN), ["GET"]),
+    );
+    const response = await fetch("data:text/plain;charset=utf-8,immutable-body");
+
+    expect(() => response.headers.set("X-Test", "blocked")).toThrow();
+    const decorated = decorateCorsResponse(response, allowed);
+
+    expect(decorated.status).toBe(response.status);
+    expect(decorated.statusText).toBe(response.statusText);
+    expect(decorated.headers.get("Content-Type")).toBe(
+      "text/plain;charset=utf-8",
+    );
+    expect(decorated.headers.get("Access-Control-Allow-Origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    await expect(decorated.text()).resolves.toBe("immutable-body");
+  });
+
+  it("preserves multiple Set-Cookie values when reconstructing a response", () => {
+    const allowed = expectAllowed(
+      corsHeaders(actualRequest(APP_ORIGIN), ["GET"]),
+    );
+    const headers = new Headers({ "X-Result": "preserved" });
+    headers.append("Set-Cookie", "first=one; Path=/");
+    headers.append("Set-Cookie", "second=two; Path=/");
+    const response = new Response(null, {
+      status: 201,
+      statusText: "Created",
+      headers,
+    });
+
+    const decorated = decorateCorsResponse(response, allowed);
+
+    expect(decorated.status).toBe(201);
+    expect(decorated.statusText).toBe("Created");
+    expect(decorated.headers.getSetCookie()).toEqual([
+      "first=one; Path=/",
+      "second=two; Path=/",
+    ]);
+    expect(decorated.headers.get("X-Result")).toBe("preserved");
   });
 });
 

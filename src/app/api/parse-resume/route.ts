@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import { readFormDataBody } from "@/lib/security/request-body";
 
 // Point to the worker file for server-side usage
 GlobalWorkerOptions.workerSrc = "pdfjs-dist/legacy/build/pdf.worker.mjs";
@@ -10,7 +11,7 @@ const route = createProtectedRoute(["POST"]);
 export const OPTIONS = route.OPTIONS;
 
 export const POST = route.handler(async function POST(request: NextRequest) {
-  const formData = await request.formData();
+  const formData = await readFormDataBody(request);
   const file = formData.get("file") as File | null;
 
   if (!file) {

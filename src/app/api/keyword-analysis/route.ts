@@ -2,13 +2,14 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import { readJsonBody } from "@/lib/security/request-body";
 
 const route = createProtectedRoute(["POST"]);
 
 export const OPTIONS = route.OPTIONS;
 
 export const POST = route.handler(async function POST(request: NextRequest) {
-  const body = await request.json();
+  const body = await readJsonBody(request);
   const { description } = body;
 
   if (!description || !description.trim()) {

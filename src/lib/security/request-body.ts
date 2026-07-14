@@ -9,6 +9,31 @@ export class RequestBodyTooLargeError extends Error {
   }
 }
 
+export class InvalidRequestError extends Error {
+  constructor() {
+    super("Request body could not be parsed");
+    this.name = "InvalidRequestError";
+  }
+}
+
+export async function readJsonBody(
+  request: Request,
+): Promise<Awaited<ReturnType<Request["json"]>>> {
+  try {
+    return await request.json();
+  } catch {
+    throw new InvalidRequestError();
+  }
+}
+
+export async function readFormDataBody(request: Request): Promise<FormData> {
+  try {
+    return await request.formData();
+  } catch {
+    throw new InvalidRequestError();
+  }
+}
+
 export async function readBoundedJsonBody(
   request: Request,
   maxBytes = MAX_LOGIN_BODY_BYTES,

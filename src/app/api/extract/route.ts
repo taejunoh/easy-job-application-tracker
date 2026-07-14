@@ -4,13 +4,14 @@ import { createProvider } from "@/lib/extract/llm-provider";
 import { prisma } from "@/lib/prisma";
 import { decrypt } from "@/lib/crypto";
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import { readJsonBody } from "@/lib/security/request-body";
 
 const route = createProtectedRoute(["POST"]);
 
 export const OPTIONS = route.OPTIONS;
 
 export const POST = route.handler(async function POST(request: NextRequest) {
-  const body = await request.json();
+  const body = await readJsonBody(request);
   const { url, text } = body;
 
   // Mode 1: Text paste — send directly to LLM

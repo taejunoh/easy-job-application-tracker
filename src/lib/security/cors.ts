@@ -103,19 +103,26 @@ export function decorateCorsResponse(
   response: Response,
   cors: CorsAllowed,
 ): Response {
+  const headers = new Headers(response.headers);
+
   for (const name of MANAGED_CORS_HEADERS) {
-    response.headers.delete(name);
+    headers.delete(name);
   }
   for (const [name, value] of cors.headers) {
     if (name.toLowerCase() !== "vary") {
-      response.headers.set(name, value);
+      headers.set(name, value);
     }
   }
-  response.headers.set(
+  headers.set(
     "Vary",
-    mergeVary(response.headers.get("Vary"), cors.headers.get("Vary")),
+    mergeVary(headers.get("Vary"), cors.headers.get("Vary")),
   );
-  return response;
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function evaluateOrigin(

@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import { readJsonBody } from "@/lib/security/request-body";
 
 const route = createProtectedRoute(["GET", "PATCH", "DELETE"]);
 
@@ -28,7 +30,7 @@ export const PATCH = route.handler(async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const body = await request.json();
+  const body = await readJsonBody(request);
 
   try {
     const application = await prisma.application.update({
@@ -45,7 +47,10 @@ export const PATCH = route.handler(async function PATCH(
       },
     });
     return NextResponse.json(application);
-  } catch {
+  } catch (error) {
+    if (!isApplicationNotFound(error)) {
+      throw error;
+    }
     return NextResponse.json(
       { error: "Application not found" },
       { status: 404 }
@@ -62,10 +67,20 @@ export const DELETE = route.handler(async function DELETE(
   try {
     await prisma.application.delete({ where: { id } });
     return NextResponse.json({ success: true });
-  } catch {
+  } catch (error) {
+    if (!isApplicationNotFound(error)) {
+      throw error;
+    }
     return NextResponse.json(
       { error: "Application not found" },
       { status: 404 }
     );
   }
 });
+
+function isApplicationNotFound(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2025"
+  );
+}

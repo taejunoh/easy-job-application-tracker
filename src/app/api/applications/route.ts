@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import { readJsonBody } from "@/lib/security/request-body";
 
 const VALID_STATUSES = ["Applied", "Interview", "Offer", "Rejected"];
 const VALID_JOB_TYPES = ["Remote", "Hybrid", "Onsite"];
@@ -36,7 +37,7 @@ export const GET = route.handler(async function GET(request: NextRequest) {
 });
 
 export const POST = route.handler(async function POST(request: NextRequest) {
-  const body = await request.json();
+  const body = await readJsonBody(request);
 
   if (!body.url || !body.jobTitle || !body.company) {
     return NextResponse.json(

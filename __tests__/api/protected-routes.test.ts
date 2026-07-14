@@ -1,4 +1,6 @@
 import { NextRequest } from "next/server";
+import { notFound, permanentRedirect, redirect } from "next/navigation";
+import { Prisma } from "@prisma/client";
 
 import * as applicationsRoute from "@/app/api/applications/route";
 import * as applicationDetailRoute from "@/app/api/applications/[id]/route";
@@ -11,6 +13,7 @@ import {
   SESSION_COOKIE_NAME,
   createSessionToken,
 } from "@/lib/security/auth";
+import { createProtectedRoute } from "@/lib/security/protected-route";
 
 jest.mock("@/lib/server-env", () => {
   const actual = jest.requireActual<typeof import("@/lib/server-env")>(
@@ -468,6 +471,181 @@ describe("protected product API actual requests", () => {
         error: "Internal server error",
         code: "internal_error",
       });
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        EXTENSION_ORIGIN,
+      );
+      consoleError.mockRestore();
+    },
+  );
+
+  it.each([
+    ["redirect", () => redirect("/connect"), "NEXT_REDIRECT"],
+    [
+      "permanentRedirect",
+      () => permanentRedirect("/connect"),
+      "NEXT_REDIRECT",
+    ],
+    ["notFound", () => notFound(), "NEXT_HTTP_ERROR_FALLBACK;404"],
+  ])(
+    "rethrows the framework control flow from %s",
+    async (_name, frameworkControlFlow, expectedDigest) => {
+      const handler = createProtectedRoute(["GET"]).handler(
+        async function frameworkHandler() {
+          frameworkControlFlow();
+          return new Response("unreachable");
+        },
+      );
+      const consoleError = jest
+        .spyOn(console, "error")
+        .mockImplementation(() => undefined);
+
+      await expect(
+        handler(
+          new NextRequest("https://jobs.example.com/api/framework", {
+            headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+          }),
+        ),
+      ).rejects.toMatchObject({
+        digest: expect.stringContaining(expectedDigest),
+      });
+      expect(consoleError).not.toHaveBeenCalled();
+      consoleError.mockRestore();
+    },
+  );
+
+  it.each(
+    actualRoutes.filter((route) => route.body === "json"),
+  )("$name returns invalid_request for authenticated malformed JSON", async (route) => {
+    const request = new NextRequest(
+      `https://jobs.example.com${route.pathname}`,
+      {
+        method: route.method,
+        headers: {
+          Origin: EXTENSION_ORIGIN,
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: "{",
+      },
+    );
+    const consoleError = jest
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    const response = await invokeActual(route, request);
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Invalid request",
+      code: "invalid_request",
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+    expectNoDownstreamWork();
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it("parse resume returns invalid_request for authenticated malformed multipart", async () => {
+    const route = actualRoutes.find(
+      ({ name }) => name === "parse resume POST",
+    ) as ActualRouteCase;
+    const request = new NextRequest(
+      "https://jobs.example.com/api/parse-resume",
+      {
+        method: "POST",
+        headers: {
+          Origin: EXTENSION_ORIGIN,
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          "Content-Type": "multipart/form-data",
+        },
+        body: "not-multipart",
+      },
+    );
+    const consoleError = jest
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    const response = await invokeActual(route, request);
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Invalid request",
+      code: "invalid_request",
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+    expectNoDownstreamWork();
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it.each(["application detail PATCH", "application detail DELETE"])(
+    "%s maps Prisma P2025 to the existing 404",
+    async (name) => {
+      const route = actualRoutes.find(
+        (candidate) => candidate.name === name,
+      ) as ActualRouteCase;
+      const operation =
+        route.method === "PATCH"
+          ? prisma.application.update
+          : prisma.application.delete;
+      jest.mocked(operation).mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError("missing", {
+          code: "P2025",
+          clientVersion: "7.6.0",
+        }) as never,
+      );
+
+      const response = await invokeActual(
+        route,
+        productRequest(route, {
+          origin: EXTENSION_ORIGIN,
+          authorization: `Bearer ${ACCESS_TOKEN}`,
+        }),
+      );
+
+      expect(response.status).toBe(404);
+      await expect(response.json()).resolves.toEqual({
+        error: "Application not found",
+      });
+    },
+  );
+
+  it.each(["application detail PATCH", "application detail DELETE"])(
+    "%s rethrows a generic database error for stable internal_error mapping",
+    async (name) => {
+      const route = actualRoutes.find(
+        (candidate) => candidate.name === name,
+      ) as ActualRouteCase;
+      const operation =
+        route.method === "PATCH"
+          ? prisma.application.update
+          : prisma.application.delete;
+      jest
+        .mocked(operation)
+        .mockRejectedValueOnce(new Error("database connection detail") as never);
+      const consoleError = jest
+        .spyOn(console, "error")
+        .mockImplementation(() => undefined);
+
+      const response = await invokeActual(
+        route,
+        productRequest(route, {
+          origin: EXTENSION_ORIGIN,
+          authorization: `Bearer ${ACCESS_TOKEN}`,
+        }),
+      );
+
+      expect(response.status).toBe(500);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual({
+        error: "Internal server error",
+        code: "internal_error",
+      });
+      expect(text).not.toContain("database connection detail");
       expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
         EXTENSION_ORIGIN,
       );
