@@ -53,6 +53,8 @@ export function parsePdfInWorker(
         maxCodePoints: MAX_RESUME_CODE_POINTS,
       },
       transferList: [arrayBuffer],
+      // These constrain V8 heap/stack only. Native PDF/canvas allocations can
+      // still raise process RSS, so production memory monitoring remains required.
       resourceLimits: {
         maxOldGenerationSizeMb: 128,
         maxYoungGenerationSizeMb: 16,
@@ -68,16 +70,29 @@ export function parsePdfInWorker(
   return new Promise<string>((resolve, reject) => {
     let settled = false;
 
+    const onLateError = (): void => {
+      // Worker termination can emit after the request result has settled.
+    };
+    const removeLateErrorListener = (): void => {
+      worker.removeListener(
+        "error",
+        onLateError as (...args: never[]) => void,
+      );
+    };
     const terminate = (): void => {
       try {
-        void worker.terminate().catch(() => undefined);
+        void worker.terminate().then(
+          removeLateErrorListener,
+          removeLateErrorListener,
+        );
       } catch {
-        // Termination must not alter the stable result.
+        // Keep the safe listener if synchronous termination failed.
       }
     };
     const cleanup = (): void => {
       deadline.signal.removeEventListener("abort", onAbort);
       worker.removeListener("message", onMessage as (...args: never[]) => void);
+      worker.on("error", onLateError);
       worker.removeListener("error", onError as (...args: never[]) => void);
       worker.removeListener("exit", onExit as (...args: never[]) => void);
       terminate();

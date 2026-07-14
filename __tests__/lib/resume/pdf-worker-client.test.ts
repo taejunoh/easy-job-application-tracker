@@ -63,6 +63,56 @@ describe("PDF worker client", () => {
     }
   });
 
+  it("absorbs a late worker error after success until termination completes", async () => {
+    const deadline = createResumeDeadline(15_000, new Error("deadline"));
+    const worker = fakeWorker();
+    const termination = deferred<number>();
+    worker.terminate.mockReturnValue(termination.promise);
+
+    try {
+      const parsing = parsePdfInWorker(Buffer.from("%PDF-success"), deadline, {
+        createWorker: () => worker,
+      });
+      worker.emit("message", { ok: true, text: "parsed" });
+
+      await expect(parsing).resolves.toBe("parsed");
+      expect(worker.listenerCount("error")).toBe(1);
+      expect(() => worker.emit("error", new Error("late success error"))).not.toThrow();
+
+      termination.resolve(0);
+      await termination.promise;
+      await Promise.resolve();
+      expect(worker.listenerCount("error")).toBe(0);
+    } finally {
+      deadline.dispose();
+    }
+  });
+
+  it("absorbs a late worker error after failure until termination completes", async () => {
+    const deadline = createResumeDeadline(15_000, new Error("deadline"));
+    const worker = fakeWorker();
+    const termination = deferred<number>();
+    worker.terminate.mockReturnValue(termination.promise);
+
+    try {
+      const parsing = parsePdfInWorker(Buffer.from("%PDF-failure"), deadline, {
+        createWorker: () => worker,
+      });
+      worker.emit("exit", 9);
+
+      await expect(parsing).rejects.toThrow("resume_parse_failed");
+      expect(worker.listenerCount("error")).toBe(1);
+      expect(() => worker.emit("error", new Error("late failure error"))).not.toThrow();
+
+      termination.resolve(0);
+      await termination.promise;
+      await Promise.resolve();
+      expect(worker.listenerCount("error")).toBe(0);
+    } finally {
+      deadline.dispose();
+    }
+  });
+
   it.each([
     ["worker error", (worker: FakeWorker) => worker.emit("error", new Error("private detail"))],
     ["early exit", (worker: FakeWorker) => worker.emit("exit", 9)],
@@ -131,4 +181,15 @@ function fakeWorker(): FakeWorker {
   const worker = new EventEmitter() as FakeWorker;
   worker.terminate = jest.fn().mockResolvedValue(0);
   return worker;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((fulfill) => {
+    resolve = fulfill;
+  });
+  return { promise, resolve };
 }
