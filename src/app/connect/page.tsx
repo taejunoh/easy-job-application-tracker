@@ -39,7 +39,7 @@ export default function ConnectPage() {
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex min-h-dvh items-center justify-center bg-gray-950 px-4 py-10 sm:px-6">
+    <div className="flex min-h-dvh items-center justify-center bg-gray-950 px-4 py-10 sm:px-6">
       <main className="w-full max-w-md" aria-labelledby="connect-title">
         <div className="mb-5 flex items-center justify-between border-b border-gray-800 pb-3">
           <div className="font-mono text-sm font-semibold tracking-wide text-blue-400">
