@@ -71,7 +71,9 @@ the canonical origin
 `https://easy-job-application-tracker.vercel.app`. The currently verified
 installed extension ID is `gihbagcjnmkhkekjkbfjhcbddnamaiap`; stop if the
 installed ID differs from the exact extension origin approved in production
-`CORS_ALLOWED_ORIGINS`.
+`CORS_ALLOWED_ORIGINS`. The system-Chrome evidence below was observed in
+Chrome 150 (the verified version); do not generalize browser UI or Site access
+behavior to other versions without re-verification.
 
 Preconditions:
 
@@ -105,11 +107,13 @@ Perform the smoke:
    persistence.
 6. Delete the temporary application from the dashboard and confirm the unique
    marker no longer appears.
-7. Select **Disconnect**; confirm there is no cleanup warning, then reload the
-   extension and confirm the popup reload must remain disconnected. The exact
-   runtime-requested origin may remain listed under **Site access** after
-   removal in current Chrome; its toggle must be off. Mere list presence does
-   not mean host access remains granted.
+7. Select **Disconnect** and confirm no cleanup warning is shown in the popup
+   connection-status area. Reload the extension in `chrome://extensions`,
+   return to the job tab, and click the JobTracker toolbar icon. The reopened
+   popup after reload must remain disconnected; confirm that it does. The exact
+   runtime-requested origin may remain listed under Site access after removal
+   in Chrome 150 (the verified version); its toggle must be off. Mere list
+   presence does not mean host access remains granted.
 
 Cleanup is unconditional, including when an earlier step fails: delete the
 unique-marker row, disconnect the extension, remove the exact site permission,
