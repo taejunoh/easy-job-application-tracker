@@ -53,13 +53,13 @@ export default function SettingsPage() {
       githubUrl,
       resumeText,
     };
-    if (apiKey) body.apiKey = apiKey;
+    if (apiKey.trim()) body.apiKey = apiKey;
 
     try {
-      await saveSettings(api, () => {
+      await saveSettings(api, (savedHasApiKey) => {
         setMessage("Settings saved.");
         setMessageIsError(false);
-        setHasExistingKey(true);
+        setHasExistingKey(savedHasApiKey);
         setApiKey("");
       }, body);
     } catch (failure) {
@@ -272,15 +272,17 @@ interface SettingsResponse {
 
 export async function saveSettings(
   api: ClientApi,
-  markSaved: () => void,
+  markSaved: (hasApiKey: boolean) => void,
   body: Record<string, string>,
 ): Promise<void> {
-  await api("/api/settings", {
+  const response = await api<{ hasApiKey?: unknown }>("/api/settings", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  markSaved();
+  markSaved(
+    response.hasApiKey === true || Boolean(body.apiKey?.trim()),
+  );
 }
 
 function errorMessage(error: unknown, fallback: string): string {

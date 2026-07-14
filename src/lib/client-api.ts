@@ -23,6 +23,7 @@ interface ErrorPayload {
 }
 
 let sessionRedirectPending = false;
+let sessionGeneration = 0;
 
 export class ClientApiError extends Error {
   readonly name = "ClientApiError";
@@ -43,6 +44,7 @@ export function buildConnectPath(location: ClientLocation): string {
 }
 
 export function resetClientApiSessionRedirect(): void {
+  sessionGeneration += 1;
   sessionRedirectPending = false;
 }
 
@@ -57,6 +59,7 @@ export function createClientApi(
     input: string,
     init?: RequestInit,
   ): Promise<T> {
+    const requestGeneration = sessionGeneration;
     let response: Response;
     try {
       response = await fetchImpl(input, init);
@@ -69,7 +72,11 @@ export function createClientApi(
     }
 
     if (!response.ok) {
-      if (response.status === 401 && !sessionRedirectPending) {
+      if (
+        response.status === 401 &&
+        requestGeneration === sessionGeneration &&
+        !sessionRedirectPending
+      ) {
         sessionRedirectPending = true;
         navigate(buildConnectPath(getLocation()));
       }

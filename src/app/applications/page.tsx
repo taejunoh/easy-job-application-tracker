@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import ApplicationTable from "@/components/ApplicationTable";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
@@ -25,6 +25,8 @@ export default function ApplicationsPage() {
   const [statusFilter, setStatusFilter] = useState("All");
   const [jobTypeFilter, setJobTypeFilter] = useState("All");
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const requestSequence = useRef(0);
 
   const loadApplications = useCallback(() => {
     const params = new URLSearchParams();
@@ -36,25 +38,23 @@ export default function ApplicationsPage() {
   }, [api, search, statusFilter, jobTypeFilter]);
 
   const refreshApplications = useCallback(async () => {
-    try {
-      const data = await loadApplications();
-      setApplications(data);
-      setError("");
-    } catch (failure) {
-      setError(errorMessage(failure, "Failed to load applications."));
-    }
+    await loadLatestApplications(
+      requestSequence,
+      loadApplications,
+      (data) => {
+        setApplications(data);
+        setError("");
+      },
+      (failure) => {
+        setError(errorMessage(failure, "Failed to load applications."));
+      },
+      setLoading,
+    );
   }, [loadApplications]);
 
   useEffect(() => {
-    loadApplications()
-      .then((data) => {
-        setApplications(data);
-        setError("");
-      })
-      .catch((failure: unknown) => {
-        setError(errorMessage(failure, "Failed to load applications."));
-      });
-  }, [loadApplications]);
+    void refreshApplications();
+  }, [refreshApplications]);
 
   async function handleStatusChange(id: string, status: string) {
     setError("");
@@ -66,7 +66,7 @@ export default function ApplicationsPage() {
   }
 
   return (
-    <div>
+    <div aria-busy={loading}>
       <h1 className="text-xl font-semibold mb-6">Applications</h1>
 
       <div className="flex gap-3 mb-4">
@@ -127,6 +127,25 @@ export async function updateApplicationStatus(
     body: JSON.stringify({ status }),
   });
   await refresh();
+}
+
+export async function loadLatestApplications<T>(
+  sequence: { current: number },
+  request: () => Promise<T>,
+  apply: (data: T) => void,
+  fail: (error: unknown) => void,
+  setLoading: (loading: boolean) => void,
+): Promise<void> {
+  const requestId = ++sequence.current;
+  setLoading(true);
+  try {
+    const data = await request();
+    if (requestId === sequence.current) apply(data);
+  } catch (error) {
+    if (requestId === sequence.current) fail(error);
+  } finally {
+    if (requestId === sequence.current) setLoading(false);
+  }
 }
 
 function errorMessage(error: unknown, fallback: string): string {

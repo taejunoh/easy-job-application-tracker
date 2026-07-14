@@ -67,6 +67,20 @@ describe("client mutations", () => {
     expect(markSaved).not.toHaveBeenCalled();
   });
 
+  it("keeps API-key status false after a fresh profile-only save", async () => {
+    const request = jest.fn(() =>
+      Promise.resolve({ hasApiKey: false }),
+    ) as ClientApi;
+    const markSaved = jest.fn();
+
+    await saveSettings(request, markSaved, {
+      llmProvider: "openai",
+      linkedinUrl: "https://linkedin.com/in/example",
+    });
+
+    expect(markSaved).toHaveBeenCalledWith(false);
+  });
+
   it("does not clear the add-application form after a 4xx response", async () => {
     const clearForm = jest.fn();
 

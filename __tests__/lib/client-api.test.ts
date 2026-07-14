@@ -105,4 +105,38 @@ describe("client API session recovery", () => {
 
     expect(navigate).toHaveBeenCalledTimes(2);
   });
+
+  it("ignores a stale 401 that arrives after a new session is connected", async () => {
+    const navigate = jest.fn();
+    const response = deferred<Response>();
+    const fetchImpl = jest.fn() as jest.MockedFunction<typeof fetch>;
+    fetchImpl.mockReturnValueOnce(response.promise);
+    const api = createClientApi(navigate, {
+      fetchImpl,
+      getLocation: () => ({ pathname: "/settings", search: "", hash: "" }),
+    });
+
+    const staleRequest = api("/api/settings");
+    resetClientApiSessionRedirect();
+    response.resolve(
+      Response.json({ error: "Authentication required" }, { status: 401 }),
+    );
+
+    await expect(staleRequest).rejects.toMatchObject({ status: 401 });
+    expect(navigate).not.toHaveBeenCalled();
+  });
 });
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
