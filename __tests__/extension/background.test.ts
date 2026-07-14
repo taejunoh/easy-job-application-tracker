@@ -28,12 +28,33 @@ describe("extension trusted storage background", () => {
     if (!existsSync(backgroundPath)) return;
 
     const setAccessLevel = jest.fn().mockRejectedValue(new Error("unsupported"));
+    const remove = jest.fn().mockResolvedValue(undefined);
     const script = readFileSync(backgroundPath, "utf8");
     const context = vm.createContext({
-      chrome: { storage: { local: { setAccessLevel } } },
+      chrome: { storage: { local: { remove, setAccessLevel } } },
     });
 
     expect(() => new vm.Script(script).runInContext(context)).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(remove).toHaveBeenCalledWith([
+      "connection",
+      "serverUrl",
+      "accessToken",
+    ]);
+  });
+
+  it("handles credential purge rejection after trusted storage setup fails", async () => {
+    const setAccessLevel = jest.fn().mockRejectedValue(new Error("unsupported"));
+    const remove = jest.fn().mockRejectedValue(new Error("purge unavailable"));
+    const script = readFileSync(backgroundPath, "utf8");
+    const context = vm.createContext({
+      chrome: { storage: { local: { remove, setAccessLevel } } },
+    });
+
+    expect(() => new vm.Script(script).runInContext(context)).not.toThrow();
+    await Promise.resolve();
     await Promise.resolve();
   });
 });

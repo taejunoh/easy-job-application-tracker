@@ -84,10 +84,17 @@ function loadPopup(options: {
   const executeScript = jest.fn().mockResolvedValue(undefined);
   const query = jest.fn();
   const fetchMock = jest.fn();
+  let permissionGranted = options.permissionGranted ?? true;
   const permissions = {
-    contains: jest.fn().mockResolvedValue(options.permissionGranted ?? true),
-    request: jest.fn().mockResolvedValue(true),
-    remove: jest.fn().mockResolvedValue(true),
+    contains: jest.fn(async () => permissionGranted),
+    request: jest.fn(async () => {
+      permissionGranted = true;
+      return true;
+    }),
+    remove: jest.fn(async () => {
+      permissionGranted = false;
+      return true;
+    }),
   };
   const storage = {
     get: jest.fn().mockResolvedValue({}),

@@ -31,6 +31,7 @@ interface PopupApi {
   initializationPromise?: Promise<void>;
   initializePopup(): Promise<void>;
   restoreConnection(result: Record<string, unknown>): void;
+  runKeywordAnalysis(): Promise<void>;
 }
 
 function deferred<T>() {
@@ -61,7 +62,14 @@ function createElement(value = ""): MockElement {
 
 function loadLifecyclePopup(options: {
   accessLevel?: "resolve" | "reject" | "defer";
+  grantedOrigins?: Set<string>;
   permissionRemoval?: boolean | "reject";
+  sessionState?: Record<string, unknown>;
+  storageGetGate?: {
+    promise: Promise<void>;
+    resolve(value: void): void;
+    reject(error: unknown): void;
+  };
   storageState?: Record<string, unknown>;
 } = {}) {
   const elements: Record<string, MockElement> = {};
@@ -75,7 +83,8 @@ function loadLifecyclePopup(options: {
   };
 
   const storageState = options.storageState ?? {};
-  const grantedOrigins = new Set<string>();
+  const sessionState = options.sessionState ?? {};
+  const grantedOrigins = options.grantedOrigins ?? new Set<string>();
   const accessGate = deferred<void>();
   const accessLevel = options.accessLevel ?? "resolve";
   const setAccessLevel = jest.fn(() => {
@@ -86,9 +95,13 @@ function loadLifecyclePopup(options: {
     return Promise.resolve();
   });
   const storage = {
-    get: jest.fn(async (keys: string[]) => Object.fromEntries(
-      keys.filter((key) => key in storageState).map((key) => [key, storageState[key]])
-    )),
+    get: jest.fn(async (keys: string[]) => {
+      const snapshot = Object.fromEntries(
+        keys.filter((key) => key in storageState).map((key) => [key, storageState[key]])
+      );
+      if (options.storageGetGate) await options.storageGetGate.promise;
+      return snapshot;
+    }),
     set: jest.fn(async (values: Record<string, unknown>) => {
       Object.assign(storageState, values);
     }),
@@ -98,6 +111,19 @@ function loadLifecyclePopup(options: {
       }
     }),
     setAccessLevel,
+  };
+  const session = {
+    get: jest.fn(async (keys: string[]) => Object.fromEntries(
+      keys.filter((key) => key in sessionState).map((key) => [key, sessionState[key]])
+    )),
+    set: jest.fn(async (values: Record<string, unknown>) => {
+      Object.assign(sessionState, values);
+    }),
+    remove: jest.fn(async (keys: string | string[]) => {
+      for (const key of Array.isArray(keys) ? keys : [keys]) {
+        delete sessionState[key];
+      }
+    }),
   };
   const permissions = {
     contains: jest.fn(async ({ origins }: { origins: string[] }) =>
@@ -123,7 +149,7 @@ function loadLifecyclePopup(options: {
   const chrome = {
     permissions,
     scripting: { executeScript: jest.fn().mockResolvedValue(undefined) },
-    storage: { local: storage },
+    storage: { local: storage, session },
     tabs: {
       create: jest.fn(),
       query,
@@ -177,6 +203,8 @@ function loadLifecyclePopup(options: {
     grantedOrigins,
     permissions,
     ready,
+    session,
+    sessionState,
     storage,
     storageState,
   };
@@ -222,8 +250,35 @@ describe("trusted extension storage", () => {
     await ready();
 
     expect(storage.get).not.toHaveBeenCalled();
+    expect(storage.remove).toHaveBeenCalledWith([
+      "connection",
+      "serverUrl",
+      "accessToken",
+    ]);
     expect(getElement("connectionStatus").textContent).toMatch(/storage|chrome 102/i);
     await expect(api.apiFetch("/api/settings")).rejects.toThrow(/storage|connect/i);
+  });
+
+  it("fails closed and warns when trusted-storage credential purge also fails", async () => {
+    const harness = loadLifecyclePopup({
+      accessLevel: "reject",
+      storageState: {
+        connection: {
+          serverUrl: "https://jobs.example.com",
+          accessToken: TOKEN_A,
+          invalidated: false,
+        },
+      },
+    });
+    harness.storage.remove.mockRejectedValueOnce(new Error("storage unavailable"));
+
+    await harness.ready();
+
+    expect(harness.getElement("connectionStatus").textContent).toMatch(
+      /purge|remove|credential/i
+    );
+    expect(harness.fetchMock).not.toHaveBeenCalled();
+    await expect(harness.api.apiFetch("/api/settings")).rejects.toThrow();
   });
 
   it("does not verify or store a new token when trusted storage is unavailable", async () => {
@@ -258,9 +313,92 @@ describe("trusted extension storage", () => {
     expect((state.connection as Record<string, unknown>).accessToken).toBeUndefined();
     expect((state.connection as Record<string, unknown>).invalidated).toBe(true);
   });
+
+  it("does not activate a stored token after host access was revoked", async () => {
+    const state = {
+      connection: {
+        serverUrl: "https://jobs.example.com",
+        accessToken: TOKEN_A,
+        invalidated: false,
+      },
+    };
+    const harness = loadLifecyclePopup({ storageState: state });
+
+    await harness.ready();
+
+    expect(harness.fetchMock).not.toHaveBeenCalled();
+    expect(state.connection).toEqual({
+      serverUrl: "https://jobs.example.com",
+      invalidated: true,
+    });
+    expect(harness.getElement("connectionStatus").textContent).toMatch(
+      /host access|connect again|reconnect/i
+    );
+  });
+
+  it("keeps a rejected startup credential inactive but available to Disconnect for purge", async () => {
+    const state = {
+      connection: {
+        serverUrl: "https://jobs.example.com",
+        accessToken: TOKEN_A,
+        invalidated: false,
+      },
+    };
+    const harness = loadLifecyclePopup({ storageState: state });
+    harness.grantedOrigins.add(permissionFor("https://jobs.example.com"));
+    harness.fetchMock.mockResolvedValueOnce({ ok: false, status: 403 });
+
+    await harness.ready();
+
+    expect(harness.getElement("disconnectBtn").disabled).toBe(false);
+    await expect(harness.api.apiFetch("/api/settings")).rejects.toThrow(/connect/i);
+    await harness.api.disconnectServer();
+    expect((state.connection as Record<string, unknown>).accessToken).toBeUndefined();
+    expect((state.connection as Record<string, unknown>).invalidated).toBe(true);
+  });
 });
 
 describe("connection generations", () => {
+  it("newest generation wins when startup storage.get returns an old A snapshot after B pairing", async () => {
+    const storageGate = deferred<void>();
+    const state = {
+      connection: {
+        serverUrl: "https://a.example.com",
+        accessToken: TOKEN_A,
+        invalidated: false,
+      },
+    };
+    const harness = loadLifecyclePopup({
+      storageGetGate: storageGate,
+      storageState: state,
+    });
+    harness.grantedOrigins.add(permissionFor("https://a.example.com"));
+    harness.fetchMock.mockResolvedValue({ ok: true, status: 200 });
+    for (let index = 0; index < 20 && !harness.storage.get.mock.calls.length; index += 1) {
+      await Promise.resolve();
+    }
+    expect(harness.storage.get).toHaveBeenCalled();
+
+    harness.enterPair("https://b.example.com");
+    await harness.api.connectServer();
+    storageGate.resolve();
+    await harness.ready();
+
+    expect(state.connection).toEqual({
+      serverUrl: "https://b.example.com",
+      accessToken: TOKEN_B,
+      invalidated: false,
+    });
+    expect(harness.getElement("connectionStatus").textContent).toContain(
+      "https://b.example.com"
+    );
+    await harness.api.apiFetch("/api/settings");
+    const request = harness.fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
+    expect(new Headers(request.headers).get("Authorization")).toBe(
+      `Bearer ${TOKEN_B}`
+    );
+  });
+
   it("does not let stale startup verification clear a newly paired connection", async () => {
     const state = {
       connection: {
@@ -275,8 +413,10 @@ describe("connection generations", () => {
     harness.fetchMock
       .mockReturnValueOnce(startupResponse.promise)
       .mockResolvedValueOnce({ ok: true, status: 200 });
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let index = 0; index < 50 && !harness.fetchMock.mock.calls.length; index += 1) {
+      await Promise.resolve();
+    }
+    expect(harness.fetchMock).toHaveBeenCalledTimes(1);
 
     harness.enterPair("https://b.example.com");
     await harness.api.connectServer();
@@ -323,6 +463,89 @@ describe("connection generations", () => {
     );
   });
 
+  it("newest generation wins when same-origin reconnect races an old 401", async () => {
+    const harness = loadLifecyclePopup();
+    await harness.ready();
+    harness.establish("https://a.example.com", TOKEN_A);
+    const oldResponse = deferred<Response>();
+    const pairResponse = deferred<Response>();
+    harness.fetchMock
+      .mockReturnValueOnce(oldResponse.promise)
+      .mockReturnValueOnce(pairResponse.promise);
+
+    const oldRequest = harness.api.apiFetch("/api/settings");
+    harness.enterPair("https://a.example.com", TOKEN_B);
+    const reconnect = harness.api.connectServer();
+    oldResponse.resolve({ ok: false, status: 401 } as Response);
+    await Promise.resolve();
+    pairResponse.resolve({ ok: true, status: 200 } as Response);
+
+    await reconnect;
+    await expect(oldRequest).rejects.toThrow(/reconnect|expired/i);
+    expect(harness.storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      accessToken: TOKEN_B,
+      invalidated: false,
+    });
+    expect(harness.grantedOrigins).toContain(permissionFor("https://a.example.com"));
+    expect(harness.getElement("connectionStatus").textContent).toMatch(/connected/i);
+  });
+
+  it("newest generation status wins when B gets 401 during A permission cleanup", async () => {
+    const harness = loadLifecyclePopup();
+    await harness.ready();
+    harness.establish("https://a.example.com", TOKEN_A);
+    const oldCleanup = deferred<boolean>();
+    harness.permissions.remove.mockImplementationOnce(async ({ origins }) => {
+      const removed = await oldCleanup.promise;
+      if (removed) origins.forEach((origin: string) => harness.grantedOrigins.delete(origin));
+      return removed;
+    });
+    harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    harness.enterPair("https://b.example.com");
+
+    const reconnect = harness.api.connectServer();
+    for (let index = 0; index < 50 && !harness.permissions.remove.mock.calls.length; index += 1) {
+      await Promise.resolve();
+    }
+    expect(harness.permissions.remove).toHaveBeenCalledWith({
+      origins: [permissionFor("https://a.example.com")],
+    });
+
+    harness.fetchMock.mockResolvedValueOnce({ ok: false, status: 401 });
+    const requestB = harness.api.apiFetch("/api/settings");
+    await Promise.resolve();
+    oldCleanup.resolve(true);
+    await reconnect;
+    await expect(requestB).rejects.toThrow(/reconnect|expired/i);
+
+    expect(harness.getElement("connectionStatus").textContent).toMatch(
+      /expired|reconnect/i
+    );
+    expect((harness.storageState.connection as Record<string, unknown>).invalidated)
+      .toBe(true);
+  });
+
+  it("does not store a token when commit-time host access is missing", async () => {
+    const harness = loadLifecyclePopup();
+    await harness.ready();
+    harness.permissions.contains
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false);
+    harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    harness.enterPair("https://b.example.com");
+
+    await harness.api.connectServer();
+
+    expect(harness.storageState.connection).toBeUndefined();
+    expect(harness.getElement("connectionStatus").textContent).toMatch(
+      /click connect again|server access.*changed/i
+    );
+    expect(harness.permissions.request.mock.invocationCallOrder[0]).toBeLessThan(
+      harness.fetchMock.mock.invocationCallOrder[0]
+    );
+  });
+
   it("invalidates storage and permission once for concurrent same-generation 401s", async () => {
     const harness = loadLifecyclePopup();
     await harness.ready();
@@ -341,7 +564,9 @@ describe("connection generations", () => {
     second.resolve({ ok: false, status: 401 } as Response);
 
     await Promise.all(requests.map((request) => expect(request).rejects.toThrow()));
-    expect(harness.storage.set).toHaveBeenCalledTimes(1);
+    // Persist cleanup intent before attempting permission removal, then clear
+    // the intent after the removal succeeds.
+    expect(harness.storage.set).toHaveBeenCalledTimes(2);
     expect(harness.permissions.remove).toHaveBeenCalledTimes(1);
     expect(harness.storageState.connection).toEqual({
       serverUrl: "https://a.example.com",
@@ -349,7 +574,7 @@ describe("connection generations", () => {
     });
   });
 
-  it("builds a saved application View URL from the request's captured origin", async () => {
+  it("does not revive a stale saved-application target after reconnect", async () => {
     const harness = loadLifecyclePopup();
     await harness.ready();
     harness.establish("https://a.example.com", TOKEN_A);
@@ -370,9 +595,35 @@ describe("connection generations", () => {
     } as Response);
     await save;
 
-    expect(harness.getElement("openTracker").dataset.appUrl).toBe(
-      "https://a.example.com/applications/17"
-    );
+    expect(harness.getElement("openTracker").dataset.appUrl).toBeUndefined();
+  });
+
+  it("uses the keyword request's captured origin for the no-resume Settings link", async () => {
+    const harness = loadLifecyclePopup();
+    await harness.ready();
+    harness.establish("https://a.example.com", TOKEN_A);
+    harness.getElement("description").value = "TypeScript and security";
+    const analysisResponse = deferred<Response>();
+    harness.fetchMock
+      .mockReturnValueOnce(analysisResponse.promise)
+      .mockResolvedValueOnce({ ok: true, status: 200 });
+
+    const analysis = harness.api.runKeywordAnalysis();
+    harness.enterPair("https://b.example.com");
+    await harness.api.connectServer();
+    analysisResponse.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({ error: "no_resume" }),
+    } as Response);
+    await analysis;
+    eventHandler(harness.getElement("openSettings"), "click")({
+      preventDefault: jest.fn(),
+    });
+
+    expect(harness.chrome.tabs.create).toHaveBeenCalledWith({
+      url: "https://a.example.com/settings",
+    });
   });
 });
 
@@ -426,7 +677,7 @@ describe("connection teardown", () => {
     await expect(harness.api.apiFetch("/api/settings")).rejects.toThrow(/reconnect/i);
 
     expect(harness.getElement("connectionStatus").textContent).toMatch(
-      /storage|could not save/i
+      /expired|reconnect/i
     );
     await expect(harness.api.apiFetch("/api/settings")).rejects.toThrow();
 
@@ -436,6 +687,256 @@ describe("connection teardown", () => {
       /disconnected/i
     );
     expect(reopened.fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("explicit disconnect stays durable after local tombstone set and purge both fail", async () => {
+    const storageState: Record<string, unknown> = {};
+    const sessionState: Record<string, unknown> = {};
+    const grantedOrigins = new Set<string>();
+    const harness = loadLifecyclePopup({
+      grantedOrigins,
+      sessionState,
+      storageState,
+    });
+    await harness.ready();
+    harness.establish("https://a.example.com", TOKEN_A);
+    harness.storage.set.mockRejectedValueOnce(new Error("set unavailable"));
+    harness.storage.remove.mockRejectedValueOnce(new Error("remove unavailable"));
+
+    await harness.api.disconnectServer();
+
+    expect(sessionState).toEqual(expect.objectContaining({
+      connectionTombstone: expect.objectContaining({
+        serverUrl: "https://a.example.com",
+      }),
+    }));
+    expect(harness.getElement("connectionStatus").textContent).toMatch(/storage|purge/i);
+
+    const reopened = loadLifecyclePopup({
+      grantedOrigins,
+      sessionState,
+      storageState,
+    });
+    reopened.fetchMock.mockResolvedValue({ ok: true, status: 200 });
+    await reopened.ready();
+
+    expect(reopened.fetchMock).not.toHaveBeenCalled();
+    expect(reopened.getElement("connectionStatus").textContent).toMatch(/disconnected/i);
+    await expect(reopened.api.apiFetch("/api/settings")).rejects.toThrow();
+  });
+
+  it("retries a persisted disconnect permission cleanup on next startup", async () => {
+    const storageState: Record<string, unknown> = {};
+    const sessionState: Record<string, unknown> = {};
+    const grantedOrigins = new Set<string>();
+    const first = loadLifecyclePopup({
+      grantedOrigins,
+      permissionRemoval: false,
+      sessionState,
+      storageState,
+    });
+    await first.ready();
+    first.establish("https://a.example.com", TOKEN_A);
+
+    await first.api.disconnectServer();
+
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      invalidated: true,
+      pendingCleanupOrigins: ["https://a.example.com"],
+    });
+    expect(grantedOrigins).toContain(permissionFor("https://a.example.com"));
+
+    const reopened = loadLifecyclePopup({
+      grantedOrigins,
+      sessionState,
+      storageState,
+    });
+    await reopened.ready();
+
+    expect(reopened.permissions.remove).toHaveBeenCalledWith({
+      origins: [permissionFor("https://a.example.com")],
+    });
+    expect(grantedOrigins).not.toContain(permissionFor("https://a.example.com"));
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      invalidated: true,
+    });
+  });
+
+  it("persists and retries old-origin cleanup after a successful server change", async () => {
+    const storageState: Record<string, unknown> = {};
+    const grantedOrigins = new Set<string>();
+    const first = loadLifecyclePopup({
+      grantedOrigins,
+      permissionRemoval: false,
+      storageState,
+    });
+    await first.ready();
+    first.establish("https://a.example.com", TOKEN_A);
+    first.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    first.enterPair("https://b.example.com");
+
+    await first.api.connectServer();
+
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://b.example.com",
+      accessToken: TOKEN_B,
+      invalidated: false,
+      pendingCleanupOrigins: ["https://a.example.com"],
+    });
+
+    const reopened = loadLifecyclePopup({ grantedOrigins, storageState });
+    reopened.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    await reopened.ready();
+
+    expect(grantedOrigins).not.toContain(permissionFor("https://a.example.com"));
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://b.example.com",
+      accessToken: TOKEN_B,
+      invalidated: false,
+    });
+  });
+
+  it("persists and retries cleanup after a newly granted connection fails verification", async () => {
+    const storageState: Record<string, unknown> = {};
+    const grantedOrigins = new Set<string>();
+    const first = loadLifecyclePopup({
+      grantedOrigins,
+      permissionRemoval: false,
+      storageState,
+    });
+    await first.ready();
+    first.fetchMock.mockResolvedValueOnce({ ok: false, status: 401 });
+    first.enterPair("https://new.example.com");
+
+    await first.api.connectServer();
+
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://new.example.com",
+      invalidated: true,
+      pendingCleanupOrigins: ["https://new.example.com"],
+    });
+
+    const reopened = loadLifecyclePopup({ grantedOrigins, storageState });
+    await reopened.ready();
+    expect(grantedOrigins).not.toContain(permissionFor("https://new.example.com"));
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://new.example.com",
+      invalidated: true,
+    });
+  });
+
+  it("persists and retries 401 permission cleanup on next startup", async () => {
+    const storageState: Record<string, unknown> = {};
+    const grantedOrigins = new Set<string>();
+    const first = loadLifecyclePopup({
+      grantedOrigins,
+      permissionRemoval: false,
+      storageState,
+    });
+    await first.ready();
+    first.establish("https://a.example.com", TOKEN_A);
+    first.fetchMock.mockResolvedValueOnce({ ok: false, status: 401 });
+
+    await expect(first.api.apiFetch("/api/settings")).rejects.toThrow();
+
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      invalidated: true,
+      pendingCleanupOrigins: ["https://a.example.com"],
+    });
+
+    const reopened = loadLifecyclePopup({ grantedOrigins, storageState });
+    await reopened.ready();
+    expect(grantedOrigins).not.toContain(permissionFor("https://a.example.com"));
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      invalidated: true,
+    });
+  });
+
+  it("handles a false legacy cleanup result during successful startup migration", async () => {
+    const storageState: Record<string, unknown> = {
+      serverUrl: "https://a.example.com",
+      accessToken: TOKEN_A,
+    };
+    const grantedOrigins = new Set([permissionFor("https://a.example.com")]);
+    const harness = loadLifecyclePopup({ grantedOrigins, storageState });
+    harness.storage.remove.mockRejectedValueOnce(new Error("legacy cleanup failed"));
+    harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+
+    await harness.ready();
+
+    expect(storageState.accessToken).toBeUndefined();
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      accessToken: TOKEN_A,
+      invalidated: false,
+    });
+    expect(harness.getElement("connectionStatus").textContent).toMatch(/connected/i);
+  });
+
+  it("does not report Connected when an unsafe session tombstone cannot be cleared", async () => {
+    const storageState: Record<string, unknown> = {};
+    const sessionState: Record<string, unknown> = {};
+    const harness = loadLifecyclePopup({ sessionState, storageState });
+    await harness.ready();
+    harness.establish("https://a.example.com", TOKEN_A);
+    harness.storage.set.mockRejectedValueOnce(new Error("set unavailable"));
+    harness.storage.remove.mockRejectedValueOnce(new Error("purge unavailable"));
+    await harness.api.disconnectServer();
+    expect(sessionState.connectionTombstone).toBeDefined();
+
+    harness.session.remove.mockRejectedValueOnce(new Error("session unavailable"));
+    harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    harness.enterPair("https://a.example.com", TOKEN_B);
+    await harness.api.connectServer();
+
+    expect(harness.getElement("connectionStatus").textContent).not.toMatch(/^Connected/i);
+    expect(sessionState.connectionTombstone).toBeDefined();
+    expect((storageState.connection as Record<string, unknown>).accessToken).toBeUndefined();
+    expect((storageState.connection as Record<string, unknown>).invalidated).toBe(true);
+    await expect(harness.api.apiFetch("/api/settings")).rejects.toThrow();
+  });
+
+  it("handles failed legacy-key cleanup while persisting a 401 invalidation", async () => {
+    const storageState: Record<string, unknown> = {};
+    const harness = loadLifecyclePopup({ storageState });
+    await harness.ready();
+    harness.establish("https://a.example.com", TOKEN_A);
+    storageState.serverUrl = "https://a.example.com";
+    storageState.accessToken = TOKEN_A;
+    harness.storage.remove.mockRejectedValueOnce(new Error("legacy cleanup failed"));
+    harness.fetchMock.mockResolvedValueOnce({ ok: false, status: 401 });
+
+    await expect(harness.api.apiFetch("/api/settings")).rejects.toThrow();
+
+    expect(storageState.accessToken).toBeUndefined();
+    expect(harness.getElement("connectionStatus").textContent).toMatch(
+      /expired|reconnect/i
+    );
+  });
+
+  it("does not revive a stale saved-application target after disconnect", async () => {
+    const harness = loadLifecyclePopup();
+    await harness.ready();
+    harness.establish("https://a.example.com", TOKEN_A);
+    harness.getElement("jobTitle").value = "Engineer";
+    harness.getElement("company").value = "Example";
+    const response = deferred<Response>();
+    harness.fetchMock.mockReturnValueOnce(response.promise);
+
+    const save = eventHandler(harness.getElement("saveBtn"), "click")();
+    await harness.api.disconnectServer();
+    response.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: 17, updated: false }),
+    } as Response);
+    await save;
+
+    expect(harness.getElement("openTracker").dataset.appUrl).toBeUndefined();
   });
 
   it.each([false, "reject"] as const)(
@@ -457,6 +958,7 @@ describe("connection teardown", () => {
       expect(harness.storageState.connection).toEqual({
         serverUrl: "https://a.example.com",
         invalidated: true,
+        pendingCleanupOrigins: ["https://a.example.com"],
       });
     }
   );
@@ -494,6 +996,7 @@ describe("connection teardown", () => {
         serverUrl: "https://b.example.com",
         accessToken: TOKEN_B,
         invalidated: false,
+        pendingCleanupOrigins: ["https://a.example.com"],
       });
       expect(harness.getElement("connectionStatus").textContent).toMatch(
         /connected.*could not remove|host access/i
@@ -508,5 +1011,5 @@ function eventHandler(element: MockElement, eventName: string) {
     ([registeredEvent]) => registeredEvent === eventName
   );
   if (!registration) throw new Error(`Missing ${eventName} event handler`);
-  return registration[1] as () => Promise<void> | void;
+  return registration[1] as (event?: { preventDefault(): void }) => Promise<void> | void;
 }
