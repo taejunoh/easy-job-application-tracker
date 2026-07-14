@@ -26,14 +26,27 @@ export type SessionCookieOptions = Readonly<{
   maxAge: number;
 }>;
 
-export type AuthenticationError = Readonly<{
+export type UnauthorizedAuthenticationError = Readonly<{
   authenticated: false;
-  status: 401 | 403;
+  status: 401;
   error: Readonly<{
-    error: "Authentication required" | "Origin not allowed";
-    code: "unauthorized" | "origin_not_allowed";
+    error: "Authentication required";
+    code: "unauthorized";
   }>;
 }>;
+
+export type OriginAuthenticationError = Readonly<{
+  authenticated: false;
+  status: 403;
+  error: Readonly<{
+    error: "Origin not allowed";
+    code: "origin_not_allowed";
+  }>;
+}>;
+
+export type AuthenticationError =
+  | UnauthorizedAuthenticationError
+  | OriginAuthenticationError;
 
 export type AuthenticationSuccess = Readonly<{
   authenticated: true;
@@ -51,9 +64,11 @@ type SessionPayload = Readonly<{
 }>;
 
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/u;
-const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const SESSION_KEY_LABEL = "jobtracker/session-key/v1\0";
+const SESSION_FINGERPRINT_LABEL = "jobtracker/session-fingerprint/v1\0";
 
-const UNAUTHORIZED: AuthenticationError = Object.freeze({
+const UNAUTHORIZED: UnauthorizedAuthenticationError = Object.freeze({
   authenticated: false,
   status: 401,
   error: Object.freeze({
@@ -62,7 +77,7 @@ const UNAUTHORIZED: AuthenticationError = Object.freeze({
   }),
 });
 
-const ORIGIN_NOT_ALLOWED: AuthenticationError = Object.freeze({
+const ORIGIN_NOT_ALLOWED: OriginAuthenticationError = Object.freeze({
   authenticated: false,
   status: 403,
   error: Object.freeze({
@@ -85,15 +100,22 @@ export function verifyBearerToken(
 
 export function createSessionToken(options: AuthOptions = {}): string {
   const config = resolveConfig(options.config);
+  const now = authenticationTimeInSeconds(options.now);
+  if (now === null) {
+    throw new RangeError("Invalid authentication clock");
+  }
+  const sessionKey = deriveSessionKey(config);
   const payload: SessionPayload = {
     v: 1,
-    exp: nowInSeconds(options.now) + SESSION_MAX_AGE_SECONDS,
-    fp: sha256(config.appAccessToken).toString("base64url"),
+    exp: now + SESSION_MAX_AGE_SECONDS,
+    fp: sessionFingerprint(sessionKey, config.appAccessToken).toString(
+      "base64url",
+    ),
   };
   const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString(
     "base64url",
   );
-  const signature = sign(encodedPayload, config.encryptionSecret);
+  const signature = sign(encodedPayload, sessionKey);
 
   return `${encodedPayload}.${signature.toString("base64url")}`;
 }
@@ -103,6 +125,11 @@ export function verifySessionToken(
   options: AuthOptions = {},
 ): boolean {
   if (typeof token !== "string") {
+    return false;
+  }
+
+  const now = authenticationTimeInSeconds(options.now);
+  if (now === null) {
     return false;
   }
 
@@ -118,7 +145,8 @@ export function verifySessionToken(
   }
 
   const config = resolveConfig(options.config);
-  const expectedSignature = sign(encodedPayload, config.encryptionSecret);
+  const sessionKey = deriveSessionKey(config);
+  const expectedSignature = sign(encodedPayload, sessionKey);
   if (!timingSafeEqual(signature, expectedSignature)) {
     return false;
   }
@@ -129,7 +157,7 @@ export function verifySessionToken(
   }
 
   const payload = parseSessionPayload(payloadBuffer);
-  if (payload === null || payload.exp <= nowInSeconds(options.now)) {
+  if (payload === null || payload.exp <= now) {
     return false;
   }
 
@@ -138,16 +166,22 @@ export function verifySessionToken(
     return false;
   }
 
-  return timingSafeEqual(fingerprint, sha256(config.appAccessToken));
+  return timingSafeEqual(
+    fingerprint,
+    sessionFingerprint(sessionKey, config.appAccessToken),
+  );
 }
 
 export function getSessionCookieOptions(
-  nodeEnv = process.env.NODE_ENV,
+  options: Pick<AuthOptions, "config"> = {},
 ): SessionCookieOptions {
+  const appOrigin = resolveConfig(options.config).appOrigin;
+  const secure = secureCookieForOrigin(appOrigin);
+
   return {
     httpOnly: true,
     sameSite: "strict" as const,
-    secure: nodeEnv === "production",
+    secure,
     path: "/",
     maxAge: SESSION_MAX_AGE_SECONDS,
   };
@@ -158,10 +192,14 @@ export function authenticateApiRequest(
   options: AuthOptions = {},
 ): ApiAuthenticationResult {
   const config = resolveConfig(options.config);
+  const now = authenticationTimeInSeconds(options.now);
+  if (now === null) {
+    return UNAUTHORIZED;
+  }
 
   if (request.headers.has("authorization")) {
     const authorization = request.headers.get("authorization");
-    const match = authorization?.match(/^Bearer ([^\s]+)$/u);
+    const match = authorization?.match(/^Bearer +([^\s]+)$/iu);
     if (
       match === undefined ||
       match === null ||
@@ -176,12 +214,12 @@ export function authenticateApiRequest(
     request.headers.get("cookie"),
     SESSION_COOKIE_NAME,
   );
-  if (!verifySessionToken(sessionToken, { config, now: options.now })) {
+  if (!verifySessionToken(sessionToken, { config, now: now * 1000 })) {
     return UNAUTHORIZED;
   }
 
   if (
-    UNSAFE_METHODS.has(request.method.toUpperCase()) &&
+    !SAFE_METHODS.has(request.method.toUpperCase()) &&
     request.headers.get("origin") !== config.appOrigin
   ) {
     return ORIGIN_NOT_ALLOWED;
@@ -194,16 +232,59 @@ function resolveConfig(config: AuthConfig | undefined): AuthConfig {
   return config ?? getServerEnv();
 }
 
-function nowInSeconds(now: number | undefined): number {
-  return Math.floor((now ?? Date.now()) / 1000);
+function authenticationTimeInSeconds(now: number | undefined): number | null {
+  const value = now ?? Date.now();
+  if (!Number.isSafeInteger(value) || value < 0) {
+    return null;
+  }
+  return Math.floor(value / 1000);
 }
 
 function sha256(value: string): Buffer {
   return createHash("sha256").update(value, "utf8").digest();
 }
 
-function sign(encodedPayload: string, secret: string): Buffer {
-  return createHmac("sha256", secret).update(encodedPayload, "utf8").digest();
+function deriveSessionKey(config: AuthConfig): Buffer {
+  return createHmac("sha256", config.encryptionSecret)
+    .update(SESSION_KEY_LABEL, "utf8")
+    .update(config.appOrigin, "utf8")
+    .digest();
+}
+
+function sessionFingerprint(sessionKey: Buffer, accessToken: string): Buffer {
+  return createHmac("sha256", sessionKey)
+    .update(SESSION_FINGERPRINT_LABEL, "utf8")
+    .update(accessToken, "utf8")
+    .digest();
+}
+
+function sign(encodedPayload: string, sessionKey: Buffer): Buffer {
+  return createHmac("sha256", sessionKey)
+    .update(encodedPayload, "utf8")
+    .digest();
+}
+
+function secureCookieForOrigin(appOrigin: string): boolean {
+  let origin: URL;
+  try {
+    origin = new URL(appOrigin);
+  } catch {
+    throw new Error("Invalid application origin for session cookie");
+  }
+
+  if (origin.origin !== appOrigin) {
+    throw new Error("Invalid application origin for session cookie");
+  }
+  if (origin.protocol === "https:") {
+    return true;
+  }
+  if (
+    origin.protocol === "http:" &&
+    (origin.hostname === "localhost" || origin.hostname === "127.0.0.1")
+  ) {
+    return false;
+  }
+  throw new Error("Invalid application origin for session cookie");
 }
 
 function decodeBase64Url(value: string): Buffer | null {

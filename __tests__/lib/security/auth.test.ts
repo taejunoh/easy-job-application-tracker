@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 
 import {
   SESSION_COOKIE_NAME,
@@ -15,6 +15,8 @@ const NOW = Date.UTC(2026, 6, 13, 12, 0, 0);
 const APP_ACCESS_TOKEN = "access-token-" + "a".repeat(32);
 const ENCRYPTION_SECRET = "encryption-secret-" + "e".repeat(32);
 const APP_ORIGIN = "https://jobs.example.com";
+const SESSION_KEY_LABEL = "jobtracker/session-key/v1\0";
+const SESSION_FINGERPRINT_LABEL = "jobtracker/session-fingerprint/v1\0";
 
 const config: AuthConfig = {
   appAccessToken: APP_ACCESS_TOKEN,
@@ -44,19 +46,31 @@ describe("verifyBearerToken", () => {
 });
 
 describe("session tokens", () => {
-  it("issues a signed v1 token with a 30-day expiry and no raw access token", () => {
+  it("issues a domain-separated signed v1 token with a keyed fingerprint", () => {
     const token = createSessionToken({ config, now: NOW });
     const [encodedPayload, encodedSignature] = token.split(".");
     const payload = JSON.parse(
       Buffer.from(encodedPayload, "base64url").toString("utf8"),
     );
+    const sessionKey = deriveTestSessionKey(config);
+    const expectedFingerprint = createHmac("sha256", sessionKey)
+      .update(SESSION_FINGERPRINT_LABEL, "utf8")
+      .update(APP_ACCESS_TOKEN, "utf8")
+      .digest("base64url");
+    const expectedSignature = createHmac("sha256", sessionKey)
+      .update(encodedPayload, "utf8")
+      .digest("base64url");
+    const unkeyedFingerprint = createHash("sha256")
+      .update(APP_ACCESS_TOKEN, "utf8")
+      .digest("base64url");
 
     expect(payload).toEqual({
       v: 1,
       exp: Math.floor(NOW / 1000) + SESSION_MAX_AGE_SECONDS,
-      fp: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      fp: expectedFingerprint,
     });
-    expect(encodedSignature).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(payload.fp).not.toBe(unkeyedFingerprint);
+    expect(encodedSignature).toBe(expectedSignature);
     expect(token).not.toContain(APP_ACCESS_TOKEN);
     expect(encodedPayload).not.toContain(APP_ACCESS_TOKEN);
     expect(verifySessionToken(token, { config, now: NOW })).toBe(true);
@@ -66,11 +80,29 @@ describe("session tokens", () => {
     const token = createSessionToken({ config, now: NOW });
     const expiry = NOW + SESSION_MAX_AGE_SECONDS * 1000;
 
-    expect(verifySessionToken(token, { config, now: expiry - 1_000 })).toBe(
+    expect(verifySessionToken(token, { config, now: expiry - 1 })).toBe(
       true,
     );
     expect(verifySessionToken(token, { config, now: expiry })).toBe(false);
   });
+
+  it.each([NaN, Infinity, -Infinity, -1, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid issuance clock %s",
+    (now) => {
+      expect(() => createSessionToken({ config, now })).toThrow(
+        "Invalid authentication clock",
+      );
+    },
+  );
+
+  it.each([NaN, Infinity, -Infinity, -1, Number.MAX_SAFE_INTEGER + 1])(
+    "returns false for invalid verification clock %s",
+    (now) => {
+      const token = createSessionToken({ config, now: NOW });
+
+      expect(verifySessionToken(token, { config, now })).toBe(false);
+    },
+  );
 
   it("rejects tampered payloads and signatures", () => {
     const token = createSessionToken({ config, now: NOW });
@@ -102,6 +134,18 @@ describe("session tokens", () => {
     expect(verifySessionToken(token, { config, now: NOW })).toBe(false);
   });
 
+  it("rejects padded and otherwise non-canonical base64url segments", () => {
+    const token = createSessionToken({ config, now: NOW });
+    const [payload, signature] = token.split(".");
+
+    expect(
+      verifySessionToken(`${payload}=.${signature}`, { config, now: NOW }),
+    ).toBe(false);
+    expect(
+      verifySessionToken(`${payload}.${signature}=`, { config, now: NOW }),
+    ).toBe(false);
+  });
+
   it.each([
     "not-json",
     "null",
@@ -117,7 +161,7 @@ describe("session tokens", () => {
       extra: true,
     }),
   ])("rejects a signed malformed session payload %j", (payload) => {
-    const token = signTestPayload(payload, ENCRYPTION_SECRET);
+    const token = signTestPayload(payload, config);
 
     expect(verifySessionToken(token, { config, now: NOW })).toBe(false);
   });
@@ -146,12 +190,47 @@ describe("session tokens", () => {
       }),
     ).toBe(false);
   });
+
+  it("invalidates a session after canonical app-origin rotation", () => {
+    const token = createSessionToken({ config, now: NOW });
+
+    expect(
+      verifySessionToken(token, {
+        config: { ...config, appOrigin: "https://new-jobs.example.com" },
+        now: NOW,
+      }),
+    ).toBe(false);
+  });
+
+  it("changes the keyed fingerprint when the secret or origin changes", () => {
+    const original = sessionFingerprint(
+      createSessionToken({ config, now: NOW }),
+    );
+    const newSecret = sessionFingerprint(
+      createSessionToken({
+        config: {
+          ...config,
+          encryptionSecret: "rotated-secret-" + "s".repeat(32),
+        },
+        now: NOW,
+      }),
+    );
+    const newOrigin = sessionFingerprint(
+      createSessionToken({
+        config: { ...config, appOrigin: "https://new-jobs.example.com" },
+        now: NOW,
+      }),
+    );
+
+    expect(newSecret).not.toBe(original);
+    expect(newOrigin).not.toBe(original);
+  });
 });
 
 describe("session cookie metadata", () => {
-  it("uses the approved cookie name and production attributes", () => {
+  it("uses Secure for the canonical HTTPS application origin", () => {
     expect(SESSION_COOKIE_NAME).toBe("jobtracker_session");
-    expect(getSessionCookieOptions("production")).toEqual({
+    expect(getSessionCookieOptions({ config })).toEqual({
       httpOnly: true,
       sameSite: "strict",
       secure: true,
@@ -160,15 +239,44 @@ describe("session cookie metadata", () => {
     });
   });
 
-  it("does not mark the development cookie secure", () => {
-    expect(getSessionCookieOptions("development").secure).toBe(false);
+  it.each(["http://localhost:3000", "http://127.0.0.1:3000"])(
+    "does not mark an explicit loopback HTTP cookie Secure (%s)",
+    (appOrigin) => {
+      expect(
+        getSessionCookieOptions({ config: { ...config, appOrigin } }).secure,
+      ).toBe(false);
+    },
+  );
+
+  it.each([
+    "http://jobs.example.com",
+    "http://[::1]:3000",
+    "https://jobs.example.com/",
+  ])("rejects a non-canonical or unsafe cookie origin %s", (appOrigin) => {
+    expect(() =>
+      getSessionCookieOptions({ config: { ...config, appOrigin } }),
+    ).toThrow("Invalid application origin for session cookie");
   });
 });
 
 describe("authenticateApiRequest", () => {
-  it("accepts an exact Bearer authorization header", () => {
+  it.each(["Bearer", "bearer", "BEARER"])(
+    "accepts the case-insensitive %s authorization scheme",
+    (scheme) => {
+      const request = apiRequest("POST", {
+        authorization: `${scheme} ${APP_ACCESS_TOKEN}`,
+      });
+
+      expect(authenticateApiRequest(request, { config, now: NOW })).toEqual({
+        authenticated: true,
+        via: "bearer",
+      });
+    },
+  );
+
+  it("accepts one or more ASCII spaces before the Bearer credential", () => {
     const request = apiRequest("POST", {
-      authorization: `Bearer ${APP_ACCESS_TOKEN}`,
+      authorization: `Bearer    ${APP_ACCESS_TOKEN}`,
     });
 
     expect(authenticateApiRequest(request, { config, now: NOW })).toEqual({
@@ -178,9 +286,9 @@ describe("authenticateApiRequest", () => {
   });
 
   it.each([
-    `bearer ${APP_ACCESS_TOKEN}`,
-    `Bearer  ${APP_ACCESS_TOKEN}`,
     `Bearer\t${APP_ACCESS_TOKEN}`,
+    `Bearer ${APP_ACCESS_TOKEN}\textra`,
+    `Bearer ${APP_ACCESS_TOKEN} extra`,
     `Basic ${APP_ACCESS_TOKEN}`,
     "Bearer",
   ])("rejects a non-exact authorization header %j", (authorization) => {
@@ -191,10 +299,20 @@ describe("authenticateApiRequest", () => {
     );
   });
 
-  it("accepts a valid session cookie on safe methods without Origin", () => {
+  it("rejects trailing whitespace preserved by the request adapter", () => {
+    const request = requestWithRawAuthorization(
+      `Bearer ${APP_ACCESS_TOKEN} `,
+    );
+
+    expect(authenticateApiRequest(request, { config, now: NOW })).toEqual(
+      unauthorized,
+    );
+  });
+
+  it("accepts a valid session cookie on allowlisted safe methods without Origin", () => {
     const token = createSessionToken({ config, now: NOW });
 
-    for (const method of ["GET", "HEAD"]) {
+    for (const method of ["GET", "HEAD", "OPTIONS"]) {
       const request = apiRequest(method, {
         cookie: `theme=dark; ${SESSION_COOKIE_NAME}=${token}`,
       });
@@ -205,7 +323,7 @@ describe("authenticateApiRequest", () => {
     }
   });
 
-  it.each(["POST", "PUT", "PATCH", "DELETE"])(
+  it.each(["POST", "PUT", "PATCH", "DELETE", "PURGE"])(
     "accepts a same-origin session cookie for %s",
     (method) => {
       const token = createSessionToken({ config, now: NOW });
@@ -221,13 +339,29 @@ describe("authenticateApiRequest", () => {
     },
   );
 
-  it.each([undefined, "https://evil.example.com", `${APP_ORIGIN}/`])(
+  it.each(["POST", "PUT", "PATCH", "DELETE", "PURGE"])(
+    "rejects a cookie-authenticated %s request without Origin",
+    (method) => {
+      const token = createSessionToken({ config, now: NOW });
+      const request = apiRequest(method, {
+        cookie: `${SESSION_COOKIE_NAME}=${token}`,
+      });
+
+      expect(authenticateApiRequest(request, { config, now: NOW })).toEqual({
+        authenticated: false,
+        status: 403,
+        error: { error: "Origin not allowed", code: "origin_not_allowed" },
+      });
+    },
+  );
+
+  it.each(["https://evil.example.com", `${APP_ORIGIN}/`])(
     "rejects an unsafe session request with Origin %j",
     (origin) => {
       const token = createSessionToken({ config, now: NOW });
-      const request = apiRequest("POST", {
+      const request = apiRequest("DELETE", {
         cookie: `${SESSION_COOKIE_NAME}=${token}`,
-        ...(origin === undefined ? {} : { origin }),
+        origin,
       });
 
       expect(authenticateApiRequest(request, { config, now: NOW })).toEqual({
@@ -297,6 +431,36 @@ describe("authenticateApiRequest", () => {
       );
     },
   );
+
+  it.each([NaN, Infinity, -Infinity, -1, Number.MAX_SAFE_INTEGER + 1])(
+    "returns unauthorized for invalid authentication clock %s",
+    (now) => {
+      const token = createSessionToken({ config, now: NOW });
+      const request = apiRequest("GET", {
+        cookie: `${SESSION_COOKIE_NAME}=${token}`,
+      });
+
+      expect(authenticateApiRequest(request, { config, now })).toEqual(
+        unauthorized,
+      );
+    },
+  );
+
+  it("rejects duplicate, percent-encoded, and quoted valid session cookies", () => {
+    const token = createSessionToken({ config, now: NOW });
+
+    for (const cookie of [
+      `${SESSION_COOKIE_NAME}=${token}; ${SESSION_COOKIE_NAME}=${token}`,
+      `${SESSION_COOKIE_NAME}=${token.replace(".", "%2E")}`,
+      `${SESSION_COOKIE_NAME}="${token}"`,
+    ]) {
+      const request = apiRequest("GET", { cookie });
+
+      expect(authenticateApiRequest(request, { config, now: NOW })).toEqual(
+        unauthorized,
+      );
+    }
+  });
 });
 
 function apiRequest(method: string, headers: Record<string, string> = {}) {
@@ -306,15 +470,39 @@ function apiRequest(method: string, headers: Record<string, string> = {}) {
   });
 }
 
+function requestWithRawAuthorization(authorization: string): Request {
+  return {
+    method: "GET",
+    headers: {
+      has: (name: string) => name.toLowerCase() === "authorization",
+      get: (name: string) =>
+        name.toLowerCase() === "authorization" ? authorization : null,
+    } as Headers,
+  } as unknown as Request;
+}
+
 function flipLast(value: string): string {
   const replacement = value.endsWith("A") ? "B" : "A";
   return value.slice(0, -1) + replacement;
 }
 
-function signTestPayload(payload: string, secret: string): string {
+function deriveTestSessionKey(authConfig: AuthConfig): Buffer {
+  return createHmac("sha256", authConfig.encryptionSecret)
+    .update(SESSION_KEY_LABEL, "utf8")
+    .update(authConfig.appOrigin, "utf8")
+    .digest();
+}
+
+function signTestPayload(payload: string, authConfig: AuthConfig): string {
   const encodedPayload = Buffer.from(payload, "utf8").toString("base64url");
-  const signature = createHmac("sha256", secret)
+  const signature = createHmac("sha256", deriveTestSessionKey(authConfig))
     .update(encodedPayload)
     .digest("base64url");
   return `${encodedPayload}.${signature}`;
+}
+
+function sessionFingerprint(token: string): string {
+  const [encodedPayload] = token.split(".");
+  return JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"))
+    .fp;
 }

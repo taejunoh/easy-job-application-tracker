@@ -136,11 +136,11 @@ On success, the server issues `jobtracker_session` with:
 
 - `HttpOnly`
 - `SameSite=Strict`
-- `Secure` in production
+- `Secure` for an HTTPS application origin, omitted only for explicit loopback HTTP development
 - `Path=/`
 - `Max-Age=2592000` seconds (30 days)
 
-The cookie contains a version, expiration time, and SHA-256 fingerprint of the current `APP_ACCESS_TOKEN`. The payload is base64url encoded and signed with HMAC-SHA-256 using `ENCRYPTION_SECRET`. The raw access token is never placed in the cookie. Verification checks the signature, expiration, and current token fingerprint. Rotating either server secret invalidates existing sessions.
+The cookie contains a version, expiration time, and keyed fingerprint of the current `APP_ACCESS_TOKEN`. A domain-separated session key is derived with HMAC-SHA-256 from `ENCRYPTION_SECRET`, a versioned session-key label, and the canonical application origin. The fingerprint is a second HMAC over a separate versioned label and `APP_ACCESS_TOKEN`, keyed by that session key, so the cookie does not expose an offline access-token verifier. The payload is base64url encoded and signed with HMAC-SHA-256 using the derived session key. The raw access token is never placed in the cookie. Verification checks the signature, expiration, and current keyed fingerprint. Rotating either server secret or the canonical application origin invalidates existing sessions and prevents cross-origin session replay.
 
 `DELETE /api/auth/session` clears the cookie and requires the configured app origin, even when the cookie is absent or invalid. A lightweight `proxy.ts` verifies the cookie before protected page rendering and redirects invalid or missing sessions to `/connect`. Its matcher excludes `/connect`, all `/api/*` routes, Next.js assets, public files, and the favicon so APIs retain JSON status semantics. This redirect improves UX only; every API handler independently authenticates the request.
 
@@ -158,7 +158,7 @@ The shared API guard accepts either:
 1. `Authorization: Bearer` matching `APP_ACCESS_TOKEN`, or
 2. a valid `jobtracker_session` cookie.
 
-For `POST`, `PUT`, `PATCH`, and `DELETE` requests authenticated by cookie, the `Origin` header must exactly equal `APP_BASE_URL`'s origin. Bearer-authenticated extension calls do not require same-origin CSRF validation because the credential is explicit and not ambient.
+For cookie-authenticated requests, only `GET`, `HEAD`, and `OPTIONS` are treated as safe methods. Every other method requires the `Origin` header to exactly equal `APP_BASE_URL`'s origin. Bearer-authenticated extension calls do not require same-origin CSRF validation because the credential is explicit and not ambient.
 
 ### Extension pairing
 
