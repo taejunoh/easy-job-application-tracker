@@ -1,4 +1,4 @@
-import { createProvider, LLMProvider } from "@/lib/extract/llm-provider";
+import { createProvider } from "@/lib/extract/llm-provider";
 
 describe("createProvider", () => {
   it("creates an openai provider", () => {
