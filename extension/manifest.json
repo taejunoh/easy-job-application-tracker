@@ -4,6 +4,11 @@
   "version": "1.0",
   "description": "Extract job posting data and send it to JobTracker",
   "permissions": ["activeTab", "scripting", "storage"],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
   "action": {
     "default_popup": "popup.html"
   },

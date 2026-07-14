@@ -41,7 +41,10 @@
       margin-bottom: 10px;
       outline: none;
     }
-    input:focus { border-color: #3b82f6; }
+    input:focus-visible, button:focus-visible, a:focus-visible {
+      outline: 2px solid #60a5fa;
+      outline-offset: 2px;
+    }
     .actions {
       display: flex;
       gap: 8px;
@@ -182,6 +185,42 @@
       font-size: 11px;
       margin-bottom: 6px;
     }
+    .settings-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    .settings-header label { margin: 0; }
+    .tracker-link {
+      color: #60a5fa;
+      font-size: 11px;
+      text-decoration: none;
+    }
+    .tracker-link:hover { text-decoration: underline; }
+    .pair-row {
+      display: flex;
+      align-items: stretch;
+      gap: 6px;
+    }
+    .pair-row input { margin-bottom: 0; }
+    .pair-row button {
+      flex: 0 0 auto;
+      background: #2563eb;
+      color: white;
+    }
+    .pair-row button:hover { background: #1d4ed8; }
+    .pair-row button:disabled { opacity: 0.55; cursor: wait; }
+    .connection-status {
+      min-height: 16px;
+      margin-top: 6px;
+      font-size: 10px;
+      line-height: 1.4;
+      color: #94a3b8;
+    }
+    .connection-status.success { color: #6ee7b7; }
+    .connection-status.error { color: #fca5a5; }
+    .connection-status.info { color: #93c5fd; }
   </style>
 </head>
 <body>
@@ -195,13 +234,13 @@
     </div>
 
     <div id="form" style="display:none">
-      <label>Job Title</label>
+      <label for="jobTitle">Job Title</label>
       <input type="text" id="jobTitle" placeholder="Job title">
 
-      <label>Company</label>
+      <label for="company">Company</label>
       <input type="text" id="company" placeholder="Company name">
 
-      <label>Location</label>
+      <label for="location">Location</label>
       <input type="text" id="location" placeholder="Location (optional)">
 
       <input type="hidden" id="jobUrl">
@@ -249,12 +288,19 @@
     </div>
   </div>
 
-  <div class="settings">
-    <label>JobTracker URL</label>
-    <div style="display: flex; gap: 6px; align-items: center;">
-      <input type="text" id="serverUrl" placeholder="http://localhost:3000" value="http://localhost:3000" style="margin-bottom: 0; flex: 1;">
-      <a id="openTracker" href="#" style="color: #60a5fa; font-size: 11px; white-space: nowrap; text-decoration: none;">Open</a>
+  <div class="settings" aria-labelledby="connectionHeading">
+    <div class="settings-header">
+      <label for="serverUrl" id="connectionHeading">JobTracker URL</label>
+      <a id="openTracker" class="tracker-link" href="#">Open tracker</a>
     </div>
+    <input type="url" id="serverUrl" placeholder="https://jobs.example.com" value="http://localhost:3000" autocomplete="url" spellcheck="false">
+
+    <label for="accessToken">Access token</label>
+    <div class="pair-row">
+      <input type="password" id="accessToken" placeholder="Paste token to connect" autocomplete="off" spellcheck="false">
+      <button type="button" id="connectBtn">Connect</button>
+    </div>
+    <div id="connectionStatus" class="connection-status" role="status" aria-live="polite">Disconnected — enter a token to connect.</div>
   </div>
 
   <script src="popup.js"></script>
