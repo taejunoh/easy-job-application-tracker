@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getServerEnv } from "@/lib/server-env";
+import { privateNoStore } from "@/lib/security/auth-response";
 import {
   SESSION_COOKIE_NAME,
   createSessionToken,
@@ -12,6 +13,10 @@ import {
   decorateCorsResponse,
   type CorsAllowed,
 } from "@/lib/security/cors";
+import {
+  RequestBodyTooLargeError,
+  readBoundedJsonBody,
+} from "@/lib/security/request-body";
 
 const UNAUTHORIZED = Object.freeze({
   error: "Authentication required" as const,
@@ -28,10 +33,15 @@ const INVALID_REQUEST = Object.freeze({
   code: "invalid_request" as const,
 });
 
+const REQUEST_TOO_LARGE = Object.freeze({
+  error: "Request too large" as const,
+  code: "request_too_large" as const,
+});
+
 export async function POST(request: Request): Promise<Response> {
   const cors = corsHeaders(request, ["POST"]);
   if (!cors.allowed) {
-    return cors.response;
+    return privateNoStore(cors.response);
   }
   if (request.headers.get("origin") !== getServerEnv().appOrigin) {
     return originError(cors);
@@ -39,19 +49,24 @@ export async function POST(request: Request): Promise<Response> {
 
   let body: unknown;
   try {
-    body = await request.json();
-  } catch {
-    return decorateCorsResponse(
-      Response.json(INVALID_REQUEST, { status: 400 }),
-      cors,
+    body = await readBoundedJsonBody(request);
+  } catch (error) {
+    const response =
+      error instanceof RequestBodyTooLargeError
+        ? Response.json(REQUEST_TOO_LARGE, { status: 413 })
+        : Response.json(INVALID_REQUEST, { status: 400 });
+    return privateNoStore(
+      decorateCorsResponse(response, cors),
     );
   }
 
   const token = readToken(body);
   if (!verifyBearerToken(token)) {
-    return decorateCorsResponse(
-      Response.json(UNAUTHORIZED, { status: 401 }),
-      cors,
+    return privateNoStore(
+      decorateCorsResponse(
+        Response.json(UNAUTHORIZED, { status: 401 }),
+        cors,
+      ),
     );
   }
 
@@ -61,13 +76,13 @@ export async function POST(request: Request): Promise<Response> {
     value: createSessionToken(),
     ...getSessionCookieOptions(),
   });
-  return decorateCorsResponse(response, cors);
+  return privateNoStore(decorateCorsResponse(response, cors));
 }
 
 export async function DELETE(request: Request): Promise<Response> {
   const cors = corsHeaders(request, ["DELETE"]);
   if (!cors.allowed) {
-    return cors.response;
+    return privateNoStore(cors.response);
   }
   if (request.headers.get("origin") !== getServerEnv().appOrigin) {
     return originError(cors);
@@ -80,7 +95,7 @@ export async function DELETE(request: Request): Promise<Response> {
     ...getSessionCookieOptions(),
     maxAge: 0,
   });
-  return decorateCorsResponse(response, cors);
+  return privateNoStore(decorateCorsResponse(response, cors));
 }
 
 function readToken(body: unknown): string | undefined {
@@ -92,8 +107,10 @@ function readToken(body: unknown): string | undefined {
 }
 
 function originError(cors: CorsAllowed): Response {
-  return decorateCorsResponse(
-    Response.json(ORIGIN_NOT_ALLOWED, { status: 403 }),
-    cors,
+  return privateNoStore(
+    decorateCorsResponse(
+      Response.json(ORIGIN_NOT_ALLOWED, { status: 403 }),
+      cors,
+    ),
   );
 }

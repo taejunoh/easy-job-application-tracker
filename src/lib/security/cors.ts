@@ -23,6 +23,15 @@ type CorsConfig = Readonly<{
 
 const HTTP_TOKEN_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u;
 const ALLOWED_REQUEST_HEADERS = new Set(["authorization", "content-type"]);
+const NEXT_ROUTE_METHODS = new Set([
+  "GET",
+  "HEAD",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "OPTIONS",
+]);
 const MANAGED_CORS_HEADERS = [
   "Access-Control-Allow-Origin",
   "Access-Control-Allow-Credentials",
@@ -54,15 +63,21 @@ export function corsPreflight(
   methods: readonly string[],
 ): Response {
   const methodPolicy = normalizeMethodPolicy(methods);
+  const variationHeaders = preflightVariationHeaders();
   if (
     request.method.toUpperCase() !== "OPTIONS" ||
     !validRequestedMethod(request, methodPolicy) ||
     !validRequestedHeaders(request)
   ) {
-    return rejectedOriginResponse().response;
+    return rejectedOriginResponse(variationHeaders).response;
   }
 
-  const result = evaluateOrigin(request, getServerEnv(), false);
+  const result = evaluateOrigin(
+    request,
+    getServerEnv(),
+    false,
+    variationHeaders,
+  );
 
   if (!result.allowed) {
     return result.response;
@@ -107,22 +122,29 @@ function evaluateOrigin(
   request: Request,
   config: CorsConfig,
   allowMissing: boolean,
+  variationHeaders = originVariationHeaders(),
 ): CorsResult {
   const origin = request.headers.get("origin");
   if (origin === null) {
     return allowMissing
-      ? { allowed: true, headers: originVariationHeaders() }
-      : rejectedOriginResponse();
+      ? { allowed: true, headers: variationHeaders }
+      : rejectedOriginResponse(variationHeaders);
   }
   if (!config.corsAllowedOrigins.includes(origin)) {
-    return rejectedOriginResponse();
+    return rejectedOriginResponse(variationHeaders);
   }
 
-  return { allowed: true, headers: allowedOriginHeaders(origin, config) };
+  return {
+    allowed: true,
+    headers: allowedOriginHeaders(origin, config, variationHeaders),
+  };
 }
 
-function allowedOriginHeaders(origin: string, config: CorsConfig): Headers {
-  const headers = originVariationHeaders();
+function allowedOriginHeaders(
+  origin: string,
+  config: CorsConfig,
+  headers: Headers,
+): Headers {
   headers.set("Access-Control-Allow-Origin", origin);
   if (origin === config.appOrigin) {
     headers.set("Access-Control-Allow-Credentials", "true");
@@ -134,12 +156,21 @@ function originVariationHeaders(): Headers {
   return new Headers({ Vary: "Origin" });
 }
 
-function rejectedOriginResponse(): CorsRejected {
+function preflightVariationHeaders(): Headers {
+  return new Headers({
+    Vary:
+      "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+  });
+}
+
+function rejectedOriginResponse(
+  headers = originVariationHeaders(),
+): CorsRejected {
   return {
     allowed: false,
     response: Response.json(ORIGIN_NOT_ALLOWED, {
       status: 403,
-      headers: originVariationHeaders(),
+      headers,
     }),
   };
 }
@@ -154,12 +185,16 @@ function normalizeMethodPolicy(methods: readonly string[]): string[] {
 
   for (const method of methods) {
     const value = normalizeHttpToken(method);
-    if (value === null || value === "*") {
+    if (value === null || !NEXT_ROUTE_METHODS.has(value)) {
       throw new TypeError("Invalid CORS method policy");
     }
     if (!seen.has(value)) {
       seen.add(value);
       normalized.push(value);
+    }
+    if (value === "GET" && !seen.has("HEAD")) {
+      seen.add("HEAD");
+      normalized.push("HEAD");
     }
   }
   return normalized;

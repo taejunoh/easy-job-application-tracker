@@ -23,7 +23,17 @@ jest.mock("@/lib/server-env", () => {
 });
 
 describe("auth proxy", () => {
-  it.each(["/", "/applications", "/applications/abc", "/settings", "/connect"])(
+  it.each([
+    "/",
+    "/applications",
+    "/applications/abc",
+    "/applications/probe.json",
+    "/applications/probe%2Ejson",
+    "/applications/probe.json?view=full",
+    "/nested/public-file.png",
+    "/settings",
+    "/connect",
+  ])(
     "matches application page %s",
     (url) => {
       expect(doesMatch(url)).toBe(true);
@@ -37,7 +47,10 @@ describe("auth proxy", () => {
     "/_next/image",
     "/favicon.ico",
     "/file.svg",
-    "/nested/public-file.png",
+    "/globe.svg",
+    "/next.svg",
+    "/vercel.svg",
+    "/window.svg",
   ])("does not match API or asset path %s", (url) => {
     expect(doesMatch(url)).toBe(false);
   });
@@ -47,7 +60,19 @@ describe("auth proxy", () => {
 
     expect(response.status).toBe(307);
     expect(response.headers.get("Location")).toBe(
-      "https://jobs.example.com/connect",
+      "https://jobs.example.com/connect?next=%2Fsettings",
+    );
+  });
+
+  it("preserves a protected pathname and query as an encoded return path", () => {
+    const response = proxy(
+      new NextRequest(
+        "https://jobs.example.com/applications/probe.json?view=full&sort=asc",
+      ),
+    );
+
+    expect(response.headers.get("Location")).toBe(
+      "https://jobs.example.com/connect?next=%2Fapplications%2Fprobe.json%3Fview%3Dfull%26sort%3Dasc",
     );
   });
 
@@ -72,6 +97,26 @@ describe("auth proxy", () => {
     expect(invalid.status).toBe(200);
     expect(missing.headers.get("Location")).toBeNull();
     expect(invalid.headers.get("Location")).toBeNull();
+    expect(invalid.headers.get("Set-Cookie")).toMatch(
+      new RegExp(`^${SESSION_COOKIE_NAME}=;.*Max-Age=0`),
+    );
+  });
+
+  it("clears an expired cookie while redirecting to /connect", () => {
+    const expired = createSessionToken({ now: 0 });
+    const response = proxy(
+      new NextRequest("https://jobs.example.com/applications", {
+        headers: { Cookie: `${SESSION_COOKIE_NAME}=${expired}` },
+      }),
+    );
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get("Location")).toBe(
+      "https://jobs.example.com/connect?next=%2Fapplications",
+    );
+    expect(response.headers.get("Set-Cookie")).toMatch(
+      new RegExp(`^${SESSION_COOKIE_NAME}=;.*Max-Age=0`),
+    );
   });
 
   it("redirects /connect with a valid session to the dashboard", () => {

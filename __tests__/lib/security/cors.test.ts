@@ -108,6 +108,12 @@ describe("corsHeaders", () => {
     );
   });
 
+  it("allows implicit HEAD when a Route Handler declares GET", () => {
+    const result = corsHeaders(actualRequest(APP_ORIGIN, "HEAD"), ["GET"]);
+
+    expect(result.allowed).toBe(true);
+  });
+
   it("rejects an actual request whose method was not declared", async () => {
     const result = corsHeaders(actualRequest(APP_ORIGIN, "PATCH"), [
       "GET",
@@ -131,6 +137,9 @@ describe("corsHeaders", () => {
     [["GET,POST"]],
     [["GET POST"]],
     [["*"]],
+    [["TRACE"]],
+    [["CONNECT"]],
+    [["CUSTOM"]],
   ])("throws for an invalid declared method list %j", (methods) => {
     expect(() => corsHeaders(actualRequest(APP_ORIGIN), methods)).toThrow(
       "Invalid CORS method policy",
@@ -268,7 +277,7 @@ describe("corsPreflight", () => {
       EXTENSION_ORIGIN,
     );
     expect(response.headers.get("Access-Control-Allow-Methods")).toBe(
-      "GET, POST",
+      "GET, HEAD, POST",
     );
     expect(response.headers.get("Access-Control-Allow-Headers")).toBe(
       "Authorization, Content-Type",
@@ -278,7 +287,9 @@ describe("corsPreflight", () => {
     );
     expect(CORS_PREFLIGHT_MAX_AGE_SECONDS).toBe(600);
     expect(response.headers.get("Access-Control-Allow-Credentials")).toBeNull();
-    expect(response.headers.get("Vary")).toBe("Origin");
+    expect(response.headers.get("Vary")).toBe(
+      "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+    );
     expectNoWildcard(response.headers);
   });
 
@@ -313,7 +324,9 @@ describe("corsPreflight", () => {
       error: "Origin not allowed",
       code: "origin_not_allowed",
     });
-    expect(response.headers.get("Vary")).toBe("Origin");
+    expect(response.headers.get("Vary")).toBe(
+      "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+    );
     expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
     expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
     expect(response.headers.get("Access-Control-Allow-Headers")).toBeNull();
@@ -384,6 +397,21 @@ describe("corsPreflight", () => {
     );
 
     expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBe(
+      "GET, HEAD",
+    );
+  });
+
+  it("accepts HEAD through the implicit GET policy", () => {
+    const response = corsPreflight(
+      preflightRequest(EXTENSION_ORIGIN, "HEAD", null),
+      ["GET"],
+    );
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBe(
+      "GET, HEAD",
+    );
   });
 
   it("never emits a wildcard from an invalid declared method", () => {
@@ -464,4 +492,7 @@ async function expectRejectedPreflight(response: Response): Promise<void> {
   expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
   expect(response.headers.get("Access-Control-Allow-Headers")).toBeNull();
   expect(response.headers.get("Access-Control-Max-Age")).toBeNull();
+  expect(response.headers.get("Vary")).toBe(
+    "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+  );
 }

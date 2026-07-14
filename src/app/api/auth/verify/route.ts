@@ -1,4 +1,5 @@
 import { authenticateApiRequest } from "@/lib/security/auth";
+import { privateNoStore } from "@/lib/security/auth-response";
 import {
   corsHeaders,
   corsPreflight,
@@ -19,7 +20,7 @@ const ORIGIN_NOT_ALLOWED = Object.freeze({
 export function POST(request: Request): Response {
   const cors = corsHeaders(request, ["POST"]);
   if (!cors.allowed) {
-    return cors.response;
+    return privateNoStore(cors.response);
   }
   if (request.headers.get("origin") === null) {
     return originError(cors);
@@ -29,25 +30,31 @@ export function POST(request: Request): Response {
     ? authenticateApiRequest(request)
     : undefined;
   if (!authentication?.authenticated || authentication.via !== "bearer") {
-    return decorateCorsResponse(
-      Response.json(UNAUTHORIZED, { status: 401 }),
-      cors,
+    return privateNoStore(
+      decorateCorsResponse(
+        Response.json(UNAUTHORIZED, { status: 401 }),
+        cors,
+      ),
     );
   }
 
-  return decorateCorsResponse(
-    Response.json({ authenticated: true }),
-    cors,
+  return privateNoStore(
+    decorateCorsResponse(
+      Response.json({ authenticated: true }),
+      cors,
+    ),
   );
 }
 
 export function OPTIONS(request: Request): Response {
-  return corsPreflight(request, ["POST"]);
+  return privateNoStore(corsPreflight(request, ["POST"]));
 }
 
 function originError(cors: CorsAllowed): Response {
-  return decorateCorsResponse(
-    Response.json(ORIGIN_NOT_ALLOWED, { status: 403 }),
-    cors,
+  return privateNoStore(
+    decorateCorsResponse(
+      Response.json(ORIGIN_NOT_ALLOWED, { status: 403 }),
+      cors,
+    ),
   );
 }

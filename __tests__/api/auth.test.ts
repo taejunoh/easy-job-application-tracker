@@ -115,6 +115,47 @@ describe("POST /api/auth/session", () => {
       expect(response.headers.get("Set-Cookie")).toBeNull();
     },
   );
+
+  it("rejects a declared login body larger than 4 KiB before parsing", async () => {
+    const request = sessionRequest("POST", APP_ORIGIN, "{}");
+    request.headers.set("Content-Length", "4097");
+
+    const response = await createSession(request);
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toEqual({
+      error: "Request too large",
+      code: "request_too_large",
+    });
+  });
+
+  it("stops reading a chunked login body after 4 KiB", async () => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("a".repeat(4_000)));
+        controller.enqueue(encoder.encode("b".repeat(97)));
+        controller.close();
+      },
+    });
+    const response = await createSession(
+      new Request("https://jobs.example.com/api/auth/session", {
+        method: "POST",
+        headers: {
+          Origin: APP_ORIGIN,
+          "Content-Type": "application/json",
+        },
+        body: stream,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" }),
+    );
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toEqual({
+      error: "Request too large",
+      code: "request_too_large",
+    });
+  });
 });
 
 describe("DELETE /api/auth/session", () => {
@@ -279,6 +320,55 @@ describe("POST /api/auth/verify", () => {
   );
 });
 
+describe("auth response caching", () => {
+  it("marks session success and errors as non-cacheable", async () => {
+    const responses = await Promise.all([
+      createSession(
+        sessionRequest("POST", APP_ORIGIN, JSON.stringify({ token: ACCESS_TOKEN })),
+      ),
+      createSession(
+        sessionRequest("POST", APP_ORIGIN, JSON.stringify({ token: "wrong" })),
+      ),
+      createSession(
+        sessionRequest("POST", "https://evil.example.com", "not-json"),
+      ),
+      deleteSession(sessionRequest("DELETE", APP_ORIGIN)),
+      deleteSession(sessionRequest("DELETE", undefined)),
+    ]);
+
+    responses.forEach(expectPrivateNoStore);
+  });
+
+  it("marks verify success, errors, and preflight responses as non-cacheable", async () => {
+    const responses = [
+      verifyAccess(verifyRequest(EXTENSION_ORIGIN, ACCESS_TOKEN)),
+      verifyAccess(verifyRequest(EXTENSION_ORIGIN, "wrong")),
+      verifyAccess(verifyRequest(undefined, ACCESS_TOKEN)),
+      verifyPreflight(
+        new Request("https://jobs.example.com/api/auth/verify", {
+          method: "OPTIONS",
+          headers: {
+            Origin: EXTENSION_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Authorization",
+          },
+        }),
+      ),
+      verifyPreflight(
+        new Request("https://jobs.example.com/api/auth/verify", {
+          method: "OPTIONS",
+          headers: {
+            Origin: EXTENSION_ORIGIN,
+            "Access-Control-Request-Method": "DELETE",
+          },
+        }),
+      ),
+    ];
+
+    responses.forEach(expectPrivateNoStore);
+  });
+});
+
 function sessionRequest(
   method: "POST" | "DELETE",
   origin?: string,
@@ -305,4 +395,9 @@ function verifyRequest(origin?: string, token?: string): Request {
     method: "POST",
     headers,
   });
+}
+
+function expectPrivateNoStore(response: Response): void {
+  expect(response.headers.get("Cache-Control")).toBe("no-store");
+  expect(response.headers.get("Pragma")).toBe("no-cache");
 }
