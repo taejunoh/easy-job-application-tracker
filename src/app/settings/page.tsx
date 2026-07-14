@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 
+import { RESUME_UPLOAD_FIELD } from "@/lib/resume/constants";
+
 const PROVIDERS = [
   { value: "openai", label: "OpenAI" },
   { value: "gemini", label: "Google Gemini" },
@@ -195,7 +197,7 @@ export default function SettingsPage() {
                 setUploading(true);
                 try {
                   const formData = new FormData();
-                  formData.append("file", file);
+                  formData.append(RESUME_UPLOAD_FIELD, file);
                   const res = await fetch("/api/parse-resume", {
                     method: "POST",
                     body: formData,

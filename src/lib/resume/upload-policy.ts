@@ -2,8 +2,13 @@ import "server-only";
 
 import Busboy, { type BusboyFileStream } from "@fastify/busboy";
 
-export const MAX_RESUME_BYTES = 5 * 1024 * 1024;
-export const MAX_MULTIPART_BYTES = 6 * 1024 * 1024;
+import {
+  MAX_MULTIPART_BYTES,
+  MAX_RESUME_BYTES,
+  RESUME_UPLOAD_FIELD,
+} from "./constants";
+
+export { MAX_MULTIPART_BYTES, MAX_RESUME_BYTES } from "./constants";
 
 export type ResumeUpload = Readonly<{
   filename: string;
@@ -23,7 +28,15 @@ export class ResumeUploadError extends Error {
   }
 }
 
-export async function readResumeUpload(request: Request): Promise<ResumeUpload> {
+type ResumeUploadOptions = Readonly<{
+  signal?: AbortSignal;
+  createParser?: typeof Busboy;
+}>;
+
+export async function readResumeUpload(
+  request: Request,
+  options: ResumeUploadOptions = {},
+): Promise<ResumeUpload> {
   rejectDeclaredOversize(request.headers.get("content-length"));
   if (request.body === null) throw new ResumeUploadError("invalid_request");
 
@@ -31,7 +44,7 @@ export async function readResumeUpload(request: Request): Promise<ResumeUpload> 
   try {
     const contentType = request.headers.get("content-type");
     if (contentType === null) throw new Error("Missing content type");
-    parser = Busboy({
+    parser = (options.createParser ?? Busboy)({
       headers: { "content-type": contentType },
       limits: {
         fields: 0,
@@ -54,15 +67,36 @@ export async function readResumeUpload(request: Request): Promise<ResumeUpload> 
     let fileCount = 0;
     let upload: ResumeUpload | undefined;
 
-    const fail = (error: ResumeUploadError): void => {
+    const settledController = new AbortController();
+    const onAbort = (): void => {
+      fail(
+        options.signal?.reason instanceof Error
+          ? options.signal.reason
+          : new ResumeUploadError("invalid_request"),
+      );
+    };
+    const finishSettling = (): void => {
+      options.signal?.removeEventListener("abort", onAbort);
+      settledController.abort();
+    };
+    const destroyParser = (): void => {
+      try {
+        parser.destroy();
+      } catch {
+        // Cleanup must not alter the response.
+      }
+    };
+    const fail = (error: Error): void => {
       if (settled) return;
       settled = true;
-      parser.destroy();
-      void reader
-        .cancel(error)
-        .catch(() => undefined)
-        .finally(() => reject(error));
+      finishSettling();
+      reject(error);
+      destroyParser();
+      void reader.cancel(error).catch(() => undefined);
     };
+
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
 
     parser.on(
       "file",
@@ -74,7 +108,7 @@ export async function readResumeUpload(request: Request): Promise<ResumeUpload> 
         mimeType: string,
       ) => {
         fileCount += 1;
-        if (fieldName !== "resume" || fileCount !== 1) {
+        if (fieldName !== RESUME_UPLOAD_FIELD || fileCount !== 1) {
           file.resume();
           fail(new ResumeUploadError("invalid_request"));
           return;
@@ -115,7 +149,8 @@ export async function readResumeUpload(request: Request): Promise<ResumeUpload> 
         return;
       }
       settled = true;
-      parser.destroy();
+      finishSettling();
+      destroyParser();
       resolve(upload);
     });
 
@@ -133,15 +168,36 @@ export async function readResumeUpload(request: Request): Promise<ResumeUpload> 
             return;
           }
           if (!parser.write(Buffer.from(value))) {
-            await new Promise<void>((resume) => parser.once("drain", resume));
+            await waitForDrainOrSettle(parser, settledController.signal);
           }
         }
       } catch {
         fail(new ResumeUploadError("invalid_request"));
       } finally {
-        reader.releaseLock();
+        try {
+          reader.releaseLock();
+        } catch {
+          // A noncooperative pending read may retain the lock after settlement.
+        }
       }
     })();
+  });
+}
+
+function waitForDrainOrSettle(
+  parser: ReturnType<typeof Busboy>,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      parser.removeListener("drain", finish);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    parser.once("drain", finish);
+    signal.addEventListener("abort", finish, { once: true });
   });
 }
 

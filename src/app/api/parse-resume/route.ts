@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs";
 
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import { RESUME_PROCESSING_DEADLINE_MS } from "@/lib/resume/constants";
+import { createResumeDeadline } from "@/lib/resume/deadline";
+import { parsePdfInWorker } from "@/lib/resume/pdf-worker-client";
 import {
   ParseResumeError,
   parseResumeFile,
-  type PdfLoadingTask,
 } from "@/lib/resume/parse-resume";
 import {
   ResumeUploadError,
@@ -14,23 +15,21 @@ import {
 
 export const runtime = "nodejs";
 
-GlobalWorkerOptions.workerSrc = "pdfjs-dist/legacy/build/pdf.worker.mjs";
-
 const route = createProtectedRoute(["POST"]);
 
 export const OPTIONS = route.OPTIONS;
 
 export const POST = route.handler(async function POST(request: NextRequest) {
+  const deadlineError = new ParseResumeError("resume_parse_failed");
+  const deadline = createResumeDeadline(
+    RESUME_PROCESSING_DEADLINE_MS,
+    deadlineError,
+  );
   try {
-    const upload = await readResumeUpload(request);
-    const text = await parseResumeFile(upload, (bytes) =>
-      getDocument({
-        data: bytes,
-        useWorkerFetch: false,
-        isEvalSupported: false,
-        useSystemFonts: true,
-      }) as unknown as PdfLoadingTask,
-    );
+    const upload = await readResumeUpload(request, {
+      signal: deadline.signal,
+    });
+    const text = await parseResumeFile(upload, parsePdfInWorker, { deadline });
     return NextResponse.json({ text });
   } catch (error) {
     if (error instanceof ResumeUploadError || error instanceof ParseResumeError) {
@@ -40,6 +39,8 @@ export const POST = route.handler(async function POST(request: NextRequest) {
       );
     }
     throw error;
+  } finally {
+    deadline.dispose();
   }
 });
 

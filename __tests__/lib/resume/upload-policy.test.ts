@@ -4,6 +4,7 @@ import {
   ResumeUploadError,
   readResumeUpload,
 } from "@/lib/resume/upload-policy";
+import { EventEmitter } from "node:events";
 
 describe("bounded resume multipart uploads", () => {
   it("accepts exactly one resume file at the 5 MiB file boundary", async () => {
@@ -55,6 +56,21 @@ describe("bounded resume multipart uploads", () => {
     expect(source.readerCancel).toHaveBeenCalled();
   });
 
+  it("accepts a valid multipart envelope exactly at 6 MiB", async () => {
+    const body = rawMultipartEnvelope(MAX_MULTIPART_BYTES);
+    const request = new Request("https://example.test/api/parse-resume", {
+      method: "POST",
+      headers: { "Content-Type": "multipart/form-data; boundary=x" },
+      body,
+    });
+
+    await expect(readResumeUpload(request)).resolves.toMatchObject({
+      filename: "resume.pdf",
+      mimeType: "application/pdf",
+      bytes: Buffer.from("%PDF-x"),
+    });
+  });
+
   it.each([
     ["a non-multipart request", new Request("https://example.test", { method: "POST", body: "x" })],
     [
@@ -97,7 +113,98 @@ describe("bounded resume multipart uploads", () => {
       status: 400,
     });
   });
+
+  it("rejects on an abort without awaiting a noncooperative reader cancel", async () => {
+    const reason = new Error("deadline");
+    const cancel = jest.fn(() => new Promise<void>(() => undefined));
+    const body = new ReadableStream<Uint8Array>({
+      pull: () => new Promise<void>(() => undefined),
+      cancel,
+    });
+    const request = requestWithBody(body);
+    const controller = new AbortController();
+
+    const upload = callReadResumeUpload(request, {
+      signal: controller.signal,
+    });
+    controller.abort(reason);
+
+    await expect(settlesWithin(upload, 100)).resolves.toEqual({
+      status: "rejected",
+      reason,
+    });
+    expect(cancel).toHaveBeenCalled();
+  });
+
+  it("escapes a parser drain wait when the shared signal aborts", async () => {
+    const reason = new Error("deadline");
+    const parser = new EventEmitter() as EventEmitter & {
+      destroy: jest.Mock;
+      end: jest.Mock;
+      write: jest.Mock;
+    };
+    parser.destroy = jest.fn();
+    parser.end = jest.fn();
+    parser.write = jest.fn(() => false);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(Buffer.from("multipart bytes"));
+      },
+      cancel: () => new Promise<void>(() => undefined),
+    });
+    const controller = new AbortController();
+    const createParser = jest.fn(() => parser);
+
+    const upload = callReadResumeUpload(requestWithBody(body), {
+      signal: controller.signal,
+      createParser,
+    });
+    await Promise.resolve();
+    controller.abort(reason);
+
+    await expect(settlesWithin(upload, 100)).resolves.toEqual({
+      status: "rejected",
+      reason,
+    });
+    expect(createParser).toHaveBeenCalled();
+  });
 });
+
+type TestUploadOptions = {
+  signal?: AbortSignal;
+  createParser?: (...args: never[]) => unknown;
+};
+
+function callReadResumeUpload(
+  request: Request,
+  options: TestUploadOptions,
+): Promise<unknown> {
+  return (
+    readResumeUpload as unknown as (
+      request: Request,
+      options: TestUploadOptions,
+    ) => Promise<unknown>
+  )(request, options);
+}
+
+async function settlesWithin(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+): Promise<
+  | { status: "resolved"; value: unknown }
+  | { status: "rejected"; reason: unknown }
+  | { status: "pending" }
+> {
+  return Promise.race([
+    promise.then(
+      (value) => ({ status: "resolved" as const, value }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    ),
+    new Promise<{ status: "pending" }>((resolve) => {
+      setTimeout(() => resolve({ status: "pending" }), timeoutMs);
+    }),
+  ]);
+}
 
 function multipartRequest(
   bytes: BlobPart,
@@ -170,6 +277,29 @@ function streamingRequest(byteLength: number): {
     } as RequestInit & { duplex: "half" }),
     readerCancel,
   };
+}
+
+function requestWithBody(body: ReadableStream<Uint8Array>): Request {
+  return new Request("https://example.test/api/parse-resume", {
+    method: "POST",
+    headers: { "Content-Type": "multipart/form-data; boundary=x" },
+    body,
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
+}
+
+function rawMultipartEnvelope(byteLength: number): string {
+  const part = [
+    "--x",
+    'Content-Disposition: form-data; name="resume"; filename="resume.pdf"',
+    "Content-Type: application/pdf",
+    "",
+    "%PDF-x",
+    "--x--",
+    "",
+  ].join("\r\n");
+  const separator = "\r\n";
+  return `${"p".repeat(byteLength - Buffer.byteLength(part) - separator.length)}${separator}${part}`;
 }
 
 function instrumentCancellation(source: Request, cancel: jest.Mock): Request {

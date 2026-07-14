@@ -1,17 +1,18 @@
 import {
-  MAX_PDF_PAGES,
   MAX_RESUME_CODE_POINTS,
+} from "@/lib/resume/constants";
+import { createResumeDeadline } from "@/lib/resume/deadline";
+import type { ResumeDeadline } from "@/lib/resume/deadline";
+import {
   ParseResumeError,
   parseResumeFile,
-  type PdfLoadingTask,
+  type PdfTextParser,
 } from "@/lib/resume/parse-resume";
 import type { ResumeUpload } from "@/lib/resume/upload-policy";
 
 describe("resume file parsing policy", () => {
   it("decodes valid UTF-8 plain text", async () => {
-    await expect(
-      parseResumeFile(textUpload("Résumé 😀"), unusedPdfLoader),
-    ).resolves.toBe("Résumé 😀");
+    await expect(parse(textUpload("Résumé 😀"))).resolves.toBe("Résumé 😀");
   });
 
   it.each([
@@ -22,7 +23,7 @@ describe("resume file parsing policy", () => {
     ["unsupported extension", upload("resume.doc", "text/plain", "hello")],
     ["unsupported MIME", upload("resume.txt", "application/octet-stream", "hello")],
   ])("rejects %s with 415", async (_name, file) => {
-    await expect(parseResumeFile(file, unusedPdfLoader)).rejects.toMatchObject({
+    await expect(parse(file)).rejects.toMatchObject({
       name: "ParseResumeError",
       code: "unsupported_resume_type",
       status: 415,
@@ -34,17 +35,14 @@ describe("resume file parsing policy", () => {
     ["a NUL byte", Buffer.from("hello\0world")],
   ])("rejects text containing %s", async (_name, bytes) => {
     await expect(
-      parseResumeFile(
-        { filename: "resume.txt", mimeType: "text/plain", bytes },
-        unusedPdfLoader,
-      ),
+      parse({ filename: "resume.txt", mimeType: "text/plain", bytes }),
     ).rejects.toMatchObject({ code: "resume_parse_failed", status: 422 });
   });
 
   it("allows exactly 500,000 Unicode code points", async () => {
     const text = `${"a".repeat(MAX_RESUME_CODE_POINTS - 1)}😀`;
 
-    const result = await parseResumeFile(textUpload(text), unusedPdfLoader);
+    const result = await parse(textUpload(text));
 
     expect(Array.from(result)).toHaveLength(MAX_RESUME_CODE_POINTS);
   });
@@ -52,79 +50,66 @@ describe("resume file parsing policy", () => {
   it("rejects 500,001 Unicode code points", async () => {
     const text = `${"a".repeat(MAX_RESUME_CODE_POINTS)}😀`;
 
-    await expect(
-      parseResumeFile(textUpload(text), unusedPdfLoader),
-    ).rejects.toMatchObject({ code: "resume_parse_failed", status: 422 });
+    await expect(parse(textUpload(text))).rejects.toMatchObject({
+      code: "resume_parse_failed",
+      status: 422,
+    });
   });
 
-  it("extracts 100 PDF pages and destroys the document", async () => {
-    const document = fakeDocument(MAX_PDF_PAGES);
-    const loadingTask = resolvedLoadingTask(document);
-
-    const result = await parseResumeFile(pdfUpload(), () => loadingTask);
-
-    expect(result.split("\n")).toHaveLength(MAX_PDF_PAGES);
-    expect(document.destroy).toHaveBeenCalledTimes(1);
-  });
-
-  it("rejects 101 PDF pages and destroys the document before reading pages", async () => {
-    const document = fakeDocument(MAX_PDF_PAGES + 1);
-
-    await expect(
-      parseResumeFile(pdfUpload(), () => resolvedLoadingTask(document)),
-    ).rejects.toMatchObject({ code: "resume_parse_failed", status: 422 });
-    expect(document.getPage).not.toHaveBeenCalled();
-    expect(document.destroy).toHaveBeenCalledTimes(1);
-  });
-
-  it("maps corrupt PDF loading to 422 and destroys the loading task", async () => {
-    const loadingTask: PdfLoadingTask = {
-      promise: Promise.reject(new Error("corrupt details")),
-      destroy: jest.fn().mockResolvedValue(undefined),
-    };
-
-    await expect(parseResumeFile(pdfUpload(), () => loadingTask)).rejects.toEqual(
-      expect.objectContaining({ code: "resume_parse_failed", status: 422 }),
+  it("passes PDF bytes and the same deadline to the isolated parser", async () => {
+    const deadline = createResumeDeadline(15_000, parseFailure());
+    const parser = jest.fn(
+      async (_bytes: Buffer, receivedDeadline: ResumeDeadline) => {
+        expect(receivedDeadline).toBe(deadline);
+        return "pdf text";
+      },
     );
-    expect(loadingTask.destroy).toHaveBeenCalledTimes(1);
-  });
-
-  it("enforces a deadline while PDF loading is pending and destroys the task", async () => {
-    jest.useFakeTimers();
-    const loadingTask: PdfLoadingTask = {
-      promise: new Promise(() => undefined),
-      destroy: jest.fn().mockResolvedValue(undefined),
-    };
 
     try {
-      const parsing = parseResumeFile(pdfUpload(), () => loadingTask, {
-        deadlineMs: 15_000,
-      });
-      const rejection = expect(parsing).rejects.toMatchObject({
-        code: "resume_parse_failed",
-        status: 422,
-      });
-      await jest.advanceTimersByTimeAsync(15_001);
-
-      await rejection;
-      expect(loadingTask.destroy).toHaveBeenCalledTimes(1);
+      await expect(
+        parseResumeFile(pdfUpload(), parser, { deadline }),
+      ).resolves.toBe("pdf text");
+      expect(parser).toHaveBeenCalledWith(pdfUpload().bytes, deadline);
     } finally {
-      jest.useRealTimers();
+      deadline.dispose();
     }
   });
 
-  it("destroys the PDF document when page extraction fails", async () => {
-    const document = fakeDocument(1);
-    document.getPage.mockRejectedValueOnce(new Error("page failure"));
+  it("maps isolated parser details to the stable 422 error", async () => {
+    const parser: PdfTextParser = jest
+      .fn(async () => "")
+      .mockRejectedValue(new Error("private parser detail"));
+
+    const error = await parse(pdfUpload(), parser).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toMatchObject({
+      name: "ParseResumeError",
+      code: "resume_parse_failed",
+      status: 422,
+    });
+    expect(String(error)).not.toContain("private parser detail");
+  });
+
+  it("honors a deadline that expired during upload before parsing text", async () => {
+    const reason = parseFailure();
+    const controller = new AbortController();
+    controller.abort(reason);
+    const deadline = {
+      expiresAt: 0,
+      signal: controller.signal,
+      remainingMs: () => 0,
+      dispose: () => undefined,
+    };
 
     await expect(
-      parseResumeFile(pdfUpload(), () => resolvedLoadingTask(document)),
-    ).rejects.toMatchObject({ code: "resume_parse_failed", status: 422 });
-    expect(document.destroy).toHaveBeenCalledTimes(1);
+      parseResumeFile(textUpload("hello"), unusedPdfParser, { deadline }),
+    ).rejects.toBe(reason);
   });
 
   it("exposes only stable error metadata", () => {
-    expect(new ParseResumeError("resume_parse_failed")).toMatchObject({
+    expect(parseFailure()).toMatchObject({
       name: "ParseResumeError",
       code: "resume_parse_failed",
       status: 422,
@@ -132,9 +117,25 @@ describe("resume file parsing policy", () => {
   });
 });
 
-const unusedPdfLoader = () => {
-  throw new Error("PDF loader should not be called");
+const unusedPdfParser: PdfTextParser = async () => {
+  throw new Error("PDF parser should not be called");
 };
+
+async function parse(
+  file: ResumeUpload,
+  parser: PdfTextParser = unusedPdfParser,
+): Promise<string> {
+  const deadline = createResumeDeadline(15_000, parseFailure());
+  try {
+    return await parseResumeFile(file, parser, { deadline });
+  } finally {
+    deadline.dispose();
+  }
+}
+
+function parseFailure(): ParseResumeError {
+  return new ParseResumeError("resume_parse_failed");
+}
 
 function upload(filename: string, mimeType: string, contents: string): ResumeUpload {
   return { filename, mimeType, bytes: Buffer.from(contents) };
@@ -146,25 +147,4 @@ function textUpload(contents: string): ResumeUpload {
 
 function pdfUpload(): ResumeUpload {
   return upload("resume.pdf", "application/pdf", "%PDF-1.7");
-}
-
-function fakeDocument(numPages: number) {
-  return {
-    numPages,
-    getPage: jest.fn(async (pageNumber: number) => ({
-      getTextContent: jest.fn().mockResolvedValue({
-        items: [{ str: `page ${pageNumber}` }],
-      }),
-    })),
-    destroy: jest.fn().mockResolvedValue(undefined),
-  };
-}
-
-function resolvedLoadingTask(
-  document: ReturnType<typeof fakeDocument>,
-): PdfLoadingTask {
-  return {
-    promise: Promise.resolve(document),
-    destroy: jest.fn().mockResolvedValue(undefined),
-  };
 }

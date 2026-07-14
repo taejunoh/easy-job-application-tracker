@@ -71,14 +71,13 @@ jest.mock("@/lib/keyword-matcher", () => ({
   analyzeKeywordMatch: jest.fn(),
 }));
 
+jest.mock("@/lib/resume/pdf-worker-client", () => ({
+  parsePdfInWorker: jest.fn(),
+}));
+
 jest.mock("@/lib/crypto", () => ({
   decrypt: jest.fn(() => "decrypted-key"),
   encrypt: jest.fn((value: string) => `encrypted:${value}`),
-}));
-
-jest.mock("pdfjs-dist/legacy/build/pdf.mjs", () => ({
-  GlobalWorkerOptions: {},
-  getDocument: jest.fn(),
 }));
 
 import { prisma } from "@/lib/prisma";
@@ -90,7 +89,7 @@ import {
   safeFetchJobUrl,
   type SafeFetchErrorCode,
 } from "@/lib/security/safe-fetch";
-import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { parsePdfInWorker } from "@/lib/resume/pdf-worker-client";
 
 const APP_ORIGIN = "https://jobs.example.com";
 const EXTENSION_ORIGIN =
@@ -712,6 +711,7 @@ describe("protected product API actual requests", () => {
     const response = await parseResumeRoute.POST(requestFactory());
 
     expect(response.status).toBe(status);
+    expect(response.headers.get("Cache-Control")).toContain("no-store");
     await expect(response.json()).resolves.toEqual({
       error: expect.any(String),
       code,
@@ -719,12 +719,9 @@ describe("protected product API actual requests", () => {
   });
 
   it("parse resume maps corrupt PDFs to resume_parse_failed", async () => {
-    const corruptPdf = Promise.reject(new Error("private parser detail"));
-    void corruptPdf.catch(() => undefined);
-    jest.mocked(getDocument).mockReturnValueOnce({
-      promise: corruptPdf,
-      destroy: jest.fn().mockResolvedValue(undefined),
-    } as never);
+    jest
+      .mocked(parsePdfInWorker)
+      .mockRejectedValueOnce(new Error("private parser detail"));
     const form = new FormData();
     form.set(
       "resume",
@@ -739,6 +736,7 @@ describe("protected product API actual requests", () => {
       error: expect.any(String),
       code: "resume_parse_failed",
     });
+    expect(response.headers.get("Cache-Control")).toContain("no-store");
     expect(text).not.toContain("private parser detail");
   });
 
@@ -760,6 +758,67 @@ describe("protected product API actual requests", () => {
       error: "Invalid request",
       code: "invalid_request",
     });
+    expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("settings accepts exactly 500,000 Unicode code points", async () => {
+    const request = authenticatedSettingsRequest(
+      JSON.stringify({ resumeText: `${"a".repeat(499_999)}😀` }),
+    );
+
+    const response = await settingsRoute.PUT(request);
+
+    expect(response.status).toBe(200);
+    expect(prisma.settings.findFirst).toHaveBeenCalled();
+  });
+
+  it.each([
+    ["without Content-Length", undefined],
+    ["with a lying Content-Length", "1"],
+  ])(
+    "settings rejects an actual JSON envelope above 6 MiB %s",
+    async (_name, contentLength) => {
+      const body = jsonEnvelopeOfSize(6 * 1024 * 1024 + 1);
+      const response = await settingsRoute.PUT(
+        authenticatedSettingsRequest(body, contentLength),
+      );
+
+      expect(response.status).toBe(413);
+      await expect(response.json()).resolves.toEqual({
+        error: "Request too large",
+        code: "request_too_large",
+      });
+      expect(response.headers.get("Cache-Control")).toContain("no-store");
+      expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+    },
+  );
+
+  it("settings accepts an actual JSON envelope exactly at 6 MiB", async () => {
+    const response = await settingsRoute.PUT(
+      authenticatedSettingsRequest(jsonEnvelopeOfSize(6 * 1024 * 1024)),
+    );
+
+    expect(response.status).toBe(200);
+    expect(prisma.settings.findFirst).toHaveBeenCalled();
+  });
+
+  it("settings rejects an oversized stream without awaiting reader cancellation", async () => {
+    const cancel = jest.fn(() => new Promise<void>(() => undefined));
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(6 * 1024 * 1024 + 1));
+      },
+      cancel,
+    });
+    const request = authenticatedSettingsStreamRequest(body);
+
+    const outcome = await settleResponseWithin(settingsRoute.PUT(request), 200);
+
+    expect(outcome.status).toBe("resolved");
+    if (outcome.status !== "resolved") return;
+    expect(outcome.response.status).toBe(413);
+    expect(outcome.response.headers.get("Cache-Control")).toContain("no-store");
+    expect(cancel).toHaveBeenCalled();
     expect(prisma.settings.findFirst).not.toHaveBeenCalled();
   });
 
@@ -930,6 +989,63 @@ function authenticatedResumeRequest(
   });
 }
 
+function authenticatedSettingsRequest(
+  body: string,
+  contentLength?: string,
+): NextRequest {
+  const headers = new Headers({
+    Origin: EXTENSION_ORIGIN,
+    Authorization: `Bearer ${ACCESS_TOKEN}`,
+    "Content-Type": "application/json",
+  });
+  if (contentLength !== undefined) headers.set("Content-Length", contentLength);
+  return new NextRequest("https://jobs.example.com/api/settings", {
+    method: "PUT",
+    headers,
+    body,
+  });
+}
+
+function authenticatedSettingsStreamRequest(
+  body: ReadableStream<Uint8Array>,
+): NextRequest {
+  return new NextRequest("https://jobs.example.com/api/settings", {
+    method: "PUT",
+    headers: {
+      Origin: EXTENSION_ORIGIN,
+      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body,
+    duplex: "half",
+  } as never);
+}
+
+function jsonEnvelopeOfSize(byteLength: number): string {
+  const prefix = '{"padding":"';
+  const suffix = '"}';
+  return `${prefix}${"x".repeat(byteLength - prefix.length - suffix.length)}${suffix}`;
+}
+
+async function settleResponseWithin(
+  promise: Promise<Response>,
+  timeoutMs: number,
+): Promise<
+  | { status: "resolved"; response: Response }
+  | { status: "rejected"; reason: unknown }
+  | { status: "pending" }
+> {
+  return Promise.race([
+    promise.then(
+      (response) => ({ status: "resolved" as const, response }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    ),
+    new Promise<{ status: "pending" }>((resolve) => {
+      setTimeout(() => resolve({ status: "pending" }), timeoutMs);
+    }),
+  ]);
+}
+
 function jsonBody(route: ActualRouteCase): Record<string, string> {
   switch (route.name) {
     case "applications POST":
@@ -1028,17 +1144,7 @@ function arrangeSuccessfulBusinessLogic(): void {
     html: "<html><title>Engineer</title></html>",
     finalUrl: "https://example.com/jobs/1",
   });
-  jest.mocked(getDocument).mockReturnValue({
-    promise: Promise.resolve({
-      numPages: 1,
-      getPage: jest.fn().mockResolvedValue({
-        getTextContent: jest.fn().mockResolvedValue({
-          items: [{ str: "resume text" }],
-        }),
-      }),
-      destroy: jest.fn().mockResolvedValue(undefined),
-    }),
-  } as never);
+  jest.mocked(parsePdfInWorker).mockResolvedValue("resume text");
 }
 
 function expectNoDownstreamWork(): void {
@@ -1069,7 +1175,7 @@ function expectedDownstream(route: ActualRouteCase): jest.Mock {
     case "keyword analysis POST":
       return jest.mocked(analyzeKeywordMatch);
     case "parse resume POST":
-      return jest.mocked(getDocument);
+      return jest.mocked(parsePdfInWorker);
     case "settings GET":
     case "settings PUT":
       return jest.mocked(prisma.settings.findFirst);
@@ -1095,6 +1201,6 @@ function downstreamMocks(): jest.Mock[] {
     jest.mocked(createProvider),
     jest.mocked(analyzeKeywordMatch),
     jest.mocked(safeFetchJobUrl),
-    jest.mocked(getDocument),
+    jest.mocked(parsePdfInWorker),
   ];
 }

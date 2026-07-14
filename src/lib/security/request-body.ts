@@ -1,6 +1,7 @@
 import "server-only";
 
 export const MAX_LOGIN_BODY_BYTES = 4_096;
+export const MAX_SETTINGS_BODY_BYTES = 6 * 1024 * 1024;
 
 export class RequestBodyTooLargeError extends Error {
   constructor() {
@@ -54,7 +55,7 @@ export async function readBoundedJsonBody(
       if (done) break;
       totalBytes += value.byteLength;
       if (totalBytes > maxBytes) {
-        await reader.cancel().catch(() => undefined);
+        void reader.cancel().catch(() => undefined);
         throw new RequestBodyTooLargeError();
       }
       chunks.push(value);
