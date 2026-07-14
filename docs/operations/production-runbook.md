@@ -65,7 +65,9 @@ self-hosted contract with a direct Next.js command.
 5. Promote the candidate, repeat the public `401` check immediately, then run a
    create/update/delete smoke record with cleanup in a `finally` path.
 6. Confirm browser session sign-in and Chrome extension pairing, save, and
-   disconnect behavior on the canonical origin.
+   disconnect behavior on the canonical origin by completing
+   [the Chrome extension smoke runbook](chrome-extension-smoke.md), including
+   its unconditional row, permission, and credential cleanup.
 7. Inspect Vercel logs for the release window and require no related 5xx
    response before closing the release.
 

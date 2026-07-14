@@ -92,4 +92,44 @@ describe("production operations documentation contract", () => {
     }
     expect(evidence).not.toMatch(/\/Users\/|taejunoh|Bearer\s+\S+/u);
   });
+
+  it("documents the isolated bundled-Chromium extension E2E contract", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const smokeRunbook = readFileSync(
+      join(root, "docs/operations/chrome-extension-smoke.md"),
+      "utf8",
+    );
+    const normalizedSmokeRunbook = smokeRunbook.replace(/\s+/gu, " ");
+
+    for (const requiredText of [
+      "npm run test:extension:e2e:local",
+      "npm run test:extension:e2e",
+      "PostgreSQL 17",
+      "jobtracker_extension_e2e_test",
+      "bundled Chromium",
+      "docs/operations/chrome-extension-smoke.md",
+    ]) {
+      expect(readme).toContain(requiredText);
+    }
+
+    for (const requiredText of [
+      "actual Chrome action popup",
+      "https://jobs.lever.co/*",
+      "chrome.developerPrivate.addHostPermission",
+      "isolated temporary profile",
+      "exact loopback",
+      "no HAR or trace",
+      "full extension reload",
+      "system Chrome",
+      "https://easy-job-application-tracker.vercel.app",
+      "gihbagcjnmkhkekjkbfjhcbddnamaiap",
+      "activeTab",
+      "invalid token",
+      "unique marker",
+      "permission cleanup",
+      "credential cleanup",
+    ]) {
+      expect(normalizedSmokeRunbook).toContain(requiredText);
+    }
+  });
 });

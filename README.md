@@ -207,15 +207,48 @@ procedures are maintained in the
 [2026-07-14 cutover record](docs/operations/production-cutover-2026-07-14.md)
 contains sanitized release evidence.
 
+### Chrome Extension E2E
+
+Run the isolated extension journey locally with:
+
+```bash
+npm run test:extension:e2e:local
+```
+
+The wrapper requires a local PostgreSQL 17 server listening on the explicit
+loopback address `127.0.0.1:5432`. It connects to the `postgres` maintenance
+database as the `postgres` role by default; set
+`EXTENSION_E2E_POSTGRES_ADMIN_URL` to another loopback PostgreSQL 17 admin URL
+when needed. The wrapper refuses to proceed if the exact disposable database
+`jobtracker_extension_e2e_test` already exists. Otherwise, it creates that
+database, builds the app with fixed non-production values, runs the E2E suite,
+and force-drops the disposable database in its cleanup path.
+
+The suite uses Playwright's bundled Chromium and a temporary browser profile;
+it never launches or modifies system Chrome. It drives the actual extension
+action popup through invalid and valid pairing, extraction, save, database
+verification, popup reopen, disconnect, and server-`401` cleanup journeys.
+The lower-level CI command is `npm run test:extension:e2e`; do not run it
+directly unless its destructive-test sentinels, exact disposable database,
+server identity, migration, build, and browser prerequisites are already in
+place.
+
+The automated scope and the required manual production verification are
+documented in the
+[Chrome extension smoke runbook](docs/operations/chrome-extension-smoke.md).
+
 ### Continuous Integration
 
-The GitHub Actions workflow runs on Node.js 22.22.2 with a disposable PostgreSQL
-16 service. It installs the checked-in dependency graph, validates and applies
-the Prisma migration history, verifies schema parity, checks the extension's
-static assets, runs the full unit and database integration suite, lints,
-typechecks with `next typegen`, and creates a production build. All credentials
-in the workflow are fixed test-only values; the workflow does not require
-repository secrets or contact external application services.
+The primary GitHub Actions verification job runs on Node.js 22.22.2 with a
+disposable PostgreSQL 16 service. It installs the checked-in dependency graph,
+validates and applies the Prisma migration history, verifies schema parity,
+checks the extension's static assets, runs the full unit and database
+integration suite, lints, typechecks with `next typegen`, and creates a
+production build. A separate extension E2E job uses a digest-pinned PostgreSQL
+17 service, installs Playwright's bundled Chromium, builds the app, and runs
+`npm run test:extension:e2e`. All credentials in both jobs are fixed test-only
+values; neither job requires repository secrets or contacts external
+application services.
 
 The database integration suite runs only when every destructive-test guard is
 satisfied: `RUN_DATABASE_INTEGRATION=1`,
