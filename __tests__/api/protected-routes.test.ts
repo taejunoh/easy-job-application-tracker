@@ -1,0 +1,726 @@
+import { NextRequest } from "next/server";
+
+import * as applicationsRoute from "@/app/api/applications/route";
+import * as applicationDetailRoute from "@/app/api/applications/[id]/route";
+import * as extractRoute from "@/app/api/extract/route";
+import * as keywordAnalysisRoute from "@/app/api/keyword-analysis/route";
+import * as parseResumeRoute from "@/app/api/parse-resume/route";
+import * as settingsRoute from "@/app/api/settings/route";
+import * as statsRoute from "@/app/api/stats/route";
+import {
+  SESSION_COOKIE_NAME,
+  createSessionToken,
+} from "@/lib/security/auth";
+
+jest.mock("@/lib/server-env", () => {
+  const actual = jest.requireActual<typeof import("@/lib/server-env")>(
+    "@/lib/server-env",
+  );
+  const config = actual.parseServerEnv(
+    {
+      DATABASE_URL: "postgresql://user:password@db.example.com:5432/jobtracker",
+      ENCRYPTION_SECRET: "encryption-secret-" + "e".repeat(32),
+      APP_ACCESS_TOKEN: "access-token-" + "a".repeat(32),
+      APP_BASE_URL: "https://jobs.example.com",
+      CORS_ALLOWED_ORIGINS:
+        "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+    },
+    "production",
+  );
+
+  return { ...actual, getServerEnv: () => config };
+});
+
+jest.mock("@/lib/prisma", () => ({
+  prisma: {
+    application: {
+      findMany: jest.fn(),
+      findUnique: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+      delete: jest.fn(),
+      count: jest.fn(),
+    },
+    settings: {
+      findFirst: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+    },
+  },
+}));
+
+jest.mock("@/lib/extract/meta-parser", () => ({
+  parseMetaTags: jest.fn(),
+}));
+
+jest.mock("@/lib/extract/llm-provider", () => ({
+  createProvider: jest.fn(() => ({ extract: jest.fn() })),
+}));
+
+jest.mock("@/lib/keyword-matcher", () => ({
+  analyzeKeywordMatch: jest.fn(),
+}));
+
+jest.mock("@/lib/crypto", () => ({
+  decrypt: jest.fn(() => "decrypted-key"),
+  encrypt: jest.fn((value: string) => `encrypted:${value}`),
+}));
+
+jest.mock("pdfjs-dist/legacy/build/pdf.mjs", () => ({
+  GlobalWorkerOptions: {},
+  getDocument: jest.fn(),
+}));
+
+import { prisma } from "@/lib/prisma";
+import { createProvider } from "@/lib/extract/llm-provider";
+import { parseMetaTags } from "@/lib/extract/meta-parser";
+import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
+import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+
+const fetchMock = jest.fn();
+global.fetch = fetchMock;
+
+const APP_ORIGIN = "https://jobs.example.com";
+const EXTENSION_ORIGIN =
+  "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+const UNKNOWN_ORIGIN = "https://evil.example.com";
+const ACCESS_TOKEN = "access-token-" + "a".repeat(32);
+const SESSION_COOKIE = `${SESSION_COOKIE_NAME}=${createSessionToken()}`;
+
+type RouteContext = { params: Promise<{ id: string }> };
+type RouteHandler = (
+  request: NextRequest,
+  context?: RouteContext,
+) => Response | Promise<Response>;
+type RouteModule = Record<string, unknown>;
+
+type ActualRouteCase = Readonly<{
+  name: string;
+  pathname: string;
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  module: RouteModule;
+  body?: "json" | "resume";
+  successStatus: number;
+  context?: () => RouteContext;
+}>;
+
+type PreflightCase = Readonly<{
+  name: string;
+  pathname: string;
+  module: RouteModule;
+  requestMethod: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  allowedMethods: string;
+}>;
+
+const actualRoutes: readonly ActualRouteCase[] = [
+  {
+    name: "applications GET",
+    pathname: "/api/applications",
+    method: "GET",
+    module: applicationsRoute,
+    successStatus: 200,
+  },
+  {
+    name: "applications POST",
+    pathname: "/api/applications",
+    method: "POST",
+    module: applicationsRoute,
+    body: "json",
+    successStatus: 201,
+  },
+  {
+    name: "application detail GET",
+    pathname: "/api/applications/app-1",
+    method: "GET",
+    module: applicationDetailRoute,
+    successStatus: 200,
+    context: detailContext,
+  },
+  {
+    name: "application detail PATCH",
+    pathname: "/api/applications/app-1",
+    method: "PATCH",
+    module: applicationDetailRoute,
+    body: "json",
+    successStatus: 200,
+    context: detailContext,
+  },
+  {
+    name: "application detail DELETE",
+    pathname: "/api/applications/app-1",
+    method: "DELETE",
+    module: applicationDetailRoute,
+    successStatus: 200,
+    context: detailContext,
+  },
+  {
+    name: "extract POST",
+    pathname: "/api/extract",
+    method: "POST",
+    module: extractRoute,
+    body: "json",
+    successStatus: 200,
+  },
+  {
+    name: "keyword analysis POST",
+    pathname: "/api/keyword-analysis",
+    method: "POST",
+    module: keywordAnalysisRoute,
+    body: "json",
+    successStatus: 200,
+  },
+  {
+    name: "parse resume POST",
+    pathname: "/api/parse-resume",
+    method: "POST",
+    module: parseResumeRoute,
+    body: "resume",
+    successStatus: 200,
+  },
+  {
+    name: "settings GET",
+    pathname: "/api/settings?includeResume=true",
+    method: "GET",
+    module: settingsRoute,
+    successStatus: 200,
+  },
+  {
+    name: "settings PUT",
+    pathname: "/api/settings",
+    method: "PUT",
+    module: settingsRoute,
+    body: "json",
+    successStatus: 200,
+  },
+  {
+    name: "stats GET",
+    pathname: "/api/stats",
+    method: "GET",
+    module: statsRoute,
+    successStatus: 200,
+  },
+] as const;
+
+const preflightRoutes: readonly PreflightCase[] = [
+  {
+    name: "applications OPTIONS",
+    pathname: "/api/applications",
+    module: applicationsRoute,
+    requestMethod: "POST",
+    allowedMethods: "GET, HEAD, POST",
+  },
+  {
+    name: "application detail OPTIONS",
+    pathname: "/api/applications/app-1",
+    module: applicationDetailRoute,
+    requestMethod: "PATCH",
+    allowedMethods: "GET, HEAD, PATCH, DELETE",
+  },
+  {
+    name: "extract OPTIONS",
+    pathname: "/api/extract",
+    module: extractRoute,
+    requestMethod: "POST",
+    allowedMethods: "POST",
+  },
+  {
+    name: "keyword analysis OPTIONS",
+    pathname: "/api/keyword-analysis",
+    module: keywordAnalysisRoute,
+    requestMethod: "POST",
+    allowedMethods: "POST",
+  },
+  {
+    name: "parse resume OPTIONS",
+    pathname: "/api/parse-resume",
+    module: parseResumeRoute,
+    requestMethod: "POST",
+    allowedMethods: "POST",
+  },
+  {
+    name: "settings OPTIONS",
+    pathname: "/api/settings",
+    module: settingsRoute,
+    requestMethod: "PUT",
+    allowedMethods: "GET, HEAD, PUT",
+  },
+  {
+    name: "stats OPTIONS",
+    pathname: "/api/stats",
+    module: statsRoute,
+    requestMethod: "GET",
+    allowedMethods: "GET, HEAD",
+  },
+] as const;
+
+describe("protected product API actual requests", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    arrangeSuccessfulBusinessLogic();
+  });
+
+  it.each(actualRoutes)(
+    "$name returns 401 before request parsing or downstream work",
+    async (route) => {
+      const request = productRequest(route);
+      const jsonSpy = jest.spyOn(request, "json");
+      const formDataSpy = jest.spyOn(request, "formData");
+
+      const response = await invokeActual(route, request);
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toEqual({
+        error: "Authentication required",
+        code: "unauthorized",
+      });
+      expect(jsonSpy).not.toHaveBeenCalled();
+      expect(formDataSpy).not.toHaveBeenCalled();
+      expectNoDownstreamWork();
+    },
+  );
+
+  it.each(actualRoutes)(
+    "$name rejects an unknown Origin with 403 before authentication or work",
+    async (route) => {
+      const response = await invokeActual(
+        route,
+        productRequest(route, { origin: UNKNOWN_ORIGIN }),
+      );
+
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toEqual({
+        error: "Origin not allowed",
+        code: "origin_not_allowed",
+      });
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+      expectNoDownstreamWork();
+    },
+  );
+
+  it.each(actualRoutes)(
+    "$name exposes its anonymous 401 to the exact allowed extension Origin",
+    async (route) => {
+      const response = await invokeActual(
+        route,
+        productRequest(route, { origin: EXTENSION_ORIGIN }),
+      );
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toEqual({
+        error: "Authentication required",
+        code: "unauthorized",
+      });
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        EXTENSION_ORIGIN,
+      );
+      expect(response.headers.get("Access-Control-Allow-Credentials")).toBeNull();
+      expect(response.headers.get("Vary")).toContain("Origin");
+      expectNoDownstreamWork();
+    },
+  );
+
+  it.each(actualRoutes)(
+    "$name lets a valid extension Bearer request reach business logic",
+    async (route) => {
+      const response = await invokeActual(
+        route,
+        productRequest(route, {
+          origin: EXTENSION_ORIGIN,
+          authorization: `Bearer ${ACCESS_TOKEN}`,
+        }),
+      );
+
+      expect(response.status).toBe(route.successStatus);
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        EXTENSION_ORIGIN,
+      );
+      expectAnyDownstreamWork(route);
+    },
+  );
+
+  it.each(actualRoutes)(
+    "$name lets a valid same-origin web session reach business logic",
+    async (route) => {
+      const response = await invokeActual(
+        route,
+        productRequest(route, {
+          origin: APP_ORIGIN,
+          cookie: SESSION_COOKIE,
+        }),
+      );
+
+      expect(response.status).toBe(route.successStatus);
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        APP_ORIGIN,
+      );
+      expect(response.headers.get("Access-Control-Allow-Credentials")).toBe(
+        "true",
+      );
+      expectAnyDownstreamWork(route);
+    },
+  );
+
+  it.each([
+    ["Bearer", { authorization: `Bearer ${ACCESS_TOKEN}` }],
+    ["web session", { cookie: SESSION_COOKIE }],
+  ])(
+    "allows an authenticated %s GET without Origin and omits allow-origin",
+    async (_name, authentication) => {
+      const route = actualRoutes[0];
+      const response = await invokeActual(
+        route,
+        productRequest(route, authentication),
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+      expect(prisma.application.findMany).toHaveBeenCalled();
+    },
+  );
+
+  it("decorates a handler-owned error for an allowed extension Origin", async () => {
+    const route = actualRoutes.find(
+      ({ name }) => name === "applications POST",
+    ) as ActualRouteCase;
+    const request = productRequest(route, {
+      origin: EXTENSION_ORIGIN,
+      authorization: `Bearer ${ACCESS_TOKEN}`,
+    });
+    jest.spyOn(request, "json").mockResolvedValue({});
+
+    const response = await invokeActual(route, request);
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "url, jobTitle, and company are required",
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+  });
+
+  it("converts an unexpected handler error to a stable, non-leaking response", async () => {
+    const route = actualRoutes.find(
+      ({ name }) => name === "stats GET",
+    ) as ActualRouteCase;
+    jest
+      .mocked(prisma.application.count)
+      .mockRejectedValueOnce(new Error("database password leaked"));
+    const consoleError = jest
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    const response = await invokeActual(
+      route,
+      productRequest(route, {
+        origin: EXTENSION_ORIGIN,
+        authorization: `Bearer ${ACCESS_TOKEN}`,
+      }),
+    );
+
+    expect(response.status).toBe(500);
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({
+      error: "Internal server error",
+      code: "internal_error",
+    });
+    expect(text).not.toContain("database password leaked");
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+    expect(consoleError).toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it.each([
+    [
+      "applications POST",
+      () =>
+        jest
+          .mocked(prisma.application.create)
+          .mockRejectedValueOnce(new Error("database detail")),
+    ],
+    [
+      "extract POST",
+      () => fetchMock.mockRejectedValueOnce(new Error("network detail")),
+    ],
+  ])(
+    "normalizes an internally caught %s failure to internal_error",
+    async (name, arrangeFailure) => {
+      const route = actualRoutes.find(
+        (candidate) => candidate.name === name,
+      ) as ActualRouteCase;
+      arrangeFailure();
+      const consoleError = jest
+        .spyOn(console, "error")
+        .mockImplementation(() => undefined);
+
+      const response = await invokeActual(
+        route,
+        productRequest(route, {
+          origin: EXTENSION_ORIGIN,
+          authorization: `Bearer ${ACCESS_TOKEN}`,
+        }),
+      );
+
+      expect(response.status).toBe(500);
+      await expect(response.json()).resolves.toEqual({
+        error: "Internal server error",
+        code: "internal_error",
+      });
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        EXTENSION_ORIGIN,
+      );
+      consoleError.mockRestore();
+    },
+  );
+});
+
+describe("protected product API preflights", () => {
+  it.each(preflightRoutes)(
+    "$name succeeds without authentication for its exact extension Origin",
+    async (route) => {
+      const response = await invokeOptions(
+        route,
+        preflightRequest(route, EXTENSION_ORIGIN),
+      );
+
+      expect(response.status).toBe(204);
+      expect(await response.text()).toBe("");
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        EXTENSION_ORIGIN,
+      );
+      expect(response.headers.get("Access-Control-Allow-Methods")).toBe(
+        route.allowedMethods,
+      );
+      expect(response.headers.get("Access-Control-Allow-Headers")).toBe(
+        "Authorization, Content-Type",
+      );
+    },
+  );
+
+  it.each(preflightRoutes)("$name rejects an unknown Origin", async (route) => {
+    const response = await invokeOptions(
+      route,
+      preflightRequest(route, UNKNOWN_ORIGIN),
+    );
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: "Origin not allowed",
+      code: "origin_not_allowed",
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+});
+
+function detailContext(): RouteContext {
+  return { params: Promise.resolve({ id: "app-1" }) };
+}
+
+function productRequest(
+  route: ActualRouteCase,
+  authentication: {
+    origin?: string;
+    authorization?: string;
+    cookie?: string;
+  } = {},
+): NextRequest {
+  const headers = new Headers();
+  if (authentication.origin !== undefined) {
+    headers.set("Origin", authentication.origin);
+  }
+  if (authentication.authorization !== undefined) {
+    headers.set("Authorization", authentication.authorization);
+  }
+  if (authentication.cookie !== undefined) {
+    headers.set("Cookie", authentication.cookie);
+  }
+
+  let body: BodyInit | undefined;
+  if (route.body === "json") {
+    headers.set("Content-Type", "application/json");
+    body = JSON.stringify(jsonBody(route));
+  } else if (route.body === "resume") {
+    const form = new FormData();
+    form.set(
+      "file",
+      new File(["resume pdf"], "resume.pdf", { type: "application/pdf" }),
+    );
+    body = form;
+  }
+
+  return new NextRequest(`https://jobs.example.com${route.pathname}`, {
+    method: route.method,
+    headers,
+    body,
+  });
+}
+
+function jsonBody(route: ActualRouteCase): Record<string, string> {
+  switch (route.name) {
+    case "applications POST":
+      return {
+        url: "https://example.com/jobs/1",
+        jobTitle: "Engineer",
+        company: "Example",
+      };
+    case "application detail PATCH":
+      return { status: "Interview" };
+    case "extract POST":
+      return { url: "https://example.com/jobs/1" };
+    case "keyword analysis POST":
+      return { description: "TypeScript and PostgreSQL" };
+    case "settings PUT":
+      return { llmProvider: "openai" };
+    default:
+      return {};
+  }
+}
+
+function preflightRequest(route: PreflightCase, origin: string): NextRequest {
+  return new NextRequest(`https://jobs.example.com${route.pathname}`, {
+    method: "OPTIONS",
+    headers: {
+      Origin: origin,
+      "Access-Control-Request-Method": route.requestMethod,
+      "Access-Control-Request-Headers": "Authorization, Content-Type",
+    },
+  });
+}
+
+async function invokeActual(
+  route: ActualRouteCase,
+  request: NextRequest,
+): Promise<Response> {
+  const handler = route.module[route.method];
+  expect(handler).toEqual(expect.any(Function));
+  return (handler as RouteHandler)(request, route.context?.());
+}
+
+async function invokeOptions(
+  route: PreflightCase,
+  request: NextRequest,
+): Promise<Response> {
+  const handler = route.module.OPTIONS;
+  expect(handler).toEqual(expect.any(Function));
+  return (handler as RouteHandler)(request);
+}
+
+function arrangeSuccessfulBusinessLogic(): void {
+  const application = {
+    id: "app-1",
+    url: "https://example.com/jobs/1",
+    jobTitle: "Engineer",
+    company: "Example",
+    status: "Applied",
+  };
+  jest.mocked(prisma.application.findMany).mockResolvedValue([]);
+  jest.mocked(prisma.application.findUnique).mockResolvedValue(application as never);
+  jest.mocked(prisma.application.create).mockResolvedValue(application as never);
+  jest.mocked(prisma.application.update).mockResolvedValue(application as never);
+  jest.mocked(prisma.application.delete).mockResolvedValue(application as never);
+  jest.mocked(prisma.application.count).mockResolvedValue(0);
+
+  const settings = {
+    id: "singleton",
+    llmProvider: "openai",
+    apiKey: "encrypted-key",
+    linkedinUrl: "",
+    githubUrl: "",
+    resumeText: "TypeScript PostgreSQL",
+  };
+  jest.mocked(prisma.settings.findFirst).mockResolvedValue(settings as never);
+  jest.mocked(prisma.settings.create).mockResolvedValue(settings as never);
+  jest.mocked(prisma.settings.update).mockResolvedValue(settings as never);
+
+  jest.mocked(parseMetaTags).mockReturnValue({
+    jobTitle: "Engineer",
+    company: "Example",
+    location: "Remote",
+  });
+  jest.mocked(createProvider).mockReturnValue({
+    extract: jest.fn().mockResolvedValue({
+      jobTitle: "Engineer",
+      company: "Example",
+    }),
+  });
+  jest.mocked(analyzeKeywordMatch).mockReturnValue({
+    matchPercentage: 100,
+    matchedKeywords: [],
+    missingKeywords: [],
+    totalJobKeywords: 0,
+  });
+  fetchMock.mockResolvedValue(
+    new Response("<html><title>Engineer</title></html>"),
+  );
+  jest.mocked(getDocument).mockReturnValue({
+    promise: Promise.resolve({
+      numPages: 1,
+      getPage: jest.fn().mockResolvedValue({
+        getTextContent: jest.fn().mockResolvedValue({
+          items: [{ str: "resume text" }],
+        }),
+      }),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    }),
+  } as never);
+}
+
+function expectNoDownstreamWork(): void {
+  for (const mock of downstreamMocks()) {
+    expect(mock).not.toHaveBeenCalled();
+  }
+}
+
+function expectAnyDownstreamWork(route: ActualRouteCase): void {
+  const expected = expectedDownstream(route);
+  expect(expected).toHaveBeenCalled();
+}
+
+function expectedDownstream(route: ActualRouteCase): jest.Mock {
+  switch (route.name) {
+    case "applications GET":
+      return jest.mocked(prisma.application.findMany);
+    case "applications POST":
+      return jest.mocked(prisma.application.create);
+    case "application detail GET":
+      return jest.mocked(prisma.application.findUnique);
+    case "application detail PATCH":
+      return jest.mocked(prisma.application.update);
+    case "application detail DELETE":
+      return jest.mocked(prisma.application.delete);
+    case "extract POST":
+      return jest.mocked(global.fetch);
+    case "keyword analysis POST":
+      return jest.mocked(analyzeKeywordMatch);
+    case "parse resume POST":
+      return jest.mocked(getDocument);
+    case "settings GET":
+    case "settings PUT":
+      return jest.mocked(prisma.settings.findFirst);
+    case "stats GET":
+      return jest.mocked(prisma.application.count);
+    default:
+      throw new Error(`Unhandled route: ${route.name}`);
+  }
+}
+
+function downstreamMocks(): jest.Mock[] {
+  return [
+    jest.mocked(prisma.application.findMany),
+    jest.mocked(prisma.application.findUnique),
+    jest.mocked(prisma.application.create),
+    jest.mocked(prisma.application.update),
+    jest.mocked(prisma.application.delete),
+    jest.mocked(prisma.application.count),
+    jest.mocked(prisma.settings.findFirst),
+    jest.mocked(prisma.settings.create),
+    jest.mocked(prisma.settings.update),
+    jest.mocked(parseMetaTags),
+    jest.mocked(createProvider),
+    jest.mocked(analyzeKeywordMatch),
+    fetchMock,
+    jest.mocked(getDocument),
+  ];
+}

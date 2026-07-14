@@ -1,7 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { createProtectedRoute } from "@/lib/security/protected-route";
 
-export async function GET(
+const route = createProtectedRoute(["GET", "PATCH", "DELETE"]);
+
+export const OPTIONS = route.OPTIONS;
+
+export const GET = route.handler(async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -16,9 +21,9 @@ export async function GET(
   }
 
   return NextResponse.json(application);
-}
+});
 
-export async function PATCH(
+export const PATCH = route.handler(async function PATCH(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -46,9 +51,9 @@ export async function PATCH(
       { status: 404 }
     );
   }
-}
+});
 
-export async function DELETE(
+export const DELETE = route.handler(async function DELETE(
   _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -63,4 +68,4 @@ export async function DELETE(
       { status: 404 }
     );
   }
-}
+});

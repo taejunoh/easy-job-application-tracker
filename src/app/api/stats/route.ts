@@ -1,7 +1,12 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { createProtectedRoute } from "@/lib/security/protected-route";
 
-export async function GET() {
+const route = createProtectedRoute(["GET"]);
+
+export const OPTIONS = route.OPTIONS;
+
+export const GET = route.handler(async function GET() {
   const [total, applied, interview, offer, rejected, recentApplications] =
     await Promise.all([
       prisma.application.count(),
@@ -39,4 +44,4 @@ export async function GET() {
     monthlyCount,
     recentApplications,
   });
-}
+});

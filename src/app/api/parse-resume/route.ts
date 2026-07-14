@@ -1,30 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { createProtectedRoute } from "@/lib/security/protected-route";
 
 // Point to the worker file for server-side usage
-GlobalWorkerOptions.workerSrc = new URL(
-  "pdfjs-dist/legacy/build/pdf.worker.mjs",
-  import.meta.url
-).toString();
+GlobalWorkerOptions.workerSrc = "pdfjs-dist/legacy/build/pdf.worker.mjs";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+const route = createProtectedRoute(["POST"]);
 
-export async function OPTIONS() {
-  return NextResponse.json(null, { headers: corsHeaders });
-}
+export const OPTIONS = route.OPTIONS;
 
-export async function POST(request: NextRequest) {
+export const POST = route.handler(async function POST(request: NextRequest) {
   const formData = await request.formData();
   const file = formData.get("file") as File | null;
 
   if (!file) {
     return NextResponse.json(
       { error: "No file uploaded" },
-      { status: 400, headers: corsHeaders }
+      { status: 400 }
     );
   }
 
@@ -52,5 +44,5 @@ export async function POST(request: NextRequest) {
     text = Buffer.from(arrayBuffer).toString("utf-8");
   }
 
-  return NextResponse.json({ text: text.trim() }, { headers: corsHeaders });
-}
+  return NextResponse.json({ text: text.trim() });
+});

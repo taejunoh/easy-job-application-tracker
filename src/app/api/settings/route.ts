@@ -1,18 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { encrypt } from "@/lib/crypto";
+import { createProtectedRoute } from "@/lib/security/protected-route";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, PUT, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+const route = createProtectedRoute(["GET", "PUT"]);
 
-export async function OPTIONS() {
-  return NextResponse.json(null, { headers: corsHeaders });
-}
+export const OPTIONS = route.OPTIONS;
 
-export async function GET(request: NextRequest) {
+export const GET = route.handler(async function GET(request: NextRequest) {
   let settings = await prisma.settings.findFirst();
 
   if (!settings) {
@@ -33,10 +28,10 @@ export async function GET(request: NextRequest) {
     response.resumeText = settings.resumeText;
   }
 
-  return NextResponse.json(response, { headers: corsHeaders });
-}
+  return NextResponse.json(response);
+});
 
-export async function PUT(request: NextRequest) {
+export const PUT = route.handler(async function PUT(request: NextRequest) {
   const body = await request.json();
 
   const data: Record<string, string> = {};
@@ -67,5 +62,5 @@ export async function PUT(request: NextRequest) {
     linkedinUrl: settings.linkedinUrl,
     githubUrl: settings.githubUrl,
     resumeText: settings.resumeText,
-  }, { headers: corsHeaders });
-}
+  });
+});
