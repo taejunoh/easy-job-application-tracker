@@ -7,7 +7,7 @@ if (!readyPath || !marker) {
   throw new Error("extension E2E signal fixture controls are required");
 }
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
+for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
   process.on(signal, () => undefined);
 }
 
@@ -16,7 +16,7 @@ const grandchild = spawn(
   [
     "--input-type=module",
     "--eval",
-    `for (const signal of ["SIGINT", "SIGTERM"]) {
+    `for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
       process.on(signal, () => undefined);
     }
     setInterval(() => undefined, 1000);`,
@@ -31,6 +31,7 @@ if (!Number.isInteger(grandchild.pid)) {
 await writeFile(
   readyPath,
   `${JSON.stringify({
+    wrapperPid: process.ppid,
     parentPid: process.pid,
     grandchildPid: grandchild.pid,
     marker,

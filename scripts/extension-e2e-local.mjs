@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import pg from "pg";
@@ -32,8 +33,9 @@ const state = {
   treeTerminationPromise: null,
 };
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.once(signal, () => {
+for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    traceSignal(signal, state.requestedSignal === null);
     if (state.requestedSignal) return;
     state.requestedSignal = signal;
     state.treeTerminationPromise = terminateActiveChildTree(signal);
@@ -122,7 +124,7 @@ if (failure) {
   );
   process.exitCode = 1;
 } else if (state.requestedSignal) {
-  process.exitCode = state.requestedSignal === "SIGINT" ? 130 : 143;
+  process.exitCode = signalExitCode(state.requestedSignal);
 }
 
 async function verifyPostgres17(admin, target) {
@@ -258,4 +260,24 @@ function throwIfShutdownRequested() {
 
 function quotedDatabaseName() {
   return `"${databaseName}"`;
+}
+
+function signalExitCode(signal) {
+  if (signal === "SIGHUP") return 129;
+  if (signal === "SIGINT") return 130;
+  return 143;
+}
+
+function traceSignal(signal, first) {
+  const tracePath = process.env.EXTENSION_E2E_SIGNAL_TRACE_PATH;
+  if (
+    !tracePath ||
+    process.env.EXTENSION_E2E_LOCAL_SIGNAL_FIXTURE !== "1" ||
+    process.env.RUN_EXTENSION_E2E_SIGNAL_INTEGRATION !== "1"
+  ) {
+    return;
+  }
+  appendFileSync(tracePath, `${signal}:${first ? "first" : "additional"}\n`, {
+    mode: 0o600,
+  });
 }
