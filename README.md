@@ -108,6 +108,10 @@ npx prisma migrate deploy
 npm run dev
 ```
 
+Use `npm run dev` for local development. Its startup preloader loads Next.js
+dotenv files and validates the complete server environment before Next.js opens
+a listener.
+
 Open [http://localhost:3000](http://localhost:3000). Update the extension's server URL to `http://localhost:3000`.
 
 ### Database Deployment
@@ -125,6 +129,20 @@ npx prisma migrate status
 Confirm that the `Application`, `Settings`, and `_prisma_migrations` tables are
 present before starting the application. The Settings row is created lazily on
 the first authenticated Settings request, so no database seed is required.
+
+Start a production deployment with:
+
+```bash
+npm start
+```
+
+`npm start` and `npm run dev` are the only supported application launch
+contracts. Direct `next start` and `npx next` invocations are unsupported, as
+are standalone output and hosting platforms that replace the package scripts,
+unless they execute `scripts/validate-startup-env.mjs` before opening a
+listener. The instrumentation hook remains a request-blocking defense in depth;
+Next.js 16 can print `Ready` before that hook finishes, so instrumentation alone
+does not provide startup fail-fast behavior.
 
 If an existing PostgreSQL database was previously created with
 `prisma db push`, do not apply the initial migration directly. Back up the
@@ -179,8 +197,10 @@ path segment matching `[A-Za-z0-9_]+_(ci|test)`. Query parameters, fragments,
 connection-service options, socket targets, ambiguous user information, and
 additional path segments are rejected. The suite also queries the connected
 PostgreSQL server for its database, address, port, and current schema before
-every bulk cleanup; those values must match the guarded loopback target and the
-`public` schema before any row is deleted. An integration run fails before
+every bulk cleanup. The address must exactly match
+`EXPECTED_DATABASE_SERVER_ADDRESS` (the inspected service-container bridge
+address in CI), and the other identity fields plus the `public` schema must
+match before any row is deleted. An integration run fails before
 Prisma is imported if the URL guard is missing, and before mutation if the live
 identity differs. Never point the suite at a development, staging, or
 production database because it deletes every application and settings row
