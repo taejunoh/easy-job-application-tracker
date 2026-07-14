@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "node --import ./scripts/validate-startup-env.mjs node_modules/next/dist/bin/next dev",
+    "dev": "node --import ./scripts/validate-startup-env-development.mjs node_modules/next/dist/bin/next dev",
     "build": "prisma generate && next build",
-    "start": "node --import ./scripts/validate-startup-env.mjs node_modules/next/dist/bin/next start",
+    "start": "node --import ./scripts/validate-startup-env-production.mjs node_modules/next/dist/bin/next start",
     "lint": "eslint",
     "test": "jest",
     "test:ci": "jest --runInBand",

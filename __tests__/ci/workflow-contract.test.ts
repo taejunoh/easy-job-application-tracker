@@ -40,9 +40,9 @@ describe("deployment verification contract", () => {
   it("provides deterministic typecheck, test, and extension checks", () => {
     expect(packageJson.scripts).toMatchObject({
       dev:
-        "node --import ./scripts/validate-startup-env.mjs node_modules/next/dist/bin/next dev",
+        "node --import ./scripts/validate-startup-env-development.mjs node_modules/next/dist/bin/next dev",
       start:
-        "node --import ./scripts/validate-startup-env.mjs node_modules/next/dist/bin/next start",
+        "node --import ./scripts/validate-startup-env-production.mjs node_modules/next/dist/bin/next start",
       typecheck: "next typegen && tsc --noEmit",
       "test:ci": "jest --runInBand",
       "check:startup-env": "node scripts/verify-invalid-startup.mjs",
@@ -61,17 +61,34 @@ describe("deployment verification contract", () => {
 
   it("documents the only startup commands that enforce pre-listen validation", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
-    const preloader = readFileSync(
-      join(root, "scripts/validate-startup-env.mjs"),
+    const loader = readFileSync(
+      join(root, "scripts/load-and-validate-startup-env.mjs"),
+      "utf8",
+    );
+    const developmentPreloader = readFileSync(
+      join(root, "scripts/validate-startup-env-development.mjs"),
+      "utf8",
+    );
+    const productionPreloader = readFileSync(
+      join(root, "scripts/validate-startup-env-production.mjs"),
       "utf8",
     );
 
-    expect(preloader).toContain("loadEnvConfig(process.cwd(), isDevelopment)");
+    expect(loader).toContain("loadEnvConfig(process.cwd(), isDevelopment)");
+    expect(loader).toContain("export function loadAndValidateStartupEnv");
+    expect(developmentPreloader).toContain(
+      "loadAndValidateStartupEnv(true)",
+    );
+    expect(productionPreloader).toContain(
+      "loadAndValidateStartupEnv(false)",
+    );
     expect(readme).toContain("npm start");
     expect(readme).toContain("npm run dev");
     expect(readme).toContain("Direct `next start` and `npx next`");
     expect(readme).toContain("unsupported");
     expect(readme).toContain("request-blocking defense in depth");
+    expect(readme).toContain("validate-startup-env-development.mjs");
+    expect(readme).toContain("validate-startup-env-production.mjs");
   });
 
   it("parses as the exact Node and PostgreSQL deployment gate", () => {

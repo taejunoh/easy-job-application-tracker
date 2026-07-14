@@ -1,5 +1,6 @@
 import {
   access,
+  cp,
   copyFile,
   mkdir,
   mkdtemp,
@@ -8,7 +9,6 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
@@ -34,6 +34,11 @@ const VALID_ENV = Object.freeze({
   APP_ACCESS_TOKEN: "startup-access-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   APP_BASE_URL: "https://jobtracker.test",
   CORS_ALLOWED_ORIGINS: "https://jobtracker.test",
+});
+const VALID_DEVELOPMENT_ENV = Object.freeze({
+  ...VALID_ENV,
+  APP_BASE_URL: "http://localhost:3000",
+  CORS_ALLOWED_ORIGINS: "http://localhost:3000",
 });
 const PRIVATE_INVALID_SECRET = "never-print-this-secret";
 
@@ -79,6 +84,12 @@ await verifyScenario({
   expected: "ready",
 });
 await verifyScenario({
+  name: "valid .env.development dev start",
+  files: { ".env.development": envFile(VALID_DEVELOPMENT_ENV) },
+  command: "dev",
+  expected: "ready",
+});
+await verifyScenario({
   name: "invalid .env.development dev start",
   files: {
     ".env": envFile(VALID_ENV),
@@ -98,7 +109,7 @@ async function verifyScenario({
   command,
   expected,
 }) {
-  const checkout = await createTemporaryCheckout(files);
+  const checkout = await createTemporaryCheckout(files, command);
   const port = await availablePort();
   const execution = startNpmCommand(checkout, command, port, explicitEnv);
 
@@ -108,7 +119,15 @@ async function verifyScenario({
       if (outcome.kind !== "ready") {
         throw new Error(`${name} exited before Ready: ${execution.output()}`);
       }
-      const response = await fetch(`http://127.0.0.1:${port}/connect`);
+      let response;
+      try {
+        response = await fetch(`http://127.0.0.1:${port}/connect`);
+      } catch (cause) {
+        throw new Error(
+          `${name} request failed after Ready: ${execution.output()}`,
+          { cause },
+        );
+      }
       if (response.status !== 200) {
         throw new Error(`${name} returned HTTP ${response.status}`);
       }
@@ -142,22 +161,47 @@ async function verifyScenario({
   }
 }
 
-async function createTemporaryCheckout(files) {
-  const checkout = await mkdtemp(join(tmpdir(), "jobtracker-startup-"));
+async function createTemporaryCheckout(files, command) {
+  const checkout = await mkdtemp(join(root, ".jobtracker-startup-"));
   await mkdir(join(checkout, "scripts"), { recursive: true });
-  await mkdir(join(checkout, "src", "lib"), { recursive: true });
+  if (command === "start") {
+    await mkdir(join(checkout, "src", "lib"), { recursive: true });
+  }
   await Promise.all([
     copyFile(join(root, "package.json"), join(checkout, "package.json")),
     copyFile(
-      join(root, "scripts", "validate-startup-env.mjs"),
-      join(checkout, "scripts", "validate-startup-env.mjs"),
+      join(root, "scripts", "load-and-validate-startup-env.mjs"),
+      join(checkout, "scripts", "load-and-validate-startup-env.mjs"),
     ),
     copyFile(
-      join(root, "src", "lib", "server-env-core.js"),
-      join(checkout, "src", "lib", "server-env-core.js"),
+      join(root, "scripts", "validate-startup-env-development.mjs"),
+      join(checkout, "scripts", "validate-startup-env-development.mjs"),
+    ),
+    copyFile(
+      join(root, "scripts", "validate-startup-env-production.mjs"),
+      join(checkout, "scripts", "validate-startup-env-production.mjs"),
     ),
     symlink(join(root, "node_modules"), join(checkout, "node_modules"), "dir"),
-    symlink(join(root, ".next"), join(checkout, ".next"), "dir"),
+    ...(command === "start"
+      ? [
+          copyFile(
+            join(root, "src", "lib", "server-env-core.js"),
+            join(checkout, "src", "lib", "server-env-core.js"),
+          ),
+          symlink(join(root, ".next"), join(checkout, ".next"), "dir"),
+        ]
+      : [
+          cp(join(root, "src"), join(checkout, "src"), { recursive: true }),
+          copyFile(
+            join(root, "next.config.ts"),
+            join(checkout, "next.config.ts"),
+          ),
+          copyFile(join(root, "tsconfig.json"), join(checkout, "tsconfig.json")),
+          copyFile(
+            join(root, "postcss.config.mjs"),
+            join(checkout, "postcss.config.mjs"),
+          ),
+        ]),
     ...Object.entries(files).map(([name, contents]) =>
       writeFile(join(checkout, name), contents, { mode: 0o600 }),
     ),

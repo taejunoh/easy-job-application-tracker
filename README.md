@@ -139,8 +139,9 @@ npm start
 `npm start` and `npm run dev` are the only supported application launch
 contracts. Direct `next start` and `npx next` invocations are unsupported, as
 are standalone output and hosting platforms that replace the package scripts,
-unless they execute `scripts/validate-startup-env.mjs` before opening a
-listener. The instrumentation hook remains a request-blocking defense in depth;
+unless they execute `scripts/validate-startup-env-development.mjs` or
+`scripts/validate-startup-env-production.mjs`, as appropriate, before opening
+a listener. The instrumentation hook remains a request-blocking defense in depth;
 Next.js 16 can print `Ready` before that hook finishes, so instrumentation alone
 does not provide startup fail-fast behavior.
 
