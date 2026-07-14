@@ -1,10 +1,13 @@
 import type { LookupAddress } from "node:dns";
+import { Response as UndiciResponse, errors as undiciErrors } from "undici";
 
 import {
   MAX_JOB_PAGE_BYTES,
   SafeFetchTransportError,
+  createPinnedConnector,
   createPinnedLookup,
   createSafeFetchJobUrl,
+  createUndiciTransport,
   validateJobUrl,
   type SafeFetchDependencies,
   type SafeFetchTransportRequest,
@@ -74,6 +77,154 @@ describe("createPinnedLookup", () => {
     await expect(runLookup(lookup, "attacker.example", true)).rejects.toMatchObject({
       code: "ENOTFOUND",
     });
+  });
+});
+
+describe("createPinnedConnector", () => {
+  it("pins connector hostname and explicitly preserves the TLS servername", () => {
+    const lookup = createPinnedLookup("example.com", [PUBLIC_V4]);
+    const innerConnector = jest.fn();
+    const connectorBuilder = jest.fn(() => innerConnector);
+    const connector = createPinnedConnector(
+      "example.com",
+      lookup,
+      10_000,
+      connectorBuilder as never,
+    );
+    const callback = jest.fn();
+    const options = {
+      hostname: "example.com",
+      host: "example.com:443",
+      protocol: "https:",
+      port: "443",
+    };
+
+    connector(options, callback);
+
+    expect(connectorBuilder).toHaveBeenCalledWith(
+      expect.objectContaining({ lookup, timeout: 10_000, maxCachedSessions: 0 }),
+    );
+    expect(innerConnector).toHaveBeenCalledWith(
+      { ...options, servername: "example.com" },
+      callback,
+    );
+  });
+
+  it("fails closed before the socket connector can switch hostnames", () => {
+    const innerConnector = jest.fn();
+    const connector = createPinnedConnector(
+      "example.com",
+      createPinnedLookup("example.com", [PUBLIC_V4]),
+      10_000,
+      jest.fn(() => innerConnector) as never,
+    );
+    const callback = jest.fn();
+
+    connector(
+      {
+        hostname: "attacker.example",
+        host: "attacker.example:443",
+        protocol: "https:",
+        port: "443",
+      },
+      callback,
+    );
+
+    expect(innerConnector).not.toHaveBeenCalled();
+    expect(callback).toHaveBeenCalledWith(expect.any(Error), null);
+  });
+});
+
+describe("createUndiciTransport", () => {
+  it("passes the original URL host to fetch while pinning only socket lookup", async () => {
+    const fetchImplementation = jest.fn().mockResolvedValue(
+      new UndiciResponse("<html>ok</html>", {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      }),
+    );
+    const transport = createUndiciTransport(fetchImplementation as never);
+    const request = transportRequest();
+
+    const response = await transport(request);
+
+    expect(fetchImplementation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hostname: "example.com",
+        host: "example.com",
+      }),
+      expect.objectContaining({ redirect: "manual", dispatcher: expect.anything() }),
+    );
+    await response.body?.cancel();
+    await response.dispose();
+  });
+
+  it("normalizes an aborted request as a timeout without leaking its cause", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const detail = new Error("internal abort detail");
+    const transport = createUndiciTransport(
+      jest.fn().mockRejectedValue(detail) as never,
+    );
+
+    await expect(transport(transportRequest(controller.signal))).rejects.toEqual(
+      expect.objectContaining({
+        name: "SafeFetchTransportError",
+        kind: "timeout",
+        message: "Upstream transport timed out",
+      }),
+    );
+  });
+
+  it.each([
+    [new undiciErrors.ConnectTimeoutError(), "timeout"],
+    [new undiciErrors.HeadersTimeoutError(), "timeout"],
+    [new undiciErrors.BodyTimeoutError(), "timeout"],
+    [new undiciErrors.SocketError("socket reset detail"), "network"],
+    [
+      Object.assign(new Error("TLS certificate detail"), {
+        code: "ERR_TLS_CERT_ALTNAME_INVALID",
+      }),
+      "network",
+    ],
+    [
+      Object.assign(new Error("connection detail"), { code: "ECONNREFUSED" }),
+      "network",
+    ],
+    [Object.assign(new Error("DNS detail"), { code: "ENOTFOUND" }), "network"],
+    [
+      Object.assign(new Error("TLS issuer detail"), {
+        code: "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      }),
+      "network",
+    ],
+  ] as const)("normalizes known fetch cause %# as %s", async (cause, kind) => {
+    const fetchError = new TypeError("fetch failed", { cause });
+    const transport = createUndiciTransport(
+      jest.fn().mockRejectedValue(fetchError) as never,
+    );
+
+    await expect(transport(transportRequest())).rejects.toMatchObject({
+      name: "SafeFetchTransportError",
+      kind,
+    });
+  });
+
+  it.each([
+    new Error("programmer failure"),
+    new TypeError("fetch failed"),
+    new TypeError("fetch failed", {
+      cause: new undiciErrors.InvalidArgumentError("invalid trusted option"),
+    }),
+    Object.assign(new Error("invalid TLS configuration"), {
+      code: "ERR_TLS_INVALID_PROTOCOL_VERSION",
+    }),
+  ])("rethrows unexpected fetch exception %# for the route 500 boundary", async (error) => {
+    const transport = createUndiciTransport(
+      jest.fn().mockRejectedValue(error) as never,
+    );
+
+    await expect(transport(transportRequest())).rejects.toBe(error);
   });
 });
 
@@ -282,6 +433,8 @@ describe("createSafeFetchJobUrl", () => {
   });
 
   it("rejects more than 2 MiB of decoded body even when declared smaller", async () => {
+    // This fake transport follows undici.fetch's contract: yielded chunks are
+    // already decoded even though the response retains Content-Encoding.
     transport.mockResolvedValue(
       response({
         headers: {
@@ -486,6 +639,21 @@ function response({
       },
     }),
     dispose: jest.fn().mockResolvedValue(undefined),
+  };
+}
+
+function transportRequest(
+  signal = new AbortController().signal,
+): SafeFetchTransportRequest {
+  return {
+    url: new URL("https://example.com/jobs/1"),
+    lookup: createPinnedLookup("example.com", [PUBLIC_V4]),
+    signal,
+    timeoutMs: 10_000,
+    headers: new Headers({
+      Accept: "text/html, application/xhtml+xml",
+      "User-Agent": "JobTracker/1.0 (+server-side job extraction)",
+    }),
   };
 }
 

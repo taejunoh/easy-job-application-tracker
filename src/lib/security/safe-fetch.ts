@@ -3,7 +3,12 @@ import "server-only";
 import { lookup } from "node:dns/promises";
 import { isIP, type LookupFunction } from "node:net";
 
-import { Agent, buildConnector, fetch as undiciFetch } from "undici";
+import {
+  Agent,
+  buildConnector,
+  errors as undiciErrors,
+  fetch as undiciFetch,
+} from "undici";
 
 import { isPublicIpAddress } from "./ip-address";
 
@@ -13,6 +18,38 @@ const REQUEST_TIMEOUT_MS = 10_000;
 const REDIRECT_CHAIN_TIMEOUT_MS = 20_000;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const ACCEPTED_MEDIA_TYPES = new Set(["text/html", "application/xhtml+xml"]);
+const TIMEOUT_ERROR_CODES = new Set([
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "ETIMEDOUT",
+]);
+const NETWORK_ERROR_CODES = new Set([
+  "UND_ERR_SOCKET",
+  "UND_ERR_HEADERS_OVERFLOW",
+  "UND_ERR_RES_CONTENT_LENGTH_MISMATCH",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ECONNABORTED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENETDOWN",
+  "EPIPE",
+  "EADDRNOTAVAIL",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EAI_FAIL",
+  "EAI_NODATA",
+  "EAI_NONAME",
+  "EAI_ADDRFAMILY",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+  "ERR_TLS_CERT_SIGNATURE_ALGORITHM_UNSUPPORTED",
+  "CERT_HAS_EXPIRED",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+]);
 
 export type SafeFetchErrorCode =
   | "url_not_allowed"
@@ -112,11 +149,13 @@ const defaultDependencies: SafeFetchDependencies = {
   async resolve(hostname) {
     try {
       return await lookup(hostname, { all: true });
-    } catch {
-      throw new SafeFetchTransportError("network");
+    } catch (error) {
+      const kind = classifyTransportFailure(error);
+      if (kind) throw new SafeFetchTransportError(kind);
+      throw error;
     }
   },
-  transport: undiciTransport,
+  transport: createUndiciTransport(undiciFetch),
   now: Date.now,
   setTimeout,
   clearTimeout,
@@ -233,6 +272,34 @@ export function createPinnedLookup(
     }
 
     callback(null, matching[0].address, matching[0].family);
+  };
+}
+
+export function createPinnedConnector(
+  expectedHostname: string,
+  lookupFunction: LookupFunction,
+  timeoutMs: number,
+  connectorBuilder: typeof buildConnector = buildConnector,
+): ReturnType<typeof buildConnector> {
+  const expected = canonicalLookupHostname(expectedHostname);
+  const connector = connectorBuilder({
+    lookup: lookupFunction,
+    timeout: Math.max(1, Math.ceil(timeoutMs)),
+    maxCachedSessions: 0,
+  });
+
+  return (options, callback) => {
+    if (canonicalLookupHostname(options.hostname) !== expected) {
+      callback(lookupError("ENOTFOUND"), null);
+      return;
+    }
+
+    connector(
+      options.protocol === "https:" && isIP(expected) === 0
+        ? { ...options, servername: expected }
+        : options,
+      callback,
+    );
   };
 }
 
@@ -393,66 +460,89 @@ function safeUpstreamHeaders(): Headers {
   });
 }
 
-async function undiciTransport(
-  request: SafeFetchTransportRequest,
-): Promise<SafeFetchTransportResponse> {
-  const timeoutMs = Math.max(1, Math.ceil(request.timeoutMs));
-  const connector = buildConnector({
-    lookup: request.lookup,
-    timeout: timeoutMs,
-    maxCachedSessions: 0,
-  });
-  const dispatcher = new Agent({
-    connect: connector,
-    connections: 1,
-    maxOrigins: 1,
-    pipelining: 1,
-    headersTimeout: timeoutMs,
-    bodyTimeout: timeoutMs,
-  });
-
-  try {
-    const upstream = await undiciFetch(request.url, {
-      method: "GET",
-      headers: Object.fromEntries(request.headers.entries()),
-      credentials: "omit",
-      redirect: "manual",
-      referrerPolicy: "no-referrer",
-      signal: request.signal,
-      dispatcher,
-    });
-    const headers = new Headers();
-    upstream.headers.forEach((value, name) => headers.append(name, value));
-    return {
-      status: upstream.status,
-      headers,
-      body: upstream.body as unknown as ReadableStream<Uint8Array> | null,
-      async dispose() {
-        await dispatcher.destroy().catch(() => undefined);
-      },
-    };
-  } catch (error) {
-    await dispatcher.destroy().catch(() => undefined);
-    throw new SafeFetchTransportError(
-      request.signal.aborted || isUndiciTimeout(error) ? "timeout" : "network",
+export function createUndiciTransport(fetchImplementation: typeof undiciFetch) {
+  return async function transport(
+    request: SafeFetchTransportRequest,
+  ): Promise<SafeFetchTransportResponse> {
+    const timeoutMs = Math.max(1, Math.ceil(request.timeoutMs));
+    const connector = createPinnedConnector(
+      normalizeHostname(request.url.hostname),
+      request.lookup,
+      timeoutMs,
     );
-  }
+    const dispatcher = new Agent({
+      connect: connector,
+      connections: 1,
+      maxOrigins: 1,
+      pipelining: 1,
+      headersTimeout: timeoutMs,
+      bodyTimeout: timeoutMs,
+    });
+
+    try {
+      const upstream = await fetchImplementation(request.url, {
+        method: "GET",
+        headers: Object.fromEntries(request.headers.entries()),
+        credentials: "omit",
+        redirect: "manual",
+        referrerPolicy: "no-referrer",
+        signal: request.signal,
+        dispatcher,
+      });
+      const headers = new Headers();
+      upstream.headers.forEach((value, name) => headers.append(name, value));
+      return {
+        status: upstream.status,
+        headers,
+        // undici.fetch exposes decoded body bytes after Content-Encoding.
+        body: upstream.body as unknown as ReadableStream<Uint8Array> | null,
+        async dispose() {
+          await dispatcher.destroy().catch(() => undefined);
+        },
+      };
+    } catch (error) {
+      await dispatcher.destroy().catch(() => undefined);
+      const kind = classifyTransportFailure(error, request.signal);
+      if (kind) throw new SafeFetchTransportError(kind);
+      throw error;
+    }
+  };
 }
 
-function isUndiciTimeout(error: unknown): boolean {
+function classifyTransportFailure(
+  error: unknown,
+  signal?: AbortSignal,
+): "network" | "timeout" | null {
+  if (signal?.aborted) return "timeout";
+
   let current = error;
   for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
     const code = (current as Error & { code?: unknown }).code;
-    if (
-      code === "UND_ERR_CONNECT_TIMEOUT" ||
-      code === "UND_ERR_HEADERS_TIMEOUT" ||
-      code === "UND_ERR_BODY_TIMEOUT"
-    ) {
-      return true;
+    if (typeof code === "string" && TIMEOUT_ERROR_CODES.has(code)) {
+      return "timeout";
     }
+    if (isKnownNetworkFailure(current, code)) return "network";
     current = (current as Error & { cause?: unknown }).cause;
   }
-  return false;
+  return null;
+}
+
+function isKnownNetworkFailure(error: Error, code: unknown): boolean {
+  if (
+    error instanceof undiciErrors.SocketError ||
+    error instanceof undiciErrors.HeadersOverflowError ||
+    error instanceof undiciErrors.ResponseContentLengthMismatchError ||
+    error instanceof undiciErrors.HTTPParserError
+  ) {
+    return true;
+  }
+
+  return (
+    typeof code === "string" &&
+    (NETWORK_ERROR_CODES.has(code) ||
+      code.startsWith("HPE_") ||
+      code.startsWith("ERR_SSL_"))
+  );
 }
 
 function normalizeHostname(hostname: string): string {

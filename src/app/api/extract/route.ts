@@ -13,6 +13,7 @@ import {
 export const runtime = "nodejs";
 
 const route = createProtectedRoute(["POST"]);
+const MAX_LLM_TEXT_CODE_POINTS = 4_000;
 
 export const OPTIONS = route.OPTIONS;
 
@@ -117,7 +118,9 @@ export const POST = route.handler(async function POST(request: NextRequest) {
     .replace(/\s+/g, " ")
     .trim();
 
-  const llmResult = await provider.extract(textContent);
+  const llmResult = await provider.extract(
+    truncateCodePoints(textContent, MAX_LLM_TEXT_CODE_POINTS),
+  );
 
   return NextResponse.json({
     jobTitle: metaResult.jobTitle || llmResult.jobTitle,
@@ -126,3 +129,14 @@ export const POST = route.handler(async function POST(request: NextRequest) {
     url,
   });
 });
+
+function truncateCodePoints(text: string, maxCodePoints: number): string {
+  let result = "";
+  let count = 0;
+  for (const codePoint of text) {
+    if (count >= maxCodePoints) break;
+    result += codePoint;
+    count += 1;
+  }
+  return result;
+}

@@ -523,6 +523,48 @@ describe("protected product API actual requests", () => {
   );
 
   it.each([
+    ["ASCII", "a".repeat(4_001), "a".repeat(4_000)],
+    [
+      "surrogate pair boundary",
+      `${"a".repeat(3_999)}😀b`,
+      `${"a".repeat(3_999)}😀`,
+    ],
+  ])(
+    "limits URL extraction LLM fallback to 4,000 Unicode code points for %s",
+    async (_caseName, extractedText, expectedText) => {
+      const route = actualRoutes.find(
+        (candidate) => candidate.name === "extract POST",
+      ) as ActualRouteCase;
+      const extract = jest.fn().mockResolvedValue({
+        jobTitle: "Engineer",
+        company: "Example",
+      });
+      jest.mocked(createProvider).mockReturnValue({ extract });
+      jest.mocked(parseMetaTags).mockReturnValue({
+        jobTitle: null,
+        company: null,
+        location: null,
+      });
+      jest.mocked(safeFetchJobUrl).mockResolvedValue({
+        html: `<main>${extractedText}</main>`,
+        finalUrl: "https://example.com/jobs/1",
+      });
+
+      const response = await invokeActual(
+        route,
+        productRequest(route, {
+          origin: EXTENSION_ORIGIN,
+          authorization: `Bearer ${ACCESS_TOKEN}`,
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      expect(extract).toHaveBeenCalledWith(expectedText);
+      expect(Array.from(extract.mock.calls[0][0])).toHaveLength(4_000);
+    },
+  );
+
+  it.each([
     ["redirect", () => redirect("/connect"), "NEXT_REDIRECT"],
     [
       "permanentRedirect",
