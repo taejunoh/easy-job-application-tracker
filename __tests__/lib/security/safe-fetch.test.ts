@@ -6,6 +6,7 @@ import {
   type Server as NetServer,
   type Socket,
 } from "node:net";
+import { runInNewContext } from "node:vm";
 import { gzipSync } from "node:zlib";
 import {
   Response as UndiciResponse,
@@ -65,6 +66,11 @@ const NODE_X509_VERIFY_CODES = [
 const REMOTE_TLS_ERROR_CODES = [
   "ERR_SSL_WRONG_VERSION_NUMBER",
   "ERR_SSL_UNSUPPORTED_PROTOCOL",
+  "ERR_SSL_PACKET_LENGTH_TOO_LONG",
+  "ERR_SSL_BAD_RECORD_TYPE",
+  "ERR_SSL_RECORD_TOO_SMALL",
+  "ERR_SSL_DECRYPTION_FAILED_OR_BAD_RECORD_MAC",
+  "ERR_SSL_UNEXPECTED_RECORD",
   "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE",
   "ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC",
   "ERR_SSL_SSLV3_ALERT_CERTIFICATE_EXPIRED",
@@ -257,11 +263,11 @@ describe("createUndiciTransport", () => {
       socket.once("close", () => sockets.delete(socket));
       socket.end("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
     });
-    await listenOnLoopback(server);
-    const { port } = server.address() as AddressInfo;
     const transport = createUndiciTransport(undiciFetch);
 
     try {
+      await listenOnLoopback(server);
+      const { port } = server.address() as AddressInfo;
       await expect(
         settleWithin(
           transport({
@@ -280,7 +286,7 @@ describe("createUndiciTransport", () => {
       });
     } finally {
       for (const socket of sockets) socket.destroy();
-      await closeServer(server);
+      await closeServerIfListening(server);
     }
   });
 
@@ -301,22 +307,23 @@ describe("createUndiciTransport", () => {
         markSocketClosed();
       });
     });
-    await listenOnLoopback(server);
-
-    const { port } = server.address() as AddressInfo;
     const controller = new AbortController();
     const transport = createUndiciTransport(undiciFetch);
-    const response = await transport({
-      ...transportRequest(controller.signal),
-      url: new URL(`http://body-timeout.test:${port}/`),
-      lookup: createPinnedLookup("body-timeout.test", [
-        { address: "127.0.0.1", family: 4 },
-      ]),
-      timeoutMs: 2_000,
-    });
-    const reader = response.body?.getReader();
+    let response: SafeFetchTransportResponse | undefined;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
     try {
+      await listenOnLoopback(server);
+      const { port } = server.address() as AddressInfo;
+      response = await transport({
+        ...transportRequest(controller.signal),
+        url: new URL(`http://body-timeout.test:${port}/`),
+        lookup: createPinnedLookup("body-timeout.test", [
+          { address: "127.0.0.1", family: 4 },
+        ]),
+        timeoutMs: 2_000,
+      });
+      reader = response.body?.getReader();
       expect(reader).toBeDefined();
       const firstChunk = await settleWithin(reader!.read(), 1_000);
       expect(firstChunk.done).toBe(false);
@@ -334,9 +341,9 @@ describe("createUndiciTransport", () => {
     } finally {
       controller.abort();
       reader?.releaseLock();
-      await response.dispose();
+      await response?.dispose();
       for (const socket of sockets) socket.destroy();
-      await closeServer(server);
+      await closeServerIfListening(server);
     }
   });
 
@@ -430,6 +437,39 @@ describe("createUndiciTransport", () => {
     },
   );
 
+  it("recognizes an exact remote TLS code on a cross-realm native error", async () => {
+    const cause = runInNewContext(
+      `Object.assign(new Error("peer record detail"), {
+        code: "ERR_SSL_PACKET_LENGTH_TOO_LONG"
+      })`,
+    );
+    const transport = createUndiciTransport(
+      jest
+        .fn()
+        .mockRejectedValue(new TypeError("fetch failed", { cause })) as never,
+    );
+
+    await expect(transport(transportRequest())).rejects.toMatchObject({
+      name: "SafeFetchTransportError",
+      kind: "network",
+    });
+  });
+
+  it("bounds an unexpected cyclic cause chain and preserves the original error", async () => {
+    const cycle = new Error("cyclic programmer failure") as Error & {
+      cause?: unknown;
+    };
+    cycle.cause = cycle;
+    const error = new TypeError("fetch failed", { cause: cycle });
+    const transport = createUndiciTransport(
+      jest.fn().mockRejectedValue(error) as never,
+    );
+
+    await expect(
+      settleWithin(transport(transportRequest()), 1_000),
+    ).rejects.toBe(error);
+  });
+
   it.each([
     new Error("programmer failure"),
     new TypeError("fetch failed"),
@@ -452,6 +492,12 @@ describe("createUndiciTransport", () => {
     }),
     Object.assign(new Error("unlisted SSL failure"), {
       code: "ERR_SSL_UNLISTED_FAILURE",
+    }),
+    Object.assign(new Error("internal record bookkeeping failure"), {
+      code: "ERR_SSL_INVALID_RECORD",
+    }),
+    Object.assign(new Error("internal record layer failure"), {
+      code: "ERR_SSL_RECORD_LAYER_FAILURE",
     }),
   ])("rethrows unexpected fetch exception %# for the route 500 boundary", async (error) => {
     const transport = createUndiciTransport(
@@ -725,11 +771,11 @@ describe("createSafeFetchJobUrl", () => {
       sockets.add(socket);
       socket.once("close", () => sockets.delete(socket));
     });
-    await listenOnLoopback(server);
-    const { port } = server.address() as AddressInfo;
     let upstream: SafeFetchTransportResponse | undefined;
 
     try {
+      await listenOnLoopback(server);
+      const { port } = server.address() as AddressInfo;
       upstream = await settleWithin(
         createUndiciTransport(undiciFetch)({
           ...transportRequest(),
@@ -752,7 +798,7 @@ describe("createSafeFetchJobUrl", () => {
     } finally {
       await upstream?.dispose();
       for (const socket of sockets) socket.destroy();
-      await closeServer(server);
+      await closeServerIfListening(server);
     }
   });
 
@@ -1010,6 +1056,10 @@ function closeServer(server: NetServer): Promise<void> {
       else resolve();
     });
   });
+}
+
+async function closeServerIfListening(server: NetServer): Promise<void> {
+  if (server.listening) await closeServer(server);
 }
 
 async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
