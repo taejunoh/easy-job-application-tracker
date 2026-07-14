@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import {
   loadLatestApplications,
   updateApplicationStatus,
@@ -5,32 +8,44 @@ import {
 import type { ClientApi } from "@/lib/client-api";
 
 describe("application filter requests", () => {
-  it("refreshes the active filter when a pending status update resolves", async () => {
+  it("schedules the committed filter after a pending status update resolves", async () => {
     const patch = deferred<unknown>();
     const api = jest.fn(() => patch.promise) as ClientApi;
     const requestedFilters: string[] = [];
-    const refreshA = jest.fn(() => {
-      requestedFilters.push("A");
+    let committedFilter = "A";
+    let refreshRevision = 0;
+    const scheduleRefresh = jest.fn(() => {
+      refreshRevision += 1;
     });
-    const refreshB = jest.fn(() => {
-      requestedFilters.push("B");
-    });
-    const activeRefresh = { current: refreshA };
 
     const statusUpdate = updateApplicationStatus(
       api,
-      activeRefresh,
+      scheduleRefresh,
       "app-1",
       "Interview",
     );
-    activeRefresh.current = refreshB;
-    await refreshB();
+    committedFilter = "B";
     patch.resolve({});
     await statusUpdate;
 
-    expect(refreshA).not.toHaveBeenCalled();
-    expect(refreshB).toHaveBeenCalledTimes(2);
-    expect(requestedFilters).toEqual(["B", "B"]);
+    expect(requestedFilters).toEqual([]);
+    expect(scheduleRefresh).toHaveBeenCalledTimes(1);
+    expect(refreshRevision).toBe(1);
+
+    requestedFilters.push(committedFilter);
+    expect(requestedFilters).toEqual(["B"]);
+  });
+
+  it("routes status refresh through render state instead of a passive ref", () => {
+    const source = readFileSync(
+      join(process.cwd(), "src/app/applications/page.tsx"),
+      "utf8",
+    );
+
+    expect(source).toContain("const [refreshRevision, setRefreshRevision]");
+    expect(source).toContain("setRefreshRevision((revision) => revision + 1)");
+    expect(source).toContain("[refreshApplications, refreshRevision]");
+    expect(source).not.toContain("activeRefresh");
   });
 
   it("does not let an older success replace the newest results", async () => {

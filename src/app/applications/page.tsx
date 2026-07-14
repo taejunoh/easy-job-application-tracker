@@ -26,7 +26,9 @@ export default function ApplicationsPage() {
   const [jobTypeFilter, setJobTypeFilter] = useState("All");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [refreshRevision, setRefreshRevision] = useState(0);
   const requestSequence = useRef(0);
+  const mounted = useRef(false);
 
   const loadApplications = useCallback(() => {
     const params = new URLSearchParams();
@@ -51,20 +53,31 @@ export default function ApplicationsPage() {
       setLoading,
     );
   }, [loadApplications]);
-  const activeRefresh = useRef(refreshApplications);
-
   useEffect(() => {
-    activeRefresh.current = refreshApplications;
-  }, [refreshApplications]);
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      requestSequence.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
     void refreshApplications();
-  }, [refreshApplications]);
+  }, [refreshApplications, refreshRevision]);
 
   async function handleStatusChange(id: string, status: string) {
     setError("");
     try {
-      await updateApplicationStatus(api, activeRefresh, id, status);
+      await updateApplicationStatus(
+        api,
+        () => {
+          if (mounted.current) {
+            setRefreshRevision((revision) => revision + 1);
+          }
+        },
+        id,
+        status,
+      );
     } catch (failure) {
       setError(errorMessage(failure, "Failed to update application status."));
     }
@@ -122,9 +135,7 @@ export default function ApplicationsPage() {
 
 export async function updateApplicationStatus(
   api: ClientApi,
-  activeRefresh:
-    | (() => void | Promise<void>)
-    | { current: () => void | Promise<void> },
+  scheduleRefresh: () => void,
   id: string,
   status: string,
 ): Promise<void> {
@@ -133,11 +144,7 @@ export async function updateApplicationStatus(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ status }),
   });
-  const refresh =
-    typeof activeRefresh === "function"
-      ? activeRefresh
-      : activeRefresh.current;
-  await refresh();
+  scheduleRefresh();
 }
 
 export async function loadLatestApplications<T>(
