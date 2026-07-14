@@ -1,6 +1,38 @@
-import { loadLatestApplications } from "@/app/applications/page";
+import {
+  loadLatestApplications,
+  updateApplicationStatus,
+} from "@/app/applications/page";
+import type { ClientApi } from "@/lib/client-api";
 
 describe("application filter requests", () => {
+  it("refreshes the active filter when a pending status update resolves", async () => {
+    const patch = deferred<unknown>();
+    const api = jest.fn(() => patch.promise) as ClientApi;
+    const requestedFilters: string[] = [];
+    const refreshA = jest.fn(() => {
+      requestedFilters.push("A");
+    });
+    const refreshB = jest.fn(() => {
+      requestedFilters.push("B");
+    });
+    const activeRefresh = { current: refreshA };
+
+    const statusUpdate = updateApplicationStatus(
+      api,
+      activeRefresh,
+      "app-1",
+      "Interview",
+    );
+    activeRefresh.current = refreshB;
+    await refreshB();
+    patch.resolve({});
+    await statusUpdate;
+
+    expect(refreshA).not.toHaveBeenCalled();
+    expect(refreshB).toHaveBeenCalledTimes(2);
+    expect(requestedFilters).toEqual(["B", "B"]);
+  });
+
   it("does not let an older success replace the newest results", async () => {
     const first = deferred<string[]>();
     const second = deferred<string[]>();

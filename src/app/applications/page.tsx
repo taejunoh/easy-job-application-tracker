@@ -51,6 +51,11 @@ export default function ApplicationsPage() {
       setLoading,
     );
   }, [loadApplications]);
+  const activeRefresh = useRef(refreshApplications);
+
+  useEffect(() => {
+    activeRefresh.current = refreshApplications;
+  }, [refreshApplications]);
 
   useEffect(() => {
     void refreshApplications();
@@ -59,7 +64,7 @@ export default function ApplicationsPage() {
   async function handleStatusChange(id: string, status: string) {
     setError("");
     try {
-      await updateApplicationStatus(api, refreshApplications, id, status);
+      await updateApplicationStatus(api, activeRefresh, id, status);
     } catch (failure) {
       setError(errorMessage(failure, "Failed to update application status."));
     }
@@ -117,7 +122,9 @@ export default function ApplicationsPage() {
 
 export async function updateApplicationStatus(
   api: ClientApi,
-  refresh: () => void | Promise<void>,
+  activeRefresh:
+    | (() => void | Promise<void>)
+    | { current: () => void | Promise<void> },
   id: string,
   status: string,
 ): Promise<void> {
@@ -126,6 +133,10 @@ export async function updateApplicationStatus(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ status }),
   });
+  const refresh =
+    typeof activeRefresh === "function"
+      ? activeRefresh
+      : activeRefresh.current;
   await refresh();
 }
 
