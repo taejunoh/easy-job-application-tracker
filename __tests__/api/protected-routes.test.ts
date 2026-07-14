@@ -60,6 +60,13 @@ jest.mock("@/lib/extract/llm-provider", () => ({
   createProvider: jest.fn(() => ({ extract: jest.fn() })),
 }));
 
+jest.mock("@/lib/security/safe-fetch", () => {
+  const actual = jest.requireActual<typeof import("@/lib/security/safe-fetch")>(
+    "@/lib/security/safe-fetch",
+  );
+  return { ...actual, safeFetchJobUrl: jest.fn() };
+});
+
 jest.mock("@/lib/keyword-matcher", () => ({
   analyzeKeywordMatch: jest.fn(),
 }));
@@ -78,10 +85,12 @@ import { prisma } from "@/lib/prisma";
 import { createProvider } from "@/lib/extract/llm-provider";
 import { parseMetaTags } from "@/lib/extract/meta-parser";
 import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
+import {
+  SafeFetchError,
+  safeFetchJobUrl,
+  type SafeFetchErrorCode,
+} from "@/lib/security/safe-fetch";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
-
-const fetchMock = jest.fn();
-global.fetch = fetchMock;
 
 const APP_ORIGIN = "https://jobs.example.com";
 const EXTENSION_ORIGIN =
@@ -445,7 +454,10 @@ describe("protected product API actual requests", () => {
     ],
     [
       "extract POST",
-      () => fetchMock.mockRejectedValueOnce(new Error("network detail")),
+      () =>
+        jest
+          .mocked(safeFetchJobUrl)
+          .mockRejectedValueOnce(new Error("network detail")),
     ],
   ])(
     "normalizes an internally caught %s failure to internal_error",
@@ -475,6 +487,38 @@ describe("protected product API actual requests", () => {
         EXTENSION_ORIGIN,
       );
       consoleError.mockRestore();
+    },
+  );
+
+  it.each([
+    ["url_not_allowed", 422],
+    ["upstream_timeout", 504],
+    ["unsupported_upstream_type", 415],
+    ["upstream_too_large", 413],
+    ["upstream_failed", 422],
+  ] as [SafeFetchErrorCode, number][])(
+    "maps safe fetch failure %s without leaking upstream details",
+    async (code, status) => {
+      const route = actualRoutes.find(
+        (candidate) => candidate.name === "extract POST",
+      ) as ActualRouteCase;
+      jest.mocked(safeFetchJobUrl).mockRejectedValueOnce(new SafeFetchError(code));
+
+      const response = await invokeActual(
+        route,
+        productRequest(route, {
+          origin: EXTENSION_ORIGIN,
+          authorization: `Bearer ${ACCESS_TOKEN}`,
+        }),
+      );
+
+      expect(response.status).toBe(status);
+      const payload = await response.json();
+      expect(payload).toEqual({ error: expect.any(String), code });
+      expect(JSON.stringify(payload)).not.toContain("93.184.216.34");
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        EXTENSION_ORIGIN,
+      );
     },
   );
 
@@ -829,9 +873,10 @@ function arrangeSuccessfulBusinessLogic(): void {
     missingKeywords: [],
     totalJobKeywords: 0,
   });
-  fetchMock.mockResolvedValue(
-    new Response("<html><title>Engineer</title></html>"),
-  );
+  jest.mocked(safeFetchJobUrl).mockResolvedValue({
+    html: "<html><title>Engineer</title></html>",
+    finalUrl: "https://example.com/jobs/1",
+  });
   jest.mocked(getDocument).mockReturnValue({
     promise: Promise.resolve({
       numPages: 1,
@@ -869,7 +914,7 @@ function expectedDownstream(route: ActualRouteCase): jest.Mock {
     case "application detail DELETE":
       return jest.mocked(prisma.application.delete);
     case "extract POST":
-      return jest.mocked(global.fetch);
+      return jest.mocked(safeFetchJobUrl);
     case "keyword analysis POST":
       return jest.mocked(analyzeKeywordMatch);
     case "parse resume POST":
@@ -898,7 +943,7 @@ function downstreamMocks(): jest.Mock[] {
     jest.mocked(parseMetaTags),
     jest.mocked(createProvider),
     jest.mocked(analyzeKeywordMatch),
-    fetchMock,
+    jest.mocked(safeFetchJobUrl),
     jest.mocked(getDocument),
   ];
 }

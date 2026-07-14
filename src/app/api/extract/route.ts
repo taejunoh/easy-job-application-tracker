@@ -5,6 +5,12 @@ import { prisma } from "@/lib/prisma";
 import { decrypt } from "@/lib/crypto";
 import { createProtectedRoute } from "@/lib/security/protected-route";
 import { readJsonBody } from "@/lib/security/request-body";
+import {
+  SafeFetchError,
+  safeFetchJobUrl,
+} from "@/lib/security/safe-fetch";
+
+export const runtime = "nodejs";
 
 const route = createProtectedRoute(["POST"]);
 
@@ -40,21 +46,18 @@ export const POST = route.handler(async function POST(request: NextRequest) {
     return NextResponse.json({ error: "URL or text is required" }, { status: 400 });
   }
 
-  // Fetch the page
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; JobTracker/1.0)",
-    },
-  });
-
-  if (!response.ok) {
-    return NextResponse.json(
-      { error: "Failed to fetch URL" },
-      { status: 422 }
-    );
+  let html: string;
+  try {
+    ({ html } = await safeFetchJobUrl(url));
+  } catch (error) {
+    if (error instanceof SafeFetchError) {
+      return NextResponse.json(
+        { error: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    throw error;
   }
-
-  const html = await response.text();
 
   // Detect login/auth walls
   const loginPatterns = [
