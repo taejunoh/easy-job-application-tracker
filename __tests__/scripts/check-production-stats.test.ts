@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type RequestListener, type Server } from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { join } from "node:path";
@@ -26,7 +26,7 @@ type MonitorResult = Readonly<{
 }>;
 
 async function listen(
-  handler: Parameters<typeof createServer>[0],
+  handler: RequestListener,
 ): Promise<{ server: Server; url: string }> {
   const server = createServer(handler);
   server.listen(0, "127.0.0.1");

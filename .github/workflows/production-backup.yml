@@ -1,0 +1,133 @@
+name: Encrypted production backup
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: jobtracker_backup
+          POSTGRES_PASSWORD: jobtracker_backup
+          POSTGRES_DB: jobtracker_restore
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobtracker_backup -d jobtracker_restore"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.2"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Install age
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends age
+      - name: Capture PostgreSQL service container
+        env:
+          POSTGRES_SERVICE_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: printf 'POSTGRES_SERVICE_CONTAINER_ID=%s\n' "$POSTGRES_SERVICE_CONTAINER_ID" >> "$GITHUB_ENV"
+      - name: Create source backup and fingerprint
+        env:
+          PRODUCTION_DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          umask 077
+          DUMP_FILE="$RUNNER_TEMP/jobtracker.dump"
+          TOC_FILE="$RUNNER_TEMP/jobtracker.toc"
+          PLAINTEXT_CHECKSUM="$RUNNER_TEMP/jobtracker.dump.sha256"
+          SOURCE_FINGERPRINT="$RUNNER_TEMP/source-fingerprint.json"
+
+          printf '%s\n' "$PRODUCTION_DATABASE_URL" | docker exec -i "$POSTGRES_SERVICE_CONTAINER_ID" sh -c '
+            IFS= read -r PRODUCTION_DATABASE_URL
+            pg_dump --dbname="$PRODUCTION_DATABASE_URL" --format=custom --no-owner --no-privileges --file=/tmp/jobtracker.dump
+          '
+          docker cp "$POSTGRES_SERVICE_CONTAINER_ID:/tmp/jobtracker.dump" "$DUMP_FILE"
+          chmod 600 "$DUMP_FILE"
+          sha256sum "$DUMP_FILE" > "$PLAINTEXT_CHECKSUM"
+          sha256sum --check "$PLAINTEXT_CHECKSUM"
+          docker exec "$POSTGRES_SERVICE_CONTAINER_ID" pg_restore --list /tmp/jobtracker.dump > "$TOC_FILE"
+          test -s "$TOC_FILE"
+          DATABASE_URL="$PRODUCTION_DATABASE_URL" node scripts/fingerprint-database.mjs "$SOURCE_FINGERPRINT"
+      - name: Restore into empty scratch and compare fingerprints
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: jobtracker_backup
+          PGPASSWORD: jobtracker_backup
+          PGDATABASE: jobtracker_restore
+        run: |
+          set -euo pipefail
+          SOURCE_FINGERPRINT="$RUNNER_TEMP/source-fingerprint.json"
+          RESTORE_FINGERPRINT="$RUNNER_TEMP/restore-fingerprint.json"
+
+          docker exec --env PGPASSWORD=jobtracker_backup "$POSTGRES_SERVICE_CONTAINER_ID" pg_restore --exit-on-error --no-owner --no-privileges --host=127.0.0.1 --username=jobtracker_backup --dbname=jobtracker_restore /tmp/jobtracker.dump
+          node scripts/fingerprint-database.mjs "$RESTORE_FINGERPRINT"
+          cmp --silent "$SOURCE_FINGERPRINT" "$RESTORE_FINGERPRINT"
+      - name: Encrypt verified backup
+        env:
+          BACKUP_AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
+        run: |
+          set -euo pipefail
+          umask 077
+          DUMP_FILE="$RUNNER_TEMP/jobtracker.dump"
+          ENCRYPTED_FILE="$RUNNER_TEMP/jobtracker.dump.age"
+          ENCRYPTED_CHECKSUM="$RUNNER_TEMP/jobtracker.dump.age.sha256"
+          PLAINTEXT_CHECKSUM="$RUNNER_TEMP/jobtracker.dump.sha256"
+          SOURCE_FINGERPRINT="$RUNNER_TEMP/source-fingerprint.json"
+          RESTORE_FINGERPRINT="$RUNNER_TEMP/restore-fingerprint.json"
+          TOC_FILE="$RUNNER_TEMP/jobtracker.toc"
+          MANIFEST_FILE="$RUNNER_TEMP/backup-manifest.json"
+
+          test -n "$BACKUP_AGE_RECIPIENT"
+          DUMP_SHA256="$(cut -d ' ' -f 1 "$PLAINTEXT_CHECKSUM")"
+          age --recipient "$BACKUP_AGE_RECIPIENT" --output "$ENCRYPTED_FILE" "$DUMP_FILE"
+          chmod 600 "$ENCRYPTED_FILE"
+          ENCRYPTED_SHA256="$(sha256sum "$ENCRYPTED_FILE" | cut -d ' ' -f 1)"
+          printf '%s  %s\n' "$ENCRYPTED_SHA256" "$(basename "$ENCRYPTED_FILE")" > "$ENCRYPTED_CHECKSUM"
+          (cd "$RUNNER_TEMP" && sha256sum --check "$(basename "$ENCRYPTED_CHECKSUM")")
+          jq -n \
+            --arg createdAt "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --arg dumpSha256 "$DUMP_SHA256" \
+            --arg encryptedSha256 "$ENCRYPTED_SHA256" \
+            --slurpfile fingerprint "$SOURCE_FINGERPRINT" \
+            '{version: 1, createdAt: $createdAt, format: "PostgreSQL custom", restoreValidated: true, dumpSha256: $dumpSha256, encryptedSha256: $encryptedSha256, fingerprint: $fingerprint[0]}' \
+            > "$MANIFEST_FILE"
+          chmod 600 "$ENCRYPTED_CHECKSUM" "$MANIFEST_FILE"
+          rm -f "$DUMP_FILE" "$PLAINTEXT_CHECKSUM" "$TOC_FILE" "$SOURCE_FINGERPRINT" "$RESTORE_FINGERPRINT"
+      - name: Upload encrypted backup
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-backup-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/jobtracker.dump.age
+            ${{ runner.temp }}/jobtracker.dump.age.sha256
+            ${{ runner.temp }}/backup-manifest.json
+          retention-days: 30
+          if-no-files-found: error
+      - name: Remove temporary backup files
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/jobtracker.dump" \
+            "$RUNNER_TEMP/jobtracker.dump.sha256" \
+            "$RUNNER_TEMP/jobtracker.toc" \
+            "$RUNNER_TEMP/source-fingerprint.json" \
+            "$RUNNER_TEMP/restore-fingerprint.json"
+          docker exec "$POSTGRES_SERVICE_CONTAINER_ID" rm -f /tmp/jobtracker.dump 2>/dev/null || true

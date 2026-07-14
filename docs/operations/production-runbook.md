@@ -120,6 +120,24 @@ row editing, or a restore with destructive cleanup against Production.
 
 ## Backup and restore
 
+The scheduled `.github/workflows/production-backup.yml` job runs nightly and
+may also be started manually after merge. It reads Production only through the
+`PRODUCTION_DATABASE_URL` repository secret, creates a PostgreSQL 17 custom
+dump, validates its checksum and table-of-contents, restores it into a fresh
+local scratch database, and compares ordered SHA-256 fingerprints before age
+encryption. GitHub retains only the encrypted dump, encrypted-file checksum,
+and sanitized manifest for 30 days. The public recipient is stored in the
+`BACKUP_AGE_RECIPIENT` repository variable.
+
+The recovery identity is private operator material at
+`~/Library/Application Support/easy-job-application-tracker/secrets/backup.agekey`.
+Keep it outside Git and cloud artifacts with mode `0600`; never print or upload
+it. Back it up through the approved private credential channel. After download,
+verify the encrypted checksum, decrypt with `age --decrypt --identity`, verify
+the decrypted dump against `dumpSha256` in the manifest, and follow the scratch
+restore rehearsal below. Workflow dispatch is a post-merge validation and
+remains pending until these workflow files exist on the default branch.
+
 Before a migration or risky release, create a PostgreSQL custom-format dump in
 an access-controlled location outside the repository:
 
@@ -155,6 +173,18 @@ Restore rehearsal:
 Restore to Production is a declared incident operation. Restore into an
 isolated target first, validate it, then switch the application connection in a
 controlled release. Do not overwrite the active database in place.
+
+## Authenticated production monitoring
+
+The `.github/workflows/production-monitor.yml` workflow runs hourly and may be
+dispatched manually after merge. It supplies the root HTTPS origin from the
+`PRODUCTION_APP_URL` repository variable and the credential from the
+`PRODUCTION_APP_ACCESS_TOKEN` repository secret to `npm run check:production`.
+Success requires an exact authenticated `200` JSON stats shape. All other
+statuses, malformed responses, connection failures, and timeouts fail with a
+generic message that excludes the URL, credential, and response body. Treat a
+failed scheduled run as an incident signal and follow Vercel and Neon diagnosis
+below; do not weaken authentication to make the check pass.
 
 ## Incident diagnosis
 
