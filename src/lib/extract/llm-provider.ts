@@ -71,8 +71,10 @@ class AnthropicProvider implements LLMProvider {
       messages: [{ role: "user", content: PROMPT + text.slice(0, 4000) }],
     });
     const block = response.content[0];
-    const responseText = block.type === "text" ? block.text : "{}";
-    return parseResponse(responseText);
+    if (!block || block.type !== "text") {
+      throw new Error("Anthropic response did not contain a text block");
+    }
+    return parseResponse(block.text);
   }
 }
 
