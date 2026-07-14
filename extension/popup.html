@@ -87,11 +87,15 @@
     }
     .analysis-header {
       display: flex;
+      width: 100%;
       align-items: center;
       justify-content: space-between;
       padding: 8px 10px;
+      border: 0;
+      border-radius: 0;
       cursor: pointer;
       background: #111827;
+      color: inherit;
     }
     .analysis-header:hover { background: #1a2332; }
     .analysis-title {
@@ -203,7 +207,7 @@
       align-items: stretch;
       gap: 6px;
     }
-    .pair-row input { margin-bottom: 0; }
+    .pair-row input { flex: 1 1 auto; min-width: 0; margin-bottom: 0; }
     .pair-row button {
       flex: 0 0 auto;
       background: #2563eb;
@@ -211,6 +215,8 @@
     }
     .pair-row button:hover { background: #1d4ed8; }
     .pair-row button:disabled { opacity: 0.55; cursor: wait; }
+    .pair-row .disconnect-button { background: #334155; color: #cbd5e1; }
+    .pair-row .disconnect-button:hover { background: #475569; }
     .connection-status {
       min-height: 16px;
       margin-top: 6px;
@@ -258,10 +264,10 @@
 
       <div id="analysisSection" style="display:none">
         <div class="analysis">
-          <div class="analysis-header" id="analysisToggle">
+          <button type="button" class="analysis-header" id="analysisToggle" aria-expanded="true" aria-controls="analysisBody">
             <span class="analysis-title">Keyword Match</span>
             <span class="analysis-badge" id="analysisBadge">0%</span>
-          </div>
+          </button>
           <div class="analysis-body" id="analysisBody">
             <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
             <div class="analysis-summary" id="analysisSummary"></div>
@@ -299,6 +305,7 @@
     <div class="pair-row">
       <input type="password" id="accessToken" placeholder="Paste token to connect" autocomplete="off" spellcheck="false">
       <button type="button" id="connectBtn">Connect</button>
+      <button type="button" id="disconnectBtn" class="disconnect-button" disabled>Disconnect</button>
     </div>
     <div id="connectionStatus" class="connection-status" role="status" aria-live="polite">Disconnected — enter a token to connect.</div>
   </div>

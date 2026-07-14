@@ -27,6 +27,7 @@ interface MockElement {
   addEventListener: jest.Mock;
   appendChild: jest.Mock;
   focus: jest.Mock;
+  setAttribute: jest.Mock;
 }
 
 interface PopupApi {
@@ -44,6 +45,7 @@ interface PopupApi {
     serverUrl?: string;
     accessToken?: string;
   }): void;
+  initializePopup(): Promise<void>;
   connectServer(): Promise<void>;
   apiFetch(path: string, init?: RequestInit): Promise<Response>;
 }
@@ -60,6 +62,7 @@ function createElement(value = ""): MockElement {
     addEventListener: jest.fn(),
     appendChild: jest.fn(),
     focus: jest.fn(),
+    setAttribute: jest.fn(),
   };
 }
 
@@ -87,9 +90,10 @@ function loadPopup(options: {
     remove: jest.fn().mockResolvedValue(true),
   };
   const storage = {
-    get: jest.fn(),
+    get: jest.fn().mockResolvedValue({}),
     set: jest.fn().mockResolvedValue(undefined),
     remove: jest.fn().mockResolvedValue(undefined),
+    setAccessLevel: jest.fn().mockResolvedValue(undefined),
   };
   const chrome = {
     permissions,
@@ -166,6 +170,8 @@ describe("extension connection configuration", () => {
       "scripting",
       "storage",
     ]);
+    expect(manifest.minimum_chrome_version).toBe("102");
+    expect(manifest.background).toEqual({ service_worker: "background.js" });
   });
 
   it("renders an accessible compact connection form with a blank password field", () => {
@@ -175,8 +181,21 @@ describe("extension connection configuration", () => {
     expect(popupHtml).toContain('id="accessToken"');
     expect(popupHtml).toContain('type="password"');
     expect(popupHtml).toContain('id="connectBtn"');
+    expect(popupHtml).toContain('id="disconnectBtn"');
     expect(popupHtml).toContain('id="connectionStatus"');
     expect(popupHtml).toMatch(/id="connectionStatus"[^>]+aria-live="polite"/);
+    expect(popupHtml).toMatch(/<button[^>]+id="analysisToggle"[^>]+aria-expanded="true"/);
+  });
+
+  it("keeps keyword analysis disclosure state in sync", async () => {
+    const { getElement } = loadPopup();
+    const toggle = getElement("analysisToggle");
+    const body = getElement("analysisBody");
+
+    await eventHandler(toggle, "click")();
+
+    expect(body.style.display).toBe("none");
+    expect(toggle.setAttribute).toHaveBeenCalledWith("aria-expanded", "false");
   });
 });
 
@@ -190,7 +209,17 @@ describe("server origin policy", () => {
   ])("normalizes %s to its exact origin", (value, expected) => {
     const { api } = loadPopup();
     expect(api.normalizeServerOrigin(value)).toBe(expected);
-    expect(api.permissionPattern(expected)).toBe(`${expected}/*`);
+  });
+
+  it.each([
+    ["https://jobs.example.com", "https://jobs.example.com:443/*"],
+    ["https://jobs.example.com:8443", "https://jobs.example.com:8443/*"],
+    ["http://localhost", "http://localhost:80/*"],
+    ["http://127.0.0.1:3000", "http://127.0.0.1:3000/*"],
+    ["https://[2001:db8::1]", "https://[2001:db8::1]:443/*"],
+  ])("derives the effective-port host permission for %s", (origin, expected) => {
+    const { api } = loadPopup();
+    expect(api.permissionPattern(origin)).toBe(expected);
   });
 
   it.each([
@@ -236,7 +265,7 @@ describe("secure extension pairing", () => {
     await api.connectServer();
 
     expect(permissions.request).toHaveBeenCalledWith({
-      origins: ["https://new.example.com/*"],
+      origins: ["https://new.example.com:443/*"],
     });
     expect(fetchMock).not.toHaveBeenCalled();
     expect(storage.set).not.toHaveBeenCalled();
@@ -292,7 +321,7 @@ describe("secure extension pairing", () => {
 
       expect(storage.set).not.toHaveBeenCalled();
       expect(permissions.remove).toHaveBeenCalledWith({
-        origins: ["https://new.example.com/*"],
+        origins: ["https://new.example.com:443/*"],
       });
       expect(getElement("connectionStatus").textContent).toMatch(message);
 
@@ -316,7 +345,7 @@ describe("secure extension pairing", () => {
 
     expect(storage.set).not.toHaveBeenCalled();
     expect(permissions.remove).toHaveBeenCalledWith({
-      origins: ["https://new.example.com/*"],
+      origins: ["https://new.example.com:443/*"],
     });
     expect(getElement("connectionStatus").textContent).toMatch(/could not reach/i);
   });
@@ -382,7 +411,7 @@ describe("secure extension pairing", () => {
     await api.connectServer();
 
     expect(permissions.request).toHaveBeenCalledWith({
-      origins: ["https://new.example.com/*"],
+      origins: ["https://new.example.com:443/*"],
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [verifyUrl, verifyInit] = fetchMock.mock.calls[0] as [
@@ -395,8 +424,11 @@ describe("secure extension pairing", () => {
       `Bearer ${TEST_TOKEN}`
     );
     expect(storage.set).toHaveBeenCalledWith({
-      serverUrl: "https://new.example.com",
-      accessToken: TEST_TOKEN,
+      connection: {
+        serverUrl: "https://new.example.com",
+        accessToken: TEST_TOKEN,
+        invalidated: false,
+      },
     });
     expect(fetchMock.mock.invocationCallOrder[0]).toBeLessThan(
       storage.set.mock.invocationCallOrder[0]
@@ -420,7 +452,7 @@ describe("secure extension pairing", () => {
     await api.connectServer();
 
     expect(permissions.remove).toHaveBeenCalledWith({
-      origins: ["https://new.example.com/*"],
+      origins: ["https://new.example.com:443/*"],
     });
     fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
     await api.apiFetch("/api/settings");
@@ -443,7 +475,7 @@ describe("secure extension pairing", () => {
     await api.connectServer();
 
     expect(permissions.remove).toHaveBeenCalledWith({
-      origins: ["https://old.example.com/*"],
+      origins: ["https://old.example.com:443/*"],
     });
     expect(storage.set.mock.invocationCallOrder[0]).toBeLessThan(
       permissions.remove.mock.invocationCallOrder[0]
@@ -489,21 +521,23 @@ describe("secure extension pairing", () => {
   });
 
   it("loads both persisted connection fields before popup extraction", async () => {
-    const { api, getElement, query, storage } = loadPopup({ connection: {} });
+    const { api, fetchMock, getElement, query, storage } = loadPopup({
+      connection: {},
+    });
     query.mockResolvedValueOnce([]);
-    expect(storage.get).toHaveBeenCalledWith(
-      ["serverUrl", "accessToken"],
-      expect.any(Function)
-    );
-
-    const restore = storage.get.mock.calls[0][1] as (
-      result: { serverUrl: string; accessToken: string }
-    ) => void;
-    restore({
+    storage.get.mockResolvedValueOnce({
       serverUrl: "https://jobs.example.com",
       accessToken: TEST_TOKEN,
     });
-    await Promise.resolve();
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+
+    await api.initializePopup();
+
+    expect(storage.get).toHaveBeenCalledWith([
+      "connection",
+      "serverUrl",
+      "accessToken",
+    ]);
 
     expect(getElement("serverUrl").value).toBe("https://jobs.example.com");
     expect(getElement("accessToken").value).toBe("");
@@ -543,8 +577,13 @@ describe("authenticated extension API client", () => {
 
     await expect(api.apiFetch("/api/settings")).rejects.toThrow(/reconnect/i);
 
-    expect(storage.remove).toHaveBeenCalledWith("accessToken");
-    expect(storage.set).not.toHaveBeenCalled();
+    expect(storage.set).toHaveBeenCalledWith({
+      connection: {
+        serverUrl: "http://localhost:3000",
+        invalidated: true,
+      },
+    });
+    expect(storage.remove).toHaveBeenCalledWith(["serverUrl", "accessToken"]);
     expect(getElement("serverUrl").value).toBe("http://localhost:3000");
     expect(getElement("connectionStatus").textContent).toMatch(/reconnect/i);
     await expect(api.apiFetch("/api/settings")).rejects.toThrow(

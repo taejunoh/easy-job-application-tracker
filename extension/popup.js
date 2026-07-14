@@ -7,9 +7,25 @@ const refreshBtn = document.getElementById("refreshBtn");
 const serverUrlInput = document.getElementById("serverUrl");
 const accessTokenInput = document.getElementById("accessToken");
 const connectBtn = document.getElementById("connectBtn");
+const disconnectBtn = document.getElementById("disconnectBtn");
 const connectionStatus = document.getElementById("connectionStatus");
+const openTracker = document.getElementById("openTracker");
 
 let currentConnection = null;
+let connectionGeneration = 0;
+let credentialMutationQueue = Promise.resolve();
+
+let trustedStoragePromise;
+try {
+  trustedStoragePromise = Promise.resolve(
+    chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" })
+  ).then(
+    () => true,
+    () => false
+  );
+} catch {
+  trustedStoragePromise = Promise.resolve(false);
+}
 
 function normalizeServerOrigin(value) {
   const input = String(value).trim();
@@ -59,7 +75,9 @@ function normalizeServerOrigin(value) {
 }
 
 function permissionPattern(origin) {
-  return `${origin}/*`;
+  const parsed = new URL(origin);
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  return `${parsed.protocol}//${parsed.hostname}:${port}/*`;
 }
 
 function setConnectionStatus(message, type = "info", loading = false) {
@@ -67,21 +85,88 @@ function setConnectionStatus(message, type = "info", loading = false) {
   connectionStatus.className = `connection-status ${type}`;
   connectBtn.disabled = loading;
   connectBtn.textContent = loading ? "Connecting..." : "Connect";
+  disconnectBtn.disabled = loading || !currentConnection;
+}
+
+function clearApplicationTarget() {
+  delete openTracker.dataset.appUrl;
+  openTracker.textContent = "Open tracker";
+}
+
+function replaceCurrentConnection(connection) {
+  connectionGeneration += 1;
+  currentConnection = connection
+    ? { ...connection, generation: connectionGeneration }
+    : null;
+}
+
+function mutateCredentials(operation) {
+  const mutation = credentialMutationQueue.then(operation, operation);
+  credentialMutationQueue = mutation.then(
+    () => undefined,
+    () => undefined
+  );
+  return mutation;
+}
+
+async function requireTrustedStorage() {
+  if (await trustedStoragePromise) return;
+  replaceCurrentConnection(null);
+  clearApplicationTarget();
+  setConnectionStatus(
+    "Secure credential storage is unavailable. JobTracker requires Chrome 102 or newer.",
+    "error"
+  );
+  throw new Error("Secure extension storage is unavailable.");
+}
+
+function getStoredConnection(result) {
+  const record = result?.connection && typeof result.connection === "object"
+    ? result.connection
+    : null;
+  if (record) {
+    return {
+      serverUrl: record.serverUrl,
+      accessToken: record.invalidated ? undefined : record.accessToken,
+      invalidated: record.invalidated === true,
+      legacy: false,
+    };
+  }
+  return {
+    serverUrl: result?.serverUrl,
+    accessToken: result?.accessToken,
+    invalidated: false,
+    legacy: true,
+  };
+}
+
+async function storeConnectionRecord(record) {
+  await chrome.storage.local.set({ connection: record });
+  try {
+    await chrome.storage.local.remove(["serverUrl", "accessToken"]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function restoreConnection(result) {
-  currentConnection = null;
+  replaceCurrentConnection(null);
   accessTokenInput.value = "";
+  const stored = getStoredConnection(result);
 
-  if (typeof result?.serverUrl === "string" && result.serverUrl) {
-    serverUrlInput.value = result.serverUrl;
+  if (typeof stored.serverUrl === "string" && stored.serverUrl) {
+    serverUrlInput.value = stored.serverUrl;
   }
 
-  if (typeof result?.accessToken === "string" && result.accessToken &&
-      typeof result?.serverUrl === "string") {
+  if (!stored.invalidated && typeof stored.accessToken === "string" &&
+      stored.accessToken && typeof stored.serverUrl === "string") {
     try {
-      const origin = normalizeServerOrigin(result.serverUrl);
-      currentConnection = { serverUrl: origin, accessToken: result.accessToken };
+      const origin = normalizeServerOrigin(stored.serverUrl);
+      replaceCurrentConnection({
+        serverUrl: origin,
+        accessToken: stored.accessToken,
+      });
       serverUrlInput.value = origin;
       setConnectionStatus(`Connected to ${origin}`, "success");
       return;
@@ -96,11 +181,11 @@ function restoreConnection(result) {
   );
 }
 
-async function removePermissionQuietly(pattern) {
+async function removePermission(pattern) {
   try {
-    await chrome.permissions.remove({ origins: [pattern] });
+    return await chrome.permissions.remove({ origins: [pattern] }) === true;
   } catch {
-    // Permission cleanup is best effort and never changes a verified pair.
+    return false;
   }
 }
 
@@ -124,7 +209,6 @@ async function connectServer() {
   }
 
   const pattern = permissionPattern(origin);
-  const oldConnection = currentConnection;
   let priorPermissionState = "unknown";
   let granted = false;
   let stored = false;
@@ -156,6 +240,8 @@ async function connectServer() {
       return;
     }
 
+    phase = "storage-access";
+    await requireTrustedStorage();
     phase = "verify";
     setConnectionStatus("Verifying access token...", "info", true);
     const response = await fetch(`${origin}/api/auth/verify`, {
@@ -174,21 +260,45 @@ async function connectServer() {
     }
 
     phase = "storage";
-    await chrome.storage.local.set({ serverUrl: origin, accessToken: token });
-    stored = true;
-    currentConnection = { serverUrl: origin, accessToken: token };
-    serverUrlInput.value = origin;
-    setConnectionStatus(`Connected to ${origin}`, "success");
+    const mutation = await mutateCredentials(async () => {
+      await requireTrustedStorage();
+      const previous = currentConnection;
+      const legacyClean = await storeConnectionRecord({
+        serverUrl: origin,
+        accessToken: token,
+        invalidated: false,
+      });
+      stored = true;
+      replaceCurrentConnection({ serverUrl: origin, accessToken: token });
+      clearApplicationTarget();
+      serverUrlInput.value = origin;
+      return { legacyClean, previous };
+    });
 
-    if (oldConnection && oldConnection.serverUrl !== origin) {
-      await removePermissionQuietly(permissionPattern(oldConnection.serverUrl));
+    let permissionClean = true;
+    if (mutation.previous && mutation.previous.serverUrl !== origin) {
+      permissionClean = await removePermission(
+        permissionPattern(mutation.previous.serverUrl)
+      );
     }
+    const warning = !permissionClean
+      ? " Old host access could not be removed."
+      : !mutation.legacyClean
+        ? " Legacy credential cleanup failed."
+        : "";
+    setConnectionStatus(`Connected to ${origin}.${warning}`, warning ? "info" : "success");
   } catch (error) {
+    let permissionClean = true;
     if (granted && priorPermissionState === false && !stored) {
-      await removePermissionQuietly(pattern);
+      permissionClean = await removePermission(pattern);
     }
 
-    if (phase === "permission") {
+    if (phase === "storage-access") {
+      setConnectionStatus(
+        "Secure credential storage is unavailable. JobTracker requires Chrome 102 or newer.",
+        "error"
+      );
+    } else if (phase === "permission") {
       setConnectionStatus(
         "Server access was not granted. The previous connection is unchanged.",
         "error"
@@ -208,6 +318,12 @@ async function connectServer() {
         "error"
       );
     }
+    if (!permissionClean) {
+      setConnectionStatus(
+        `${connectionStatus.textContent} Host access could not be removed.`,
+        "error"
+      );
+    }
   } finally {
     accessTokenInput.value = "";
     connectBtn.disabled = false;
@@ -215,7 +331,97 @@ async function connectServer() {
   }
 }
 
-async function apiFetch(path, init = {}) {
+async function disconnectServer() {
+  await mutateCredentials(async () => {
+    const connection = currentConnection;
+    let origin = connection?.serverUrl;
+    if (!origin) {
+      try {
+        origin = normalizeServerOrigin(serverUrlInput.value);
+      } catch {
+        origin = "";
+      }
+    }
+
+    replaceCurrentConnection(null);
+    clearApplicationTarget();
+    accessTokenInput.value = "";
+
+    let storageClean = true;
+    try {
+      await requireTrustedStorage();
+      if (origin) {
+        storageClean = await storeConnectionRecord({
+          serverUrl: origin,
+          invalidated: true,
+        });
+      }
+    } catch {
+      storageClean = false;
+    }
+
+    const permissionClean = origin
+      ? await removePermission(permissionPattern(origin))
+      : true;
+    const warnings = [
+      !storageClean ? "Credential storage could not be updated." : "",
+      !permissionClean ? "Host access could not be removed." : "",
+    ].filter(Boolean).join(" ");
+    setConnectionStatus(
+      warnings || "Disconnected. Enter an access token to reconnect.",
+      warnings ? "error" : "info"
+    );
+  });
+}
+
+function sameConnection(left, right) {
+  return Boolean(left && right &&
+    left.generation === right.generation &&
+    left.serverUrl === right.serverUrl &&
+    left.accessToken === right.accessToken);
+}
+
+async function invalidateUnauthorizedConnection(connection) {
+  return mutateCredentials(async () => {
+    if (!sameConnection(currentConnection, connection)) return false;
+
+    replaceCurrentConnection(null);
+    clearApplicationTarget();
+    accessTokenInput.value = "";
+
+    let storageClean = true;
+    try {
+      await requireTrustedStorage();
+      await storeConnectionRecord({
+        serverUrl: connection.serverUrl,
+        invalidated: true,
+      });
+    } catch {
+      storageClean = false;
+      try {
+        await chrome.storage.local.remove(["connection", "accessToken"]);
+      } catch {
+        // Startup verification prevents a stale record from being trusted.
+      }
+    }
+
+    const permissionClean = await removePermission(
+      permissionPattern(connection.serverUrl)
+    );
+    const warnings = [
+      !storageClean ? "Credential storage could not be updated." : "",
+      !permissionClean ? "Host access could not be removed." : "",
+    ].filter(Boolean).join(" ");
+    setConnectionStatus(
+      warnings || "Connection expired. Enter the access token to reconnect.",
+      "error"
+    );
+    return true;
+  });
+}
+
+async function authenticatedRequest(path, init = {}) {
+  await requireTrustedStorage();
   if (!currentConnection) {
     throw new Error("Connect this extension to a server before using its API.");
   }
@@ -223,7 +429,7 @@ async function apiFetch(path, init = {}) {
     throw new Error("API paths must be relative to the connected server.");
   }
 
-  const connection = currentConnection;
+  const connection = { ...currentConnection };
   const headers = new Headers(init.headers || {});
   headers.set("Authorization", `Bearer ${connection.accessToken}`);
   const response = await fetch(`${connection.serverUrl}${path}`, {
@@ -232,21 +438,15 @@ async function apiFetch(path, init = {}) {
   });
 
   if (response.status === 401) {
-    currentConnection = null;
-    accessTokenInput.value = "";
-    try {
-      await chrome.storage.local.remove("accessToken");
-    } catch {
-      // Keep the popup disconnected even if Chrome storage is unavailable.
-    }
-    setConnectionStatus(
-      "Connection expired. Enter the access token to reconnect.",
-      "error"
-    );
+    await invalidateUnauthorizedConnection(connection);
     throw new Error("Connection expired. Reconnect to the server.");
   }
 
-  return response;
+  return { connection, response };
+}
+
+async function apiFetch(path, init = {}) {
+  return (await authenticatedRequest(path, init)).response;
 }
 
 function showStatus(message, type) {
@@ -400,7 +600,12 @@ document.getElementById("analyzeBtn")?.addEventListener("click", () => {
 // Toggle analysis body
 document.getElementById("analysisToggle")?.addEventListener("click", () => {
   const body = document.getElementById("analysisBody");
-  body.style.display = body.style.display === "none" ? "block" : "none";
+  const expanded = body.style.display !== "none";
+  body.style.display = expanded ? "none" : "block";
+  document.getElementById("analysisToggle").setAttribute(
+    "aria-expanded",
+    String(!expanded)
+  );
 });
 
 // Try sendMessage first; if the content script isn't loaded (e.g. LinkedIn
@@ -510,7 +715,7 @@ saveBtn.addEventListener("click", async () => {
   saveBtn.textContent = "Saving...";
 
   try {
-    const res = await apiFetch("/api/applications", {
+    const request = await authenticatedRequest("/api/applications", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -524,12 +729,12 @@ saveBtn.addEventListener("click", async () => {
       }),
     });
 
-    if (!res.ok) {
-      throw new Error("Server returned " + res.status);
+    if (!request.response.ok) {
+      throw new Error("Server returned " + request.response.status);
     }
 
-    const result = await res.json();
-    const appUrl = `${currentConnection.serverUrl}/applications/${result.id}`;
+    const result = await request.response.json();
+    const appUrl = `${request.connection.serverUrl}/applications/${result.id}`;
 
     if (result.updated) {
       showStatus("Existing application updated with full details!", "success");
@@ -611,18 +816,134 @@ connectBtn.addEventListener("click", () => {
   connectServer();
 });
 
-// Restore the verified pair (or a legacy URL-only draft) before extraction.
-chrome.storage.local.get(["serverUrl", "accessToken"], (result) => {
-  restoreConnection(result);
-  extractFromPage();
+disconnectBtn.addEventListener("click", () => {
+  disconnectServer();
 });
+
+async function initializePopup() {
+  try {
+    await requireTrustedStorage();
+    const result = await chrome.storage.local.get([
+      "connection",
+      "serverUrl",
+      "accessToken",
+    ]);
+    const stored = getStoredConnection(result || {});
+
+    replaceCurrentConnection(null);
+    const startupGeneration = connectionGeneration;
+    clearApplicationTarget();
+    accessTokenInput.value = "";
+    if (typeof stored.serverUrl === "string" && stored.serverUrl) {
+      serverUrlInput.value = stored.serverUrl;
+    }
+    if (stored.invalidated || !stored.accessToken || !stored.serverUrl) {
+      setConnectionStatus(
+        "Disconnected — enter an access token to connect.",
+        "info"
+      );
+      return;
+    }
+
+    let origin;
+    try {
+      origin = normalizeServerOrigin(stored.serverUrl);
+    } catch {
+      setConnectionStatus("Stored server URL is invalid. Reconnect.", "error");
+      return;
+    }
+
+    let response;
+    try {
+      response = await fetch(`${origin}/api/auth/verify`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${stored.accessToken}` },
+      });
+    } catch {
+      if (connectionGeneration === startupGeneration) {
+        setConnectionStatus(
+          "Stored connection could not be verified. Check the server and reconnect.",
+          "error"
+        );
+      }
+      return;
+    }
+
+    if (response.ok) {
+      await mutateCredentials(async () => {
+        if (connectionGeneration !== startupGeneration) return;
+        if (stored.legacy) {
+          await storeConnectionRecord({
+            serverUrl: origin,
+            accessToken: stored.accessToken,
+            invalidated: false,
+          });
+        }
+        replaceCurrentConnection({
+          serverUrl: origin,
+          accessToken: stored.accessToken,
+        });
+        serverUrlInput.value = origin;
+        setConnectionStatus(`Connected to ${origin}`, "success");
+      });
+      return;
+    }
+
+    if (response.status === 401) {
+      await mutateCredentials(async () => {
+        if (connectionGeneration !== startupGeneration) return;
+        replaceCurrentConnection(null);
+        let storageClean = true;
+        try {
+          await storeConnectionRecord({
+            serverUrl: origin,
+            invalidated: true,
+          });
+        } catch {
+          storageClean = false;
+          try {
+            await chrome.storage.local.remove(["connection", "accessToken"]);
+          } catch {
+            // Retry verification on the next popup open.
+          }
+        }
+        const permissionClean = await removePermission(permissionPattern(origin));
+        const warning = [
+          !storageClean ? "Credential storage could not be updated." : "",
+          !permissionClean ? "Host access could not be removed." : "",
+        ].filter(Boolean).join(" ");
+        setConnectionStatus(
+          warning || "Connection expired. Enter the access token to reconnect.",
+          "error"
+        );
+      });
+      return;
+    }
+
+    if (connectionGeneration === startupGeneration) {
+      setConnectionStatus("Stored connection was rejected. Reconnect.", "error");
+    }
+  } catch {
+    // requireTrustedStorage already displayed a fail-closed compatibility error.
+  } finally {
+    extractFromPage();
+  }
+}
+
+let initializationPromise = Promise.resolve();
+if (typeof module === "undefined") {
+  initializationPromise = initializePopup();
+}
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     apiFetch,
     connectServer,
+    disconnectServer,
     extractFromPage,
     fillProfiles,
+    initializationPromise,
+    initializePopup,
     normalizeServerOrigin,
     permissionPattern,
     restoreConnection,

@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "JobTracker",
   "version": "1.0",
+  "minimum_chrome_version": "102",
   "description": "Extract job posting data and send it to JobTracker",
   "permissions": ["activeTab", "scripting", "storage"],
   "optional_host_permissions": [
@@ -11,6 +12,9 @@
   ],
   "action": {
     "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {

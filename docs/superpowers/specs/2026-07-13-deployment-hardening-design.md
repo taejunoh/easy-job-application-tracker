@@ -170,17 +170,21 @@ The popup retains the persisted server URL and adds an access token field plus C
 
 These patterns live under `optional_host_permissions`, not `host_permissions`, and are not granted at install time. `<all_urls>` is prohibited. Plain HTTP for non-loopback hosts is not declared or accepted.
 
+The extension requires Chrome 102 or newer. Its service worker and popup both set `chrome.storage.local` to `TRUSTED_CONTEXTS` before credential access so content scripts cannot read the access token. The popup fails closed when that access level cannot be established.
+
 Pairing proceeds as follows from the user-initiated Connect click:
 
 1. Normalize the entered server URL by removing only a trailing slash; require `https` outside localhost development.
-2. Derive the exact origin and permission pattern `${origin}/*`. Check `chrome.permissions.contains`; when absent, call `chrome.permissions.request({ origins: [`${origin}/*`] })` while the click's user gesture is active.
+2. Derive the exact origin and an effective-port permission pattern (`https://host:443/*`, `http://host:80/*`, or the explicit custom port). Check `chrome.permissions.contains`; when absent, call `chrome.permissions.request({ origins: [pattern] })` while the click's user gesture is active. A failed `contains` call is an unknown prior state, not proof that the permission is newly granted.
 3. If permission is denied, make no network request, store no token, retain any previously verified connection unchanged, and show that access to the selected server was not granted.
 4. After permission succeeds, call `POST /api/auth/verify` with the entered token in `Authorization: Bearer`.
-5. Store the verified `{ serverUrl, accessToken }` pair in `chrome.storage.local` only after both permission grant and verification succeed. A verification failure stores neither the new token nor a new active server URL.
+5. Store the verified `{ serverUrl, accessToken, invalidated: false }` pair in one `connection` record only after both permission grant and verification succeed. A verification failure stores neither the new token nor a new active server URL. Legacy top-level `{ serverUrl, accessToken }` values are read once and migrated after successful startup verification.
 6. Attach the Bearer header to extraction, keyword analysis, application save, settings read, and future API requests.
-7. On `401`, remove only the invalid token, retain the server URL as an unpaired draft, return the popup to its connection state, and show a reconnect message.
+7. On `401`, replace the record with `{ serverUrl, invalidated: true }`, retain the server URL as an unpaired draft, remove the origin permission, return the popup to its connection state, and show a reconnect message. Startup re-verifies any stored token before reporting Connected, so a failed credential cleanup cannot silently revive a stale connection.
 
-The verified token is bound to its stored server origin. Editing the server URL does not send the old token to the new origin. When changing servers, the previous verified pair remains active until the new origin permission and token verification both succeed; the new pair then replaces it atomically. After replacement, the extension makes a best-effort `chrome.permissions.remove` for the old origin when it differs from the new origin. Failure to remove the old optional permission does not expose the token and does not roll back the verified new pair.
+The verified token is bound to its stored server origin and a monotonically increasing in-memory connection generation. Every request captures an immutable origin, token, and generation. Credential mutations are serialized; a delayed `401` can invalidate only the exact generation that issued the request and cannot clear a newer pair. Editing the server URL does not send the old token to the new origin. When changing servers, the previous verified pair remains active until the new origin permission and token verification both succeed; the new pair then replaces it atomically. After replacement, the extension removes the old origin permission when it differs from the new origin. A false or rejected cleanup result is surfaced as a warning without rolling back the functional connection.
+
+Disconnect clears the token and any application-specific tracker link, retains the server URL as a draft, persists the invalidated record, and attempts to remove its host permission. Storage or permission cleanup failures leave the current popup disconnected and are shown explicitly; they never restore a credential.
 
 An existing installation may already have `serverUrl` set to localhost without a token or optional host permission. On upgrade, that value pre-fills the connection form as an unpaired draft. The next Connect click requests the loopback origin permission and verifies the newly configured access token. It never discards the existing localhost value merely because the new manifest has not yet received permission.
 
