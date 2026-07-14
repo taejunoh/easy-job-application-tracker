@@ -1,13 +1,19 @@
-chrome.storage.local.setAccessLevel({
-  accessLevel: "TRUSTED_CONTEXTS",
-}).catch(() => {
-  // Never leave known credential keys exposed if trusted-only access cannot
-  // be established. The popup independently fails closed and reports it.
-  return chrome.storage.local.remove([
-    "connection",
-    "serverUrl",
-    "accessToken",
-  ]).catch(() => {
-    // The background never reads or uses credentials after either failure.
-  });
-});
+const credentialKeys = ["connection", "serverUrl", "accessToken"];
+
+function purgeCredentials() {
+  try {
+    return Promise.resolve(
+      chrome.storage.local.remove(credentialKeys)
+    ).catch(() => undefined);
+  } catch {
+    return Promise.resolve();
+  }
+}
+
+try {
+  Promise.resolve(
+    chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" })
+  ).catch(purgeCredentials);
+} catch {
+  purgeCredentials();
+}

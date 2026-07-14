@@ -35,8 +35,9 @@ describe("extension trusted storage background", () => {
     });
 
     expect(() => new vm.Script(script).runInContext(context)).not.toThrow();
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let index = 0; index < 10 && !remove.mock.calls.length; index += 1) {
+      await Promise.resolve();
+    }
 
     expect(remove).toHaveBeenCalledWith([
       "connection",
@@ -57,4 +58,28 @@ describe("extension trusted storage background", () => {
     await Promise.resolve();
     await Promise.resolve();
   });
+
+  it.each(["missing", "throws"] as const)(
+    "purges credentials when local.setAccessLevel synchronously %s",
+    async (failure) => {
+      const remove = jest.fn().mockResolvedValue(undefined);
+      const local: Record<string, unknown> = { remove };
+      if (failure === "throws") {
+        local.setAccessLevel = jest.fn(() => {
+          throw new Error("setAccessLevel unavailable");
+        });
+      }
+      const script = readFileSync(backgroundPath, "utf8");
+      const context = vm.createContext({ chrome: { storage: { local } } });
+
+      expect(() => new vm.Script(script).runInContext(context)).not.toThrow();
+      await Promise.resolve();
+
+      expect(remove).toHaveBeenCalledWith([
+        "connection",
+        "serverUrl",
+        "accessToken",
+      ]);
+    }
+  );
 });

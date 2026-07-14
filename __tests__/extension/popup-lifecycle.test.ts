@@ -137,7 +137,8 @@ function loadLifecyclePopup(options: {
       if (options.permissionRemoval === "reject") {
         throw new Error("permission removal unavailable");
       }
-      const removed = options.permissionRemoval ?? true;
+      const removed = options.permissionRemoval ??
+        origins.some((origin) => grantedOrigins.has(origin));
       if (removed) {
         for (const origin of origins) grantedOrigins.delete(origin);
       }
@@ -603,20 +604,13 @@ describe("connection generations", () => {
     await harness.ready();
     harness.establish("https://a.example.com", TOKEN_A);
     harness.getElement("description").value = "TypeScript and security";
-    const analysisResponse = deferred<Response>();
-    harness.fetchMock
-      .mockReturnValueOnce(analysisResponse.promise)
-      .mockResolvedValueOnce({ ok: true, status: 200 });
-
-    const analysis = harness.api.runKeywordAnalysis();
-    harness.enterPair("https://b.example.com");
-    await harness.api.connectServer();
-    analysisResponse.resolve({
+    harness.fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
       json: async () => ({ error: "no_resume" }),
-    } as Response);
-    await analysis;
+    });
+
+    await harness.api.runKeywordAnalysis();
     eventHandler(harness.getElement("openSettings"), "click")({
       preventDefault: jest.fn(),
     });
@@ -625,9 +619,194 @@ describe("connection generations", () => {
       url: "https://a.example.com/settings",
     });
   });
+
+  it("does not let stale A keyword results overwrite B UI", async () => {
+    const harness = loadLifecyclePopup();
+    await harness.ready();
+    harness.establish("https://a.example.com", TOKEN_A);
+    harness.getElement("description").value = "TypeScript and security";
+    const analysisResponse = deferred<Response>();
+    harness.fetchMock
+      .mockReturnValueOnce(analysisResponse.promise)
+      .mockResolvedValueOnce({ ok: true, status: 200 });
+
+    const analysis = harness.api.runKeywordAnalysis();
+    harness.enterPair("https://b.example.com");
+    await harness.api.connectServer();
+    harness.getElement("analyzeBtn").textContent = "B ready";
+    harness.getElement("analyzeBtn").disabled = false;
+    analysisResponse.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        matchPercentage: 80,
+        matchedKeywords: [{ keyword: "TypeScript" }],
+        missingKeywords: [],
+        totalJobKeywords: 1,
+      }),
+    } as Response);
+    await analysis;
+
+    expect(harness.getElement("analysisSection").style.display).not.toBe("block");
+    expect(harness.getElement("analysisBadge").textContent).toBe("");
+    expect(harness.getElement("analysisPrompt").innerHTML).toBe("");
+    expect(harness.getElement("analyzeBtn").textContent).toBe("B ready");
+    expect(harness.getElement("analyzeBtn").disabled).toBe(false);
+  });
 });
 
 describe("connection teardown", () => {
+  it("removes the active origin from same-origin pending cleanup before reopen", async () => {
+    const storageState: Record<string, unknown> = {};
+    const grantedOrigins = new Set([permissionFor("https://a.example.com")]);
+    const first = loadLifecyclePopup({ grantedOrigins, storageState });
+    await first.ready();
+    storageState.connection = {
+      serverUrl: "https://a.example.com",
+      accessToken: TOKEN_A,
+      invalidated: false,
+      pendingCleanupOrigins: ["https://a.example.com"],
+    };
+    first.api.restoreConnection({ connection: storageState.connection });
+    first.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    first.enterPair("https://a.example.com", TOKEN_B);
+    await first.api.connectServer();
+
+    const reopened = loadLifecyclePopup({ grantedOrigins, storageState });
+    reopened.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    await reopened.ready();
+
+    expect(grantedOrigins).toContain(permissionFor("https://a.example.com"));
+    expect(reopened.fetchMock).toHaveBeenCalledWith(
+      "https://a.example.com/api/auth/verify",
+      expect.any(Object)
+    );
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      accessToken: TOKEN_B,
+      invalidated: false,
+    });
+    expect(reopened.getElement("connectionStatus").textContent).toMatch(/connected/i);
+  });
+
+  it("clears an absent permission marker on reopen after record persistence failed", async () => {
+    const storageState: Record<string, unknown> = {
+      connection: {
+        serverUrl: "https://a.example.com",
+        invalidated: true,
+        pendingCleanupOrigins: ["https://a.example.com"],
+      },
+    };
+    const grantedOrigins = new Set([permissionFor("https://a.example.com")]);
+    const first = loadLifecyclePopup({ grantedOrigins, storageState });
+    first.storage.set.mockRejectedValueOnce(new Error("record persistence failed"));
+    await first.ready();
+    expect(grantedOrigins).not.toContain(permissionFor("https://a.example.com"));
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      invalidated: true,
+      pendingCleanupOrigins: ["https://a.example.com"],
+    });
+
+    const reopened = loadLifecyclePopup({ grantedOrigins, storageState });
+    await reopened.ready();
+
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      invalidated: true,
+    });
+  });
+
+  it("treats remove false followed by contains false as clean", async () => {
+    const storageState: Record<string, unknown> = {
+      connection: {
+        serverUrl: "https://a.example.com",
+        invalidated: true,
+        pendingCleanupOrigins: ["https://a.example.com"],
+      },
+    };
+    const grantedOrigins = new Set([permissionFor("https://a.example.com")]);
+    const harness = loadLifecyclePopup({ grantedOrigins, storageState });
+    harness.permissions.remove.mockImplementationOnce(async ({ origins }) => {
+      origins.forEach((origin: string) => grantedOrigins.delete(origin));
+      return false;
+    });
+
+    await harness.ready();
+
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      invalidated: true,
+    });
+  });
+
+  it("fails closed when cleanup permission state cannot be read", async () => {
+    const storageState: Record<string, unknown> = {
+      connection: {
+        serverUrl: "https://a.example.com",
+        invalidated: true,
+        pendingCleanupOrigins: ["https://a.example.com"],
+      },
+    };
+    const grantedOrigins = new Set([permissionFor("https://a.example.com")]);
+    const harness = loadLifecyclePopup({ grantedOrigins, storageState });
+    harness.permissions.contains.mockRejectedValueOnce(
+      new Error("permission state unavailable")
+    );
+
+    await harness.ready();
+
+    expect(grantedOrigins).toContain(permissionFor("https://a.example.com"));
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://a.example.com",
+      invalidated: true,
+      pendingCleanupOrigins: ["https://a.example.com"],
+    });
+  });
+
+  it("moves a failed session-only A cleanup into B and retries it on reopen", async () => {
+    const storageState: Record<string, unknown> = {};
+    const sessionState: Record<string, unknown> = {
+      connectionTombstone: {
+        serverUrl: "https://a.example.com",
+        invalidated: true,
+      },
+    };
+    const grantedOrigins = new Set([permissionFor("https://a.example.com")]);
+    const first = loadLifecyclePopup({
+      grantedOrigins,
+      permissionRemoval: false,
+      sessionState,
+      storageState,
+    });
+    await first.ready();
+    first.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    first.enterPair("https://b.example.com", TOKEN_B);
+
+    await first.api.connectServer();
+
+    expect(sessionState.connectionTombstone).toBeUndefined();
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://b.example.com",
+      accessToken: TOKEN_B,
+      invalidated: false,
+      pendingCleanupOrigins: ["https://a.example.com"],
+    });
+    expect(grantedOrigins).toContain(permissionFor("https://a.example.com"));
+
+    const reopened = loadLifecyclePopup({ grantedOrigins, storageState });
+    reopened.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    await reopened.ready();
+
+    expect(grantedOrigins).not.toContain(permissionFor("https://a.example.com"));
+    expect(grantedOrigins).toContain(permissionFor("https://b.example.com"));
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://b.example.com",
+      accessToken: TOKEN_B,
+      invalidated: false,
+    });
+  });
+
   it("disconnects atomically, retains the URL draft, and removes host access", async () => {
     const harness = loadLifecyclePopup();
     await harness.ready();

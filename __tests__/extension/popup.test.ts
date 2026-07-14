@@ -92,8 +92,9 @@ function loadPopup(options: {
       return true;
     }),
     remove: jest.fn(async () => {
+      const removed = permissionGranted;
       permissionGranted = false;
-      return true;
+      return removed;
     }),
   };
   const storage = {
@@ -177,7 +178,11 @@ describe("extension connection configuration", () => {
       "scripting",
       "storage",
     ]);
-    expect(manifest.minimum_chrome_version).toBe("102");
+    // Generic StorageArea.setAccessLevel docs say Chrome 102+, but Chromium
+    // commit a8f1f337c692360aaec9470a0a91f965011d37a3 enabled the local/sync
+    // implementations in the M140 development cycle.
+    expect(manifest.minimum_chrome_version).toBe("140");
+    expect(popupScript).toContain("requires Chrome 140 or newer");
     expect(manifest.background).toEqual({ service_worker: "background.js" });
   });
 
@@ -307,6 +312,26 @@ describe("secure extension pairing", () => {
     resolveContains(false);
     await pairing;
   });
+
+  it.each(["contains", "request"] as const)(
+    "resets Connect UI when permissions.%s throws synchronously",
+    async (method) => {
+      const { api, getElement, permissions } = loadPopup();
+      permissions[method].mockImplementationOnce(() => {
+        throw new Error("permissions API unavailable");
+      });
+      enterPair(getElement);
+
+      await expect(api.connectServer()).resolves.toBeUndefined();
+
+      expect(getElement("connectBtn").disabled).toBe(false);
+      expect(getElement("connectBtn").textContent).toBe("Connect");
+      expect(getElement("accessToken").value).toBe("");
+      expect(getElement("connectionStatus").textContent).toMatch(
+        /not granted|permission|server access/i
+      );
+    }
+  );
 
   it.each([
     [401, /access token/i],

@@ -144,8 +144,8 @@ async function handleTrustedStorageFailure() {
   await trustedStorageFailurePromise;
   setConnectionStatus(
     trustedStoragePurgeSucceeded
-      ? "Secure credential storage is unavailable. Stored credentials were purged. JobTracker requires Chrome 102 or newer."
-      : "Secure credential storage is unavailable and stored credentials could not be purged. They will not be used. JobTracker requires Chrome 102 or newer.",
+      ? "Secure credential storage is unavailable. Stored credentials were purged. JobTracker requires Chrome 140 or newer."
+      : "Secure credential storage is unavailable and stored credentials could not be purged. They will not be used. JobTracker requires Chrome 140 or newer.",
     "error"
   );
 }
@@ -261,8 +261,28 @@ function restoreConnection(result) {
 }
 
 async function removePermission(pattern) {
+  let permissionPresent;
   try {
-    return await chrome.permissions.remove({ origins: [pattern] }) === true;
+    permissionPresent = await chrome.permissions.contains({
+      origins: [pattern],
+    }) === true;
+  } catch {
+    return false;
+  }
+  if (!permissionPresent) return true;
+
+  let removed;
+  try {
+    removed = await chrome.permissions.remove({ origins: [pattern] }) === true;
+  } catch {
+    return false;
+  }
+  if (removed) return true;
+
+  try {
+    return await chrome.permissions.contains({
+      origins: [pattern],
+    }) === false;
   } catch {
     return false;
   }
@@ -418,19 +438,19 @@ async function connectServer() {
 
   const pattern = permissionPattern(origin);
   setConnectionStatus("Requesting access to the server...", "info", true);
-  // Both permission calls start directly from the click stack. Every later
-  // credential/permission/status mutation remains inside one queued operation.
-  const priorPermissionPromise = Promise.resolve(
-    chrome.permissions.contains({ origins: [pattern] })
-  ).then(
-    (contains) => contains === true,
-    () => "unknown"
-  );
-  const requestPromise = Promise.resolve(
-    chrome.permissions.request({ origins: [pattern] })
-  );
 
   try {
+    // Both permission calls start directly from the click stack. Every later
+    // credential/permission/status mutation remains inside one queued operation.
+    const priorPermissionPromise = Promise.resolve(
+      chrome.permissions.contains({ origins: [pattern] })
+    ).then(
+      (contains) => contains === true,
+      () => "unknown"
+    );
+    const requestPromise = Promise.resolve(
+      chrome.permissions.request({ origins: [pattern] })
+    );
     await mutateCredentials(async () => {
       let priorPermissionState = "unknown";
       let granted = false;
@@ -490,19 +510,24 @@ async function connectServer() {
         const oldOrigin = previous && previous.serverUrl !== origin
           ? previous.serverUrl
           : null;
-        const pendingBeforeCleanup = oldOrigin
-          ? recordWithPendingCleanup({
-            serverUrl: origin,
-            accessToken: token,
-            invalidated: false,
-            pendingCleanupOrigins: previousRecord.pendingCleanupOrigins,
-          }, oldOrigin)
-          : connectionRecord({
-            serverUrl: origin,
-            accessToken: token,
-            invalidated: false,
-            pendingCleanupOrigins: previousRecord.pendingCleanupOrigins,
-          });
+        const tombstoneOrigin = hadSessionTombstone &&
+          typeof inMemoryConnectionTombstone.serverUrl === "string"
+          ? inMemoryConnectionTombstone.serverUrl
+          : null;
+        const pendingOrigins = normalizePendingCleanupOrigins([
+          ...normalizePendingCleanupOrigins(previousRecord.pendingCleanupOrigins)
+            .filter((candidate) => candidate !== origin),
+          ...(oldOrigin ? [oldOrigin] : []),
+          ...(tombstoneOrigin && tombstoneOrigin !== origin
+            ? [tombstoneOrigin]
+            : []),
+        ]);
+        const pendingBeforeCleanup = connectionRecord({
+          serverUrl: origin,
+          accessToken: token,
+          invalidated: false,
+          pendingCleanupOrigins: pendingOrigins,
+        });
         const legacyClean = await storeConnectionRecord(pendingBeforeCleanup);
         if (hadSessionTombstone && !(await clearSessionTombstone())) {
           await persistInvalidatedRecord(origin, [origin]);
@@ -517,13 +542,20 @@ async function connectServer() {
 
         let permissionClean = true;
         let cleanupRecordClean = true;
-        if (oldOrigin) {
+        let workingRecord = pendingBeforeCleanup;
+        for (const cleanupOrigin of pendingOrigins) {
           const cleanup = await cleanupPermissionAndRecord(
-            oldOrigin,
-            pendingBeforeCleanup
+            cleanupOrigin,
+            workingRecord
           );
-          permissionClean = cleanup.permissionClean;
-          cleanupRecordClean = cleanup.recordClean;
+          permissionClean = permissionClean && cleanup.permissionClean;
+          cleanupRecordClean = cleanupRecordClean && cleanup.recordClean;
+          if (cleanup.permissionClean && cleanup.recordClean) {
+            workingRecord = recordWithoutPendingCleanup(
+              workingRecord,
+              cleanupOrigin
+            );
+          }
         }
 
         if (!sameConnection(currentConnection, committedConnection)) return;
@@ -575,6 +607,11 @@ async function connectServer() {
         }
       }
     });
+  } catch {
+    setConnectionStatus(
+      "Server permission access is unavailable. The previous connection is unchanged.",
+      "error"
+    );
   } finally {
     accessTokenInput.value = "";
     connectBtn.disabled = false;
@@ -792,6 +829,7 @@ async function runKeywordAnalysis() {
       body: JSON.stringify({ description }),
     });
     const res = request.response;
+    if (!sameConnection(currentConnection, request.connection)) return;
     if (!res.ok) {
       analyzeBtn.textContent = "Analyze Keywords";
       analyzeBtn.disabled = false;
@@ -799,6 +837,7 @@ async function runKeywordAnalysis() {
     }
 
     const data = await res.json();
+    if (!sameConnection(currentConnection, request.connection)) return;
 
     if (data.error === "no_resume") {
       prompt.innerHTML = 'Add your resume in <a href="#" id="openSettings">Settings</a> to see keyword match.';
@@ -1152,7 +1191,9 @@ async function initializePopup() {
         const origin = tombstoneOrigin || stored.serverUrl || "";
         const persistence = origin
           ? await persistInvalidatedRecord(origin, [
-            ...stored.pendingCleanupOrigins,
+            ...normalizePendingCleanupOrigins(
+              workingRecord?.pendingCleanupOrigins
+            ),
             origin,
           ])
           : { record: null, storageClean: await purgeKnownCredentials() };
