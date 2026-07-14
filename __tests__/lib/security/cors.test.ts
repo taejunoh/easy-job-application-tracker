@@ -185,6 +185,7 @@ describe("decorateCorsResponse", () => {
     );
     expect(decorated.headers.get("X-Result")).toBe("preserved");
     await expect(decorated.text()).resolves.toBe("ok");
+    await expect(response.text()).resolves.toBe("ok");
   });
 
   it("preserves CORS headers on an allowed-origin error response", async () => {
@@ -307,6 +308,7 @@ describe("decorateCorsResponse", () => {
       EXTENSION_ORIGIN,
     );
     expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    await expect(response.text()).resolves.toBe("immutable-body");
     await expect(decorated.text()).resolves.toBe("immutable-body");
   });
 

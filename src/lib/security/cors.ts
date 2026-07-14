@@ -103,7 +103,8 @@ export function decorateCorsResponse(
   response: Response,
   cors: CorsAllowed,
 ): Response {
-  const headers = new Headers(response.headers);
+  const clone = response.clone();
+  const headers = new Headers(clone.headers);
 
   for (const name of MANAGED_CORS_HEADERS) {
     headers.delete(name);
@@ -118,9 +119,9 @@ export function decorateCorsResponse(
     mergeVary(headers.get("Vary"), cors.headers.get("Vary")),
   );
 
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
+  return new Response(clone.body, {
+    status: clone.status,
+    statusText: clone.statusText,
     headers,
   });
 }
