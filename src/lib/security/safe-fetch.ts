@@ -44,11 +44,37 @@ const NETWORK_ERROR_CODES = new Set([
   "EAI_ADDRFAMILY",
   "ERR_TLS_CERT_ALTNAME_INVALID",
   "ERR_TLS_CERT_SIGNATURE_ALGORITHM_UNSUPPORTED",
+]);
+// Exact X509 verification codes documented by Node.js/OpenSSL.
+const X509_VERIFICATION_ERROR_CODES = new Set([
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_CRL",
+  "UNABLE_TO_DECRYPT_CERT_SIGNATURE",
+  "UNABLE_TO_DECRYPT_CRL_SIGNATURE",
+  "UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY",
+  "CERT_SIGNATURE_FAILURE",
+  "CRL_SIGNATURE_FAILURE",
+  "CERT_NOT_YET_VALID",
   "CERT_HAS_EXPIRED",
+  "CRL_NOT_YET_VALID",
+  "CRL_HAS_EXPIRED",
+  "ERROR_IN_CERT_NOT_BEFORE_FIELD",
+  "ERROR_IN_CERT_NOT_AFTER_FIELD",
+  "ERROR_IN_CRL_LAST_UPDATE_FIELD",
+  "ERROR_IN_CRL_NEXT_UPDATE_FIELD",
+  "OUT_OF_MEM",
   "DEPTH_ZERO_SELF_SIGNED_CERT",
   "SELF_SIGNED_CERT_IN_CHAIN",
   "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
   "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "CERT_CHAIN_TOO_LONG",
+  "CERT_REVOKED",
+  "INVALID_CA",
+  "PATH_LENGTH_EXCEEDED",
+  "INVALID_PURPOSE",
+  "CERT_UNTRUSTED",
+  "CERT_REJECTED",
+  "HOSTNAME_MISMATCH",
 ]);
 
 export type SafeFetchErrorCode =
@@ -156,12 +182,16 @@ const defaultDependencies: SafeFetchDependencies = {
     }
   },
   transport: createUndiciTransport(undiciFetch),
-  now: Date.now,
+  now: monotonicNow,
   setTimeout,
   clearTimeout,
 };
 
 export const safeFetchJobUrl = createSafeFetchJobUrl(defaultDependencies);
+
+export function monotonicNow(): number {
+  return performance.now();
+}
 
 export function createSafeFetchJobUrl(dependencies: SafeFetchDependencies) {
   return async function fetchJobUrl(rawUrl: string): Promise<SafeFetchResult> {
@@ -348,7 +378,7 @@ async function fetchHop(
     }
 
     rejectDeclaredOversize(response.headers.get("content-length"));
-    return { html: await readBoundedBody(response.body) };
+    return { html: await readBoundedBody(response.body, signal) };
   } finally {
     await response.dispose();
   }
@@ -405,6 +435,7 @@ async function withDeadline<T>(
 
 async function readBoundedBody(
   body: ReadableStream<Uint8Array> | null,
+  signal: AbortSignal,
 ): Promise<string> {
   if (!body) return "";
 
@@ -416,8 +447,10 @@ async function readBoundedBody(
       let result: ReadableStreamReadResult<Uint8Array>;
       try {
         result = await reader.read();
-      } catch {
-        throw new SafeFetchTransportError("network");
+      } catch (error) {
+        const kind = classifyTransportFailure(error, signal);
+        if (kind) throw new SafeFetchTransportError(kind);
+        throw error;
       }
       const { done, value } = result;
       if (done) break;
@@ -540,8 +573,8 @@ function isKnownNetworkFailure(error: Error, code: unknown): boolean {
   return (
     typeof code === "string" &&
     (NETWORK_ERROR_CODES.has(code) ||
-      code.startsWith("HPE_") ||
-      code.startsWith("ERR_SSL_"))
+      X509_VERIFICATION_ERROR_CODES.has(code) ||
+      code.startsWith("HPE_"))
   );
 }
 

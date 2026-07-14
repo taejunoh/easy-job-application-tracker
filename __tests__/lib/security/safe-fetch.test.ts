@@ -1,5 +1,11 @@
 import type { LookupAddress } from "node:dns";
-import { Response as UndiciResponse, errors as undiciErrors } from "undici";
+import { createServer } from "node:http";
+import type { AddressInfo, Socket } from "node:net";
+import {
+  Response as UndiciResponse,
+  errors as undiciErrors,
+  fetch as undiciFetch,
+} from "undici";
 
 import {
   MAX_JOB_PAGE_BYTES,
@@ -8,6 +14,7 @@ import {
   createPinnedLookup,
   createSafeFetchJobUrl,
   createUndiciTransport,
+  monotonicNow,
   validateJobUrl,
   type SafeFetchDependencies,
   type SafeFetchTransportRequest,
@@ -20,6 +27,36 @@ const PUBLIC_V6: LookupAddress = {
   address: "2606:2800:220:1:248:1893:25c8:1946",
   family: 6,
 };
+const NODE_X509_VERIFY_CODES = [
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_CRL",
+  "UNABLE_TO_DECRYPT_CERT_SIGNATURE",
+  "UNABLE_TO_DECRYPT_CRL_SIGNATURE",
+  "UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY",
+  "CERT_SIGNATURE_FAILURE",
+  "CRL_SIGNATURE_FAILURE",
+  "CERT_NOT_YET_VALID",
+  "CERT_HAS_EXPIRED",
+  "CRL_NOT_YET_VALID",
+  "CRL_HAS_EXPIRED",
+  "ERROR_IN_CERT_NOT_BEFORE_FIELD",
+  "ERROR_IN_CERT_NOT_AFTER_FIELD",
+  "ERROR_IN_CRL_LAST_UPDATE_FIELD",
+  "ERROR_IN_CRL_NEXT_UPDATE_FIELD",
+  "OUT_OF_MEM",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "CERT_CHAIN_TOO_LONG",
+  "CERT_REVOKED",
+  "INVALID_CA",
+  "PATH_LENGTH_EXCEEDED",
+  "INVALID_PURPOSE",
+  "CERT_UNTRUSTED",
+  "CERT_REJECTED",
+  "HOSTNAME_MISMATCH",
+] as const;
 
 describe("validateJobUrl", () => {
   it.each([
@@ -176,11 +213,81 @@ describe("createUndiciTransport", () => {
     );
   });
 
+  it("settles a stalled body and closes its dispatcher socket on deadline abort", async () => {
+    const sockets = new Set<Socket>();
+    let markSocketClosed: () => void = () => undefined;
+    const socketClosed = new Promise<void>((resolve) => {
+      markSocketClosed = resolve;
+    });
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.write("partial");
+    });
+    server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.once("close", () => {
+        sockets.delete(socket);
+        markSocketClosed();
+      });
+    });
+    await listenOnLoopback(server);
+
+    const { port } = server.address() as AddressInfo;
+    const controller = new AbortController();
+    const transport = createUndiciTransport(undiciFetch);
+    const response = await transport({
+      ...transportRequest(controller.signal),
+      url: new URL(`http://body-timeout.test:${port}/`),
+      lookup: createPinnedLookup("body-timeout.test", [
+        { address: "127.0.0.1", family: 4 },
+      ]),
+      timeoutMs: 1_000,
+    });
+    const reader = response.body?.getReader();
+
+    try {
+      expect(reader).toBeDefined();
+      const firstChunk = await settleWithin(reader!.read(), 500);
+      expect(firstChunk.done).toBe(false);
+      expect(new TextDecoder().decode(firstChunk.value)).toBe("partial");
+
+      const pendingRead = reader!.read().then(
+        () => "resolved",
+        () => "rejected",
+      );
+      controller.abort(new Error("body deadline exceeded"));
+
+      await expect(settleWithin(pendingRead, 500)).resolves.toBe("rejected");
+      await settleWithin(response.dispose(), 500);
+      await expect(settleWithin(socketClosed, 500)).resolves.toBeUndefined();
+    } finally {
+      controller.abort();
+      reader?.releaseLock();
+      await response.dispose();
+      for (const socket of sockets) socket.destroy();
+      await closeServer(server);
+    }
+  });
+
   it.each([
     [new undiciErrors.ConnectTimeoutError(), "timeout"],
     [new undiciErrors.HeadersTimeoutError(), "timeout"],
     [new undiciErrors.BodyTimeoutError(), "timeout"],
     [new undiciErrors.SocketError("socket reset detail"), "network"],
+    [new undiciErrors.HeadersOverflowError("header overflow detail"), "network"],
+    [
+      new undiciErrors.ResponseContentLengthMismatchError(
+        "response length mismatch detail",
+      ),
+      "network",
+    ],
+    [new undiciErrors.HTTPParserError("HTTP parser detail"), "network"],
+    [
+      Object.assign(new Error("HTTP parser code detail"), {
+        code: "HPE_INVALID_HEADER_TOKEN",
+      }),
+      "network",
+    ],
     [
       Object.assign(new Error("TLS certificate detail"), {
         code: "ERR_TLS_CERT_ALTNAME_INVALID",
@@ -210,14 +317,41 @@ describe("createUndiciTransport", () => {
     });
   });
 
+  it.each(NODE_X509_VERIFY_CODES)(
+    "normalizes Node X509 verification code %s as a network failure",
+    async (code) => {
+      const cause = Object.assign(new Error("certificate verification detail"), {
+        code,
+      });
+      const transport = createUndiciTransport(
+        jest
+          .fn()
+          .mockRejectedValue(new TypeError("fetch failed", { cause })) as never,
+      );
+
+      await expect(transport(transportRequest())).rejects.toMatchObject({
+        name: "SafeFetchTransportError",
+        kind: "network",
+      });
+    },
+  );
+
   it.each([
     new Error("programmer failure"),
     new TypeError("fetch failed"),
     new TypeError("fetch failed", {
       cause: new undiciErrors.InvalidArgumentError("invalid trusted option"),
     }),
+    new TypeError("fetch failed", {
+      cause: new undiciErrors.InvalidReturnValueError(
+        "invalid trusted return value",
+      ),
+    }),
     Object.assign(new Error("invalid TLS configuration"), {
       code: "ERR_TLS_INVALID_PROTOCOL_VERSION",
+    }),
+    Object.assign(new Error("invalid local cipher configuration"), {
+      code: "ERR_SSL_NO_CIPHER_MATCH",
     }),
   ])("rethrows unexpected fetch exception %# for the route 500 boundary", async (error) => {
     const transport = createUndiciTransport(
@@ -225,6 +359,25 @@ describe("createUndiciTransport", () => {
     );
 
     await expect(transport(transportRequest())).rejects.toBe(error);
+  });
+});
+
+describe("monotonicNow", () => {
+  it("is unaffected when the wall clock rolls backward", () => {
+    const wallClock = jest
+      .spyOn(Date, "now")
+      .mockReturnValueOnce(10_000)
+      .mockReturnValue(0);
+
+    try {
+      const beforeRollback = monotonicNow();
+      const afterRollback = monotonicNow();
+
+      expect(afterRollback).toBeGreaterThanOrEqual(beforeRollback);
+      expect(wallClock).not.toHaveBeenCalled();
+    } finally {
+      wallClock.mockRestore();
+    }
   });
 });
 
@@ -468,21 +621,42 @@ describe("createSafeFetchJobUrl", () => {
     ).rejects.toMatchObject({ code: "upstream_failed", status: 422 });
   });
 
-  it("maps a response-stream network failure to upstream_failed", async () => {
-    transport.mockResolvedValue({
-      status: 200,
-      headers: new Headers({ "Content-Type": "text/html" }),
-      body: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.error(new Error("socket reset detail"));
-        },
-      }),
-      dispose: jest.fn().mockResolvedValue(undefined),
-    });
+  it.each([
+    [new undiciErrors.SocketError("socket reset detail"), "upstream_failed", 422],
+    [
+      Object.assign(new Error("DNS detail"), { code: "ENOTFOUND" }),
+      "upstream_failed",
+      422,
+    ],
+    [
+      Object.assign(new Error("TLS detail"), { code: "CERT_REVOKED" }),
+      "upstream_failed",
+      422,
+    ],
+    [new undiciErrors.BodyTimeoutError(), "upstream_timeout", 504],
+  ] as const)(
+    "maps known response-stream failure %# to %s",
+    async (streamError, code, status) => {
+      transport.mockResolvedValue(streamErrorResponse(streamError));
+
+      await expect(
+        fetcher({ resolve, transport })("https://example.com/jobs/1"),
+      ).rejects.toMatchObject({ code, status });
+    },
+  );
+
+  it.each([
+    new Error("programmer stream failure"),
+    new TypeError("unexpected decoder failure"),
+    Object.assign(new Error("invalid local TLS state"), {
+      code: "ERR_SSL_NO_CIPHER_MATCH",
+    }),
+  ])("preserves unexpected response-stream error %# for the 500 boundary", async (streamError) => {
+    transport.mockResolvedValue(streamErrorResponse(streamError));
 
     await expect(
       fetcher({ resolve, transport })("https://example.com/jobs/1"),
-    ).rejects.toMatchObject({ code: "upstream_failed", status: 422 });
+    ).rejects.toBe(streamError);
   });
 
   it.each([
@@ -620,6 +794,19 @@ function redirectResponse(
   return response({ status, headers: { Location: location } });
 }
 
+function streamErrorResponse(error: Error): SafeFetchTransportResponse {
+  return {
+    status: 200,
+    headers: new Headers({ "Content-Type": "text/html" }),
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(error);
+      },
+    }),
+    dispose: jest.fn().mockResolvedValue(undefined),
+  };
+}
+
 function response({
   status = 200,
   headers = {},
@@ -655,6 +842,44 @@ function transportRequest(
       "User-Agent": "JobTracker/1.0 (+server-side job extraction)",
     }),
   };
+}
+
+function listenOnLoopback(
+  server: ReturnType<typeof createServer>,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Promise did not settle within ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function runLookup(
