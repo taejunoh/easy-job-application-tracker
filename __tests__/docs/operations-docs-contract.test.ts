@@ -115,6 +115,7 @@ describe("production operations documentation contract", () => {
     for (const requiredText of [
       "actual Chrome action popup",
       "https://jobs.lever.co/*",
+      "removes every inherited optional host pattern",
       "chrome.developerPrivate.addHostPermission",
       "chrome.developerPrivate.openDevTools",
       "isolated temporary profile",

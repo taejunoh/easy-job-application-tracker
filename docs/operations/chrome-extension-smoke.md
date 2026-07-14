@@ -34,12 +34,14 @@ retained across the MV3 service worker stop and restart. This does not perform
 a full extension reload.
 
 The checked-in extension manifest is not modified. The disposable extension
-copy narrows the optional server permission to the exact loopback test origin
-and adds only `https://jobs.lever.co/*` as a required fixture permission. This
-temporary fixture permission is needed because a programmatically opened action
-popup does not receive a user toolbar click's `activeTab` grant. The extension
-still calls its real optional server permission request, and the test asserts
-that the permission is absent after invalid pairing, disconnect, and `401`.
+copy removes every inherited optional host pattern and sets only
+`http://127.0.0.1:3100/*` as the optional server permission. Its required host
+permissions contain only `https://jobs.lever.co/*` for the deterministic
+fixture. This temporary fixture permission is needed because a programmatically
+opened action popup does not receive a user toolbar click's `activeTab` grant.
+The extension still calls its real optional server permission request, and the
+test asserts that the permission is absent after invalid pairing, disconnect,
+and `401`.
 
 Headless Chromium cannot approve its own browser-chrome permission prompt. The
 runner therefore invokes `chrome.developerPrivate.addHostPermission` only

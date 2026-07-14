@@ -6,10 +6,6 @@ const DESTRUCTIVE_ACKNOWLEDGEMENT =
   "jobtracker-extension-e2e-delete-all";
 const EXTENSION_ID_PATTERN = /^[a-p]{32}$/u;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost"]);
-const LOCAL_PERMISSION_PATTERNS = new Set([
-  "http://127.0.0.1/*",
-  "http://localhost/*",
-]);
 
 /**
  * @param {Record<string, string | undefined>} environment
@@ -101,32 +97,74 @@ export function buildE2EManifest(
   if (fixtureHostPermission !== "https://jobs.lever.co/*") {
     throw new Error("Invalid deterministic extension E2E fixture permission");
   }
-  const hostPermissions = Array.isArray(source.host_permissions)
-    ? source.host_permissions.filter(
-        (permission) => typeof permission === "string",
-      )
-    : [];
-  if (!hostPermissions.includes(fixtureHostPermission)) {
-    hostPermissions.push(fixtureHostPermission);
-  }
-  const originalPermissions = Array.isArray(source.optional_host_permissions)
-    ? source.optional_host_permissions.filter(
-        (permission) => typeof permission === "string",
-      )
-    : [];
-  const optionalHostPermissions = originalPermissions.filter(
-    (permission) => !LOCAL_PERMISSION_PATTERNS.has(permission),
-  );
   const exactPermission = `${origin}/*`;
-  if (!optionalHostPermissions.includes(exactPermission)) {
-    optionalHostPermissions.push(exactPermission);
-  }
 
   return {
     ...structuredClone(source),
-    host_permissions: hostPermissions,
-    optional_host_permissions: optionalHostPermissions,
+    host_permissions: [fixtureHostPermission],
+    optional_host_permissions: [exactPermission],
   };
+}
+
+/**
+ * @param {string} value
+ * @returns {{host: "127.0.0.1", port: number}}
+ */
+export function assertSafeExtensionE2EAdminUrl(value) {
+  if (value.includes("\\")) {
+    throw new Error("Refusing extension E2E: unsafe PostgreSQL admin target");
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Refusing extension E2E: invalid local PostgreSQL admin URL");
+  }
+  const rawTarget = value.match(
+    /^postgres(?:ql)?:\/\/([^/?#]+)\/postgres$/u,
+  );
+  if (
+    (url.protocol !== "postgres:" && url.protocol !== "postgresql:") ||
+    url.hostname !== "127.0.0.1" ||
+    !/^[0-9]+$/u.test(url.port) ||
+    Number(url.port) < 1 ||
+    Number(url.port) > 65_535 ||
+    url.pathname !== "/postgres" ||
+    url.search ||
+    url.hash ||
+    rawTarget === null ||
+    [...rawTarget[1]].filter((character) => character === "@").length > 1 ||
+    rawTarget[1].slice(rawTarget[1].lastIndexOf("@") + 1) !==
+      `127.0.0.1:${url.port}`
+  ) {
+    throw new Error("Refusing extension E2E: unsafe PostgreSQL admin target");
+  }
+  return Object.freeze({
+    host: /** @type {"127.0.0.1"} */ (url.hostname),
+    port: Number(url.port),
+  });
+}
+
+/**
+ * @param {{database?: unknown, address?: unknown, port?: unknown, version?: unknown}} row
+ * @param {{host: "127.0.0.1", port: number}} target
+ * @returns {{address: "127.0.0.1"}}
+ */
+export function assertLocalPostgres17Identity(row, target) {
+  if (
+    target.host !== "127.0.0.1" ||
+    row?.database !== "postgres" ||
+    row?.address !== target.host ||
+    row?.port !== target.port ||
+    typeof row?.version !== "number" ||
+    row.version < 170_000 ||
+    row.version >= 180_000
+  ) {
+    throw new Error(
+      "Refusing extension E2E: live PostgreSQL 17 identity mismatch",
+    );
+  }
+  return Object.freeze({ address: target.host });
 }
 
 /**

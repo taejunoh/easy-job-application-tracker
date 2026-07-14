@@ -152,10 +152,12 @@ describe("extension E2E safety support", () => {
   it("adds only the exact optional loopback origin without mutating the source", () => {
     const source = {
       manifest_version: 3,
+      host_permissions: ["https://*/*"],
       optional_host_permissions: [
         "https://*/*",
         "http://localhost/*",
         "http://127.0.0.1/*",
+        "https://example.com/*",
       ],
     };
 
@@ -171,11 +173,48 @@ describe("extension E2E safety support", () => {
 
     expect(result.host_permissions).toEqual(["https://jobs.lever.co/*"]);
     expect(result.optional_host_permissions).toEqual([
-      "https://*/*",
       "http://127.0.0.1:3100/*",
     ]);
     expect(result).not.toBe(source);
     expect(source.optional_host_permissions).toContain("http://localhost/*");
+  });
+
+  it("accepts only the canonical local PostgreSQL 17 admin identity", () => {
+    const target = callSupport(
+      "assertSafeExtensionE2EAdminUrl",
+      "postgresql://postgres@127.0.0.1:5432/postgres",
+    );
+    expect(target).toEqual({ host: "127.0.0.1", port: 5432 });
+    expect(
+      callSupport("assertLocalPostgres17Identity", {
+        database: "postgres",
+        address: "127.0.0.1",
+        port: 5432,
+        version: 170_010,
+      }, target),
+    ).toEqual({ address: "127.0.0.1" });
+
+    for (const unsafeUrl of [
+      "postgresql://postgres@localhost:5432/postgres",
+      "postgresql://postgres@10.0.0.5:5432/postgres",
+      "postgresql://postgres@127.0.0.1/postgres",
+      "postgresql://postgres@127.0.0.1:5432/postgres?host=10.0.0.5",
+    ]) {
+      expect(() =>
+        callSupport("assertSafeExtensionE2EAdminUrl", unsafeUrl),
+      ).toThrow("Refusing extension E2E");
+    }
+
+    for (const address of ["10.0.0.5", "192.168.1.10", "::1", "203.0.113.4"]) {
+      expect(() =>
+        callSupport("assertLocalPostgres17Identity", {
+          database: "postgres",
+          address,
+          port: 5432,
+          version: 170_010,
+        }, target),
+      ).toThrow("live PostgreSQL 17 identity mismatch");
+    }
   });
 
   it("derives a dynamic extension origin from an MV3 worker URL", () => {
@@ -368,6 +407,23 @@ describe("extension E2E safety support", () => {
     ]) {
       expect(runner).toContain(requiredText);
     }
+  });
+
+  it("owns and drains the full local wrapper child process group", () => {
+    const wrapper = readFileSync(
+      join(__dirname, "../../scripts/extension-e2e-local.mjs"),
+      "utf8",
+    );
+    for (const requiredText of [
+      "detached: true",
+      "process.kill(-child.pid",
+      'child.once("close"',
+      '"SIGKILL"',
+      "terminateActiveChildTree",
+    ]) {
+      expect(wrapper).toContain(requiredText);
+    }
+    expect(wrapper).not.toContain("process.exit(");
   });
 
   it("parses only a loopback Docker host-port binding", () => {

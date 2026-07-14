@@ -218,11 +218,14 @@ npm run test:extension:e2e:local
 The wrapper requires a local PostgreSQL 17 server listening on the explicit
 loopback address `127.0.0.1:5432`. It connects to the `postgres` maintenance
 database as the `postgres` role by default; set
-`EXTENSION_E2E_POSTGRES_ADMIN_URL` to another loopback PostgreSQL 17 admin URL
-when needed. The wrapper refuses to proceed if the exact disposable database
+`EXTENSION_E2E_POSTGRES_ADMIN_URL` only when credentials or the explicit port
+must differ. The hostname must remain canonical `127.0.0.1`, and the wrapper
+requires PostgreSQL to report that exact server address before it creates the
+database. The wrapper refuses to proceed if the exact disposable database
 `jobtracker_extension_e2e_test` already exists. Otherwise, it creates that
 database, builds the app with fixed non-production values, runs the E2E suite,
-and force-drops the disposable database in its cleanup path.
+and force-drops the disposable database in its cleanup path. `SIGINT` and
+`SIGTERM` stop the complete child process group before database cleanup.
 
 The suite uses Playwright's bundled Chromium and a temporary browser profile;
 it never launches or modifies system Chrome. It drives the actual extension
