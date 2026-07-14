@@ -7,6 +7,8 @@ const CHECKOUT_SHA = "df4cb1c069e1874edd31b4311f1884172cec0e10";
 const SETUP_NODE_SHA = "249970729cb0ef3589644e2896645e5dc5ba9c38";
 const UPLOAD_ARTIFACT_SHA =
   "ea165f8d65b6e75b540449e92b4886f43607fa02";
+const POSTGRES_17_ALPINE_DIGEST =
+  "sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193";
 
 type Step = Readonly<{
   name: string;
@@ -47,7 +49,7 @@ describe("encrypted production backup workflow contract", () => {
       "timeout-minutes": 20,
       services: {
         postgres: {
-          image: "postgres:17-alpine",
+          image: `docker.io/library/postgres:17-alpine@${POSTGRES_17_ALPINE_DIGEST}`,
           env: {
             POSTGRES_USER: "jobtracker_backup",
             POSTGRES_PASSWORD: "jobtracker_backup",
@@ -57,6 +59,13 @@ describe("encrypted production backup workflow contract", () => {
         },
       },
     });
+    const postgresImage = String(
+      workflow.jobs.backup.services.postgres &&
+        (workflow.jobs.backup.services.postgres as { image?: unknown }).image,
+    );
+    expect(postgresImage).toMatch(
+      /^docker\.io\/library\/postgres:17-alpine@sha256:[0-9a-f]{64}$/u,
+    );
     expect(source).not.toMatch(/pull_request|\bpush\s*:/u);
   });
 
@@ -70,6 +79,10 @@ describe("encrypted production backup workflow contract", () => {
     const joinedRuns = steps.map((step) => step.run ?? "").join("\n");
     const fingerprintSource = readFileSync(
       join(root, "scripts/fingerprint-database.mjs"),
+      "utf8",
+    );
+    const coordinatorSource = readFileSync(
+      join(root, "scripts/create-snapshot-backup.mjs"),
       "utf8",
     );
 
@@ -86,10 +99,10 @@ describe("encrypted production backup workflow contract", () => {
         }),
         expect.objectContaining({
           name: "Create source backup and fingerprint",
-          env: {
+          env: expect.objectContaining({
             PRODUCTION_DATABASE_URL:
               "${{ secrets.PRODUCTION_DATABASE_URL }}",
-          },
+          }),
         }),
         expect.objectContaining({
           name: "Encrypt verified backup",
@@ -100,13 +113,35 @@ describe("encrypted production backup workflow contract", () => {
       ]),
     );
 
-    expect(joinedRuns).toContain("pg_dump");
-    expect(joinedRuns).toMatch(/pg_dump[\s\S]*--dbname=/u);
-    expect(joinedRuns).toMatch(/--format=(?:custom|c)\b/u);
+    expect(coordinatorSource).toContain("pg_dump");
+    expect(coordinatorSource).toContain("--dbname=");
+    expect(coordinatorSource).toContain("--snapshot=");
+    expect(coordinatorSource).toContain("--format=custom");
+    expect(coordinatorSource).toContain(
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    );
+    expect(coordinatorSource).toContain("SELECT pg_export_snapshot()");
+    expect(coordinatorSource).toMatch(
+      /const dumpPromise = dumpSnapshot[\s\S]*const fingerprintPromise =\s*fingerprintClient\(client\)/u,
+    );
+    expect(coordinatorSource).toContain("Promise.allSettled");
+    expect(coordinatorSource).toContain("fingerprintClient(client)");
+    expect(coordinatorSource).toContain('client.query("ROLLBACK")');
+    expect(coordinatorSource).toContain("client.end()");
+    expect(coordinatorSource).not.toMatch(/console\.log|snapshotId|JSON\.stringify\(fingerprint/u);
+    const sourceBackupStep = steps.find(
+      (step) => step.name === "Create source backup and fingerprint",
+    );
+    expect(sourceBackupStep?.run).toContain(
+      'node scripts/create-snapshot-backup.mjs "$DUMP_FILE" "$SOURCE_FINGERPRINT"',
+    );
+    expect(sourceBackupStep?.run).not.toContain("fingerprint-database.mjs");
     expect(joinedRuns).toContain("chmod 600");
     expect(joinedRuns).toContain("sha256sum");
     expect(joinedRuns).toContain("pg_restore --list");
-    expect(fingerprintSource).toContain("BEGIN TRANSACTION READ ONLY");
+    expect(fingerprintSource).toContain(
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    );
     expect(fingerprintSource).toContain('createHash("sha256")');
     expect(fingerprintSource).not.toMatch(/console\.log|JSON\.stringify\(rows/u);
     expect(joinedRuns).toContain("pg_restore --exit-on-error");

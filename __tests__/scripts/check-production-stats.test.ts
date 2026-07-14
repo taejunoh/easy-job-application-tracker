@@ -8,6 +8,22 @@ const script = join(root, "scripts/check-production-stats.mjs");
 const secretToken = "monitor-test-token-never-print";
 const secretBody = "monitor-test-body-never-print";
 
+const validRecentApplication = {
+  id: "application-1",
+  url: "https://jobs.example.test/1",
+  jobTitle: "Engineer",
+  company: "Example",
+  status: "Applied",
+  appliedDate: "2026-07-14T12:00:00.000Z",
+  description: null,
+  notes: "Follow up",
+  salary: null,
+  location: "Remote",
+  jobType: "Full-time",
+  createdAt: "2026-07-14T12:00:00.000Z",
+  updatedAt: "2026-07-14T12:00:00.000Z",
+};
+
 const validStats = {
   total: 7,
   applied: 2,
@@ -16,7 +32,7 @@ const validStats = {
   rejected: 3,
   weeklyCount: 4,
   monthlyCount: 7,
-  recentApplications: [],
+  recentApplications: [validRecentApplication],
 };
 
 type MonitorResult = Readonly<{
@@ -98,6 +114,36 @@ describe("authenticated production stats monitor", () => {
     ["500", 500, secretBody],
     ["malformed JSON", 200, `{\"${secretBody}\"`],
     ["wrong shape", 200, JSON.stringify({ ...validStats, total: "7" })],
+    ["negative count", 200, JSON.stringify({ ...validStats, total: -1 })],
+    ["fractional count", 200, JSON.stringify({ ...validStats, total: 1.5 })],
+    [
+      "missing recent application field",
+      200,
+      JSON.stringify({
+        ...validStats,
+        recentApplications: [
+          Object.fromEntries(
+            Object.entries(validRecentApplication).filter(([key]) => key !== "id"),
+          ),
+        ],
+      }),
+    ],
+    [
+      "wrong recent application field type",
+      200,
+      JSON.stringify({
+        ...validStats,
+        recentApplications: [{ ...validRecentApplication, appliedDate: 1 }],
+      }),
+    ],
+    [
+      "extra recent application field",
+      200,
+      JSON.stringify({
+        ...validStats,
+        recentApplications: [{ ...validRecentApplication, privateField: secretBody }],
+      }),
+    ],
     ["extra response field", 200, JSON.stringify({ ...validStats, extra: 1 })],
   ])("fails generically on %s without leaking response data", async (_, status, body) => {
     const { server, url } = await listen((_request, response) => {

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import pg from "pg";
 
 const { Client } = pg;
@@ -49,27 +50,36 @@ function digestRows(tableName, rows) {
   return hash.digest("hex");
 }
 
+export async function fingerprintClient(client) {
+  const tables = {};
+  for (const table of TABLES) {
+    const result = await client.query(table.query);
+    tables[table.name] = {
+      count: result.rows.length,
+      digest: digestRows(table.name, result.rows),
+    };
+  }
+  return { version: 1, algorithm: "sha256", tables };
+}
+
+export async function writeFingerprint(outputPath, fingerprint) {
+  await writeFile(outputPath, `${JSON.stringify(fingerprint, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+}
+
 async function fingerprintDatabase(databaseUrl) {
   const client = new Client(databaseUrl ? { connectionString: databaseUrl } : {});
   await client.connect();
   try {
     await client.query(
-      "BEGIN TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ",
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
     );
-    const tables = {};
-    for (const table of TABLES) {
-      const result = await client.query(table.query);
-      tables[table.name] = {
-        count: result.rows.length,
-        digest: digestRows(table.name, result.rows),
-      };
-    }
-    await client.query("COMMIT");
-    return { version: 1, algorithm: "sha256", tables };
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => undefined);
-    throw error;
+    return await fingerprintClient(client);
   } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
     await client.end();
   }
 }
@@ -81,16 +91,14 @@ async function main() {
     throw new Error("Missing fingerprint input");
   }
   const fingerprint = await fingerprintDatabase(databaseUrl);
-  await writeFile(outputPath, `${JSON.stringify(fingerprint, null, 2)}\n`, {
-    encoding: "utf8",
-    flag: "wx",
-    mode: 0o600,
-  });
+  await writeFingerprint(outputPath, fingerprint);
 }
 
-try {
-  await main();
-} catch {
-  console.error("Database fingerprint failed.");
-  process.exitCode = 1;
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    await main();
+  } catch {
+    console.error("Database fingerprint failed.");
+    process.exitCode = 1;
+  }
 }

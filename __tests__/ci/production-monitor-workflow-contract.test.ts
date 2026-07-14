@@ -13,8 +13,14 @@ type MonitorWorkflow = Readonly<{
     monitor: Readonly<{
       "runs-on": string;
       "timeout-minutes": number;
-      env: Record<string, string>;
-      steps: readonly unknown[];
+      env?: Record<string, string>;
+      steps: readonly Readonly<{
+        name: string;
+        uses?: string;
+        run?: string;
+        env?: Record<string, string>;
+        with?: Record<string, unknown>;
+      }>[];
     }>;
   }>;
 }>;
@@ -39,12 +45,8 @@ describe("production monitor workflow contract", () => {
     expect(workflow.jobs.monitor).toMatchObject({
       "runs-on": "ubuntu-latest",
       "timeout-minutes": 5,
-      env: {
-        PRODUCTION_APP_URL: "${{ vars.PRODUCTION_APP_URL }}",
-        PRODUCTION_APP_ACCESS_TOKEN:
-          "${{ secrets.PRODUCTION_APP_ACCESS_TOKEN }}",
-      },
     });
+    expect(workflow.jobs.monitor.env).toBeUndefined();
     expect(workflow.jobs.monitor.steps).toEqual([
       {
         name: "Check out repository",
@@ -53,11 +55,28 @@ describe("production monitor workflow contract", () => {
       {
         name: "Set up Node.js",
         uses: `actions/setup-node@${SETUP_NODE_SHA}`,
-        with: { "node-version": "22.22.2", cache: "npm" },
+        with: { "node-version": "22.22.2" },
       },
-      { name: "Install dependencies", run: "npm ci" },
-      { name: "Check authenticated production stats", run: "npm run check:production" },
+      {
+        name: "Check authenticated production stats",
+        env: {
+          PRODUCTION_APP_URL: "${{ vars.PRODUCTION_APP_URL }}",
+          PRODUCTION_APP_ACCESS_TOKEN:
+            "${{ secrets.PRODUCTION_APP_ACCESS_TOKEN }}",
+        },
+        run: "npm run check:production",
+      },
     ]);
+    expect(workflow.jobs.monitor.steps.slice(0, -1)).toEqual(
+      expect.not.arrayContaining([
+        expect.objectContaining({
+          env: expect.objectContaining({
+            PRODUCTION_APP_ACCESS_TOKEN:
+              "${{ secrets.PRODUCTION_APP_ACCESS_TOKEN }}",
+          }),
+        }),
+      ]),
+    );
     expect(source).not.toMatch(/curl|response|body|set -x/iu);
   });
 });

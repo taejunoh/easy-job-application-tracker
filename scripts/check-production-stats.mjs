@@ -9,6 +9,41 @@ const STAT_KEYS = [
   "recentApplications",
 ];
 
+const APPLICATION_KEYS = [
+  "id",
+  "url",
+  "jobTitle",
+  "company",
+  "status",
+  "appliedDate",
+  "description",
+  "notes",
+  "salary",
+  "location",
+  "jobType",
+  "createdAt",
+  "updatedAt",
+];
+
+const REQUIRED_STRING_FIELDS = [
+  "id",
+  "url",
+  "jobTitle",
+  "company",
+  "status",
+  "appliedDate",
+  "createdAt",
+  "updatedAt",
+];
+
+const NULLABLE_STRING_FIELDS = [
+  "description",
+  "notes",
+  "salary",
+  "location",
+  "jobType",
+];
+
 function isLoopback(hostname) {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 }
@@ -32,8 +67,23 @@ function hasExactStatsShape(value) {
   if (!STAT_KEYS.every((key) => keys.includes(key))) return false;
   return (
     STAT_KEYS.slice(0, -1).every(
-      (key) => typeof value[key] === "number" && Number.isFinite(value[key]),
-    ) && Array.isArray(value.recentApplications)
+      (key) => Number.isInteger(value[key]) && value[key] >= 0,
+    ) &&
+    Array.isArray(value.recentApplications) &&
+    value.recentApplications.every(hasExactApplicationShape)
+  );
+}
+
+function hasExactApplicationShape(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== APPLICATION_KEYS.length) return false;
+  if (!APPLICATION_KEYS.every((key) => keys.includes(key))) return false;
+  if (!REQUIRED_STRING_FIELDS.every((key) => typeof value[key] === "string")) {
+    return false;
+  }
+  return NULLABLE_STRING_FIELDS.every(
+    (key) => value[key] === null || typeof value[key] === "string",
   );
 }
 

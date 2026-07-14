@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17-alpine
+        image: docker.io/library/postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_USER: jobtracker_backup
           POSTGRES_PASSWORD: jobtracker_backup
@@ -43,10 +43,13 @@ jobs:
       - name: Capture PostgreSQL service container
         env:
           POSTGRES_SERVICE_CONTAINER_ID: ${{ job.services.postgres.id }}
-        run: printf 'POSTGRES_SERVICE_CONTAINER_ID=%s\n' "$POSTGRES_SERVICE_CONTAINER_ID" >> "$GITHUB_ENV"
+        run: |
+          printf 'POSTGRES_SERVICE_CONTAINER_ID=%s\n' "$POSTGRES_SERVICE_CONTAINER_ID" >> "$GITHUB_ENV"
+          docker exec "$POSTGRES_SERVICE_CONTAINER_ID" pg_dump --version | grep -E '^pg_dump \(PostgreSQL\) 17\.'
       - name: Create source backup and fingerprint
         env:
           PRODUCTION_DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+          PG_DUMP_DOCKER_CONTAINER: ${{ job.services.postgres.id }}
         run: |
           set -euo pipefail
           umask 077
@@ -55,17 +58,12 @@ jobs:
           PLAINTEXT_CHECKSUM="$RUNNER_TEMP/jobtracker.dump.sha256"
           SOURCE_FINGERPRINT="$RUNNER_TEMP/source-fingerprint.json"
 
-          printf '%s\n' "$PRODUCTION_DATABASE_URL" | docker exec -i "$POSTGRES_SERVICE_CONTAINER_ID" sh -c '
-            IFS= read -r PRODUCTION_DATABASE_URL
-            pg_dump --dbname="$PRODUCTION_DATABASE_URL" --format=custom --no-owner --no-privileges --file=/tmp/jobtracker.dump
-          '
-          docker cp "$POSTGRES_SERVICE_CONTAINER_ID:/tmp/jobtracker.dump" "$DUMP_FILE"
+          DATABASE_URL="$PRODUCTION_DATABASE_URL" node scripts/create-snapshot-backup.mjs "$DUMP_FILE" "$SOURCE_FINGERPRINT"
           chmod 600 "$DUMP_FILE"
           sha256sum "$DUMP_FILE" > "$PLAINTEXT_CHECKSUM"
           sha256sum --check "$PLAINTEXT_CHECKSUM"
-          docker exec "$POSTGRES_SERVICE_CONTAINER_ID" pg_restore --list /tmp/jobtracker.dump > "$TOC_FILE"
+          docker exec -i "$POSTGRES_SERVICE_CONTAINER_ID" pg_restore --list < "$DUMP_FILE" > "$TOC_FILE"
           test -s "$TOC_FILE"
-          DATABASE_URL="$PRODUCTION_DATABASE_URL" node scripts/fingerprint-database.mjs "$SOURCE_FINGERPRINT"
       - name: Restore into empty scratch and compare fingerprints
         env:
           PGHOST: 127.0.0.1
@@ -78,7 +76,7 @@ jobs:
           SOURCE_FINGERPRINT="$RUNNER_TEMP/source-fingerprint.json"
           RESTORE_FINGERPRINT="$RUNNER_TEMP/restore-fingerprint.json"
 
-          docker exec --env PGPASSWORD=jobtracker_backup "$POSTGRES_SERVICE_CONTAINER_ID" pg_restore --exit-on-error --no-owner --no-privileges --host=127.0.0.1 --username=jobtracker_backup --dbname=jobtracker_restore /tmp/jobtracker.dump
+          docker exec -i --env PGPASSWORD=jobtracker_backup "$POSTGRES_SERVICE_CONTAINER_ID" pg_restore --exit-on-error --no-owner --no-privileges --host=127.0.0.1 --username=jobtracker_backup --dbname=jobtracker_restore < "$RUNNER_TEMP/jobtracker.dump"
           node scripts/fingerprint-database.mjs "$RESTORE_FINGERPRINT"
           cmp --silent "$SOURCE_FINGERPRINT" "$RESTORE_FINGERPRINT"
       - name: Encrypt verified backup
@@ -130,4 +128,3 @@ jobs:
             "$RUNNER_TEMP/jobtracker.toc" \
             "$RUNNER_TEMP/source-fingerprint.json" \
             "$RUNNER_TEMP/restore-fingerprint.json"
-          docker exec "$POSTGRES_SERVICE_CONTAINER_ID" rm -f /tmp/jobtracker.dump 2>/dev/null || true
