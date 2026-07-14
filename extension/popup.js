@@ -44,7 +44,7 @@ async function runKeywordAnalysis() {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tab?.id) {
-        const response = await chrome.tabs.sendMessage(tab.id, { action: "extractJob" });
+        const response = await sendMessageWithRetry(tab.id, { action: "extractJob" });
         if (response?.description) {
           description = response.description;
           document.getElementById("description").value = description;
@@ -160,6 +160,21 @@ document.getElementById("analysisToggle")?.addEventListener("click", () => {
   body.style.display = body.style.display === "none" ? "block" : "none";
 });
 
+// Try sendMessage first; if the content script isn't loaded (e.g. LinkedIn
+// SPA navigation, or the tab pre-dates the extension install), inject it
+// and retry once.
+async function sendMessageWithRetry(tabId, message) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content.js"],
+    });
+    return await chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
 async function serverExtract(url) {
   if (!url || url.startsWith("chrome://")) return null;
   const serverUrl = document.getElementById("serverUrl").value.replace(/\/$/, "");
@@ -190,21 +205,7 @@ async function extractFromPage() {
       return;
     }
 
-    // Inject content script if not on a matched page
-    const isJobSite = /linkedin\.com\/jobs|indeed\.com|glassdoor\.com\/job|glassdoor\.com\/Job|lever\.co\//.test(tab.url);
-
-    if (!isJobSite) {
-      // Try injecting content script for generic pages
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["content.js"],
-      });
-    }
-
-    // Give content script time to load
-    await new Promise((r) => setTimeout(r, 300));
-
-    const response = await chrome.tabs.sendMessage(tab.id, { action: "extractJob" });
+    const response = await sendMessageWithRetry(tab.id, { action: "extractJob" });
 
     let result = response;
 
@@ -331,19 +332,7 @@ async function fillProfiles() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) return;
 
-    // Inject content script if needed
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["content.js"],
-      });
-    } catch {
-      // Already injected
-    }
-
-    await new Promise((r) => setTimeout(r, 200));
-
-    const response = await chrome.tabs.sendMessage(tab.id, {
+    const response = await sendMessageWithRetry(tab.id, {
       action: "autoFillProfiles",
       profiles: {
         linkedinUrl: settings.linkedinUrl,
@@ -379,3 +368,12 @@ chrome.storage.local.get(["serverUrl"], (result) => {
   }
   extractFromPage();
 });
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    extractFromPage,
+    fillProfiles,
+    runKeywordAnalysis,
+    sendMessageWithRetry,
+  };
+}
