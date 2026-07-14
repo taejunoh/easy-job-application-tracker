@@ -71,16 +71,36 @@ JobTracker is designed to be self-hosted so your job data and API keys stay on y
 ```bash
 git clone https://github.com/taejunoh/easy-job-application-tracker.git
 cd easy-job-application-tracker
-npm install
+npm ci
 cp .env.example .env
 ```
 
-Edit `.env`:
+`npm ci` installs the exact dependency versions in `package-lock.json` and is
+recommended for fresh checkouts and deployments.
+
+Generate separate secrets for encryption and application access. Run this
+command twice and keep each output private:
+
+```bash
+openssl rand -base64 32
+```
+
+Edit `.env` and replace every placeholder. The values in `.env.example` are
+intentionally rejected if copied unchanged:
 
 ```
-DATABASE_URL="postgresql://user:password@host:5432/dbname?sslmode=require"
-ENCRYPTION_SECRET="any-random-string-at-least-32-characters-long"
+DATABASE_URL="postgresql://<db-user>:<db-password>@<db-host>:5432/<db-name>?sslmode=require"
+ENCRYPTION_SECRET="<first-openssl-output>"
+APP_ACCESS_TOKEN="<second-openssl-output>"
+APP_BASE_URL="http://localhost:3000"
+CORS_ALLOWED_ORIGINS="http://localhost:3000,chrome-extension://<extension-id>"
 ```
+
+For a hosted production deployment, `APP_BASE_URL` must be the root HTTPS
+origin (for example, `https://jobs.example.com`) and that exact origin must
+also appear in `CORS_ALLOWED_ORIGINS`. Add only the Chrome extension origins
+that should be allowed to connect. Production rejects plain HTTP, wildcard
+origins, URL paths, and copied placeholder values.
 
 ```bash
 npx prisma generate
