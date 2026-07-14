@@ -1,5 +1,9 @@
 import type { NextConfig } from "next";
 
+import { validateServerEnv } from "./src/lib/server-env-core";
+
+validateServerEnv(process.env, process.env.NODE_ENV);
+
 const nextConfig: NextConfig = {
   outputFileTracingIncludes: {
     "/api/parse-resume": [

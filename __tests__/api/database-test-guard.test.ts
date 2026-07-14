@@ -4,26 +4,63 @@ const safeEnvironment = {
   RUN_DATABASE_INTEGRATION: "1",
   ALLOW_DESTRUCTIVE_DATABASE_TESTS: "jobtracker-ci-delete-all",
   DATABASE_URL: "postgresql://postgres@127.0.0.1:5432/jobtracker_ci",
+  EXPECTED_DATABASE_SERVER_ADDRESS: "127.0.0.1",
 };
 
 describe("destructive database integration guard", () => {
   it.each([
     [
       "postgresql://postgres@localhost:5432/jobtracker_ci",
-      { host: "localhost", port: 5432, database: "jobtracker_ci" },
+      {
+        host: "localhost",
+        port: 5432,
+        database: "jobtracker_ci",
+        serverAddress: "127.0.0.1",
+      },
     ],
     [
       "postgresql://postgres@127.0.0.1:6543/jobtracker_test",
-      { host: "127.0.0.1", port: 6543, database: "jobtracker_test" },
+      {
+        host: "127.0.0.1",
+        port: 6543,
+        database: "jobtracker_test",
+        serverAddress: "127.0.0.1",
+      },
     ],
     [
       "postgresql://postgres@[::1]:5432/jobtracker_ci",
-      { host: "[::1]", port: 5432, database: "jobtracker_ci" },
+      {
+        host: "[::1]",
+        port: 5432,
+        database: "jobtracker_ci",
+        serverAddress: "127.0.0.1",
+      },
     ],
   ])("returns the effective identity for %s", (url, expected) => {
     expect(
       assertDatabaseTestSafety({ ...safeEnvironment, DATABASE_URL: url }),
     ).toEqual(expected);
+  });
+
+  it.each([undefined, "", "db.internal", "172.17.0.999", "::1%lo0"])(
+    "rejects an invalid expected live server address %j",
+    (value) => {
+      expect(() =>
+        assertDatabaseTestSafety({
+          ...safeEnvironment,
+          EXPECTED_DATABASE_SERVER_ADDRESS: value,
+        }),
+      ).toThrow("EXPECTED_DATABASE_SERVER_ADDRESS must be an explicit IP address");
+    },
+  );
+
+  it("carries one exact inspected service-container address into the live identity", () => {
+    expect(
+      assertDatabaseTestSafety({
+        ...safeEnvironment,
+        EXPECTED_DATABASE_SERVER_ADDRESS: "172.18.0.3",
+      }),
+    ).toMatchObject({ serverAddress: "172.18.0.3" });
   });
 
   it.each([undefined, "", "true", "0"])(

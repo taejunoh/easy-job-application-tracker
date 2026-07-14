@@ -11,6 +11,7 @@ type WorkflowStep = Readonly<{
   uses?: string;
   run?: string;
   with?: Record<string, unknown>;
+  env?: Record<string, string>;
 }>;
 
 type Workflow = Readonly<{
@@ -35,8 +36,11 @@ describe("deployment verification contract", () => {
 
   it("provides deterministic typecheck, test, and extension checks", () => {
     expect(packageJson.scripts).toMatchObject({
+      start:
+        "node --import ./scripts/validate-startup-env.mjs node_modules/next/dist/bin/next start",
       typecheck: "next typegen && tsc --noEmit",
       "test:ci": "jest --runInBand",
+      "check:startup-env": "node scripts/verify-invalid-startup.mjs",
     });
     expect(packageJson.scripts?.["check:extension"]).toContain(
       "node --check extension/background.js",
@@ -100,6 +104,13 @@ describe("deployment verification contract", () => {
         uses: `actions/setup-node@${SETUP_NODE_SHA}`,
         with: { "node-version": "22.22.2", cache: "npm" },
       },
+      {
+        name: "Capture PostgreSQL service address",
+        env: {
+          POSTGRES_SERVICE_CONTAINER_ID: "${{ job.services.postgres.id }}",
+        },
+        run: "address=\"$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \"$POSTGRES_SERVICE_CONTAINER_ID\")\"\nprintf 'EXPECTED_DATABASE_SERVER_ADDRESS=%s\\n' \"$address\" >> \"$GITHUB_ENV\"\n",
+      },
       { name: "Install dependencies", run: "npm ci" },
       { name: "Generate Prisma client", run: "npx prisma generate" },
       { name: "Validate Prisma schema", run: "npx prisma validate" },
@@ -117,6 +128,10 @@ describe("deployment verification contract", () => {
       { name: "Lint", run: "npm run lint" },
       { name: "Typecheck", run: "npm run typecheck" },
       { name: "Build production application", run: "npm run build" },
+      {
+        name: "Verify invalid deployment fails before ready",
+        run: "npm run check:startup-env",
+      },
     ]);
     expect(workflowSource).toContain(`# v6.0.3\n`);
     expect(workflowSource).toContain(`# v6.5.0\n`);

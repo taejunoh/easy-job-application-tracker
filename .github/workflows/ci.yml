@@ -51,6 +51,13 @@ jobs:
           node-version: "22.22.2"
           cache: npm
 
+      - name: Capture PostgreSQL service address
+        env:
+          POSTGRES_SERVICE_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          address="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$POSTGRES_SERVICE_CONTAINER_ID")"
+          printf 'EXPECTED_DATABASE_SERVER_ADDRESS=%s\n' "$address" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: npm ci
 
@@ -87,3 +94,6 @@ jobs:
 
       - name: Build production application
         run: npm run build
+
+      - name: Verify invalid deployment fails before ready
+        run: npm run check:startup-env

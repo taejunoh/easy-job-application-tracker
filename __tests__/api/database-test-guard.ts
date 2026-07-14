@@ -1,4 +1,5 @@
 import { parse as parsePostgresConnectionString } from "pg-connection-string";
+import { isIP } from "node:net";
 
 type DatabaseTestEnvironment = Readonly<
   Record<string, string | undefined>
@@ -8,6 +9,7 @@ export type DatabaseTestIdentity = Readonly<{
   host: "localhost" | "127.0.0.1" | "[::1]";
   port: number;
   database: string;
+  serverAddress: string;
 }>;
 
 const DESTRUCTIVE_TEST_ACKNOWLEDGEMENT = "jobtracker-ci-delete-all";
@@ -34,6 +36,11 @@ export function assertDatabaseTestSafety(
     refuse(
       "ALLOW_DESTRUCTIVE_DATABASE_TESTS must equal jobtracker-ci-delete-all",
     );
+  }
+
+  const serverAddress = environment.EXPECTED_DATABASE_SERVER_ADDRESS ?? "";
+  if (serverAddress.includes("%") || isIP(serverAddress) === 0) {
+    refuse("EXPECTED_DATABASE_SERVER_ADDRESS must be an explicit IP address");
   }
 
   const rawUrl = environment.DATABASE_URL ?? "";
@@ -121,6 +128,7 @@ export function assertDatabaseTestSafety(
     host: host as DatabaseTestIdentity["host"],
     port,
     database,
+    serverAddress,
   });
 }
 

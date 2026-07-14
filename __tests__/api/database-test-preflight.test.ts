@@ -8,15 +8,17 @@ const expected: DatabaseTestIdentity = {
   host: "127.0.0.1",
   port: 5432,
   database: "jobtracker_ci",
+  serverAddress: "127.0.0.1",
 };
 
 describe("live destructive database identity preflight", () => {
-  it.each(["127.0.0.1", "::1"])(
-    "accepts the matching public-schema loopback server at %s",
+  it.each(["127.0.0.1", "172.18.0.3"])(
+    "accepts only the exact expected server address %s",
     async (address) => {
+      const identity = { ...expected, serverAddress: address };
       const database = fakeDatabase({ address });
 
-      await expect(verifyLiveDatabaseIdentity(database, expected)).resolves.toEqual({
+      await expect(verifyLiveDatabaseIdentity(database, identity)).resolves.toEqual({
         database: "jobtracker_ci",
         address,
         port: 5432,
@@ -39,6 +41,17 @@ describe("live destructive database identity preflight", () => {
 
     await expect(
       resetVerifiedIntegrationDatabase(database, expected),
+    ).rejects.toThrow("Live database identity does not match destructive-test target");
+    expect(database.application.deleteMany).not.toHaveBeenCalled();
+    expect(database.settings.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects a different private bridge address before every mutation", async () => {
+    const identity = { ...expected, serverAddress: "172.18.0.3" };
+    const database = fakeDatabase({ address: "172.18.0.4" });
+
+    await expect(
+      resetVerifiedIntegrationDatabase(database, identity),
     ).rejects.toThrow("Live database identity does not match destructive-test target");
     expect(database.application.deleteMany).not.toHaveBeenCalled();
     expect(database.settings.deleteMany).not.toHaveBeenCalled();

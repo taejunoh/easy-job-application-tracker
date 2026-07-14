@@ -127,7 +127,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
   it("preflights the live PostgreSQL identity before destructive mutations", () => {
     expect(liveDatabaseIdentity).toEqual({
       database: requiredDatabaseIdentity().database,
-      address: expect.stringMatching(/^(?:127\.0\.0\.1|::1)$/u),
+      address: requiredDatabaseIdentity().serverAddress,
       port: requiredDatabaseIdentity().port,
       schema: "public",
     });

@@ -201,10 +201,17 @@ export APP_BASE_URL="https://jobtracker.test"
 export CORS_ALLOWED_ORIGINS="https://jobtracker.test,chrome-extension://abcdefghijklmnopabcdefghijklmnop"
 export RUN_DATABASE_INTEGRATION=1
 export ALLOW_DESTRUCTIVE_DATABASE_TESTS=jobtracker-ci-delete-all
+export EXPECTED_DATABASE_SERVER_ADDRESS="127.0.0.1"
 
 npx prisma migrate deploy
 npm run test:ci
 ```
+
+`EXPECTED_DATABASE_SERVER_ADDRESS` must equal the address reported by
+PostgreSQL for the connection. It is `127.0.0.1` for the local reproduction
+above. CI derives the exact PostgreSQL service-container address with
+`docker inspect`; the integration guard does not accept an arbitrary private
+network range.
 
 The fixed credentials above are disposable test values. The application origin
 must remain `https://jobtracker.test` and appear exactly in the CORS list when

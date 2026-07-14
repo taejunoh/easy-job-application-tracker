@@ -30,7 +30,7 @@ export async function verifyLiveDatabaseIdentity(
   const value = row as Record<string, unknown>;
   if (
     value.database !== expected.database ||
-    !isLoopbackAddress(value.address) ||
+    value.address !== expected.serverAddress ||
     value.port !== expected.port ||
     value.schema !== "public"
   ) {
@@ -53,10 +53,6 @@ export async function resetVerifiedIntegrationDatabase(
   await database.application.deleteMany();
   await database.settings.deleteMany();
   return identity;
-}
-
-function isLoopbackAddress(value: unknown): value is string {
-  return value === "127.0.0.1" || value === "::1";
 }
 
 function mismatch(): never {
