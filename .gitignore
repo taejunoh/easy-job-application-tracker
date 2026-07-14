@@ -37,6 +37,7 @@ yarn-error.log*
 
 # vercel
 .vercel
+.artifacts/extension-e2e/
 
 # typescript
 *.tsbuildinfo

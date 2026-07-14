@@ -109,9 +109,16 @@ describe("extension E2E safety support", () => {
     };
 
     const result = callSupport<{
+      host_permissions: string[];
       optional_host_permissions: string[];
-    }>("buildE2EManifest", source, "http://127.0.0.1:3100");
+    }>(
+      "buildE2EManifest",
+      source,
+      "http://127.0.0.1:3100",
+      "https://jobs.lever.co/*",
+    );
 
+    expect(result.host_permissions).toEqual(["https://jobs.lever.co/*"]);
     expect(result.optional_host_permissions).toEqual([
       "https://*/*",
       "http://127.0.0.1:3100/*",

@@ -88,10 +88,26 @@ export function assertSafeExtensionE2EEnvironment(environment) {
 /**
  * @param {Record<string, unknown>} source
  * @param {string} serverOrigin
- * @returns {Record<string, unknown> & {optional_host_permissions: string[]}}
+ * @param {string} fixtureHostPermission
+ * @returns {Record<string, unknown> & {host_permissions: string[], optional_host_permissions: string[]}}
  */
-export function buildE2EManifest(source, serverOrigin) {
+export function buildE2EManifest(
+  source,
+  serverOrigin,
+  fixtureHostPermission,
+) {
   const origin = exactLoopbackOrigin(serverOrigin);
+  if (fixtureHostPermission !== "https://jobs.lever.co/*") {
+    throw new Error("Invalid deterministic extension E2E fixture permission");
+  }
+  const hostPermissions = Array.isArray(source.host_permissions)
+    ? source.host_permissions.filter(
+        (permission) => typeof permission === "string",
+      )
+    : [];
+  if (!hostPermissions.includes(fixtureHostPermission)) {
+    hostPermissions.push(fixtureHostPermission);
+  }
   const originalPermissions = Array.isArray(source.optional_host_permissions)
     ? source.optional_host_permissions.filter(
         (permission) => typeof permission === "string",
@@ -107,6 +123,7 @@ export function buildE2EManifest(source, serverOrigin) {
 
   return {
     ...structuredClone(source),
+    host_permissions: hostPermissions,
     optional_host_permissions: optionalHostPermissions,
   };
 }

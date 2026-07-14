@@ -2,6 +2,8 @@ export const E2E_SERVER_HOST = "127.0.0.1";
 export const E2E_SERVER_PORT = 3100;
 export const E2E_SERVER_ORIGIN =
   `http://${E2E_SERVER_HOST}:${E2E_SERVER_PORT}`;
+export const E2E_CONFIGURED_APP_ORIGIN =
+  `https://${E2E_SERVER_HOST}:${E2E_SERVER_PORT}`;
 export const E2E_ACCESS_TOKEN =
   "extension-e2e-access-token-aaaaaaaaaaaaaaaa";
 export const E2E_INVALID_ACCESS_TOKEN =
@@ -19,7 +21,7 @@ export const LEVER_EXPECTED_APPLICATION = Object.freeze({
   jobType: "Remote",
   salary: "$170,000 - $210,000",
   description:
-    "Build reliable distributed systems for the JobTracker E2E platform.\n\nPartner with product engineers to ship observable, secure services.",
+    "Build reliable TypeScript and PostgreSQL systems for the JobTracker E2E platform.\n\nPartner with product engineers to ship observable Kubernetes services.",
 });
 
 export const LEVER_FIXTURE_HTML = `<!doctype html>
@@ -46,10 +48,10 @@ export const LEVER_FIXTURE_HTML = `<!doctype html>
       </div>
     </section>
     <section class="section page-centered">
-      <p>Build reliable distributed systems for the JobTracker E2E platform.</p>
+      <p>Build reliable TypeScript and PostgreSQL systems for the JobTracker E2E platform.</p>
     </section>
     <section class="section page-centered">
-      <p>Partner with product engineers to ship observable, secure services.</p>
+      <p>Partner with product engineers to ship observable Kubernetes services.</p>
     </section>
     <section class="section page-centered last-section-apply">
       <button type="button">Apply</button>
