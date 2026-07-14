@@ -45,6 +45,7 @@ const SIGNAL_EXIT_CODES = new Map([
   ["SIGTERM", 143],
 ]);
 const TERMINATION_GRACE_MS = 2_000;
+const CLEANUP_CONTROL_TIMEOUT_MS = 2_000;
 const DOCKER_DUMP_WRAPPER = [
   "set -eu",
   "pidfile=$1; startfile=$2; cancelfile=$3; shift 3",
@@ -136,6 +137,9 @@ function createSignalSupervisor() {
     trackDatabase(termination) {
       databaseTermination = termination;
       if (interruption) schedule(termination);
+    },
+    recordFailure(error) {
+      shutdownError ??= error;
     },
     async settle() {
       while (pending.size > 0) {
@@ -312,6 +316,24 @@ async function runSilent(command, args, options = {}) {
   throw new Error("Credential transport failed");
 }
 
+async function runCleanupControl(command, args) {
+  const child = spawn(command, args, {
+    env: childEnvironment(),
+    stdio: ["ignore", "ignore", "ignore"],
+    detached: process.platform !== "win32",
+  });
+  const outcome = childOutcome(child);
+  const completed = await waitBounded(outcome, CLEANUP_CONTROL_TIMEOUT_MS);
+  if (!completed) {
+    await terminateChild(child, outcome);
+    throw new Error("Backup cleanup control timed out");
+  }
+  const result = await outcome;
+  if (result.error || result.code !== 0) {
+    throw new Error("Backup cleanup control failed");
+  }
+}
+
 async function waitForDockerPidFile(docker, container, credential, supervisor) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     supervisor.throwIfInterrupted();
@@ -388,7 +410,7 @@ async function dumpSnapshot(
       let remoteTerminationError;
       if (container) {
         try {
-          await runSilent(docker, [
+          await runCleanupControl(docker, [
             "exec",
             container,
             "sh",
@@ -446,7 +468,7 @@ async function dumpSnapshot(
     const cleanup = [];
     if (container) {
       cleanup.push(
-        runSilent(docker, [
+        runCleanupControl(docker, [
           "exec",
           container,
           "rm",
@@ -461,7 +483,10 @@ async function dumpSnapshot(
     cleanup.push(rm(credential.hostPath, { force: true }));
     const results = await Promise.allSettled(cleanup);
     const failure = results.find((result) => result.status === "rejected");
-    if (failure?.status === "rejected") throw failure.reason;
+    if (failure?.status === "rejected") {
+      supervisor.recordFailure(failure.reason);
+      throw failure.reason;
+    }
   }
   await chmod(partialPath, 0o600);
   await rename(partialPath, dumpPath);
@@ -538,6 +563,30 @@ async function createSnapshotBackup(
   }
 }
 
+async function waitForCommitGate(supervisor) {
+  const gatePath = process.env.BACKUP_COMMIT_GATE_FILE;
+  if (!gatePath) return;
+  while (true) {
+    try {
+      await access(gatePath);
+      return;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    supervisor.throwIfInterrupted();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function removeBackupOutputs(dumpPath, fingerprintPath) {
+  await Promise.all([
+    rm(dumpPath, { force: true }),
+    rm(`${dumpPath}.partial`, { force: true }),
+    rm(fingerprintPath, { force: true }),
+    rm(`${fingerprintPath}.partial`, { force: true }),
+  ]);
+}
+
 async function main() {
   const databaseUrl = process.env.DATABASE_URL;
   const dumpPath = process.argv[2];
@@ -547,6 +596,7 @@ async function main() {
   }
   const supervisor = createSignalSupervisor();
   supervisor.install();
+  let listenersInstalled = true;
   try {
     await createSnapshotBackup(
       databaseUrl,
@@ -554,11 +604,19 @@ async function main() {
       fingerprintPath,
       supervisor,
     );
+    await waitForCommitGate(supervisor);
+    await supervisor.settle();
+    supervisor.throwIfInterrupted();
+    supervisor.remove();
+    listenersInstalled = false;
   } catch (error) {
+    await supervisor.settle();
+    if (supervisor.interruption) {
+      await removeBackupOutputs(dumpPath, fingerprintPath);
+    }
     if (!supervisor.interruption || supervisor.shutdownError) throw error;
   } finally {
-    await supervisor.settle();
-    supervisor.remove();
+    if (listenersInstalled) supervisor.remove();
   }
   return supervisor.interruption;
 }

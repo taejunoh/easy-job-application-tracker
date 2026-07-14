@@ -50,6 +50,7 @@ type CommandCapture = Readonly<{
   pid?: number;
   pidfile?: string;
   control?: boolean;
+  hang?: "remote-stop" | "cleanup-rm";
 }>;
 
 function requiredEnvironment(name: string): string {
@@ -257,8 +258,13 @@ async function createInterruptibleFakeDocker(
   path: string,
   logPath: string,
   readyPath: string,
-  failRemoteStop = false,
-  controlReadyPath?: string,
+  options: Readonly<{
+    failRemoteStop?: boolean;
+    controlReadyPath?: string;
+    hangRemoteStop?: boolean;
+    hangCleanupRm?: boolean;
+    cleanupReadyPath?: string;
+  }> = {},
 ): Promise<void> {
   await writeExecutable(
     path,
@@ -303,16 +309,22 @@ if (args[0] === "cp") {
     process.stdout.write("partial-fake-custom-dump");
     setInterval(() => undefined, 1_000);
   } else if (
-    ${JSON.stringify(controlReadyPath !== undefined)} &&
+    ${JSON.stringify(options.controlReadyPath !== undefined)} &&
     args.some((argument) => argument.includes('test -s "$1"'))
   ) {
     entry.pid = process.pid;
     entry.control = true;
     append(entry);
-    fs.writeFileSync(${JSON.stringify(controlReadyPath ?? "")}, "");
+    fs.writeFileSync(${JSON.stringify(options.controlReadyPath ?? "")}, "");
     setInterval(() => undefined, 1_000);
   } else if (serializedArgs.includes("kill") && entry.pidfile) {
-    if (${JSON.stringify(failRemoteStop)}) {
+    if (${JSON.stringify(options.hangRemoteStop === true)}) {
+      entry.pid = process.pid;
+      entry.hang = "remote-stop";
+      append(entry);
+      fs.writeFileSync(${JSON.stringify(options.cleanupReadyPath ?? "")}, "");
+      setInterval(() => undefined, 1_000);
+    } else if (${JSON.stringify(options.failRemoteStop === true)}) {
       append({ ...entry, remoteFailure: true });
       process.exitCode = 9;
     } else {
@@ -321,10 +333,18 @@ if (args[0] === "cp") {
       append({ ...entry, remoteSignal: "SIGTERM" });
     }
   } else if (command === "rm") {
-    for (const candidate of commandArgs.filter((argument) => argument.startsWith("/"))) {
-      fs.rmSync(candidate, { force: true });
+    if (${JSON.stringify(options.hangCleanupRm === true)}) {
+      entry.pid = process.pid;
+      entry.hang = "cleanup-rm";
+      append(entry);
+      fs.writeFileSync(${JSON.stringify(options.cleanupReadyPath ?? "")}, "");
+      setInterval(() => undefined, 1_000);
+    } else {
+      for (const candidate of commandArgs.filter((argument) => argument.startsWith("/"))) {
+        fs.rmSync(candidate, { force: true });
+      }
+      append(entry);
     }
-    append(entry);
   } else {
     append(entry);
   }
@@ -377,6 +397,29 @@ async function waitForProcessGone(pid: number): Promise<boolean> {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   return !processIsAlive(pid);
+}
+
+async function boundedChildResult(
+  result: Promise<ChildResult>,
+  milliseconds = 3_500,
+): Promise<ChildResult | "timeout"> {
+  return Promise.race([
+    result,
+    new Promise<"timeout">((resolve) =>
+      setTimeout(() => resolve("timeout"), milliseconds),
+    ),
+  ]);
+}
+
+function forceKill(pid: number | undefined): void {
+  if (!pid || !processIsAlive(pid)) return;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+      process.kill(pid, "SIGKILL");
+    }
+  }
 }
 
 async function readJsonLines(path: string): Promise<CommandCapture[]> {
@@ -802,8 +845,7 @@ describeBackup("snapshot-consistent production backup coordinator", () => {
       dockerPath,
       logPath,
       dumpReadyPath,
-      false,
-      controlReadyPath,
+      { controlReadyPath },
     );
     const execution = runChild(
       process.execPath,
@@ -844,7 +886,7 @@ describeBackup("snapshot-consistent production backup coordinator", () => {
       dockerPath,
       logPath,
       readyPath,
-      true,
+      { failRemoteStop: true },
     );
     const execution = runChild(
       process.execPath,
@@ -873,6 +915,157 @@ describeBackup("snapshot-consistent production backup coordinator", () => {
     expect(`${result.stdout}${result.stderr}`).not.toContain(secretSourceUrl);
     expect(`${result.stdout}${result.stderr}`).not.toContain(passwordSentinel);
     for (const path of [dumpPath, `${dumpPath}.partial`, fingerprintPath]) {
+      expect(await pathIsAbsent(path)).toBe(true);
+    }
+  });
+
+  it("bounds a hung remote-stop Docker CLI without leaving the dump child", async () => {
+    const dumpPath = join(runDirectory, "hung-remote-stop.dump");
+    const fingerprintPath = join(runDirectory, "hung-remote-stop.json");
+    const dockerPath = join(runDirectory, "hung-remote-stop-docker");
+    const logPath = join(runDirectory, "hung-remote-stop-log.jsonl");
+    const dumpReadyPath = join(runDirectory, "hung-remote-stop-dump-ready");
+    const cleanupReadyPath = join(runDirectory, "hung-remote-stop-cli-ready");
+    await createInterruptibleFakeDocker(
+      dockerPath,
+      logPath,
+      dumpReadyPath,
+      { hangRemoteStop: true, cleanupReadyPath },
+    );
+    const execution = runChild(
+      process.execPath,
+      [coordinator, dumpPath, fingerprintPath],
+      {
+        ...process.env,
+        BACKUP_CREDENTIAL_DIRECTORY: runDirectory,
+        DATABASE_URL: secretSourceUrl,
+        PG_DUMP_DOCKER_CONTAINER: "nonsecret-container-id",
+        DOCKER_BIN: dockerPath,
+      },
+    );
+
+    await waitForFile(dumpReadyPath, execution.result);
+    const initialCaptures = await readJsonLines(logPath);
+    const copy = initialCaptures.find((capture) => capture.args[0] === "cp")!;
+    const remote = initialCaptures.find(
+      (capture) => capture.pid !== undefined && !capture.hang,
+    )!;
+    execution.child.kill("SIGTERM");
+    await waitForFile(cleanupReadyPath, execution.result);
+    const bounded = await boundedChildResult(execution.result);
+    const captures = await readJsonLines(logPath);
+    const cleanupControl = captures.find(
+      (capture) => capture.hang === "remote-stop",
+    );
+    if (bounded === "timeout") {
+      forceKill(cleanupControl?.pid);
+      forceKill(remote.pid);
+      execution.child.kill("SIGKILL");
+      await boundedChildResult(execution.result, 1_000);
+    }
+    const containerCredentialPath = copy.args[2].replace(/^[^:]+:/u, "");
+    await rm(containerCredentialPath, { force: true });
+    if (remote.pidfile) await rm(remote.pidfile, { force: true });
+
+    expect(bounded).not.toBe("timeout");
+    expect(bounded).toMatchObject({
+      code: 1,
+      signal: null,
+      stderr: "Production backup failed.\n",
+    });
+    expect(await waitForProcessGone(remote.pid!)).toBe(true);
+    expect(await pathIsAbsent(copy.args[1])).toBe(true);
+    for (const path of [dumpPath, `${dumpPath}.partial`, fingerprintPath]) {
+      expect(await pathIsAbsent(path)).toBe(true);
+    }
+  }, 10_000);
+
+  it("bounds a hung container credential cleanup CLI and completes best effort", async () => {
+    const dumpPath = join(runDirectory, "hung-cleanup-rm.dump");
+    const fingerprintPath = join(runDirectory, "hung-cleanup-rm.json");
+    const dockerPath = join(runDirectory, "hung-cleanup-rm-docker");
+    const logPath = join(runDirectory, "hung-cleanup-rm-log.jsonl");
+    const dumpReadyPath = join(runDirectory, "hung-cleanup-rm-dump-ready");
+    const cleanupReadyPath = join(runDirectory, "hung-cleanup-rm-cli-ready");
+    await createInterruptibleFakeDocker(
+      dockerPath,
+      logPath,
+      dumpReadyPath,
+      { hangCleanupRm: true, cleanupReadyPath },
+    );
+    const execution = runChild(
+      process.execPath,
+      [coordinator, dumpPath, fingerprintPath],
+      {
+        ...process.env,
+        BACKUP_CREDENTIAL_DIRECTORY: runDirectory,
+        DATABASE_URL: secretSourceUrl,
+        PG_DUMP_DOCKER_CONTAINER: "nonsecret-container-id",
+        DOCKER_BIN: dockerPath,
+      },
+    );
+
+    await waitForFile(dumpReadyPath, execution.result);
+    const initialCaptures = await readJsonLines(logPath);
+    const copy = initialCaptures.find((capture) => capture.args[0] === "cp")!;
+    const remote = initialCaptures.find((capture) => capture.pid !== undefined)!;
+    execution.child.kill("SIGINT");
+    await waitForFile(cleanupReadyPath, execution.result);
+    const bounded = await boundedChildResult(execution.result);
+    const captures = await readJsonLines(logPath);
+    const cleanupControl = captures.find(
+      (capture) => capture.hang === "cleanup-rm",
+    );
+    if (bounded === "timeout") {
+      forceKill(cleanupControl?.pid);
+      execution.child.kill("SIGKILL");
+      await boundedChildResult(execution.result, 1_000);
+    }
+    const containerCredentialPath = copy.args[2].replace(/^[^:]+:/u, "");
+    await rm(containerCredentialPath, { force: true });
+    if (remote.pidfile) await rm(remote.pidfile, { force: true });
+
+    expect(bounded).not.toBe("timeout");
+    expect(bounded).toMatchObject({
+      code: 1,
+      signal: null,
+      stderr: "Production backup failed.\n",
+    });
+    expect(await waitForProcessGone(remote.pid!)).toBe(true);
+    expect(await pathIsAbsent(copy.args[1])).toBe(true);
+    for (const path of [dumpPath, `${dumpPath}.partial`, fingerprintPath]) {
+      expect(await pathIsAbsent(path)).toBe(true);
+    }
+  }, 10_000);
+
+  it("removes published outputs when signaled before the success commit point", async () => {
+    const dumpPath = join(runDirectory, "post-publish.dump");
+    const fingerprintPath = join(runDirectory, "post-publish.json");
+    const gatePath = join(runDirectory, "post-publish-release");
+    const execution = runChild(
+      process.execPath,
+      [coordinator, dumpPath, fingerprintPath],
+      {
+        ...process.env,
+        BACKUP_COMMIT_GATE_FILE: gatePath,
+        BACKUP_CREDENTIAL_DIRECTORY: runDirectory,
+        DATABASE_URL: secretSourceUrl,
+        PG_DUMP_BIN: requiredEnvironment("PG17_DUMP_BIN"),
+      },
+    );
+
+    await waitForFile(dumpPath, execution.result);
+    await waitForFile(fingerprintPath, execution.result);
+    execution.child.kill("SIGTERM");
+    const result = await execution.result;
+
+    expect(result).toMatchObject({ code: 143, signal: null });
+    for (const path of [
+      dumpPath,
+      `${dumpPath}.partial`,
+      fingerprintPath,
+      `${fingerprintPath}.partial`,
+    ]) {
       expect(await pathIsAbsent(path)).toBe(true);
     }
   });
