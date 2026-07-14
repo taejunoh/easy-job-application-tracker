@@ -132,6 +132,10 @@ describe("production operations documentation contract", () => {
       "unique marker",
       "permission cleanup",
       "credential cleanup",
+      "visible token input is cleared",
+      "reload must remain disconnected",
+      "toggle must be off",
+      "cleanup warning",
     ]) {
       expect(normalizedSmokeRunbook).toContain(requiredText);
     }
