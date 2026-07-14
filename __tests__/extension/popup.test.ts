@@ -321,6 +321,56 @@ describe("secure extension pairing", () => {
     expect(getElement("connectionStatus").textContent).toMatch(/could not reach/i);
   });
 
+  it.each(["401", "network"])(
+    "preserves a same-origin permission when prior permission state is unknown after %s failure",
+    async (failure) => {
+      const { api, fetchMock, getElement, permissions, storage } = loadPopup({
+        connection: {
+          serverUrl: "https://same.example.com",
+          accessToken: "obvious-old-test-token",
+        },
+      });
+      permissions.contains.mockRejectedValueOnce(new Error("permission state unavailable"));
+      if (failure === "401") {
+        fetchMock.mockResolvedValueOnce({ ok: false, status: 401 });
+      } else {
+        fetchMock.mockRejectedValueOnce(new Error("offline"));
+      }
+      enterPair(getElement, "https://same.example.com");
+
+      await api.connectServer();
+
+      expect(storage.set).not.toHaveBeenCalled();
+      expect(storage.remove).not.toHaveBeenCalled();
+      expect(permissions.remove).not.toHaveBeenCalled();
+
+      fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+      await api.apiFetch("/api/settings");
+      const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(new Headers(init.headers).get("Authorization")).toBe(
+        "Bearer obvious-old-test-token"
+      );
+    }
+  );
+
+  it("does not remove a different-origin permission when its prior state is unknown", async () => {
+    const { api, fetchMock, getElement, permissions, storage } = loadPopup({
+      connection: {
+        serverUrl: "https://old.example.com",
+        accessToken: "obvious-old-test-token",
+      },
+    });
+    permissions.contains.mockRejectedValueOnce(new Error("permission state unavailable"));
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 401 });
+    enterPair(getElement, "https://new.example.com");
+
+    await api.connectServer();
+
+    expect(storage.set).not.toHaveBeenCalled();
+    expect(storage.remove).not.toHaveBeenCalled();
+    expect(permissions.remove).not.toHaveBeenCalled();
+  });
+
   it("stores the exact origin and token only after permission and verification succeed", async () => {
     const { api, fetchMock, getElement, permissions, storage } = loadPopup({
       connection: { serverUrl: "http://localhost:3000" },

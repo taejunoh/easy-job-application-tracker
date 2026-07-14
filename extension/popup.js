@@ -125,7 +125,7 @@ async function connectServer() {
 
   const pattern = permissionPattern(origin);
   const oldConnection = currentConnection;
-  let wasGranted = false;
+  let priorPermissionState = "unknown";
   let granted = false;
   let stored = false;
   let phase = "permission";
@@ -136,12 +136,15 @@ async function connectServer() {
     // Start both calls directly from the Connect click. request() therefore
     // retains the user gesture, while contains() tells us whether a failed
     // attempt introduced a permission that should be cleaned up.
-    const containsPromise = Promise.resolve(
+    const priorPermissionPromise = Promise.resolve(
       chrome.permissions.contains({ origins: [pattern] })
-    ).catch(() => false);
+    ).then(
+      (contains) => contains === true,
+      () => "unknown"
+    );
     const requestPromise = chrome.permissions.request({ origins: [pattern] });
-    [wasGranted, granted] = await Promise.all([
-      containsPromise,
+    [priorPermissionState, granted] = await Promise.all([
+      priorPermissionPromise,
       requestPromise,
     ]);
 
@@ -181,7 +184,7 @@ async function connectServer() {
       await removePermissionQuietly(permissionPattern(oldConnection.serverUrl));
     }
   } catch (error) {
-    if (granted && !wasGranted && !stored) {
+    if (granted && priorPermissionState === false && !stored) {
       await removePermissionQuietly(pattern);
     }
 
