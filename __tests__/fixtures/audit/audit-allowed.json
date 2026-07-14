@@ -1,0 +1,83 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "@hono/node-server": {
+      "name": "@hono/node-server",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1116281,
+          "name": "@hono/node-server",
+          "severity": "moderate",
+          "title": "Middleware bypass",
+          "url": "https://github.com/advisories/GHSA-92pp-h63x-v22m",
+          "range": "<1.19.13"
+        }
+      ],
+      "effects": ["@prisma/dev"],
+      "range": "<1.19.13",
+      "nodes": ["node_modules/@hono/node-server"],
+      "fixAvailable": false
+    },
+    "@prisma/dev": {
+      "name": "@prisma/dev",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": ["@hono/node-server"],
+      "effects": ["prisma"],
+      "range": "<=0.24.8",
+      "nodes": ["node_modules/@prisma/dev"],
+      "fixAvailable": false
+    },
+    "next": {
+      "name": "next",
+      "severity": "moderate",
+      "isDirect": true,
+      "via": ["postcss"],
+      "effects": [],
+      "range": "9.3.4-canary.0 - 16.3.0-canary.5",
+      "nodes": ["node_modules/next"],
+      "fixAvailable": false
+    },
+    "postcss": {
+      "name": "postcss",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1117015,
+          "name": "postcss",
+          "severity": "moderate",
+          "title": "PostCSS XSS",
+          "url": "https://github.com/advisories/GHSA-qx2v-qp2m-jg93",
+          "range": "<8.5.10"
+        }
+      ],
+      "effects": ["next"],
+      "range": "<8.5.10",
+      "nodes": ["node_modules/next/node_modules/postcss"],
+      "fixAvailable": false
+    },
+    "prisma": {
+      "name": "prisma",
+      "severity": "moderate",
+      "isDirect": true,
+      "via": ["@prisma/dev"],
+      "effects": [],
+      "range": "6.20.0-dev.1 - 7.9.0-dev.7",
+      "nodes": ["node_modules/prisma"],
+      "fixAvailable": false
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 5,
+      "high": 0,
+      "critical": 0,
+      "total": 5
+    }
+  }
+}

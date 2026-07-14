@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "reviewedOn": "2026-07-14",
+  "reviewBy": "2026-08-14",
+  "exceptions": [
+    {
+      "id": "GHSA-92pp-h63x-v22m",
+      "url": "https://github.com/advisories/GHSA-92pp-h63x-v22m",
+      "severity": "moderate",
+      "scope": ["@hono/node-server", "@prisma/dev", "prisma"],
+      "rationale": "Fixture Prisma wrapper risk.",
+      "remediation": "Fixture Prisma upgrade condition."
+    },
+    {
+      "id": "GHSA-qx2v-qp2m-jg93",
+      "url": "https://github.com/advisories/GHSA-qx2v-qp2m-jg93",
+      "severity": "moderate",
+      "scope": ["next", "postcss"],
+      "rationale": "Fixture Next wrapper risk.",
+      "remediation": "Fixture Next upgrade condition."
+    }
+  ]
+}

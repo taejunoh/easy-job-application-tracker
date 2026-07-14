@@ -45,6 +45,7 @@ describe("deployment verification contract", () => {
         "node --import ./scripts/validate-startup-env-production.mjs node_modules/next/dist/bin/next start",
       typecheck: "next typegen && tsc --noEmit",
       "test:ci": "jest --runInBand",
+      "check:audit": "node scripts/check-audit.mjs",
       "check:startup-env": "node scripts/verify-invalid-startup.mjs",
     });
     expect(packageJson.dependencies).toMatchObject({
@@ -179,6 +180,10 @@ describe("deployment verification contract", () => {
         run: "address=\"$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \"$POSTGRES_SERVICE_CONTAINER_ID\")\"\nprintf 'EXPECTED_DATABASE_SERVER_ADDRESS=%s\\n' \"$address\" >> \"$GITHUB_ENV\"\n",
       },
       { name: "Install dependencies", run: "npm ci" },
+      {
+        name: "Enforce dependency audit policy",
+        run: "npm run check:audit",
+      },
       { name: "Generate Prisma client", run: "npx prisma generate" },
       { name: "Validate Prisma schema", run: "npx prisma validate" },
       { name: "Apply database migrations", run: "npx prisma migrate deploy" },
