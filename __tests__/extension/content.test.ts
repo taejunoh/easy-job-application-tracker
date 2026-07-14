@@ -17,7 +17,9 @@ describe("content script registration", () => {
           onMessage: { addListener },
         },
       },
-      document: {},
+      document: {
+        querySelectorAll: jest.fn(() => []),
+      },
       window: windowMock,
     });
     const script = new vm.Script(contentScript);
@@ -27,5 +29,16 @@ describe("content script registration", () => {
 
     expect(addListener).toHaveBeenCalledTimes(1);
     expect(windowMock.__jobTrackerInjected).toBe(true);
+
+    const listener = addListener.mock.calls[0][0];
+    const sendResponse = jest.fn();
+    expect(
+      listener(
+        { action: "autoFillProfiles", profiles: {} },
+        {},
+        sendResponse
+      )
+    ).toBe(true);
+    expect(sendResponse).toHaveBeenCalledWith({ filled: [] });
   });
 });

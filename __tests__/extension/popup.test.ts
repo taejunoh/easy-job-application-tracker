@@ -116,13 +116,12 @@ describe("sendMessageWithRetry", () => {
   it("injects once and retries once after the first send fails", async () => {
     const { api, executeScript, sendMessage } = loadPopup();
     const response = { description: "retry response" };
+    const message = { action: "extractJob" };
     sendMessage
-      .mockRejectedValueOnce(new Error("missing receiver"))
+      .mockRejectedValueOnce(new Error("Could not establish connection."))
       .mockResolvedValueOnce(response);
 
-    await expect(
-      api.sendMessageWithRetry(7, { action: "extractJob" })
-    ).resolves.toBe(response);
+    await expect(api.sendMessageWithRetry(7, message)).resolves.toBe(response);
 
     expect(executeScript).toHaveBeenCalledTimes(1);
     expect(executeScript).toHaveBeenCalledWith({
@@ -130,20 +129,36 @@ describe("sendMessageWithRetry", () => {
       files: ["content.js"],
     });
     expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage).toHaveBeenNthCalledWith(2, 7, message);
   });
 
   it("rejects after one retry without looping", async () => {
     const { api, executeScript, sendMessage } = loadPopup();
+    const message = { action: "extractJob" };
     sendMessage
-      .mockRejectedValueOnce(new Error("missing receiver"))
+      .mockRejectedValueOnce(new Error("Receiving end does not exist."))
       .mockRejectedValueOnce(new Error("retry failed"));
 
-    await expect(
-      api.sendMessageWithRetry(7, { action: "extractJob" })
-    ).rejects.toThrow("retry failed");
+    await expect(api.sendMessageWithRetry(7, message)).rejects.toThrow(
+      "retry failed"
+    );
 
     expect(executeScript).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage).toHaveBeenNthCalledWith(2, 7, message);
+  });
+
+  it("rethrows unrelated send errors without injecting or retrying", async () => {
+    const { api, executeScript, sendMessage } = loadPopup();
+    const error = new Error("The tab was closed.");
+    sendMessage.mockRejectedValueOnce(error);
+
+    await expect(
+      api.sendMessageWithRetry(7, { action: "extractJob" })
+    ).rejects.toBe(error);
+
+    expect(executeScript).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -160,7 +175,7 @@ describe("popup messaging flows", () => {
       { id: 7, url: "https://jobs.example.com/role" },
     ]);
     sendMessage
-      .mockRejectedValueOnce(new Error("missing receiver"))
+      .mockRejectedValueOnce(new Error("Could not establish connection."))
       .mockResolvedValueOnce({
         jobTitle: "Software Engineer",
         company: "Example",
@@ -188,7 +203,7 @@ describe("popup messaging flows", () => {
     } = loadPopup();
     query.mockResolvedValueOnce([{ id: 7 }]);
     sendMessage
-      .mockRejectedValueOnce(new Error("missing receiver"))
+      .mockRejectedValueOnce(new Error("Receiving end does not exist."))
       .mockResolvedValueOnce({ description: "TypeScript and React" });
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -229,7 +244,7 @@ describe("popup messaging flows", () => {
     });
     query.mockResolvedValueOnce([{ id: 7 }]);
     sendMessage
-      .mockRejectedValueOnce(new Error("missing receiver"))
+      .mockRejectedValueOnce(new Error("Could not establish connection."))
       .mockResolvedValueOnce({ filled: ["LinkedIn", "GitHub"] });
 
     await api.fillProfiles();

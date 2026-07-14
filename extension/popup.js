@@ -163,10 +163,19 @@ document.getElementById("analysisToggle")?.addEventListener("click", () => {
 // Try sendMessage first; if the content script isn't loaded (e.g. LinkedIn
 // SPA navigation, or the tab pre-dates the extension install), inject it
 // and retry once.
+function isMissingReceiverError(error) {
+  const message = typeof error?.message === "string"
+    ? error.message
+    : String(error);
+  return message.includes("Could not establish connection") ||
+    message.includes("Receiving end does not exist");
+}
+
 async function sendMessageWithRetry(tabId, message) {
   try {
     return await chrome.tabs.sendMessage(tabId, message);
-  } catch {
+  } catch (error) {
+    if (!isMissingReceiverError(error)) throw error;
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ["content.js"],
