@@ -163,7 +163,7 @@ baseline is a tested database restore, not a destructive down migration.
 
 ### Continuous Integration
 
-The GitHub Actions workflow runs on Node.js 22.12 with a disposable PostgreSQL
+The GitHub Actions workflow runs on Node.js 22.22.2 with a disposable PostgreSQL
 16 service. It installs the checked-in dependency graph, validates and applies
 the Prisma migration history, verifies schema parity, checks the extension's
 static assets, runs the full unit and database integration suite, lints,
@@ -173,12 +173,18 @@ repository secrets or contact external application services.
 
 The database integration suite runs only when every destructive-test guard is
 satisfied: `RUN_DATABASE_INTEGRATION=1`,
-`ALLOW_DESTRUCTIVE_DATABASE_TESTS=jobtracker-ci-delete-all`, a database host of
-`localhost` or `127.0.0.1`, and a decoded database name ending in `_ci` or
-`_test`. An integration run fails before Prisma is imported if any guard is
-missing. Never point the suite at a development, staging, or production
-database because it deletes every application and settings row before and
-after the run.
+`ALLOW_DESTRUCTIVE_DATABASE_TESTS=jobtracker-ci-delete-all`, an explicit numeric
+port on `localhost`, `127.0.0.1`, or `[::1]`, and exactly one decoded database
+path segment matching `[A-Za-z0-9_]+_(ci|test)`. Query parameters, fragments,
+connection-service options, socket targets, ambiguous user information, and
+additional path segments are rejected. The suite also queries the connected
+PostgreSQL server for its database, address, port, and current schema before
+every bulk cleanup; those values must match the guarded loopback target and the
+`public` schema before any row is deleted. An integration run fails before
+Prisma is imported if the URL guard is missing, and before mutation if the live
+identity differs. Never point the suite at a development, staging, or
+production database because it deletes every application and settings row
+before and after the run.
 
 The following reproduces the CI database gate with a uniquely named temporary
 local database. It does not read or modify the database configured in `.env`:

@@ -98,7 +98,7 @@ describe("deployment verification contract", () => {
       {
         name: "Set up Node.js",
         uses: `actions/setup-node@${SETUP_NODE_SHA}`,
-        with: { "node-version": "22.12.0", cache: "npm" },
+        with: { "node-version": "22.22.2", cache: "npm" },
       },
       { name: "Install dependencies", run: "npm ci" },
       { name: "Generate Prisma client", run: "npx prisma generate" },

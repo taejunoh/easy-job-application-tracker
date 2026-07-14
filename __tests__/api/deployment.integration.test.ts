@@ -1,6 +1,17 @@
 import type { PrismaClient } from "@prisma/client";
 import { NextRequest } from "next/server";
+import { generatedPdf } from "../fixtures/resume/generated-pdf";
 import { assertDatabaseTestSafety } from "./database-test-guard";
+import {
+  resetVerifiedIntegrationDatabase,
+  type LiveDatabaseIdentity,
+} from "./database-test-preflight";
+
+jest.mock("@/lib/extract/llm-provider", () => ({
+  createProvider: jest.fn(() => {
+    throw new Error("External LLM access is forbidden in integration tests");
+  }),
+}));
 
 jest.mock("@/lib/security/safe-fetch", () => {
   const actual = jest.requireActual<
@@ -28,11 +39,13 @@ jest.mock("@/lib/security/safe-fetch", () => {
   };
 });
 
+import { createProvider } from "@/lib/extract/llm-provider";
+
 const DATABASE_INTEGRATION_REQUESTED =
   process.env.RUN_DATABASE_INTEGRATION !== undefined;
-if (DATABASE_INTEGRATION_REQUESTED) {
-  assertDatabaseTestSafety(process.env);
-}
+const DATABASE_TEST_IDENTITY = DATABASE_INTEGRATION_REQUESTED
+  ? assertDatabaseTestSafety(process.env)
+  : undefined;
 const describeDatabase = DATABASE_INTEGRATION_REQUESTED
   ? describe
   : describe.skip;
@@ -61,6 +74,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
   let parseResume: ParseResumeRoute;
   let settings: SettingsRoute;
   let stats: StatsRoute;
+  let liveDatabaseIdentity: LiveDatabaseIdentity;
 
   beforeAll(async () => {
     expect(process.env.DATABASE_URL).toMatch(/^postgres(?:ql)?:\/\//u);
@@ -91,17 +105,32 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       import("@/app/api/stats/route"),
     ]);
 
-    await resetDatabase(prisma);
+    liveDatabaseIdentity = await resetVerifiedIntegrationDatabase(
+      prisma,
+      requiredDatabaseIdentity(),
+    );
   });
 
   afterAll(async () => {
     if (prisma) {
       try {
-        await resetDatabase(prisma);
+        await resetVerifiedIntegrationDatabase(
+          prisma,
+          requiredDatabaseIdentity(),
+        );
       } finally {
         await prisma.$disconnect();
       }
     }
+  });
+
+  it("preflights the live PostgreSQL identity before destructive mutations", () => {
+    expect(liveDatabaseIdentity).toEqual({
+      database: requiredDatabaseIdentity().database,
+      address: expect.stringMatching(/^(?:127\.0\.0\.1|::1)$/u),
+      port: requiredDatabaseIdentity().port,
+      schema: "public",
+    });
   });
 
   it("enforces exact CORS and authentication before database access", async () => {
@@ -248,6 +277,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       location: "",
       url: "https://jobs.example.test/open-role",
     });
+    expect(createProvider).not.toHaveBeenCalled();
   });
 
   it("matches keywords from resume text stored in the real database", async () => {
@@ -304,6 +334,31 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
     await expect(response.json()).resolves.toEqual({
       text: "TypeScript\nPostgreSQL\nSecurity",
     });
+  });
+
+  it("parses a generated small PDF multipart upload", async () => {
+    const form = new FormData();
+    form.append(
+      "resume",
+      new Blob([new Uint8Array(generatedPdf(["PDF Resume"]))], {
+        type: "application/pdf",
+      }),
+      "resume.pdf",
+    );
+
+    const response = await parseResume.POST(
+      new NextRequest(`${APP_ORIGIN}/api/parse-resume`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken()}`,
+          Origin: APP_ORIGIN,
+        },
+        body: form,
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ text: "PDF Resume" });
   });
 
   it("rejects representative SSRF and oversized resume inputs offline", async () => {
@@ -371,11 +426,13 @@ function accessToken(): string {
   return process.env.APP_ACCESS_TOKEN ?? "";
 }
 
-function detailContext(id: string): { params: Promise<{ id: string }> } {
-  return { params: Promise.resolve({ id }) };
+function requiredDatabaseIdentity() {
+  if (DATABASE_TEST_IDENTITY === undefined) {
+    throw new Error("Database integration identity was not validated");
+  }
+  return DATABASE_TEST_IDENTITY;
 }
 
-async function resetDatabase(prisma: PrismaClient): Promise<void> {
-  await prisma.application.deleteMany();
-  await prisma.settings.deleteMany();
+function detailContext(id: string): { params: Promise<{ id: string }> } {
+  return { params: Promise.resolve({ id }) };
 }
