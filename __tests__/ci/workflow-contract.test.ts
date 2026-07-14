@@ -8,6 +8,7 @@ const SETUP_NODE_SHA = "249970729cb0ef3589644e2896645e5dc5ba9c38";
 
 type WorkflowStep = Readonly<{
   name: string;
+  if?: string;
   uses?: string;
   run?: string;
   with?: Record<string, unknown>;
@@ -209,6 +210,96 @@ describe("deployment verification contract", () => {
     expect(workflowSource).toContain(`# v6.5.0\n`);
     expect(workflowSource).not.toContain("secrets.");
     expect(job.env).not.toHaveProperty("NODE_ENV");
+  });
+
+  it("runs the real extension in bundled Chromium against isolated PostgreSQL 17", () => {
+    const workflowSource = readFileSync(
+      join(root, ".github/workflows/ci.yml"),
+      "utf8",
+    );
+    const workflow = parse(workflowSource) as Workflow & {
+      jobs: Record<string, {
+        "runs-on": string;
+        "timeout-minutes": number;
+        services: Record<string, unknown>;
+        env: Record<string, string>;
+        steps: WorkflowStep[];
+      }>;
+    };
+    const job = workflow.jobs["extension-e2e"];
+
+    expect(job).toBeDefined();
+    expect(job["runs-on"]).toBe("ubuntu-latest");
+    expect(job["timeout-minutes"]).toBe(25);
+    expect(job.services).toEqual({
+      postgres: {
+        image:
+          "postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193",
+        env: {
+          POSTGRES_USER: "jobtracker",
+          POSTGRES_PASSWORD: "jobtracker",
+          POSTGRES_DB: "jobtracker_extension_e2e_test",
+        },
+        ports: ["5432:5432"],
+        options:
+          '--health-cmd "pg_isready -U jobtracker -d jobtracker_extension_e2e_test" --health-interval 10s --health-timeout 5s --health-retries 5',
+      },
+    });
+    expect(job.env).toEqual({
+      DATABASE_URL:
+        "postgresql://jobtracker:jobtracker@127.0.0.1:5432/jobtracker_extension_e2e_test",
+      ENCRYPTION_SECRET:
+        "extension-e2e-encryption-secret-cccccccccccc",
+      APP_ACCESS_TOKEN:
+        "extension-e2e-access-token-aaaaaaaaaaaaaaaa",
+      APP_BASE_URL: "https://127.0.0.1:3100",
+      CORS_ALLOWED_ORIGINS:
+        "https://127.0.0.1:3100,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+      RUN_EXTENSION_E2E: "1",
+      ALLOW_DESTRUCTIVE_EXTENSION_E2E:
+        "jobtracker-extension-e2e-delete-all",
+    });
+    expect(job.steps).toEqual([
+      {
+        name: "Check out repository",
+        uses: `actions/checkout@${CHECKOUT_SHA}`,
+      },
+      {
+        name: "Set up Node.js",
+        uses: `actions/setup-node@${SETUP_NODE_SHA}`,
+        with: { "node-version": "22.22.2", cache: "npm" },
+      },
+      {
+        name: "Capture PostgreSQL service address",
+        env: {
+          POSTGRES_SERVICE_CONTAINER_ID: "${{ job.services.postgres.id }}",
+        },
+        run: "address=\"$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \"$POSTGRES_SERVICE_CONTAINER_ID\")\"\nprintf 'EXPECTED_DATABASE_SERVER_ADDRESS=%s\\n' \"$address\" >> \"$GITHUB_ENV\"\n",
+      },
+      { name: "Install dependencies", run: "npm ci" },
+      {
+        name: "Install bundled Chromium",
+        run: "npx playwright install --with-deps chromium",
+      },
+      { name: "Build production application", run: "npm run build" },
+      {
+        name: "Run extension end-to-end journeys",
+        run: "npm run test:extension:e2e",
+      },
+      {
+        name: "Upload sanitized extension diagnostics",
+        if: "failure()",
+        uses:
+          "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        with: {
+          name: "extension-e2e-diagnostics",
+          path: ".artifacts/extension-e2e/",
+          "if-no-files-found": "ignore",
+          "retention-days": 7,
+        },
+      },
+    ]);
+    expect(workflowSource).not.toContain("secrets.");
   });
 
   it("uses only local typography sources", () => {
