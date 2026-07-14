@@ -229,13 +229,19 @@ function extractGlassdoor() {
   };
 }
 
+function normalizeLeverCompanyLabel(value) {
+  const label = value.trim();
+  const withoutLogo = label.replace(/\s+logo\s*$/i, "").trim();
+  return withoutLogo || label;
+}
+
 function extractLever() {
   const headlineEl = document.querySelector(".posting-headline h2");
   const jobTitle = headlineEl?.textContent?.trim() || "";
 
   const companyEl = document.querySelector(".main-header-logo img");
   const ogSiteName = document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "";
-  const company = ogSiteName || companyEl?.alt || "";
+  const company = normalizeLeverCompanyLabel(ogSiteName || companyEl?.alt || "");
 
   let location = "";
   const locationEl = document.querySelector(".posting-categories .sort-by-time.location .posting-category");
