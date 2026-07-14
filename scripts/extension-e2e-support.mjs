@@ -1,4 +1,5 @@
 import { isIP } from "node:net";
+import { basename, dirname, resolve } from "node:path";
 
 const DATABASE_NAME = "jobtracker_extension_e2e_test";
 const DESTRUCTIVE_ACKNOWLEDGEMENT =
@@ -154,6 +155,157 @@ export function extensionIdentityFromWorkerUrl(workerUrl) {
     id: url.hostname,
     origin: `chrome-extension://${url.hostname}`,
   });
+}
+
+/**
+ * @param {{registrations?: unknown[], versions?: unknown[]}} state
+ * @param {string} extensionId
+ * @returns {{registrationId: string, scopeURL: string, versionId: string, targetId: string, scriptURL: string}}
+ */
+export function extensionServiceWorkerStateFromCdp(state, extensionId) {
+  if (!EXTENSION_ID_PATTERN.test(extensionId)) {
+    throw new Error("Invalid extension ID for service worker state");
+  }
+  const scopeURL = `chrome-extension://${extensionId}/`;
+  const registrations = Array.isArray(state?.registrations)
+    ? state.registrations
+    : [];
+  const versions = Array.isArray(state?.versions) ? state.versions : [];
+  const registration = registrations.find(
+    (candidate) =>
+      candidate &&
+      typeof candidate === "object" &&
+      candidate.scopeURL === scopeURL &&
+      candidate.isDeleted !== true &&
+      typeof candidate.registrationId === "string",
+  );
+  const version = versions.find(
+    (candidate) =>
+      candidate &&
+      typeof candidate === "object" &&
+      candidate.registrationId === registration?.registrationId &&
+      candidate.runningStatus === "running" &&
+      candidate.scriptURL === `${scopeURL}background.js` &&
+      typeof candidate.versionId === "string" &&
+      typeof candidate.targetId === "string" &&
+      candidate.targetId.length > 0,
+  );
+  if (!registration || !version) {
+    throw new Error("extension service worker CDP state was unavailable");
+  }
+  return Object.freeze({
+    registrationId: registration.registrationId,
+    scopeURL,
+    versionId: version.versionId,
+    targetId: version.targetId,
+    scriptURL: version.scriptURL,
+  });
+}
+
+/**
+ * Clear extension popup content before a failure screenshot. This function is
+ * serialized into the popup execution context, so it must remain self-contained.
+ *
+ * @returns {string}
+ */
+export function redactPopupDocument() {
+  const contentIds = [
+    "analysisSection",
+    "analysisBadge",
+    "analysisSummary",
+    "matchedPills",
+    "missingPills",
+    "analysisError",
+  ];
+  for (const id of contentIds) {
+    const element = document.getElementById(id);
+    if (!element) continue;
+    element.replaceChildren();
+    element.textContent = "";
+    element.hidden = true;
+    element.style.display = "none";
+  }
+
+  for (const element of document.querySelectorAll("input, textarea")) {
+    if ("value" in element) element.value = "";
+    element.textContent = "";
+    element.removeAttribute("value");
+  }
+
+  for (const id of [
+    "serverUrl",
+    "accessToken",
+    "jobTitle",
+    "company",
+    "location",
+    "jobUrl",
+    "salary",
+    "jobType",
+    "description",
+  ]) {
+    const element = document.getElementById(id);
+    if (!element) continue;
+    if ("value" in element) element.value = "";
+    element.textContent = "";
+    element.removeAttribute("value");
+  }
+
+  for (const element of document.querySelectorAll("*")) {
+    for (const attribute of [...element.attributes]) {
+      if (
+        attribute.name.startsWith("data-") ||
+        ["href", "src", "srcset", "action", "formaction"].includes(
+          attribute.name,
+        )
+      ) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+    if (element.tagName === "A") element.textContent = "";
+  }
+
+  const connectionStatus = document.getElementById("connectionStatus");
+  if (connectionStatus) connectionStatus.textContent = "Status redacted";
+  const status = document.getElementById("statusMsg");
+  if (status) status.textContent = "E2E failure details redacted";
+  return document.documentElement.outerHTML;
+}
+
+/**
+ * @param {string} snapshot
+ * @param {string[]} sensitiveValues
+ */
+export function assertSanitizedPopupSnapshot(snapshot, sensitiveValues) {
+  if (typeof snapshot !== "string") {
+    throw new Error("sanitized popup snapshot was unavailable");
+  }
+  for (const value of sensitiveValues) {
+    if (typeof value === "string" && value.length > 0 && snapshot.includes(value)) {
+      throw new Error("sanitized popup snapshot retained sensitive content");
+    }
+  }
+}
+
+/**
+ * @param {string} workspacePath
+ * @param {string} temporaryRoot
+ * @returns {string}
+ */
+export function assertExtensionE2EWorkspacePath(
+  workspacePath,
+  temporaryRoot,
+) {
+  const root = resolve(temporaryRoot);
+  const workspace = resolve(workspacePath);
+  if (
+    dirname(workspace) !== root ||
+    !/^jobtracker-extension-e2e-[A-Za-z0-9]{6}$/u.test(
+      basename(workspace),
+    )
+  ) {
+    throw new Error("Refusing extension E2E workspace cleanup");
+  }
+  return workspace;
 }
 
 /** @param {string} output @returns {number} */

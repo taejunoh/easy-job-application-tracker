@@ -28,15 +28,30 @@ import {
   LEVER_FIXTURE_URL,
 } from "./extension-e2e-fixtures.mjs";
 import {
+  assertExtensionE2EWorkspacePath,
+  assertSanitizedPopupSnapshot,
   assertSafeExtensionE2EEnvironment,
   buildE2EManifest,
   extensionIdentityFromWorkerUrl,
+  extensionServiceWorkerStateFromCdp,
+  redactPopupDocument,
 } from "./extension-e2e-support.mjs";
 
 const { Client } = pg;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const artifactsDirectory = join(root, ".artifacts/extension-e2e");
 const permissionPattern = `${E2E_SERVER_ORIGIN}/*`;
+const popupArtifactSensitiveValues = Object.freeze([
+  E2E_ACCESS_TOKEN,
+  E2E_INVALID_ACCESS_TOKEN,
+  E2E_ENCRYPTION_SECRET,
+  E2E_SERVER_ORIGIN,
+  E2E_CONFIGURED_APP_ORIGIN,
+  ...Object.values(LEVER_EXPECTED_APPLICATION),
+  "TypeScript",
+  "PostgreSQL",
+  "Kubernetes",
+]);
 const processState = {
   browserVersion: "unknown",
   browserCdp: null,
@@ -83,8 +98,9 @@ async function run() {
   await seedResume(database);
 
   processState.step = "isolated extension preparation";
-  const workspace = await mkdtemp(
-    join(tmpdir(), "jobtracker-extension-e2e-"),
+  const workspace = assertExtensionE2EWorkspacePath(
+    await mkdtemp(join(tmpdir(), "jobtracker-extension-e2e-")),
+    tmpdir(),
   );
   processState.profileDirectory = workspace;
   const extensionDirectory = join(workspace, "extension");
@@ -181,6 +197,25 @@ async function run() {
     hasPermission: true,
   });
 
+  processState.step = "MV3 worker restart and connection restoration";
+  await popup.close();
+  processState.popup = null;
+  worker = await restartExtensionServiceWorker(
+    browserCdp,
+    context,
+    jobPage,
+    worker,
+    identity.id,
+  );
+  popup = await openActionPopup(browserCdp, worker, jobPage, identity.origin);
+  processState.popup = popup;
+  await waitForText(popup, "#connectionStatus", "Connected to");
+  await requireEmptyTokenInput(popup);
+  await requireCredentialAndPermissionState(popup, {
+    hasCredential: true,
+    hasPermission: true,
+  });
+
   processState.step = "job extraction";
   await assertExtractedApplication(popup);
 
@@ -194,6 +229,11 @@ async function run() {
   await popup.waitForVisible("#analysisSection", 10_000);
   const analysisBadge = await popup.text("#analysisBadge");
   requireCondition(/^\d+%$/u.test(analysisBadge ?? ""), "analysis did not render");
+  const sanitizedSnapshot = await popup.redact();
+  assertSanitizedPopupSnapshot(
+    sanitizedSnapshot,
+    popupArtifactSensitiveValues,
+  );
 
   processState.step = "action popup reopen and connection restoration";
   await popup.close();
@@ -383,28 +423,217 @@ async function grantOptionalHostPermission(context, extensionId) {
   }
 }
 
+async function restartExtensionServiceWorker(
+  browserCdp,
+  context,
+  jobPage,
+  oldWorker,
+  extensionId,
+) {
+  const serviceWorkerCdp = await context.newCDPSession(jobPage);
+  const registrations = new Map();
+  const versions = new Map();
+  const onRegistrations = ({ registrations: updates = [] }) => {
+    for (const registration of updates) {
+      registrations.set(registration.registrationId, registration);
+    }
+  };
+  const onVersions = ({ versions: updates = [] }) => {
+    for (const version of updates) versions.set(version.versionId, version);
+  };
+  serviceWorkerCdp.on(
+    "ServiceWorker.workerRegistrationUpdated",
+    onRegistrations,
+  );
+  serviceWorkerCdp.on("ServiceWorker.workerVersionUpdated", onVersions);
+  try {
+    await serviceWorkerCdp.send("ServiceWorker.enable");
+    const oldState = await waitForValue(() => {
+      try {
+        return extensionServiceWorkerStateFromCdp(
+          {
+            registrations: [...registrations.values()],
+            versions: [...versions.values()],
+          },
+          extensionId,
+        );
+      } catch {
+        return null;
+      }
+    }, 10_000, "extension service worker registration was unavailable");
+    requireCondition(
+      oldWorker.url() === oldState.scriptURL,
+      "Playwright worker did not match CDP version",
+    );
+    const initialTargets = await browserCdp.send("Target.getTargets");
+    requireCondition(
+      initialTargets.targetInfos.some(
+        (target) =>
+          target.targetId === oldState.targetId &&
+          target.type === "service_worker" &&
+          target.url === oldState.scriptURL,
+      ),
+      "old extension worker target was unavailable",
+    );
+
+    await serviceWorkerCdp.send("ServiceWorker.stopWorker", {
+      versionId: oldState.versionId,
+    });
+    await waitForValue(async () => {
+      const targets = await browserCdp.send("Target.getTargets");
+      return targets.targetInfos.some(
+        (target) => target.targetId === oldState.targetId,
+      )
+        ? null
+        : true;
+    }, 10_000, "old extension worker target remained after stop");
+
+    const wakePage = await context.newPage();
+    let wakeWorkerPromise;
+    try {
+      await wakePage.goto("chrome://extensions", {
+        waitUntil: "domcontentloaded",
+      });
+      wakeWorkerPromise = wakePage.evaluate(
+        async (id) => {
+          const extension =
+            await chrome.developerPrivate.getExtensionInfo(id);
+          const workerView = extension.views.find(
+            (view) =>
+              view.type === "EXTENSION_SERVICE_WORKER_BACKGROUND",
+          );
+          if (!workerView) return false;
+          await chrome.developerPrivate.openDevTools({
+            extensionId: id,
+            renderProcessId: workerView.renderProcessId,
+            renderViewId: workerView.renderViewId,
+            incognito: workerView.incognito,
+            isServiceWorker: true,
+          });
+          return true;
+        },
+        extensionId,
+      );
+      requireCondition(
+        await wakeWorkerPromise,
+        "extension service worker registration could not be woken",
+      );
+      const newTarget = await waitForValue(async () => {
+        const targets = await browserCdp.send("Target.getTargets");
+        return targets.targetInfos.find(
+          (target) =>
+            target.type === "service_worker" &&
+            target.url === oldState.scriptURL,
+        );
+      }, 10_000, "new extension worker target was unavailable");
+      const { sessionId } = await browserCdp.send("Target.attachToTarget", {
+        targetId: newTarget.targetId,
+        flatten: false,
+      });
+      const newWorkerCdp = new CdpPopup(
+        browserCdp,
+        sessionId,
+        newTarget.targetId,
+      );
+      const runtimeUrl = await newWorkerCdp.call(
+        () => globalThis.location.href,
+      );
+      requireCondition(
+        runtimeUrl === oldState.scriptURL,
+        "new extension worker runtime was unavailable",
+      );
+      await closeDevToolsTargets(browserCdp);
+      return {
+        cdp: newWorkerCdp,
+        sessionId,
+        targetId: newTarget.targetId,
+        url: () => newTarget.url,
+      };
+    } finally {
+      await wakeWorkerPromise?.catch(() => undefined);
+      await wakePage.close().catch(() => undefined);
+    }
+  } finally {
+    serviceWorkerCdp.off(
+      "ServiceWorker.workerRegistrationUpdated",
+      onRegistrations,
+    );
+    serviceWorkerCdp.off("ServiceWorker.workerVersionUpdated", onVersions);
+    await serviceWorkerCdp.send("ServiceWorker.disable").catch(() => undefined);
+    await serviceWorkerCdp.detach().catch(() => undefined);
+  }
+}
+
+async function waitForValue(readValue, timeout, message) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const value = await readValue();
+    if (value) return value;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  throw new Error(message);
+}
+
+async function closeDevToolsTargets(browserCdp) {
+  const targets = await browserCdp.send("Target.getTargets");
+  const devToolsTargets = targets.targetInfos.filter((target) =>
+    target.url.startsWith("devtools://"),
+  );
+  requireCondition(
+    devToolsTargets.length > 0,
+    "extension worker DevTools wake target was unavailable",
+  );
+  for (const target of devToolsTargets) {
+    await browserCdp.send("Target.closeTarget", {
+      targetId: target.targetId,
+    });
+  }
+  await waitForValue(async () => {
+    const currentTargets = await browserCdp.send("Target.getTargets");
+    return currentTargets.targetInfos.some((target) =>
+      target.url.startsWith("devtools://"),
+    )
+      ? null
+      : true;
+  }, 10_000, "extension worker DevTools wake target remained open");
+}
+
 async function openActionPopup(browserCdp, worker, jobPage, extensionOrigin) {
   await jobPage.bringToFront();
   const initialTargets = await browserCdp.send("Target.getTargets");
   const workerTarget = initialTargets.targetInfos.find(
-    (target) => target.type === "service_worker" && target.url === worker.url(),
+    (target) =>
+      target.type === "service_worker" &&
+      target.url === worker.url() &&
+      (!worker.targetId || target.targetId === worker.targetId),
   );
   requireCondition(workerTarget, "extension worker CDP target was unavailable");
-  const workerAttachment = await browserCdp.send("Target.attachToTarget", {
-    targetId: workerTarget.targetId,
-    flatten: false,
-  });
-  const workerCdp = new CdpPopup(
-    browserCdp,
-    workerAttachment.sessionId,
-    workerTarget.targetId,
-  );
-  await workerCdp.call(async () => {
-    await chrome.action.openPopup();
-  }, [], true);
-  await browserCdp.send("Target.detachFromTarget", {
-    sessionId: workerAttachment.sessionId,
-  });
+  const heldWorkerCdp = worker.cdp;
+  const heldWorkerSessionId = worker.sessionId;
+  if (heldWorkerCdp) {
+    worker.cdp = null;
+    worker.sessionId = null;
+  }
+  const workerAttachment = heldWorkerCdp
+    ? { sessionId: heldWorkerSessionId, cdp: heldWorkerCdp }
+    : await browserCdp
+        .send("Target.attachToTarget", {
+          targetId: workerTarget.targetId,
+          flatten: false,
+        })
+        .then(({ sessionId }) => ({
+          sessionId,
+          cdp: new CdpPopup(browserCdp, sessionId, workerTarget.targetId),
+        }));
+  try {
+    await workerAttachment.cdp.call(async () => {
+      await chrome.action.openPopup();
+    }, [], true);
+  } finally {
+    await browserCdp.send("Target.detachFromTarget", {
+      sessionId: workerAttachment.sessionId,
+    });
+  }
   const expectedUrl = `${extensionOrigin}/popup.html`;
   const deadline = Date.now() + 10_000;
   let popupTarget;
@@ -484,6 +713,15 @@ class CdpPopup {
       userGesture,
     });
     if (response.exceptionDetails) {
+      if (process.env.EXTENSION_E2E_DEBUG === "1") {
+        const description =
+          response.exceptionDetails.exception?.description ??
+          response.exceptionDetails.text ??
+          "unknown CDP exception";
+        process.stderr.write(
+          `CDP evaluation exception: ${sanitizeDiagnostic(description)}\n`,
+        );
+      }
       throw new Error("action popup evaluation failed");
     }
     return response.result?.value;
@@ -560,23 +798,7 @@ class CdpPopup {
   }
 
   async redact() {
-    await this.call(() => {
-      for (const id of [
-        "accessToken",
-        "jobTitle",
-        "company",
-        "location",
-        "jobUrl",
-        "salary",
-        "jobType",
-        "description",
-      ]) {
-        const element = document.getElementById(id);
-        if (element && "value" in element) element.value = "";
-      }
-      const status = document.getElementById("statusMsg");
-      if (status) status.textContent = "E2E failure details redacted";
-    });
+    return this.call(redactPopupDocument);
   }
 
   async screenshot(path) {
@@ -689,15 +911,20 @@ async function runCommand(command, args, environment) {
 }
 
 async function writeSanitizedFailureArtifacts(error) {
-  try {
-    await mkdir(artifactsDirectory, { recursive: true, mode: 0o700 });
-    const popup = processState.popup;
-    if (popup && !popup.closed) {
-      await popup.redact();
-      await popup.screenshot(
-        join(artifactsDirectory, "popup-redacted.png"),
-      );
+  await mkdir(artifactsDirectory, { recursive: true, mode: 0o700 }).catch(
+    () => undefined,
+  );
+  const popup = processState.popup;
+  if (popup && !popup.closed) {
+    try {
+      const snapshot = await popup.redact();
+      assertSanitizedPopupSnapshot(snapshot, popupArtifactSensitiveValues);
+      await popup.screenshot(join(artifactsDirectory, "popup-redacted.png"));
+    } catch {
+      // Never capture a screenshot unless the generic-only DOM is proven safe.
     }
+  }
+  try {
     await writeFile(
       join(artifactsDirectory, "diagnostics.json"),
       `${JSON.stringify(
@@ -762,7 +989,11 @@ function cleanup() {
       processState.database = null;
     }
     if (processState.profileDirectory) {
-      await rm(processState.profileDirectory, { recursive: true, force: true });
+      const workspace = assertExtensionE2EWorkspacePath(
+        processState.profileDirectory,
+        tmpdir(),
+      );
+      await rm(workspace, { recursive: true, force: true });
       processState.profileDirectory = null;
     }
   })();

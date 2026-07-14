@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -13,6 +14,56 @@ const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 try {
   const value = support[request.operation](...request.arguments);
   process.stdout.write(JSON.stringify({ ok: true, value }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ ok: false, error: error.message }));
+}
+`;
+const redactionRunner = `
+import {
+  assertSanitizedPopupSnapshot,
+  redactPopupDocument,
+} from ${JSON.stringify(supportUrl)};
+const chunks = [];
+for await (const chunk of process.stdin) chunks.push(chunk);
+const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+class FakeElement {
+  constructor(source) {
+    Object.assign(this, source);
+    this.attributes = Object.entries(source.attributes ?? {}).map(
+      ([name, value]) => ({ name, value }),
+    );
+    this.style = {};
+    this.hidden = false;
+  }
+  removeAttribute(name) {
+    this.attributes = this.attributes.filter((attribute) => attribute.name !== name);
+  }
+  replaceChildren() {
+    this.textContent = "";
+  }
+}
+const elements = request.elements.map((source) => new FakeElement(source));
+const byId = new Map(elements.map((element) => [element.id, element]));
+globalThis.document = {
+  getElementById: (id) => byId.get(id) ?? null,
+  querySelectorAll: (selector) => {
+    if (selector === "input, textarea") {
+      return elements.filter((element) =>
+        element.tagName === "INPUT" || element.tagName === "TEXTAREA"
+      );
+    }
+    return elements;
+  },
+  documentElement: {
+    get outerHTML() {
+      return JSON.stringify(elements);
+    },
+  },
+};
+try {
+  const snapshot = redactPopupDocument();
+  assertSanitizedPopupSnapshot(snapshot, request.sensitiveValues);
+  process.stdout.write(JSON.stringify({ ok: true, snapshot }));
 } catch (error) {
   process.stdout.write(JSON.stringify({ ok: false, error: error.message }));
 }
@@ -141,6 +192,182 @@ describe("extension E2E safety support", () => {
         `https://${id}/background.js`,
       ),
     ).toThrow("Invalid extension service worker URL");
+  });
+
+  it("selects only the live MV3 registration and version for the extension", () => {
+    const id = "abcdefghijklmnopabcdefghijklmnop";
+    expect(
+      callSupport("extensionServiceWorkerStateFromCdp", {
+        registrations: [
+          {
+            registrationId: "unrelated-registration",
+            scopeURL: "https://example.com/",
+            isDeleted: false,
+          },
+          {
+            registrationId: "extension-registration",
+            scopeURL: `chrome-extension://${id}/`,
+            isDeleted: false,
+          },
+        ],
+        versions: [
+          {
+            versionId: "extension-version",
+            registrationId: "extension-registration",
+            scriptURL: `chrome-extension://${id}/background.js`,
+            runningStatus: "running",
+            targetId: "old-target",
+          },
+        ],
+      }, id),
+    ).toEqual({
+      registrationId: "extension-registration",
+      scopeURL: `chrome-extension://${id}/`,
+      versionId: "extension-version",
+      targetId: "old-target",
+      scriptURL: `chrome-extension://${id}/background.js`,
+    });
+
+    expect(() =>
+      callSupport("extensionServiceWorkerStateFromCdp", {
+        registrations: [],
+        versions: [],
+      }, id),
+    ).toThrow("extension service worker CDP state was unavailable");
+  });
+
+  it("removes populated analysis and all fixture-derived values before capture", () => {
+    const sensitiveValues = [
+      "Senior Platform Engineer",
+      "JobTracker E2E",
+      "Build reliable TypeScript and PostgreSQL systems",
+      "TypeScript",
+      "PostgreSQL",
+      "Kubernetes",
+      "extension-e2e-access-token-aaaaaaaaaaaaaaaa",
+    ];
+    const result = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", redactionRunner],
+      {
+        input: JSON.stringify({
+          sensitiveValues,
+          elements: [
+            {
+              id: "accessToken",
+              tagName: "INPUT",
+              value: sensitiveValues[6],
+              textContent: "",
+              attributes: { value: sensitiveValues[6] },
+            },
+            {
+              id: "jobTitle",
+              tagName: "INPUT",
+              value: sensitiveValues[0],
+              textContent: "",
+              attributes: { value: sensitiveValues[0] },
+            },
+            {
+              id: "company",
+              tagName: "INPUT",
+              value: sensitiveValues[1],
+              textContent: "",
+            },
+            {
+              id: "description",
+              tagName: "TEXTAREA",
+              value: sensitiveValues[2],
+              textContent: sensitiveValues[2],
+            },
+            {
+              id: "analysisSection",
+              tagName: "DIV",
+              textContent: sensitiveValues.slice(3, 6).join(" "),
+              attributes: { "data-keywords": sensitiveValues.slice(3, 6).join(",") },
+            },
+            {
+              id: "matchedPills",
+              tagName: "DIV",
+              textContent: `${sensitiveValues[3]} ${sensitiveValues[4]}`,
+            },
+            {
+              id: "missingPills",
+              tagName: "DIV",
+              textContent: sensitiveValues[5],
+            },
+            {
+              id: "analysisSummary",
+              tagName: "DIV",
+              textContent: `${sensitiveValues[0]} at ${sensitiveValues[1]}`,
+            },
+            {
+              id: "fixtureLink",
+              tagName: "A",
+              textContent: sensitiveValues[0],
+              attributes: {
+                href: "https://jobs.lever.co/jobtracker-e2e/senior-platform-engineer",
+                "data-company": sensitiveValues[1],
+              },
+            },
+          ],
+        }),
+        encoding: "utf8",
+      },
+    );
+    expect(result.status).toBe(0);
+    const response = JSON.parse(result.stdout) as
+      | { ok: true; snapshot: string }
+      | { ok: false; error: string };
+    if (!response.ok) throw new Error(response.error);
+    for (const sensitiveValue of sensitiveValues) {
+      expect(response.snapshot).not.toContain(sensitiveValue);
+    }
+    expect(response.snapshot).not.toContain("jobs.lever.co");
+    expect(response.snapshot).not.toContain("data-company");
+  });
+
+  it("accepts cleanup only for a direct runner-owned temporary workspace", () => {
+    expect(
+      callSupport(
+        "assertExtensionE2EWorkspacePath",
+        "/private/tmp/jobtracker-extension-e2e-AbC123",
+        "/private/tmp",
+      ),
+    ).toBe("/private/tmp/jobtracker-extension-e2e-AbC123");
+    for (const unsafePath of [
+      "/private/tmp",
+      "/private/tmp/unrelated-profile",
+      "/private/tmp/nested/jobtracker-extension-e2e-AbC123",
+      "/private/tmp/jobtracker-extension-e2e-../production",
+    ]) {
+      expect(() =>
+        callSupport(
+          "assertExtensionE2EWorkspacePath",
+          unsafePath,
+          "/private/tmp",
+        ),
+      ).toThrow("Refusing extension E2E workspace cleanup");
+    }
+  });
+
+  it("retains the MV3 restart and generic-only screenshot runner contract", () => {
+    const runner = readFileSync(
+      join(__dirname, "../../scripts/extension-e2e.mjs"),
+      "utf8",
+    );
+    for (const requiredText of [
+      "ServiceWorker.enable",
+      "ServiceWorker.stopWorker",
+      "chrome.developerPrivate.openDevTools",
+      "Target.getTargets",
+      "Target.attachToTarget",
+      "MV3 worker restart and connection restoration",
+      "assertSanitizedPopupSnapshot",
+      "popupArtifactSensitiveValues",
+      "assertExtensionE2EWorkspacePath",
+    ]) {
+      expect(runner).toContain(requiredText);
+    }
   });
 
   it("parses only a loopback Docker host-port binding", () => {

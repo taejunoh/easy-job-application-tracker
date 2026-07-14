@@ -21,6 +21,18 @@ exact SQL verification, keyword analysis, popup close and reopen connection
 restoration, explicit disconnect, and server-`401` credential and permission
 cleanup.
 
+After valid pairing, the runner uses the CDP ServiceWorker domain to identify
+the exact MV3 service worker registration and running version, stop the old
+worker, prove its target disappeared, and wake a new worker target. Chromium's
+extension registration does not expose a reliable `ServiceWorker.startWorker`
+target in this harness, so the isolated profile uses
+`chrome.developerPrivate.openDevTools` as the wake equivalent, attaches to the
+new worker, closes the temporary DevTools window, and opens the actual action
+popup from that new worker. The test then proves the popup is connected, the
+token input is empty, and the stored credential and exact host permission were
+retained across the MV3 service worker stop and restart. This does not perform
+a full extension reload.
+
 The checked-in extension manifest is not modified. The disposable extension
 copy narrows the optional server permission to the exact loopback test origin
 and adds only `https://jobs.lever.co/*` as a required fixture permission. This
@@ -38,9 +50,12 @@ non-loopback server.
 
 Failure evidence is deliberately minimal and redacted: a screenshot and JSON
 metadata containing only the failed step, browser version, dynamic extension
-ID, and failure class. The runner records no HAR or trace and must never write
-tokens, authorization headers, database URLs, job row contents, or resume
-contents to an artifact.
+ID, and failure class. Before any screenshot, the runner clears and hides the
+analysis result, keyword pills and summary, every input and textarea, links,
+datasets, and fixture-derived DOM, then rejects capture unless the sanitized
+DOM snapshot contains none of the fixture or credential markers. The runner
+records no HAR or trace and must never write tokens, authorization headers,
+database URLs, job row contents, or resume contents to an artifact.
 
 Popup close and reopen is automated within one temporary profile. A full
 extension reload is intentionally a system Chrome smoke step because Chromium
