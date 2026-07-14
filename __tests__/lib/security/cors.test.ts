@@ -4,24 +4,34 @@ import {
   corsPreflight,
   decorateCorsResponse,
   type CorsAllowed,
-  type CorsConfig,
-  type CorsMethod,
 } from "@/lib/security/cors";
+
+jest.mock("@/lib/server-env", () => {
+  const actual = jest.requireActual<typeof import("@/lib/server-env")>(
+    "@/lib/server-env",
+  );
+  const config = actual.parseServerEnv(
+    {
+      DATABASE_URL: "postgresql://user:password@db.example.com:5432/jobtracker",
+      ENCRYPTION_SECRET: "encryption-secret-" + "e".repeat(32),
+      APP_ACCESS_TOKEN: "access-token-" + "a".repeat(32),
+      APP_BASE_URL: "https://jobs.example.com",
+      CORS_ALLOWED_ORIGINS:
+        "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+    },
+    "production",
+  );
+
+  return { ...actual, getServerEnv: () => config };
+});
 
 const APP_ORIGIN = "https://jobs.example.com";
 const EXTENSION_ORIGIN =
   "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
 
-const config: CorsConfig = {
-  appOrigin: APP_ORIGIN,
-  corsAllowedOrigins: [APP_ORIGIN, EXTENSION_ORIGIN],
-};
-
 describe("corsHeaders", () => {
   it("allows the exact configured application origin with credentials", () => {
-    const result = corsHeaders(actualRequest(APP_ORIGIN), ["GET", "POST"], {
-      config,
-    });
+    const result = corsHeaders(actualRequest(APP_ORIGIN), ["GET", "POST"]);
     const allowed = expectAllowed(result);
 
     expect(allowed.headers.get("Access-Control-Allow-Origin")).toBe(
@@ -36,9 +46,10 @@ describe("corsHeaders", () => {
   });
 
   it("allows the exact configured extension origin without credentials", () => {
-    const result = corsHeaders(actualRequest(EXTENSION_ORIGIN), ["POST"], {
-      config,
-    });
+    const result = corsHeaders(
+      actualRequest(EXTENSION_ORIGIN, "POST"),
+      ["POST"],
+    );
     const allowed = expectAllowed(result);
 
     expect(allowed.headers.get("Access-Control-Allow-Origin")).toBe(
@@ -59,7 +70,7 @@ describe("corsHeaders", () => {
     ["lookalike", "https://jobs-example.com"],
     ["path suffix", `${APP_ORIGIN}/api`],
   ])("rejects a present %s origin by exact comparison", async (_, origin) => {
-    const result = corsHeaders(actualRequest(origin), ["GET"], { config });
+    const result = corsHeaders(actualRequest(origin), ["GET"]);
 
     expect(result.allowed).toBe(false);
     if (result.allowed) {
@@ -76,13 +87,54 @@ describe("corsHeaders", () => {
   });
 
   it("lets an actual request without Origin continue without allow-origin", () => {
-    const result = corsHeaders(actualRequest(), ["GET"], { config });
+    const result = corsHeaders(actualRequest(), ["GET"]);
     const allowed = expectAllowed(result);
 
     expect(allowed.headers.get("Access-Control-Allow-Origin")).toBeNull();
     expect(allowed.headers.get("Access-Control-Allow-Credentials")).toBeNull();
     expect(allowed.headers.get("Vary")).toBe("Origin");
     expectActualHeadersOnly(allowed.headers);
+  });
+
+  it("normalizes declared methods to uppercase and removes duplicates", () => {
+    const result = corsHeaders(actualRequest(APP_ORIGIN, "DELETE"), [
+      "get",
+      "DELETE",
+      "GET",
+    ]);
+
+    expect(expectAllowed(result).headers.get("Access-Control-Allow-Origin")).toBe(
+      APP_ORIGIN,
+    );
+  });
+
+  it("rejects an actual request whose method was not declared", async () => {
+    const result = corsHeaders(actualRequest(APP_ORIGIN, "PATCH"), [
+      "GET",
+      "POST",
+    ]);
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) {
+      throw new Error("Expected CORS rejection");
+    }
+    expect(result.response.status).toBe(403);
+    await expect(result.response.json()).resolves.toEqual({
+      error: "Origin not allowed",
+      code: "origin_not_allowed",
+    });
+  });
+
+  it.each([
+    [[]],
+    [[""]],
+    [["GET,POST"]],
+    [["GET POST"]],
+    [["*"]],
+  ])("throws for an invalid declared method list %j", (methods) => {
+    expect(() => corsHeaders(actualRequest(APP_ORIGIN), methods)).toThrow(
+      "Invalid CORS method policy",
+    );
   });
 
   it("returns the rejection before guarded business logic runs", async () => {
@@ -105,7 +157,7 @@ describe("corsHeaders", () => {
 describe("decorateCorsResponse", () => {
   it("adds allowed-origin headers while merging Vary without duplicates", () => {
     const allowed = expectAllowed(
-      corsHeaders(actualRequest(APP_ORIGIN), ["GET"], { config }),
+      corsHeaders(actualRequest(APP_ORIGIN), ["GET"]),
     );
     const response = new Response("ok", {
       headers: { Vary: "Accept-Encoding, origin", "X-Result": "preserved" },
@@ -126,7 +178,7 @@ describe("decorateCorsResponse", () => {
 
   it("preserves CORS headers on an allowed-origin error response", async () => {
     const allowed = expectAllowed(
-      corsHeaders(actualRequest(EXTENSION_ORIGIN), ["POST"], { config }),
+      corsHeaders(actualRequest(EXTENSION_ORIGIN, "POST"), ["POST"]),
     );
     const response = Response.json(
       { error: "Invalid request", code: "invalid_request" },
@@ -148,7 +200,7 @@ describe("decorateCorsResponse", () => {
 
   it("appends Origin when Vary does not already contain it", () => {
     const allowed = expectAllowed(
-      corsHeaders(actualRequest(EXTENSION_ORIGIN), ["GET"], { config }),
+      corsHeaders(actualRequest(EXTENSION_ORIGIN), ["GET"]),
     );
     const response = new Response(null, {
       headers: { Vary: "Accept-Encoding" },
@@ -158,14 +210,58 @@ describe("decorateCorsResponse", () => {
 
     expect(response.headers.get("Vary")).toBe("Accept-Encoding, Origin");
   });
+
+  it.each([
+    ["extension", actualRequest(EXTENSION_ORIGIN), EXTENSION_ORIGIN, null],
+    ["application", actualRequest(APP_ORIGIN), APP_ORIGIN, "true"],
+    ["origin-absent", actualRequest(), null, null],
+  ])(
+    "clears stale managed CORS headers for an %s response",
+    (_, request, expectedOrigin, expectedCredentials) => {
+      const allowed = expectAllowed(corsHeaders(request, ["GET"]));
+      const response = new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "https://stale.example.com",
+          "Access-Control-Allow-Credentials": "true",
+          "Access-Control-Allow-Methods": "PUT, DELETE",
+          "Access-Control-Allow-Headers": "X-Stale",
+          "Access-Control-Max-Age": "999999",
+        },
+      });
+
+      decorateCorsResponse(response, allowed);
+
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        expectedOrigin,
+      );
+      expect(response.headers.get("Access-Control-Allow-Credentials")).toBe(
+        expectedCredentials,
+      );
+      expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
+      expect(response.headers.get("Access-Control-Allow-Headers")).toBeNull();
+      expect(response.headers.get("Access-Control-Max-Age")).toBeNull();
+    },
+  );
+
+  it("preserves a wildcard Vary value instead of appending Origin", () => {
+    const allowed = expectAllowed(
+      corsHeaders(actualRequest(APP_ORIGIN), ["GET"]),
+    );
+    const response = new Response(null, { headers: { Vary: "Accept, *" } });
+
+    decorateCorsResponse(response, allowed);
+
+    expect(response.headers.get("Vary")).toBe("*");
+  });
 });
 
 describe("corsPreflight", () => {
   it("allows an exact extension origin with only caller-specified methods", () => {
     const response = corsPreflight(preflightRequest(EXTENSION_ORIGIN, "POST"), [
-      "GET",
+      "get",
       "POST",
-    ], { config });
+      "GET",
+    ]);
 
     expect(response.status).toBe(204);
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
@@ -189,7 +285,7 @@ describe("corsPreflight", () => {
   it("allows the application origin with credentials", () => {
     const response = corsPreflight(preflightRequest(APP_ORIGIN, "DELETE"), [
       "DELETE",
-    ], { config });
+    ]);
 
     expect(response.status).toBe(204);
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
@@ -210,7 +306,7 @@ describe("corsPreflight", () => {
   ])("rejects a %s preflight without allow headers", async (_, origin) => {
     const response = corsPreflight(preflightRequest(origin, "POST"), [
       "POST",
-    ], { config });
+    ]);
 
     expect(response.status).toBe(403);
     await expect(response.json()).resolves.toEqual({
@@ -225,29 +321,101 @@ describe("corsPreflight", () => {
     expectNoWildcard(response.headers);
   });
 
-  it("never emits a wildcard even when passed an invalid runtime method", () => {
+  it.each([
+    ["non-OPTIONS request", "POST", "POST"],
+    ["missing requested method", "OPTIONS", undefined],
+    ["empty requested method", "OPTIONS", ""],
+    ["duplicate requested method", "OPTIONS", "POST, POST"],
+    ["malformed requested method", "OPTIONS", "POST DELETE"],
+    ["undeclared requested method", "OPTIONS", "DELETE"],
+  ])(
+    "rejects a %s",
+    async (_, requestMethod, requestedMethod) => {
+      const response = corsPreflight(
+        preflightRequest(
+          APP_ORIGIN,
+          requestedMethod,
+          "authorization, content-type",
+          requestMethod,
+        ),
+        ["POST"],
+      );
+
+      await expectRejectedPreflight(response);
+    },
+  );
+
+  it.each([
+    ["empty", ""],
+    ["empty member", "Authorization,,Content-Type"],
+    ["duplicate", "Authorization, authorization"],
+    ["malformed", "Authorization Content-Type"],
+    ["unsupported", "X-Admin"],
+  ])("rejects %s requested headers", async (_, requestedHeaders) => {
+    const response = corsPreflight(
+      preflightRequest(APP_ORIGIN, "POST", requestedHeaders),
+      ["POST"],
+    );
+
+    await expectRejectedPreflight(response);
+  });
+
+  it("accepts supported requested headers case-insensitively", () => {
+    const response = corsPreflight(
+      preflightRequest(
+        EXTENSION_ORIGIN,
+        "post",
+        "authorization, CONTENT-TYPE",
+      ),
+      ["POST"],
+    );
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Headers")).toBe(
+      "Authorization, Content-Type",
+    );
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBe("POST");
+  });
+
+  it("accepts a preflight without optional requested headers", () => {
+    const response = corsPreflight(
+      preflightRequest(EXTENSION_ORIGIN, "GET", null),
+      ["GET"],
+    );
+
+    expect(response.status).toBe(204);
+  });
+
+  it("never emits a wildcard from an invalid declared method", () => {
     expect(() =>
-      corsPreflight(preflightRequest(APP_ORIGIN, "POST"), [
-        "*" as CorsMethod,
-      ], { config }),
-    ).toThrow("Unsupported CORS method");
+      corsPreflight(preflightRequest(APP_ORIGIN, "POST"), ["*"]),
+    ).toThrow("Invalid CORS method policy");
   });
 });
 
-function actualRequest(origin?: string): Request {
+function actualRequest(origin?: string, method = "GET"): Request {
   return new Request("https://jobs.example.com/api/applications", {
-    method: "POST",
+    method,
     headers: origin === undefined ? undefined : { Origin: origin },
   });
 }
 
-function preflightRequest(origin: string | undefined, method: string): Request {
+function preflightRequest(
+  origin: string | undefined,
+  requestedMethod: string | undefined,
+  requestedHeaders: string | null = "authorization, content-type",
+  requestMethod = "OPTIONS",
+): Request {
   return new Request("https://jobs.example.com/api/applications", {
-    method: "OPTIONS",
+    method: requestMethod,
     headers: {
       ...(origin === undefined ? {} : { Origin: origin }),
-      "Access-Control-Request-Method": method,
-      "Access-Control-Request-Headers": "authorization, content-type",
+      ...(requestedMethod === undefined
+        ? {}
+        : { "Access-Control-Request-Method": requestedMethod }),
+      ...(requestedHeaders === null
+        ? {}
+        : { "Access-Control-Request-Headers": requestedHeaders }),
     },
   });
 }
@@ -278,10 +446,22 @@ function guardedActualResponse(
   request: Request,
   businessLogic: () => Response,
 ): Response {
-  const cors = corsHeaders(request, ["POST"], { config });
+  const cors = corsHeaders(request, ["GET"]);
   if (!cors.allowed) {
     return cors.response;
   }
 
   return decorateCorsResponse(businessLogic(), cors);
+}
+
+async function expectRejectedPreflight(response: Response): Promise<void> {
+  expect(response.status).toBe(403);
+  await expect(response.json()).resolves.toEqual({
+    error: "Origin not allowed",
+    code: "origin_not_allowed",
+  });
+  expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
+  expect(response.headers.get("Access-Control-Allow-Headers")).toBeNull();
+  expect(response.headers.get("Access-Control-Max-Age")).toBeNull();
 }
