@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import pg from "pg";
@@ -9,14 +9,43 @@ const { Client } = pg;
 const root = join(__dirname, "../..");
 const coordinator = join(root, "scripts/create-snapshot-backup.mjs");
 const fingerprintScript = join(root, "scripts/fingerprint-database.mjs");
-const dumpGate = join(root, "__tests__/fixtures/backup/pg-dump-gate.sh");
 const requested = process.env.RUN_BACKUP_INTEGRATION === "1";
 const describeBackup = requested ? describe : describe.skip;
+const passwordSentinel = "backup-password-sentinel-never-forward";
+const forbiddenChildEnvironment = [
+  "DATABASE_URL",
+  "PRODUCTION_DATABASE_URL",
+  "PASSWORD_SENTINEL",
+];
+const allowedChildEnvironment = new Set([
+  "DOCKER_CERT_PATH",
+  "DOCKER_CONFIG",
+  "DOCKER_CONTEXT",
+  "DOCKER_HOST",
+  "DOCKER_TLS_VERIFY",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "PATH",
+  "PGSERVICEFILE",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+  "SYSTEMROOT",
+  "TMPDIR",
+  "__CF_USER_TEXT_ENCODING",
+]);
 
 type ChildResult = Readonly<{
   code: number | null;
   stdout: string;
   stderr: string;
+}>;
+
+type CommandCapture = Readonly<{
+  args: readonly string[];
+  env: Record<string, string>;
+  serviceFileMode?: number | null;
+  hasPasswordLine?: boolean;
 }>;
 
 function requiredEnvironment(name: string): string {
@@ -68,6 +97,113 @@ function databaseUrl(baseUrl: string, databaseName: string): string {
   return url.toString();
 }
 
+function databaseUrlWithPassword(baseUrl: string): string {
+  const url = new URL(baseUrl);
+  url.password = passwordSentinel;
+  return url.toString();
+}
+
+async function writeExecutable(path: string, source: string): Promise<void> {
+  await writeFile(path, source, { mode: 0o700 });
+  await chmod(path, 0o700);
+}
+
+async function createPgDumpGate(
+  path: string,
+  capturePath: string,
+  readyPath: string,
+  continuePath: string,
+): Promise<void> {
+  const realPgDump = requiredEnvironment("PG17_DUMP_BIN");
+  await writeExecutable(
+    path,
+    `#!${process.execPath}
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const serviceFile = process.env.PGSERVICEFILE;
+const serviceContents = serviceFile && fs.existsSync(serviceFile)
+  ? fs.readFileSync(serviceFile, "utf8") : "";
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
+  args: process.argv.slice(2), env: process.env,
+  serviceFileMode: serviceFile ? fs.statSync(serviceFile).mode & 0o777 : null,
+  hasPasswordLine: /^password=/mu.test(serviceContents),
+}));
+fs.writeFileSync(${JSON.stringify(readyPath)}, "");
+while (!fs.existsSync(${JSON.stringify(continuePath)})) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+}
+const child = spawnSync(${JSON.stringify(realPgDump)}, process.argv.slice(2), {
+  env: process.env, stdio: ["ignore", "inherit", "inherit"],
+});
+process.exit(child.status ?? 1);
+`,
+  );
+}
+
+async function createFakeDocker(
+  path: string,
+  logPath: string,
+  failDump: boolean,
+): Promise<void> {
+  await writeExecutable(
+    path,
+    `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const entry = { args, env: process.env };
+function containerPath(value) { return value.slice(value.indexOf(":") + 1); }
+if (args[0] === "cp") {
+  const destination = containerPath(args[2]);
+  fs.copyFileSync(args[1], destination);
+} else if (args[0] === "exec") {
+  let index = 1;
+  let serviceFile;
+  while (args[index] === "--env") {
+    const assignment = args[index + 1];
+    if (assignment.startsWith("PGSERVICEFILE=")) serviceFile = assignment.slice(14);
+    index += 2;
+  }
+  index += 1;
+  const command = args[index];
+  const commandArgs = args.slice(index + 1);
+  if (command === "chmod") {
+    fs.chmodSync(commandArgs[1], Number.parseInt(commandArgs[0], 8));
+  } else if (command === "pg_dump") {
+    const contents = serviceFile && fs.existsSync(serviceFile)
+      ? fs.readFileSync(serviceFile, "utf8") : "";
+    entry.serviceFileMode = serviceFile ? fs.statSync(serviceFile).mode & 0o777 : null;
+    entry.hasPasswordLine = /^password=/mu.test(contents);
+    process.stdout.write("fake-custom-dump");
+    if (${JSON.stringify(failDump)}) process.exitCode = 7;
+  } else if (command === "rm") {
+    fs.rmSync(commandArgs.at(-1), { force: true });
+  }
+}
+const log = fs.existsSync(${JSON.stringify(logPath)})
+  ? JSON.parse(fs.readFileSync(${JSON.stringify(logPath)}, "utf8")) : [];
+log.push(entry);
+fs.writeFileSync(${JSON.stringify(logPath)}, JSON.stringify(log));
+`,
+  );
+}
+
+function expectSanitizedCapture(
+  capture: CommandCapture,
+  secretDatabaseUrl: string,
+): void {
+  const serialized = JSON.stringify(capture);
+  expect(serialized).not.toContain(secretDatabaseUrl);
+  expect(serialized).not.toContain(passwordSentinel);
+  for (const name of forbiddenChildEnvironment) {
+    expect(capture.env).not.toHaveProperty(name);
+  }
+  expect(
+    Object.keys(capture.env).filter(
+      (name) => !allowedChildEnvironment.has(name),
+    ),
+  ).toEqual([]);
+}
+
 describeBackup("snapshot-consistent production backup coordinator", () => {
   const sourceUrl = requested
     ? requiredEnvironment("DATABASE_URL")
@@ -75,6 +211,7 @@ describeBackup("snapshot-consistent production backup coordinator", () => {
   const sourceIdentity = requested
     ? assertDatabaseTestSafety(process.env)
     : undefined;
+  const secretSourceUrl = databaseUrlWithPassword(sourceUrl);
   const scratchDatabase = `jobtracker_snapshot_${process.pid}_test`;
   const scratchUrl = databaseUrl(sourceUrl, scratchDatabase);
   const adminUrl = databaseUrl(sourceUrl, "postgres");
@@ -123,16 +260,23 @@ describeBackup("snapshot-consistent production backup coordinator", () => {
     const restoreFingerprintPath = join(runDirectory, "restore.json");
     const readyPath = join(runDirectory, "dump-ready");
     const continuePath = join(runDirectory, "dump-continue");
+    const capturePath = join(runDirectory, "pg-dump-capture.json");
+    const gatePath = join(runDirectory, "pg-dump-gate");
+    await createPgDumpGate(
+      gatePath,
+      capturePath,
+      readyPath,
+      continuePath,
+    );
     const execution = runChild(
       process.execPath,
       [coordinator, dumpPath, sourceFingerprintPath],
       {
         ...process.env,
-        DATABASE_URL: sourceUrl,
-        PG_DUMP_BIN: dumpGate,
-        REAL_PG_DUMP: requiredEnvironment("PG17_DUMP_BIN"),
-        PG_DUMP_READY_FILE: readyPath,
-        PG_DUMP_CONTINUE_FILE: continuePath,
+        DATABASE_URL: secretSourceUrl,
+        PRODUCTION_DATABASE_URL: secretSourceUrl,
+        PASSWORD_SENTINEL: passwordSentinel,
+        PG_DUMP_BIN: gatePath,
       },
     );
 
@@ -153,6 +297,21 @@ describeBackup("snapshot-consistent production backup coordinator", () => {
     });
     expect((await stat(dumpPath)).mode & 0o777).toBe(0o600);
     expect((await stat(sourceFingerprintPath)).mode & 0o777).toBe(0o600);
+    const capture = JSON.parse(
+      await readFile(capturePath, "utf8"),
+    ) as CommandCapture;
+    expectSanitizedCapture(capture, secretSourceUrl);
+    expect(capture.args).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^--dbname=service=jobtracker_backup_[0-9a-f]+$/u),
+        expect.stringMatching(/^--snapshot=/u),
+      ]),
+    );
+    expect(capture.serviceFileMode).toBe(0o600);
+    expect(capture.hasPasswordLine).toBe(true);
+    await expect(stat(capture.env.PGSERVICEFILE)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
 
     await adminClient.query(`CREATE DATABASE "${scratchDatabase}"`);
     const restore = runChild(
@@ -223,4 +382,75 @@ describeBackup("snapshot-consistent production backup coordinator", () => {
     expect(`${result.stdout}${result.stderr}`).not.toContain(sourceUrl);
     expect(`${result.stdout}${result.stderr}`).not.toContain(basename(fingerprintPath));
   });
+
+  it.each([
+    ["success", false, 0],
+    ["failure", true, 1],
+  ])(
+    "keeps Docker %s argv and metadata secret-free and removes credentials",
+    async (_label, failDump, expectedCode) => {
+      const dumpPath = join(runDirectory, `docker-${String(failDump)}.dump`);
+      const fingerprintPath = join(runDirectory, `docker-${String(failDump)}.json`);
+      const dockerPath = join(runDirectory, "fake-docker");
+      const logPath = join(runDirectory, "docker-log.json");
+      await createFakeDocker(dockerPath, logPath, failDump);
+      const execution = runChild(
+        process.execPath,
+        [coordinator, dumpPath, fingerprintPath],
+        {
+          ...process.env,
+          DATABASE_URL: secretSourceUrl,
+          PRODUCTION_DATABASE_URL: secretSourceUrl,
+          PASSWORD_SENTINEL: passwordSentinel,
+          PG_DUMP_DOCKER_CONTAINER: "nonsecret-container-id",
+          DOCKER_BIN: dockerPath,
+        },
+      );
+
+      const result = await execution.result;
+      expect(result.code).toBe(expectedCode);
+      const captures = JSON.parse(
+        await readFile(logPath, "utf8"),
+      ) as CommandCapture[];
+      expect(captures.map((capture) => capture.args[0])).toEqual(
+        expect.arrayContaining(["cp", "exec"]),
+      );
+      for (const capture of captures) {
+        expectSanitizedCapture(capture, secretSourceUrl);
+      }
+      const copy = captures.find((capture) => capture.args[0] === "cp");
+      const dump = captures.find((capture) => capture.args.includes("pg_dump"));
+      const cleanup = captures.find(
+        (capture) => capture.args.includes("rm") && capture.args.includes("-f"),
+      );
+      expect(copy).toBeDefined();
+      expect(dump).toMatchObject({
+        serviceFileMode: 0o600,
+        hasPasswordLine: true,
+      });
+      expect(dump?.args).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/^--dbname=service=jobtracker_backup_[0-9a-f]+$/u),
+          expect.stringMatching(/^--snapshot=/u),
+        ]),
+      );
+      expect(cleanup).toBeDefined();
+      const hostCredentialPath = copy?.args[1] ?? "";
+      const containerCredentialPath = (copy?.args[2] ?? "").replace(
+        /^[^:]+:/u,
+        "",
+      );
+      await expect(stat(hostCredentialPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(stat(containerCredentialPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      if (failDump) {
+        for (const path of [dumpPath, `${dumpPath}.partial`, fingerprintPath]) {
+          await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
+        }
+      }
+    },
+  );
 });

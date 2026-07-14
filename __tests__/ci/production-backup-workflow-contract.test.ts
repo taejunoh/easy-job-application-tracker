@@ -126,6 +126,13 @@ describe("encrypted production backup workflow contract", () => {
     );
     expect(coordinatorSource).toContain("Promise.allSettled");
     expect(coordinatorSource).toContain("fingerprintClient(client)");
+    expect(coordinatorSource).toContain("PGSERVICEFILE=");
+    expect(coordinatorSource).toContain("CHILD_ENVIRONMENT_ALLOWLIST");
+    expect(coordinatorSource).not.toContain("env: process.env");
+    expect(coordinatorSource).not.toContain("`--dbname=${databaseUrl}`");
+    expect(coordinatorSource).toMatch(
+      /finally \{[\s\S]*credential\.containerPath[\s\S]*credential\.hostPath/u,
+    );
     expect(coordinatorSource).toContain('client.query("ROLLBACK")');
     expect(coordinatorSource).toContain("client.end()");
     expect(coordinatorSource).not.toMatch(/console\.log|snapshotId|JSON\.stringify\(fingerprint/u);
