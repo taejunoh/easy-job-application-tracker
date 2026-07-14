@@ -4,6 +4,7 @@ const config = {
   testEnvironment: "node",
   moduleNameMapper: {
     "^@/(.*)$": "<rootDir>/src/$1",
+    "^server-only$": "<rootDir>/__tests__/mocks/server-only.ts",
   },
   testMatch: ["**/__tests__/**/*.test.ts"],
 };

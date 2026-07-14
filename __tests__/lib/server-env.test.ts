@@ -25,9 +25,8 @@ describe("parseServerEnv", () => {
         "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
       ],
     });
-    expect(config.corsAllowedOriginSet).toEqual(
-      new Set(config.corsAllowedOrigins),
-    );
+    expect(config).not.toHaveProperty("corsAllowedOriginSet");
+    expect(Object.isFrozen(config.corsAllowedOrigins)).toBe(true);
   });
 
   it.each(["localhost", "127.0.0.1"])(
@@ -47,6 +46,53 @@ describe("parseServerEnv", () => {
       expect(config.corsAllowedOrigins).toEqual([appOrigin]);
     },
   );
+
+  it.each([
+    [
+      "https://bücher.example/",
+      "https://bücher.example",
+      "https://xn--bcher-kva.example",
+    ],
+    [
+      "https://[2001:db8::1]/",
+      "https://[2001:db8::1]",
+      "https://[2001:db8::1]",
+    ],
+    [
+      "https://jobs.example.com:443/",
+      "https://jobs.example.com:443",
+      "https://jobs.example.com",
+    ],
+  ])("normalizes the application and CORS origin %s", (baseUrl, cors, origin) => {
+    const config = parseServerEnv(
+      {
+        ...productionSource,
+        APP_BASE_URL: baseUrl,
+        CORS_ALLOWED_ORIGINS: cors,
+      },
+      "production",
+    );
+
+    expect(config.appOrigin).toBe(origin);
+    expect(config.corsAllowedOrigins).toEqual([origin]);
+  });
+
+  it("accepts legitimate values containing placeholder-like words", () => {
+    const origin = "https://your.company.com";
+    const secret = "your-example-change-value-" + "x".repeat(32);
+    const config = parseServerEnv(
+      {
+        ...productionSource,
+        ENCRYPTION_SECRET: secret,
+        APP_ACCESS_TOKEN: secret,
+        APP_BASE_URL: origin,
+        CORS_ALLOWED_ORIGINS: origin,
+      },
+      "production",
+    );
+
+    expect(config.appOrigin).toBe(origin);
+  });
 
   it.each(["production", "test", "staging"])(
     "rejects local HTTP origins outside development (%s)",
@@ -83,14 +129,26 @@ describe("parseServerEnv", () => {
     "postgresql:///jobtracker",
     "postgresql://db.example.com",
     "postgresql://user:password@host:5432/dbname?sslmode=require",
-    "postgresql://replace-me:replace-me@db.example.com/jobtracker",
+    "postgresql://jobtracker:secure-db-password@db.example.com/jobtracker#fragment",
   ])("rejects malformed or placeholder DATABASE_URL %s", (databaseUrl) => {
     expectInvalidWithoutValue("DATABASE_URL", databaseUrl, {
       DATABASE_URL: databaseUrl,
     });
   });
 
-  it.each(["short", " ".repeat(32), "é".repeat(15)])(
+  it("accepts a non-placeholder database URL with a conventional username", () => {
+    const databaseUrl =
+      "postgresql://user:secure-password@db.company.com/jobtracker";
+
+    const config = parseServerEnv(
+      { ...productionSource, DATABASE_URL: databaseUrl },
+      "production",
+    );
+
+    expect(config.databaseUrl).toBe(databaseUrl);
+  });
+
+  it.each(["short", " ".repeat(32), "é".repeat(15) + "a"])(
     "rejects weak ENCRYPTION_SECRET values",
     (encryptionSecret) => {
       expectInvalidWithoutValue("ENCRYPTION_SECRET", encryptionSecret, {
@@ -103,6 +161,8 @@ describe("parseServerEnv", () => {
     "generate-a-random-32-character-secret-here",
     "replace-with-your-encryption-secret-now",
     "example-encryption-secret-value-1234",
+    "any-random-string-at-least-32-characters-long",
+    "GENERATE_WITH_OPENSSL_RAND_BASE64_32",
   ])("rejects placeholder ENCRYPTION_SECRET values", (encryptionSecret) => {
     expectInvalidWithoutValue("ENCRYPTION_SECRET", encryptionSecret, {
       ENCRYPTION_SECRET: encryptionSecret,
@@ -122,11 +182,28 @@ describe("parseServerEnv", () => {
     "generate-a-random-32-character-token-here",
     "replace-with-your-application-token-now",
     "sample-app-access-token-value-12345",
+    "generate_with_openssl_rand_base64_32",
   ])("rejects placeholder APP_ACCESS_TOKEN values", (appAccessToken) => {
     expectInvalidWithoutValue("APP_ACCESS_TOKEN", appAccessToken, {
       APP_ACCESS_TOKEN: appAccessToken,
     });
   });
+
+  it.each(["ENCRYPTION_SECRET", "APP_ACCESS_TOKEN"] as const)(
+    "rejects a 31-byte %s and accepts a 32-byte multibyte value",
+    (name) => {
+      const thirtyOneBytes = "é".repeat(15) + "a";
+      const thirtyTwoBytes = "é".repeat(16);
+
+      expectInvalidWithoutValue(name, thirtyOneBytes, { [name]: thirtyOneBytes });
+      expect(() =>
+        parseServerEnv(
+          { ...productionSource, [name]: thirtyTwoBytes },
+          "production",
+        ),
+      ).not.toThrow();
+    },
+  );
 
   it.each([
     "not-a-url",
@@ -134,8 +211,9 @@ describe("parseServerEnv", () => {
     "https://jobs.example.com/app",
     "https://jobs.example.com/?mode=hosted",
     "https://jobs.example.com/#dashboard",
+    "https://jobs.example.com/?",
+    "https://jobs.example.com/#",
     "https://owner@jobs.example.com/",
-    "https://your-app.example.com/",
   ])("rejects malformed production APP_BASE_URL %s", (appBaseUrl) => {
     expectInvalidWithoutValue("APP_BASE_URL", appBaseUrl, {
       APP_BASE_URL: appBaseUrl,
@@ -165,6 +243,8 @@ describe("parseServerEnv", () => {
     "https://jobs.example.com/app",
     "https://jobs.example.com?mode=hosted",
     "https://jobs.example.com#dashboard",
+    "https://jobs.example.com?",
+    "https://jobs.example.com#",
     "https://owner@jobs.example.com",
     "http://localhost:3000",
   ])("rejects invalid production CORS_ALLOWED_ORIGINS %s", (allowedOrigin) => {
@@ -181,14 +261,16 @@ describe("parseServerEnv", () => {
     });
   });
 
-  it("rejects placeholder origins within CORS_ALLOWED_ORIGINS", () => {
-    const origins =
-      "https://jobs.example.com,https://your-extension-origin.example.com";
+  it.each(["https://*.example.com", "chrome-extension://*"])(
+    "rejects wildcard origin %s",
+    (wildcardOrigin) => {
+      const origins = `https://jobs.example.com,${wildcardOrigin}`;
 
-    expectInvalidWithoutValue("CORS_ALLOWED_ORIGINS", origins, {
-      CORS_ALLOWED_ORIGINS: origins,
-    });
-  });
+      expectInvalidWithoutValue("CORS_ALLOWED_ORIGINS", origins, {
+        CORS_ALLOWED_ORIGINS: origins,
+      });
+    },
+  );
 
   it("requires CORS_ALLOWED_ORIGINS to contain the app origin", () => {
     const origins = "https://other.example.com";

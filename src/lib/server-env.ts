@@ -1,3 +1,5 @@
+import "server-only";
+
 type ServerEnvSource = Record<string, string | undefined>;
 
 type ServerNodeEnv = "development" | "production" | "test" | string | undefined;
@@ -9,13 +11,25 @@ export type ServerEnv = Readonly<{
   appBaseUrl: string;
   appOrigin: string;
   corsAllowedOrigins: readonly string[];
-  corsAllowedOriginSet: ReadonlySet<string>;
 }>;
 
-const PLACEHOLDER_PATTERN =
-  /(?:change[-_ ]?me|default|example|generate|insert|placeholder|replace|sample|your[-_ ])/i;
-const URL_PLACEHOLDER_PATTERN =
-  /(?:<|>|change[-_. ]?me|generate|placeholder|replace[-_. ]?me|set[-_. ]?to|your[-_. ])/i;
+const SECRET_PLACEHOLDERS = new Set([
+  "any-random-string-at-least-32-characters-long",
+  "example-encryption-secret-value-1234",
+  "generate-a-random-32-char-string-here",
+  "generate-a-random-32-character-secret-here",
+  "generate-a-random-32-character-token-here",
+  "generate_with_openssl_rand_base64_32",
+  "replace-with-your-application-token-now",
+  "replace-with-your-encryption-secret-now",
+  "sample-app-access-token-value-12345",
+]);
+
+const DATABASE_URL_PLACEHOLDERS = new Set([
+  "postgresql://user:password@host:5432/dbname?sslmode=require",
+]);
+
+const TEMPLATE_MARKER_PATTERN = /<[^<>]+>/;
 
 let cachedServerEnv: ServerEnv | undefined;
 
@@ -47,7 +61,6 @@ export function parseServerEnv(
     appBaseUrl,
     appOrigin,
     corsAllowedOrigins,
-    corsAllowedOriginSet: new Set(corsAllowedOrigins),
   });
 }
 
@@ -66,7 +79,12 @@ function required(source: ServerEnvSource, name: string): string {
 
 function parseDatabaseUrl(value: string): string {
   const name = "DATABASE_URL";
-  if (value !== value.trim() || URL_PLACEHOLDER_PATTERN.test(value)) {
+  if (
+    value !== value.trim() ||
+    TEMPLATE_MARKER_PATTERN.test(value) ||
+    DATABASE_URL_PLACEHOLDERS.has(value.toLowerCase()) ||
+    value.includes("#")
+  ) {
     invalid(name, "must be a valid PostgreSQL connection URL");
   }
 
@@ -78,18 +96,11 @@ function parseDatabaseUrl(value: string): string {
   }
 
   const databaseName = url.pathname.slice(1);
-  const hasKnownPlaceholder =
-    url.hostname.toLowerCase() === "host" ||
-    databaseName.toLowerCase() === "dbname" ||
-    url.username.toLowerCase() === "user" ||
-    url.password.toLowerCase() === "password";
-
   if (
     (url.protocol !== "postgres:" && url.protocol !== "postgresql:") ||
     !url.hostname ||
     !databaseName ||
-    databaseName.includes("/") ||
-    hasKnownPlaceholder
+    databaseName.includes("/")
   ) {
     invalid(name, "must be a valid PostgreSQL connection URL");
   }
@@ -101,7 +112,8 @@ function parseSecret(name: string, value: string): string {
   if (
     Buffer.byteLength(value, "utf8") < 32 ||
     /\s/u.test(value) ||
-    PLACEHOLDER_PATTERN.test(value)
+    SECRET_PLACEHOLDERS.has(value.toLowerCase()) ||
+    TEMPLATE_MARKER_PATTERN.test(value)
   ) {
     invalid(name, "must be a non-placeholder secret of at least 32 bytes");
   }
@@ -110,7 +122,11 @@ function parseSecret(name: string, value: string): string {
 
 function parseAppOrigin(value: string, nodeEnv: ServerNodeEnv): string {
   const name = "APP_BASE_URL";
-  if (value !== value.trim() || URL_PLACEHOLDER_PATTERN.test(value)) {
+  if (
+    value !== value.trim() ||
+    TEMPLATE_MARKER_PATTERN.test(value) ||
+    /[*?#]/u.test(value)
+  ) {
     invalid(name, "must be an allowed absolute application origin");
   }
 
@@ -159,9 +175,9 @@ function parseCorsOrigins(
 function parseCorsOrigin(value: string, nodeEnv: ServerNodeEnv): string {
   const name = "CORS_ALLOWED_ORIGINS";
   if (
-    value === "*" ||
     value === "null" ||
-    URL_PLACEHOLDER_PATTERN.test(value)
+    TEMPLATE_MARKER_PATTERN.test(value) ||
+    /[*?#]/u.test(value)
   ) {
     invalid(name, "must contain only allowed exact origins");
   }
