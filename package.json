@@ -2,6 +2,9 @@
   "name": "record-application",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22.22.2 <23"
+  },
   "scripts": {
     "dev": "node --import ./scripts/validate-startup-env-development.mjs node_modules/next/dist/bin/next dev",
     "build": "prisma generate && next build",

@@ -59,6 +59,32 @@ describe("deployment verification contract", () => {
     );
   });
 
+  it("pins the supported Node 22 runtime everywhere", () => {
+    const packageLock = JSON.parse(
+      readFileSync(join(root, "package-lock.json"), "utf8"),
+    ) as {
+      packages?: Record<string, { engines?: { node?: string } }>;
+    };
+    const workflowSource = readFileSync(
+      join(root, ".github/workflows/ci.yml"),
+      "utf8",
+    );
+
+    expect(readFileSync(join(root, ".nvmrc"), "utf8").trim()).toBe(
+      "22.22.2",
+    );
+    expect(readFileSync(join(root, ".node-version"), "utf8").trim()).toBe(
+      "22.22.2",
+    );
+    expect(packageJson).toMatchObject({
+      engines: { node: ">=22.22.2 <23" },
+    });
+    expect(packageLock.packages?.[""]?.engines).toEqual({
+      node: ">=22.22.2 <23",
+    });
+    expect(workflowSource).toContain('node-version: "22.22.2"');
+  });
+
   it("documents the only startup commands that enforce pre-listen validation", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
     const loader = readFileSync(
