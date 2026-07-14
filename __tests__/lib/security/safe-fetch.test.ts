@@ -71,6 +71,7 @@ const REMOTE_TLS_ERROR_CODES = [
   "ERR_SSL_RECORD_TOO_SMALL",
   "ERR_SSL_DECRYPTION_FAILED_OR_BAD_RECORD_MAC",
   "ERR_SSL_UNEXPECTED_RECORD",
+  "ERR_SSL_RECORD_LAYER_FAILURE",
   "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE",
   "ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC",
   "ERR_SSL_SSLV3_ALERT_CERTIFICATE_EXPIRED",
@@ -495,9 +496,6 @@ describe("createUndiciTransport", () => {
     }),
     Object.assign(new Error("internal record bookkeeping failure"), {
       code: "ERR_SSL_INVALID_RECORD",
-    }),
-    Object.assign(new Error("internal record layer failure"), {
-      code: "ERR_SSL_RECORD_LAYER_FAILURE",
     }),
   ])("rethrows unexpected fetch exception %# for the route 500 boundary", async (error) => {
     const transport = createUndiciTransport(
