@@ -2,7 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { encrypt } from "@/lib/crypto";
 import { createProtectedRoute } from "@/lib/security/protected-route";
-import { readJsonBody } from "@/lib/security/request-body";
+import {
+  InvalidRequestError,
+  readJsonBody,
+} from "@/lib/security/request-body";
+import { MAX_RESUME_CODE_POINTS } from "@/lib/resume/parse-resume";
 
 const route = createProtectedRoute(["GET", "PUT"]);
 
@@ -42,7 +46,15 @@ export const PUT = route.handler(async function PUT(request: NextRequest) {
   }
   if (body.linkedinUrl !== undefined) data.linkedinUrl = body.linkedinUrl;
   if (body.githubUrl !== undefined) data.githubUrl = body.githubUrl;
-  if (body.resumeText !== undefined) data.resumeText = body.resumeText;
+  if (body.resumeText !== undefined) {
+    if (
+      typeof body.resumeText !== "string" ||
+      exceedsCodePointLimit(body.resumeText, MAX_RESUME_CODE_POINTS)
+    ) {
+      throw new InvalidRequestError();
+    }
+    data.resumeText = body.resumeText;
+  }
 
   let settings = await prisma.settings.findFirst();
 
@@ -65,3 +77,13 @@ export const PUT = route.handler(async function PUT(request: NextRequest) {
     resumeText: settings.resumeText,
   });
 });
+
+function exceedsCodePointLimit(value: string, limit: number): boolean {
+  let count = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if ((value.codePointAt(index) as number) > 0xffff) index += 1;
+    count += 1;
+    if (count > limit) return true;
+  }
+  return false;
+}

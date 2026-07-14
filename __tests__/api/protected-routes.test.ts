@@ -668,6 +668,101 @@ describe("protected product API actual requests", () => {
     consoleError.mockRestore();
   });
 
+  it("parse resume is explicitly pinned to the Node.js runtime", () => {
+    expect(parseResumeRoute.runtime).toBe("nodejs");
+  });
+
+  it("parse resume streams authenticated multipart data without formData buffering", async () => {
+    const form = new FormData();
+    form.set(
+      "resume",
+      new File(["%PDF-1.7"], "resume.pdf", { type: "application/pdf" }),
+    );
+    const request = authenticatedResumeRequest(form);
+    const formData = jest.spyOn(request, "formData");
+
+    const response = await parseResumeRoute.POST(request);
+
+    expect(response.status).toBe(200);
+    expect(formData).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "upload_too_large",
+      413,
+      () =>
+        authenticatedResumeRequest(new FormData(), {
+          "Content-Length": String(6 * 1024 * 1024 + 1),
+        }),
+    ],
+    [
+      "unsupported_resume_type",
+      415,
+      () => {
+        const form = new FormData();
+        form.set(
+          "resume",
+          new File(["not a pdf"], "resume.pdf", { type: "application/pdf" }),
+        );
+        return authenticatedResumeRequest(form);
+      },
+    ],
+  ])("parse resume maps %s to %i", async (code, status, requestFactory) => {
+    const response = await parseResumeRoute.POST(requestFactory());
+
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toEqual({
+      error: expect.any(String),
+      code,
+    });
+  });
+
+  it("parse resume maps corrupt PDFs to resume_parse_failed", async () => {
+    const corruptPdf = Promise.reject(new Error("private parser detail"));
+    void corruptPdf.catch(() => undefined);
+    jest.mocked(getDocument).mockReturnValueOnce({
+      promise: corruptPdf,
+      destroy: jest.fn().mockResolvedValue(undefined),
+    } as never);
+    const form = new FormData();
+    form.set(
+      "resume",
+      new File(["%PDF-corrupt"], "resume.pdf", { type: "application/pdf" }),
+    );
+
+    const response = await parseResumeRoute.POST(authenticatedResumeRequest(form));
+
+    expect(response.status).toBe(422);
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({
+      error: expect.any(String),
+      code: "resume_parse_failed",
+    });
+    expect(text).not.toContain("private parser detail");
+  });
+
+  it("settings rejects resumeText above 500,000 Unicode code points", async () => {
+    const request = new NextRequest("https://jobs.example.com/api/settings", {
+      method: "PUT",
+      headers: {
+        Origin: EXTENSION_ORIGIN,
+        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ resumeText: `${"a".repeat(500_000)}😀` }),
+    });
+
+    const response = await settingsRoute.PUT(request);
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Invalid request",
+      code: "invalid_request",
+    });
+    expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+  });
+
   it.each(["application detail PATCH", "application detail DELETE"])(
     "%s maps Prisma P2025 to the existing 404",
     async (name) => {
@@ -808,8 +903,8 @@ function productRequest(
   } else if (route.body === "resume") {
     const form = new FormData();
     form.set(
-      "file",
-      new File(["resume pdf"], "resume.pdf", { type: "application/pdf" }),
+      "resume",
+      new File(["%PDF-resume pdf"], "resume.pdf", { type: "application/pdf" }),
     );
     body = form;
   }
@@ -818,6 +913,20 @@ function productRequest(
     method: route.method,
     headers,
     body,
+  });
+}
+
+function authenticatedResumeRequest(
+  form: FormData,
+  extraHeaders?: HeadersInit,
+): NextRequest {
+  const headers = new Headers(extraHeaders);
+  headers.set("Origin", EXTENSION_ORIGIN);
+  headers.set("Authorization", `Bearer ${ACCESS_TOKEN}`);
+  return new NextRequest("https://jobs.example.com/api/parse-resume", {
+    method: "POST",
+    headers,
+    body: form,
   });
 }
 

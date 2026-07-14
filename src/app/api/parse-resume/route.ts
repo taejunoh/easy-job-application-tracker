@@ -1,9 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs";
-import { createProtectedRoute } from "@/lib/security/protected-route";
-import { readFormDataBody } from "@/lib/security/request-body";
 
-// Point to the worker file for server-side usage
+import { createProtectedRoute } from "@/lib/security/protected-route";
+import {
+  ParseResumeError,
+  parseResumeFile,
+  type PdfLoadingTask,
+} from "@/lib/resume/parse-resume";
+import {
+  ResumeUploadError,
+  readResumeUpload,
+} from "@/lib/resume/upload-policy";
+
+export const runtime = "nodejs";
+
 GlobalWorkerOptions.workerSrc = "pdfjs-dist/legacy/build/pdf.worker.mjs";
 
 const route = createProtectedRoute(["POST"]);
@@ -11,39 +21,39 @@ const route = createProtectedRoute(["POST"]);
 export const OPTIONS = route.OPTIONS;
 
 export const POST = route.handler(async function POST(request: NextRequest) {
-  const formData = await readFormDataBody(request);
-  const file = formData.get("file") as File | null;
-
-  if (!file) {
-    return NextResponse.json(
-      { error: "No file uploaded" },
-      { status: 400 }
+  try {
+    const upload = await readResumeUpload(request);
+    const text = await parseResumeFile(upload, (bytes) =>
+      getDocument({
+        data: bytes,
+        useWorkerFetch: false,
+        isEvalSupported: false,
+        useSystemFonts: true,
+      }) as unknown as PdfLoadingTask,
     );
-  }
-
-  const arrayBuffer = await file.arrayBuffer();
-
-  let text = "";
-
-  if (file.type === "application/pdf" || file.name.endsWith(".pdf")) {
-    const data = new Uint8Array(arrayBuffer);
-    const doc = await getDocument({ data, useWorkerFetch: false, isEvalSupported: false, useSystemFonts: true }).promise;
-    const pages: string[] = [];
-
-    for (let i = 1; i <= doc.numPages; i++) {
-      const page = await doc.getPage(i);
-      const content = await page.getTextContent();
-      const pageText = content.items
-        .map((item) => ("str" in item ? item.str : ""))
-        .join(" ");
-      pages.push(pageText);
+    return NextResponse.json({ text });
+  } catch (error) {
+    if (error instanceof ResumeUploadError || error instanceof ParseResumeError) {
+      return NextResponse.json(
+        { error: publicErrorMessage(error.code), code: error.code },
+        { status: error.status },
+      );
     }
-
-    text = pages.join("\n");
-    await doc.destroy();
-  } else {
-    text = Buffer.from(arrayBuffer).toString("utf-8");
+    throw error;
   }
-
-  return NextResponse.json({ text: text.trim() });
 });
+
+function publicErrorMessage(
+  code: ResumeUploadError["code"] | ParseResumeError["code"],
+): string {
+  switch (code) {
+    case "invalid_request":
+      return "Invalid request";
+    case "upload_too_large":
+      return "Resume upload is too large";
+    case "unsupported_resume_type":
+      return "Resume type is not supported";
+    case "resume_parse_failed":
+      return "Resume could not be parsed";
+  }
+}
