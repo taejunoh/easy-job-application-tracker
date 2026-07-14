@@ -133,20 +133,20 @@ Confirm that the `Application`, `Settings`, and `_prisma_migrations` tables are
 present before starting the application. The Settings row is created lazily on
 the first authenticated Settings request, so no database seed is required.
 
-Start a production deployment with:
+Start a self-hosted Node production deployment with:
 
 ```bash
 npm start
 ```
 
-`npm start` and `npm run dev` are the only supported application launch
-contracts. Direct `next start` and `npx next` invocations are unsupported, as
-are standalone output and hosting platforms that replace the package scripts,
-unless they execute `scripts/validate-startup-env-development.mjs` or
-`scripts/validate-startup-env-production.mjs`, as appropriate, before opening
-a listener. The instrumentation hook remains a request-blocking defense in depth;
-Next.js 16 can print `Ready` before that hook finishes, so instrumentation alone
-does not provide startup fail-fast behavior.
+For self-hosted Node, `npm start` and `npm run dev` are the only supported
+application launch contracts. Direct `next start` and `npx next` invocations
+are unsupported because they bypass the pre-listen environment preloaders.
+Those contracts use `scripts/validate-startup-env-production.mjs` and
+`scripts/validate-startup-env-development.mjs`, respectively.
+`src/instrumentation.ts` remains request-blocking defense in depth across
+supported deployments. Hosted platforms use their own lifecycle hooks; the
+Vercel contract is documented below.
 
 If an existing PostgreSQL database was previously created with
 `prisma db push`, do not apply the initial migration directly. Back up the
@@ -187,9 +187,13 @@ destructive down migration.
 
 The supported hosted topology is Vercel for the application and Neon (or
 another managed PostgreSQL provider) for the database. Production requires all
-five server variables shown above. Vercel Production must use Node 22 and run
-the checked-in `npm start` contract; Preview must never receive Production
-database credentials.
+five server variables shown above, and Vercel Production must use Node 22. The
+Vercel Next.js preset runs `npm run build`; Vercel does not run `npm start`.
+When the build loads `next.config.ts`, the complete server environment is
+validated at build time. At request-serving runtime, `src/instrumentation.ts`
+validates it again before a new Node.js server instance handles requests.
+`npm start` pre-listen validation applies to self-hosted Node only. Preview must
+never receive Production database credentials.
 
 Open `/connect` on the canonical HTTPS origin and enter the application access
 credential to create a secure browser session. For Chrome extension pairing,

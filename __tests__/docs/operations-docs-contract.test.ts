@@ -47,6 +47,33 @@ describe("production operations documentation contract", () => {
     }
   });
 
+  it("distinguishes Vercel validation from self-hosted Node startup", () => {
+    const documents = [
+      readFileSync(join(root, "README.md"), "utf8"),
+      readFileSync(
+        join(root, "docs/operations/production-runbook.md"),
+        "utf8",
+      ),
+    ].map((document) => document.replace(/\s+/gu, " "));
+
+    for (const document of documents) {
+      expect(document).toContain("Vercel Next.js preset");
+      expect(document).toContain("`npm run build`");
+      expect(document).toContain("`next.config.ts`");
+      expect(document).toContain("build time");
+      expect(document).toContain("`src/instrumentation.ts`");
+      expect(document).toContain("request-serving runtime");
+      expect(document).toContain("`npm start` pre-listen validation");
+      expect(document).toContain("self-hosted Node only");
+      expect(document).not.toContain(
+        "Vercel Production must use Node 22 and run the checked-in `npm start` contract",
+      );
+      expect(document).not.toContain(
+        "The supported server launch command is `npm start`",
+      );
+    }
+  });
+
   it("records sanitized cutover and rollback evidence", () => {
     const evidence = readFileSync(
       join(root, "docs/operations/production-cutover-2026-07-14.md"),

@@ -42,9 +42,13 @@ npm run check:extension
 npm run build
 ```
 
-The supported server launch command is `npm start`; it validates the complete
-environment before accepting requests. Do not bypass it with a direct Next.js
-command.
+The Vercel Next.js preset runs `npm run build`; Vercel does not run
+`npm start`. Loading `next.config.ts` validates the complete server environment
+at build time. At request-serving runtime, `src/instrumentation.ts` validates it
+again before a new Node.js server instance handles requests. `npm start`
+pre-listen validation applies to self-hosted Node only; it invokes the
+production environment preloader before opening a listener. Do not bypass that
+self-hosted contract with a direct Next.js command.
 
 ## Deployment and release verification
 
