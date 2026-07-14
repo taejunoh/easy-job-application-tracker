@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import StatCard from "@/components/StatCard";
 import StatusBadge from "@/components/StatusBadge";
+import { useClientApi } from "@/hooks/use-client-api";
 
 interface Stats {
   total: number;
@@ -22,13 +23,24 @@ interface Stats {
 }
 
 export default function DashboardPage() {
+  const api = useClientApi();
   const [stats, setStats] = useState<Stats | null>(null);
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    fetch("/api/stats")
-      .then((res) => res.json())
-      .then(setStats);
-  }, []);
+    api<Stats>("/api/stats")
+      .then((data) => {
+        setStats(data);
+        setError("");
+      })
+      .catch((failure: unknown) => {
+        setError(errorMessage(failure, "Failed to load dashboard."));
+      });
+  }, [api]);
+
+  if (error) {
+    return <div role="alert" className="text-red-400">{error}</div>;
+  }
 
   if (!stats) {
     return <div className="text-gray-400">Loading...</div>;
@@ -133,4 +145,8 @@ export default function DashboardPage() {
       </div>
     </div>
   );
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }

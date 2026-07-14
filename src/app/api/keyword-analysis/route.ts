@@ -1,25 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
+import { createProtectedRoute } from "@/lib/security/protected-route";
+import { readJsonBody } from "@/lib/security/request-body";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+const route = createProtectedRoute(["POST"]);
 
-export async function OPTIONS() {
-  return NextResponse.json(null, { headers: corsHeaders });
-}
+export const OPTIONS = route.OPTIONS;
 
-export async function POST(request: NextRequest) {
-  const body = await request.json();
+export const POST = route.handler(async function POST(request: NextRequest) {
+  const body = await readJsonBody(request);
   const { description } = body;
 
   if (!description || !description.trim()) {
     return NextResponse.json(
       { error: "description is required" },
-      { status: 400, headers: corsHeaders }
+      { status: 400 }
     );
   }
 
@@ -27,10 +23,10 @@ export async function POST(request: NextRequest) {
   if (!settings?.resumeText) {
     return NextResponse.json(
       { error: "no_resume", message: "No resume text configured in settings" },
-      { status: 200, headers: corsHeaders }
+      { status: 200 }
     );
   }
 
   const result = analyzeKeywordMatch(description, settings.resumeText);
-  return NextResponse.json(result, { headers: corsHeaders });
-}
+  return NextResponse.json(result);
+});

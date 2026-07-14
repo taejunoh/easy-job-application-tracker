@@ -2,6 +2,7 @@
 
 import { useEffect, useState, use } from "react";
 import ApplicationDetail from "@/components/ApplicationDetail";
+import { useClientApi } from "@/hooks/use-client-api";
 
 interface Application {
   id: string;
@@ -23,21 +24,24 @@ export default function ApplicationDetailPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = use(params);
+  const api = useClientApi();
   const [application, setApplication] = useState<Application | null>(null);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    fetch(`/api/applications/${id}`)
-      .then((res) => {
-        if (!res.ok) throw new Error("Not found");
-        return res.json();
-      })
+    api<Application>(`/api/applications/${id}`)
       .then(setApplication)
-      .catch(() => setError(true));
-  }, [id]);
+      .catch((failure: unknown) => {
+        setError(
+          failure instanceof Error
+            ? failure.message
+            : "Failed to load application.",
+        );
+      });
+  }, [api, id]);
 
   if (error) {
-    return <div className="text-red-400">Application not found.</div>;
+    return <div role="alert" className="text-red-400">{error}</div>;
   }
 
   if (!application) {

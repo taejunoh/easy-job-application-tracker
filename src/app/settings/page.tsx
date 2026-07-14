@@ -2,6 +2,10 @@
 
 import { useEffect, useState } from "react";
 
+import { useClientApi } from "@/hooks/use-client-api";
+import type { ClientApi } from "@/lib/client-api";
+import { RESUME_UPLOAD_FIELD } from "@/lib/resume/constants";
+
 const PROVIDERS = [
   { value: "openai", label: "OpenAI" },
   { value: "gemini", label: "Google Gemini" },
@@ -9,6 +13,7 @@ const PROVIDERS = [
 ];
 
 export default function SettingsPage() {
+  const api = useClientApi();
   const [provider, setProvider] = useState("openai");
   const [apiKey, setApiKey] = useState("");
   const [hasExistingKey, setHasExistingKey] = useState(false);
@@ -20,22 +25,27 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState("");
+  const [messageIsError, setMessageIsError] = useState(false);
 
   useEffect(() => {
-    fetch("/api/settings?includeResume=true")
-      .then((res) => res.json())
+    api<SettingsResponse>("/api/settings?includeResume=true")
       .then((data) => {
         setProvider(data.llmProvider);
         setHasExistingKey(data.hasApiKey);
         setLinkedinUrl(data.linkedinUrl || "");
         setGithubUrl(data.githubUrl || "");
         setResumeText(data.resumeText || "");
+      })
+      .catch((failure: unknown) => {
+        setMessage(errorMessage(failure, "Failed to load settings."));
+        setMessageIsError(true);
       });
-  }, []);
+  }, [api]);
 
   async function handleSave() {
     setSaving(true);
     setMessage("");
+    setMessageIsError(false);
 
     const body: Record<string, string> = {
       llmProvider: provider,
@@ -43,43 +53,39 @@ export default function SettingsPage() {
       githubUrl,
       resumeText,
     };
-    if (apiKey) body.apiKey = apiKey;
+    if (apiKey.trim()) body.apiKey = apiKey;
 
-    const res = await fetch("/api/settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    if (res.ok) {
-      setMessage("Settings saved.");
-      setHasExistingKey(true);
-      setApiKey("");
-    } else {
-      setMessage("Failed to save settings.");
+    try {
+      await saveSettings(api, (savedHasApiKey) => {
+        setMessage("Settings saved.");
+        setMessageIsError(false);
+        setHasExistingKey(savedHasApiKey);
+        setApiKey("");
+      }, body);
+    } catch (failure) {
+      setMessage(errorMessage(failure, "Failed to save settings."));
+      setMessageIsError(true);
+    } finally {
+      setSaving(false);
     }
-
-    setSaving(false);
   }
 
   async function handleTest() {
     setTesting(true);
     setMessage("");
+    setMessageIsError(false);
 
     try {
-      const res = await fetch("/api/extract", {
+      await api("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: "https://example.com" }),
       });
-
-      if (res.ok) {
-        setMessage("Connection successful. LLM provider is working.");
-      } else {
-        setMessage("Test failed. Check your API key and provider.");
-      }
-    } catch {
-      setMessage("Test failed. Could not connect.");
+      setMessage("Connection successful. LLM provider is working.");
+      setMessageIsError(false);
+    } catch (failure) {
+      setMessage(errorMessage(failure, "Test failed. Could not connect."));
+      setMessageIsError(true);
     }
 
     setTesting(false);
@@ -193,22 +199,21 @@ export default function SettingsPage() {
                 const file = e.target.files?.[0];
                 if (!file) return;
                 setUploading(true);
+                setMessage("");
+                setMessageIsError(false);
                 try {
                   const formData = new FormData();
-                  formData.append("file", file);
-                  const res = await fetch("/api/parse-resume", {
+                  formData.append(RESUME_UPLOAD_FIELD, file);
+                  const data = await api<{ text: string }>("/api/parse-resume", {
                     method: "POST",
                     body: formData,
                   });
-                  if (res.ok) {
-                    const data = await res.json();
-                    setResumeText(data.text);
-                    setMessage("Resume parsed. Click Save Settings to keep it.");
-                  } else {
-                    setMessage("Failed to parse resume file.");
-                  }
-                } catch {
-                  setMessage("Failed to parse resume file.");
+                  setResumeText(data.text);
+                  setMessage("Resume parsed. Click Save Settings to keep it.");
+                  setMessageIsError(false);
+                } catch (failure) {
+                  setMessage(errorMessage(failure, "Failed to parse resume file."));
+                  setMessageIsError(true);
                 }
                 setUploading(false);
                 e.target.value = "";
@@ -245,9 +250,41 @@ export default function SettingsPage() {
         </div>
 
         {message && (
-          <div className="mt-3 text-sm text-gray-300">{message}</div>
+          <div
+            role={messageIsError ? "alert" : "status"}
+            className={`mt-3 text-sm ${messageIsError ? "text-red-400" : "text-gray-300"}`}
+          >
+            {message}
+          </div>
         )}
       </div>
     </div>
   );
+}
+
+interface SettingsResponse {
+  llmProvider: string;
+  hasApiKey: boolean;
+  linkedinUrl?: string | null;
+  githubUrl?: string | null;
+  resumeText?: string | null;
+}
+
+export async function saveSettings(
+  api: ClientApi,
+  markSaved: (hasApiKey: boolean) => void,
+  body: Record<string, string>,
+): Promise<void> {
+  const response = await api<{ hasApiKey?: unknown }>("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  markSaved(
+    response.hasApiKey === true || Boolean(body.apiKey?.trim()),
+  );
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }

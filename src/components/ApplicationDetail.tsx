@@ -3,6 +3,8 @@
 import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
+import { useClientApi } from "@/hooks/use-client-api";
+import type { ClientApi } from "@/lib/client-api";
 
 interface Application {
   id: string;
@@ -29,6 +31,7 @@ export default function ApplicationDetail({
   application,
 }: ApplicationDetailProps) {
   const router = useRouter();
+  const api = useClientApi();
   const [form, setForm] = useState({
     jobTitle: application.jobTitle,
     company: application.company,
@@ -42,6 +45,7 @@ export default function ApplicationDetail({
   const [saving, setSaving] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
 
   const [saved, setSaved] = useState(false);
   const [resumeText, setResumeText] = useState<string | null>(null);
@@ -49,11 +53,13 @@ export default function ApplicationDetail({
   const [debouncedDescription, setDebouncedDescription] = useState(form.description);
 
   useEffect(() => {
-    fetch("/api/settings?includeResume=true")
-      .then((res) => res.json())
+    api<{ resumeText?: string | null }>("/api/settings?includeResume=true")
       .then((data) => setResumeText(data.resumeText || ""))
-      .catch(() => setResumeText(""));
-  }, []);
+      .catch((failure: unknown) => {
+        setResumeText("");
+        setError(errorMessage(failure, "Failed to load resume settings."));
+      });
+  }, [api]);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedDescription(form.description), 300);
@@ -68,22 +74,32 @@ export default function ApplicationDetail({
   async function handleSave() {
     setSaving(true);
     setSaved(false);
-    const res = await fetch(`/api/applications/${application.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(form),
-    });
-    setSaving(false);
-    if (res.ok) {
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+    setError("");
+    try {
+      await saveApplicationChanges(api, () => {
+        setSaved(true);
+        setTimeout(() => setSaved(false), 2000);
+      }, application.id, form);
+    } catch (failure) {
+      setError(errorMessage(failure, "Failed to save application."));
+    } finally {
+      setSaving(false);
     }
   }
 
   async function handleDelete() {
     setDeleting(true);
-    await fetch(`/api/applications/${application.id}`, { method: "DELETE" });
-    router.push("/applications");
+    setError("");
+    try {
+      await deleteApplication(
+        api,
+        (href) => router.push(href),
+        application.id,
+      );
+    } catch (failure) {
+      setError(errorMessage(failure, "Failed to delete application."));
+      setDeleting(false);
+    }
   }
 
   function updateField(field: string, value: string) {
@@ -98,6 +114,12 @@ export default function ApplicationDetail({
       >
         &larr; Back to Applications
       </button>
+
+      {error && (
+        <div role="alert" className="mb-4 text-sm text-red-400">
+          {error}
+        </div>
+      )}
 
       <div className="flex items-start justify-between mb-6">
         <div>
@@ -363,4 +385,31 @@ export default function ApplicationDetail({
       </div>
     </div>
   );
+}
+
+export async function saveApplicationChanges(
+  api: ClientApi,
+  markSaved: () => void,
+  id: string,
+  form: Record<string, string>,
+): Promise<void> {
+  await api(`/api/applications/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(form),
+  });
+  markSaved();
+}
+
+export async function deleteApplication(
+  api: ClientApi,
+  navigate: (href: string) => void,
+  id: string,
+): Promise<void> {
+  await api(`/api/applications/${id}`, { method: "DELETE" });
+  navigate("/applications");
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }

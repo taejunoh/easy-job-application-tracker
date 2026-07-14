@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import ApplicationTable from "@/components/ApplicationTable";
+import { useClientApi } from "@/hooks/use-client-api";
+import type { ClientApi } from "@/lib/client-api";
 
 interface Application {
   id: string;
@@ -17,37 +19,72 @@ const STATUSES = ["All", "Applied", "Interview", "Offer", "Rejected"];
 const JOB_TYPES = ["All", "Remote", "Hybrid", "Onsite"];
 
 export default function ApplicationsPage() {
+  const api = useClientApi();
   const [applications, setApplications] = useState<Application[]>([]);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
   const [jobTypeFilter, setJobTypeFilter] = useState("All");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [refreshRevision, setRefreshRevision] = useState(0);
+  const requestSequence = useRef(0);
+  const mounted = useRef(false);
 
-  const fetchApplications = useCallback(() => {
+  const loadApplications = useCallback(() => {
     const params = new URLSearchParams();
     if (search) params.set("search", search);
     if (statusFilter !== "All") params.set("status", statusFilter);
     if (jobTypeFilter !== "All") params.set("jobType", jobTypeFilter);
 
-    fetch(`/api/applications?${params}`)
-      .then((res) => res.json())
-      .then(setApplications);
-  }, [search, statusFilter, jobTypeFilter]);
+    return api<Application[]>(`/api/applications?${params}`);
+  }, [api, search, statusFilter, jobTypeFilter]);
+
+  const refreshApplications = useCallback(async () => {
+    await loadLatestApplications(
+      requestSequence,
+      loadApplications,
+      (data) => {
+        setApplications(data);
+        setError("");
+      },
+      (failure) => {
+        setError(errorMessage(failure, "Failed to load applications."));
+      },
+      setLoading,
+    );
+  }, [loadApplications]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      requestSequence.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
-    fetchApplications();
-  }, [fetchApplications]);
+    void refreshApplications();
+  }, [refreshApplications, refreshRevision]);
 
   async function handleStatusChange(id: string, status: string) {
-    await fetch(`/api/applications/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status }),
-    });
-    fetchApplications();
+    setError("");
+    try {
+      await updateApplicationStatus(
+        api,
+        () => {
+          if (mounted.current) {
+            setRefreshRevision((revision) => revision + 1);
+          }
+        },
+        id,
+        status,
+      );
+    } catch (failure) {
+      setError(errorMessage(failure, "Failed to update application status."));
+    }
   }
 
   return (
-    <div>
+    <div aria-busy={loading}>
       <h1 className="text-xl font-semibold mb-6">Applications</h1>
 
       <div className="flex gap-3 mb-4">
@@ -82,10 +119,53 @@ export default function ApplicationsPage() {
         </select>
       </div>
 
+      {error && (
+        <div role="alert" className="mb-4 text-sm text-red-400">
+          {error}
+        </div>
+      )}
+
       <ApplicationTable
         applications={applications}
         onStatusChange={handleStatusChange}
       />
     </div>
   );
+}
+
+export async function updateApplicationStatus(
+  api: ClientApi,
+  scheduleRefresh: () => void,
+  id: string,
+  status: string,
+): Promise<void> {
+  await api(`/api/applications/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  scheduleRefresh();
+}
+
+export async function loadLatestApplications<T>(
+  sequence: { current: number },
+  request: () => Promise<T>,
+  apply: (data: T) => void,
+  fail: (error: unknown) => void,
+  setLoading: (loading: boolean) => void,
+): Promise<void> {
+  const requestId = ++sequence.current;
+  setLoading(true);
+  try {
+    const data = await request();
+    if (requestId === sequence.current) apply(data);
+  } catch (error) {
+    if (requestId === sequence.current) fail(error);
+  } finally {
+    if (requestId === sequence.current) setLoading(false);
+  }
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }

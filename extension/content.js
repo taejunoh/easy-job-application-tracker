@@ -470,16 +470,20 @@ function setInputValue(input, value) {
   input.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-// Listen for messages from the popup
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === "extractJob") {
-    const data = extractJobData();
-    data.url = window.location.href;
-    sendResponse(data);
-  }
-  if (request.action === "autoFillProfiles") {
-    const filled = autoFillProfiles(request.profiles);
-    sendResponse({ filled });
-  }
-  return true;
-});
+// Guard against duplicate listener registration when popup re-injects
+// content.js on a page that already auto-loaded it via the manifest.
+if (!window.__jobTrackerInjected) {
+  window.__jobTrackerInjected = true;
+  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === "extractJob") {
+      const data = extractJobData();
+      data.url = window.location.href;
+      sendResponse(data);
+    }
+    if (request.action === "autoFillProfiles") {
+      const filled = autoFillProfiles(request.profiles);
+      sendResponse({ filled });
+    }
+    return true;
+  });
+}

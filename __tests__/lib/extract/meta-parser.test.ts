@@ -30,12 +30,12 @@ describe("parseMetaTags", () => {
     expect(result.company).toBe("Meta");
   });
 
-  it("falls back to <title> tag", () => {
+  it("strips the company suffix from the <title> fallback", () => {
     const html = `
       <html><head><title>Data Analyst - Stripe</title></head><body></body></html>
     `;
     const result = parseMetaTags(html);
-    expect(result.jobTitle).toBe("Data Analyst - Stripe");
+    expect(result.jobTitle).toBe("Data Analyst");
     expect(result.company).toBeNull();
   });
 

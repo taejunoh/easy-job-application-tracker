@@ -3,27 +3,34 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "node --import ./scripts/validate-startup-env-development.mjs node_modules/next/dist/bin/next dev",
     "build": "prisma generate && next build",
-    "start": "next start",
+    "start": "node --import ./scripts/validate-startup-env-production.mjs node_modules/next/dist/bin/next start",
     "lint": "eslint",
     "test": "jest",
+    "test:ci": "jest --runInBand",
+    "typecheck": "next typegen && tsc --noEmit",
+    "check:extension": "node --check extension/background.js && node --check extension/content.js && node --check extension/popup.js && node -e \"const manifest=JSON.parse(require('node:fs').readFileSync('extension/manifest.json','utf8')); if (manifest.manifest_version !== 3) process.exit(1)\"",
+    "check:startup-env": "node scripts/verify-invalid-startup.mjs",
     "screenshots": "node scripts/screenshots.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.82.0",
+    "@fastify/busboy": "^3.2.0",
     "@google/generative-ai": "^0.24.1",
+    "@next/env": "16.2.10",
     "@prisma/adapter-pg": "^7.7.0",
     "@prisma/client": "^7.6.0",
     "cheerio": "^1.2.0",
     "dotenv": "^17.4.1",
-    "next": "16.2.2",
+    "next": "16.2.10",
     "openai": "^6.33.0",
     "pdfjs-dist": "^4.10.38",
     "pg": "^8.20.0",
-    "prisma": "^7.6.0",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "server-only": "^0.0.1",
+    "undici": "7.28.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -35,11 +42,14 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.2.2",
+    "eslint-config-next": "16.2.10",
     "jest": "^30.3.0",
     "playwright": "^1.59.1",
+    "pg-connection-string": "^2.12.0",
+    "prisma": "^7.6.0",
     "tailwindcss": "^4",
     "ts-jest": "^29.4.9",
-    "typescript": "^5"
+    "typescript": "^5",
+    "yaml": "^2.9.0"
   }
 }

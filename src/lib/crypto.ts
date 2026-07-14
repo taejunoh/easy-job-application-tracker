@@ -1,9 +1,11 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
 
+import { getServerEnv } from "./server-env";
+
 const ALGORITHM = "aes-256-gcm";
 
 function getKey(): Buffer {
-  const secret = process.env.ENCRYPTION_SECRET || "";
+  const secret = getServerEnv().encryptionSecret;
   const key = Buffer.alloc(32);
   Buffer.from(secret, "utf8").copy(key);
   return key;
