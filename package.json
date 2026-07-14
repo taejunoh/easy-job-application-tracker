@@ -8,6 +8,9 @@
     "start": "next start",
     "lint": "eslint",
     "test": "jest",
+    "test:ci": "jest --runInBand",
+    "typecheck": "next typegen && tsc --noEmit",
+    "check:extension": "node --check extension/background.js && node --check extension/content.js && node --check extension/popup.js && node -e \"const manifest=JSON.parse(require('node:fs').readFileSync('extension/manifest.json','utf8')); if (manifest.manifest_version !== 3) process.exit(1)\"",
     "screenshots": "node scripts/screenshots.mjs"
   },
   "dependencies": {

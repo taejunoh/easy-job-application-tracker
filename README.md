@@ -161,6 +161,31 @@ Use `prisma db push` only for disposable development databases. Never use
 database containing records you need to keep. Rollback for the initial
 baseline is a tested database restore, not a destructive down migration.
 
+### Continuous Integration
+
+The GitHub Actions workflow runs on Node.js 22.12 with a disposable PostgreSQL
+16 service. It installs the checked-in dependency graph, validates and applies
+the Prisma migration history, verifies schema parity, checks the extension's
+static assets, runs the full unit and database integration suite, lints,
+typechecks with `next typegen`, and creates a production build. All credentials
+in the workflow are fixed test-only values; the workflow does not require
+repository secrets or contact external application services.
+
+The database integration suite runs only when `RUN_DATABASE_INTEGRATION=1`.
+For a local run, create a uniquely named temporary PostgreSQL database and set
+the same disposable HTTPS `.test` application environment used by CI. Never
+point the suite at a development, staging, or production database because it
+deletes its fixture rows before and after the run.
+
+```bash
+RUN_DATABASE_INTEGRATION=1 npm run test:ci
+```
+
+The required environment variables are `DATABASE_URL`, `ENCRYPTION_SECRET`,
+`APP_ACCESS_TOKEN`, `APP_BASE_URL`, and `CORS_ALLOWED_ORIGINS`. Use
+`https://jobtracker.test` for the application origin and include it exactly in
+the CORS list when reproducing CI locally.
+
 ## Troubleshooting
 
 **Extension says "Could not extract":** Try **Re-extract** -- some pages load content dynamically.

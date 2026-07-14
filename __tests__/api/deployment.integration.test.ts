@@ -1,0 +1,264 @@
+import type { PrismaClient } from "@prisma/client";
+import { NextRequest } from "next/server";
+
+const RUN_DATABASE_INTEGRATION =
+  process.env.RUN_DATABASE_INTEGRATION === "1";
+const describeDatabase = RUN_DATABASE_INTEGRATION ? describe : describe.skip;
+
+const APP_ORIGIN = "https://jobtracker.test";
+const EXTENSION_ORIGIN =
+  "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+const ACCESS_TOKEN = "ci-access-token-" + "a".repeat(32);
+
+type ApplicationsRoute = typeof import("@/app/api/applications/route");
+type ApplicationDetailRoute =
+  typeof import("@/app/api/applications/[id]/route");
+type AuthSessionRoute = typeof import("@/app/api/auth/session/route");
+type ExtractRoute = typeof import("@/app/api/extract/route");
+type ParseResumeRoute = typeof import("@/app/api/parse-resume/route");
+type SettingsRoute = typeof import("@/app/api/settings/route");
+type StatsRoute = typeof import("@/app/api/stats/route");
+
+describeDatabase("hosted deployment against PostgreSQL", () => {
+  let prisma: PrismaClient;
+  let applications: ApplicationsRoute;
+  let applicationDetail: ApplicationDetailRoute;
+  let authSession: AuthSessionRoute;
+  let extract: ExtractRoute;
+  let parseResume: ParseResumeRoute;
+  let settings: SettingsRoute;
+  let stats: StatsRoute;
+
+  beforeAll(async () => {
+    expect(process.env.DATABASE_URL).toMatch(/^postgres(?:ql)?:\/\//u);
+    expect(process.env.APP_BASE_URL).toBe(APP_ORIGIN);
+    expect(process.env.CORS_ALLOWED_ORIGINS?.split(",")).toEqual(
+      expect.arrayContaining([APP_ORIGIN, EXTENSION_ORIGIN]),
+    );
+    expect(process.env.APP_ACCESS_TOKEN).toBe(ACCESS_TOKEN);
+
+    ({ prisma } = await import("@/lib/prisma"));
+    [
+      applications,
+      applicationDetail,
+      authSession,
+      extract,
+      parseResume,
+      settings,
+      stats,
+    ] = await Promise.all([
+      import("@/app/api/applications/route"),
+      import("@/app/api/applications/[id]/route"),
+      import("@/app/api/auth/session/route"),
+      import("@/app/api/extract/route"),
+      import("@/app/api/parse-resume/route"),
+      import("@/app/api/settings/route"),
+      import("@/app/api/stats/route"),
+    ]);
+
+    await resetDatabase(prisma);
+  });
+
+  afterAll(async () => {
+    if (prisma) {
+      try {
+        await resetDatabase(prisma);
+      } finally {
+        await prisma.$disconnect();
+      }
+    }
+  });
+
+  it("enforces exact CORS and authentication before database access", async () => {
+    const unauthorized = await applications.GET(
+      request("/api/applications", { origin: EXTENSION_ORIGIN }),
+    );
+    expect(unauthorized.status).toBe(401);
+    expect(unauthorized.headers.get("access-control-allow-origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+
+    const denied = await applications.GET(
+      request("/api/applications", {
+        origin: "https://attacker.test",
+        bearer: true,
+      }),
+    );
+    expect(denied.status).toBe(403);
+    expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  it("persists authenticated CRUD and reports real statistics", async () => {
+    const createdResponse = await applications.POST(
+      request("/api/applications", {
+        method: "POST",
+        origin: EXTENSION_ORIGIN,
+        bearer: true,
+        json: {
+          url: "https://example.test/jobs/ci-fixture",
+          jobTitle: "CI Engineer",
+          company: "Fixture Labs",
+          status: "Applied",
+          location: "Remote",
+        },
+      }),
+    );
+    expect(createdResponse.status).toBe(201);
+    expect(createdResponse.headers.get("access-control-allow-origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+    const created = (await createdResponse.json()) as { id: string };
+
+    const listResponse = await applications.GET(
+      request("/api/applications", { bearer: true }),
+    );
+    const list = (await listResponse.json()) as Array<{ id: string }>;
+    expect(list.map(({ id }) => id)).toContain(created.id);
+
+    const updatedResponse = await applicationDetail.PATCH(
+      request(`/api/applications/${created.id}`, {
+        method: "PATCH",
+        origin: APP_ORIGIN,
+        bearer: true,
+        json: { status: "Interview", notes: "CI fixture" },
+      }),
+      detailContext(created.id),
+    );
+    expect(updatedResponse.status).toBe(200);
+    await expect(updatedResponse.json()).resolves.toMatchObject({
+      id: created.id,
+      status: "Interview",
+      notes: "CI fixture",
+    });
+
+    const statsResponse = await stats.GET(
+      request("/api/stats", { bearer: true }),
+    );
+    await expect(statsResponse.json()).resolves.toMatchObject({
+      total: 1,
+      interview: 1,
+    });
+
+    const deletedResponse = await applicationDetail.DELETE(
+      request(`/api/applications/${created.id}`, {
+        method: "DELETE",
+        origin: APP_ORIGIN,
+        bearer: true,
+      }),
+      detailContext(created.id),
+    );
+    expect(deletedResponse.status).toBe(200);
+    await expect(deletedResponse.json()).resolves.toEqual({ success: true });
+  });
+
+  it("persists settings and accepts the signed web session", async () => {
+    const settingsResponse = await settings.PUT(
+      request("/api/settings", {
+        method: "PUT",
+        origin: APP_ORIGIN,
+        bearer: true,
+        json: {
+          llmProvider: "openai",
+          apiKey: "disposable-ci-provider-key",
+          linkedinUrl: "https://www.linkedin.com/in/ci-fixture",
+          resumeText: "TypeScript PostgreSQL security",
+        },
+      }),
+    );
+    expect(settingsResponse.status).toBe(200);
+    await expect(settingsResponse.json()).resolves.toMatchObject({
+      hasApiKey: true,
+      resumeText: "TypeScript PostgreSQL security",
+    });
+
+    const loginResponse = await authSession.POST(
+      request("/api/auth/session", {
+        method: "POST",
+        origin: APP_ORIGIN,
+        json: { token: ACCESS_TOKEN },
+      }),
+    );
+    expect(loginResponse.status).toBe(200);
+    const cookie = loginResponse.headers.get("set-cookie")?.split(";", 1)[0];
+    expect(cookie).toBeDefined();
+
+    const readResponse = await settings.GET(
+      request("/api/settings?includeResume=true", { cookie }),
+    );
+    expect(readResponse.status).toBe(200);
+    await expect(readResponse.json()).resolves.toMatchObject({
+      hasApiKey: true,
+      linkedinUrl: "https://www.linkedin.com/in/ci-fixture",
+      resumeText: "TypeScript PostgreSQL security",
+    });
+  });
+
+  it("rejects representative SSRF and oversized resume inputs offline", async () => {
+    const ssrfResponse = await extract.POST(
+      request("/api/extract", {
+        method: "POST",
+        origin: APP_ORIGIN,
+        bearer: true,
+        json: { url: "http://127.0.0.1/internal" },
+      }),
+    );
+    expect(ssrfResponse.status).toBe(422);
+    await expect(ssrfResponse.json()).resolves.toMatchObject({
+      code: "url_not_allowed",
+    });
+
+    const resumeResponse = await parseResume.POST(
+      new NextRequest(`${APP_ORIGIN}/api/parse-resume`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          Origin: APP_ORIGIN,
+          "Content-Type": "multipart/form-data; boundary=ci-boundary",
+          "Content-Length": String(6 * 1024 * 1024 + 1),
+        },
+        body: new Uint8Array([0]),
+      }),
+    );
+    expect(resumeResponse.status).toBe(413);
+    await expect(resumeResponse.json()).resolves.toMatchObject({
+      code: "upload_too_large",
+    });
+  });
+});
+
+function request(
+  path: string,
+  options: Readonly<{
+    method?: string;
+    origin?: string;
+    bearer?: boolean;
+    cookie?: string;
+    json?: unknown;
+  }> = {},
+): NextRequest {
+  const headers = new Headers();
+  if (options.origin) headers.set("Origin", options.origin);
+  if (options.bearer) {
+    headers.set("Authorization", `Bearer ${ACCESS_TOKEN}`);
+  }
+  if (options.cookie) headers.set("Cookie", options.cookie);
+  if (options.json !== undefined) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  return new NextRequest(`${APP_ORIGIN}${path}`, {
+    method: options.method ?? "GET",
+    headers,
+    body:
+      options.json === undefined ? undefined : JSON.stringify(options.json),
+  });
+}
+
+function detailContext(id: string): { params: Promise<{ id: string }> } {
+  return { params: Promise.resolve({ id }) };
+}
+
+async function resetDatabase(prisma: PrismaClient): Promise<void> {
+  await prisma.application.deleteMany();
+  await prisma.settings.deleteMany();
+}
