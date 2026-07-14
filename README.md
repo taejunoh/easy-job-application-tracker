@@ -193,7 +193,11 @@ When the build loads `next.config.ts`, the complete server environment is
 validated at build time. At request-serving runtime, `src/instrumentation.ts`
 validates it again before a new Node.js server instance handles requests.
 `npm start` pre-listen validation applies to self-hosted Node only. Preview must
-never receive Production database credentials.
+never receive Production database credentials. Because Preview also runs the
+build-time validation, configure the same five variable names with an inert
+loopback database URL, Preview-only credentials, and the stable Preview HTTPS
+alias for both URL/origin fields. Use a separately provisioned disposable
+database if database-backed Preview routes are required.
 
 Open `/connect` on the canonical HTTPS origin and enter the application access
 credential to create a secure browser session. For Chrome extension pairing,

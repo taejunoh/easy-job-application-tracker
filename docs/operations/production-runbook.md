@@ -50,6 +50,14 @@ pre-listen validation applies to self-hosted Node only; it invokes the
 production environment preloader before opening a listener. Do not bypass that
 self-hosted contract with a direct Next.js command.
 
+Vercel Preview builds need the same five variable names because this validation
+runs during `npm run build`, but they must not reuse Production values. Configure
+an inert loopback database URL, Preview-only encryption and access credentials,
+and the stable Preview HTTPS alias for both `APP_BASE_URL` and
+`CORS_ALLOWED_ORIGINS`. Database-backed Preview routes remain intentionally
+unavailable unless a separate disposable Preview database is provisioned.
+Never point Preview at the Production database.
+
 ## Deployment and release verification
 
 1. Confirm CI is green for the exact commit and the worktree is clean.
