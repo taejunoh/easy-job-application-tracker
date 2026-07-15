@@ -109,6 +109,22 @@ The capability becomes inactive before callback settlement cleanup, whether the
 callback succeeds or throws. A leaked capability and any caller-created
 lookalike are rejected.
 
+The capability also owns one normalized filesystem view for its complete
+lifetime. A private `quarantine-run-fs-context.mjs` registry binds the opaque
+capability through a `WeakMap` to one frozen adapter whose method
+implementations and receiver are captured exactly once during capability
+creation. Journal, manifest, and capability-bound inventory writers obtain
+their actual filesystem operations only from that binding. Their existing
+optional `fsApi` fields remain accepted solely as source-identity assertions:
+when present, the object must be the exact source object supplied when the
+capability was created, and an equal-looking or writer-local adapter is rejected
+before mutation. Omitting the field selects the bound adapter. Replacing a
+source object's methods after capability creation cannot change the captured
+view. The binding is invalidated before callback settlement on both success and
+failure and is never re-exported by the compatibility facade. This internal
+registry adds no export to the run-capability, journal, manifest, or inventory
+public modules; their current exact export sets remain unchanged.
+
 Journal, inventory, manifest, payload, rollback, conflict, and temporary-file
 writers accept this capability rather than caller-supplied destination paths.
 They derive every path from the capability, a closed purpose enum, and validated
@@ -155,6 +171,17 @@ generation eligible, writes and syncs a pointer temporary file, renames it over
 `current`, and syncs the quarantine root. Readers therefore resolve either the
 previous complete generation or the new complete generation, never a partially
 published manifest. Prior generations remain readable audit evidence.
+
+Publication success additionally requires target identity after the last
+parent-directory sync. A newly linked generation must still be the temporary
+file's recorded device/inode and exact mode `0600`; an adopted existing
+generation must still match the identity and exact mode captured by its bounded
+read. Activation retains the generation identity across its directory sync and
+revalidates it before appending `VALIDATED`. After pointer rename and quarantine
+root sync, `current` must still have the pointer temporary's recorded
+device/inode and exact mode `0600` before activation returns. An identity or
+mode mismatch fails closed and preserves the available generation, pointer, and
+temporary evidence.
 
 An existing generation at the requested digest is accepted only when its exact
 canonical bytes are identical; the same digest name with different bytes is a
@@ -289,6 +316,24 @@ append replays through the same journal handle, truncates only a recognized
 torn final frame to the last valid offset, and `fsync`s the file and parent
 directory before appending. Sequential awaited callback appends are allowed;
 forged or leaked held-lock capabilities are rejected.
+
+Every journal, live lock, stale lock, and tombstone read or recovery path
+requires a non-symlink regular file with exact mode `0600`, including rejection
+of special permission bits. New journal and lock files are explicitly changed
+to and verified at mode `0600` through both the open handle and pathname before
+use. For append, capability `after-sync` revalidation and journal/held-lock
+identity and mode checks occur only after the journal's final parent-directory
+sync; a torn-tail truncation is likewise revalidated after its file and parent
+sync before the next mutation. Stale-lock rename and each terminal or recovery
+artifact removal are separate mutation phases with capability revalidation
+before mutation and after the resulting parent sync. A phase mismatch preserves
+the journal and all artifacts that cannot still be proven owned.
+
+All public journal option records are snapshotted before their first await as
+exact closed plain objects. Unknown string or symbol keys and missing required
+own keys are rejected, and every accepted property getter is evaluated exactly
+once. The snapshot rule applies without changing the existing journal export
+set or allowing a per-call filesystem view.
 
 Ordinary append and stale-lock recovery use the same ownership and uncertainty
 rules. Both compare the open lock handle's device/inode with a non-symlink
@@ -598,6 +643,8 @@ that permits:
   content-digest verification, and the pure closed-schema builder;
 - caller-supplied writer destinations or independent writer path validation
   instead of capability-derived paths and pre/post identity checks;
+- journal, manifest, or capability-bound inventory writers selecting or
+  normalizing a filesystem adapter independently of their live capability;
 - ordinary journal append without the held-lock ownership, conditional cleanup,
   and indeterminate-error rules used by recovery;
 - terminal stale-lock cleanup that appends an event, changes journal bytes,
@@ -646,6 +693,18 @@ the assertions:
    JSONL bytes and digest across repeated traversals. Durability order is
    file-before-child-directory-before-parent post-order, and symlink targets are
    never opened or followed.
+6. **Capability-bound filesystem view:** bind one instrumented adapter when the
+   run capability is created, omit writer-local adapters, and prove capability,
+   journal, manifest, inventory, stream, and cleanup calls use only the captured
+   methods. Passing a distinct equal-looking adapter to a writer fails before
+   mutation, source-method replacement cannot change the bound view, and
+   callback settlement invalidates the binding.
+7. **Durable target identity and private modes:** prove journal parent sync
+   precedes append `after-sync` revalidation; every cleanup mutation has matching
+   pre/post capability boundaries; journal, lock, and tombstone mode violations
+   preserve evidence; and manifest generation/current publication returns only
+   after the post-sync target retains its recorded identity and exact mode
+   `0600`.
 
 ## Success criteria
 

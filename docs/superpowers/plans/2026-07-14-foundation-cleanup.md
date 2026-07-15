@@ -13,6 +13,7 @@
 ## File map
 
 - Create `scripts/quarantine-run-capability.mjs`: callback-scoped opaque writer authority, validated run identity, purpose/ID path derivation, and phase-boundary revalidation.
+- Create `scripts/quarantine-run-fs-context.mjs`: private WeakMap binding from a live run capability to its one captured, frozen filesystem adapter; never re-export it from the compatibility facade.
 - Modify `scripts/quarantine-path-policy.mjs`: retain closed schemas, normalized relative-path policy, resolve-under-root guards, fixed generated-root allowlist, entry-ID derivation, and same-device checks.
 - Modify `scripts/quarantine-inventory.mjs`: bounded-memory file hashing and deterministic streaming JSONL inventories with digest/count/byte summaries.
 - Modify `scripts/quarantine-journal.mjs`: mode-`0600` length-framed hash-chain append, fsync, replay, torn-tail handling, and lifecycle validation.
@@ -465,6 +466,246 @@ manifest interruption, deep traversal, and RSS. Task 2 and all mutation of the
 original checkout remain blocked until both reports contain exactly zero
 Critical and zero Important findings. Fixes repeat the affected RED/GREEN suite,
 both reviews, the focused gate, full Jest, and `git diff --check`.
+
+### Task 1F: Bind every primitive writer to one filesystem context
+
+**Mandatory gate:** This amendment runs after Task 1E and before Task 2. A prior
+Task 1E review does not waive it. Use one implementer sequentially for Slices
+A-E because every later slice depends on the binding introduced in Slice A.
+Task 2 and mutation of the original checkout remain blocked until the final
+gate reports zero Critical, zero Important, and zero Minor findings.
+
+**Files:**
+- Create: `scripts/quarantine-run-fs-context.mjs`
+- Modify: `scripts/quarantine-run-capability.mjs`
+- Modify: `scripts/quarantine-inventory.mjs`
+- Modify: `scripts/quarantine-journal.mjs`
+- Modify: `scripts/quarantine-manifest.mjs`
+- Modify: their four dedicated test files
+
+#### Slice A: Bind and invalidate the run filesystem context
+
+- [ ] **Step A1: Write the binding RED tests**
+
+In `quarantine-run-capability.test.ts`, use a complete adapter with instrumented
+getters for `lstat`, `realpath`, `mkdir`, `open`, `readdir`, `rm`, `rename`,
+`unlink`, `link`, `opendir`, `readlink`, `createReadStream`, `lstatSync`, and
+`realpathSync`. Require each method implementation and its receiver to be
+captured once during capability creation. Replace source methods during the
+callback and require derivation/revalidation to keep using the captured view.
+Require both resolved and rejected callbacks to invalidate the binding, and
+assert the run-capability module still has exactly its existing three exports.
+
+- [ ] **Step A2: Run RED**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts
+```
+
+Expected: FAIL because filesystem state is currently private to the capability
+module and cannot be shared with primitive writers.
+
+- [ ] **Step A3: Implement the private WeakMap binding**
+
+Create `quarantine-run-fs-context.mjs` with no imports from quarantine modules.
+Normalize the complete method set once, capture each implementation with its
+source receiver, freeze the adapter, and bind it to the opaque capability in a
+module-private `WeakMap`. A writer lookup returns the same adapter object every
+time. An omitted writer `fsApi` selects it; a present value is accepted only
+when it is the exact source object used at capability creation. Invalidate and
+remove the binding in the capability callback's `finally` before settlement.
+Do not add or remove an export from any existing public primitive module.
+
+- [ ] **Step A4: Verify and commit**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts
+git diff --check
+git add scripts/quarantine-run-fs-context.mjs scripts/quarantine-run-capability.mjs __tests__/scripts/quarantine-run-capability.test.ts
+git commit -m "fix: bind quarantine filesystem context"
+```
+
+#### Slice B: Remove the inventory split view
+
+- [ ] **Step B1: Write inventory RED tests**
+
+Bind adapter A at capability creation. Require `writeInventoryJsonl` and
+`fsyncTree` to use A for traversal, streams, work files, publication, and
+cleanup when their `fsApi` field is omitted. Passing a distinct equal-looking
+adapter B must fail before output or work mutation and must call no B method.
+Replacing A's source methods after binding must not change the captured view.
+Move every inventory fault adapter to capability creation. Keep standalone
+`hashFileStream` behavior and the inventory module's existing six exports.
+
+- [ ] **Step B2: Run RED**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-inventory.test.ts
+```
+
+Expected: FAIL because the inventory writers currently normalize their own
+optional adapters.
+
+- [ ] **Step B3: Implement bound inventory I/O**
+
+Resolve the capability-bound adapter once at each capability-bearing public
+entry point and pass it through every private helper. Use a private hashing core
+for writer-internal file hashes so it does not normalize the bound adapter
+again. Retain the public capability-free `hashFileStream` adapter option only
+for standalone use.
+
+- [ ] **Step B4: Verify and commit**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-inventory.test.ts
+git diff --check
+git add scripts/quarantine-inventory.mjs __tests__/scripts/quarantine-inventory.test.ts
+git commit -m "fix: bind inventory IO to run capability"
+```
+
+#### Slice C: Close journal inputs and bind journal I/O
+
+- [ ] **Step C1: Write journal adapter and option RED tests**
+
+Require exact closed plain-object snapshots before the first await for these
+option records: `replayJournal`, `withJournalLock`, `appendJournalRecord`,
+`reclaimJournalLock`, and `cleanupTerminalJournalArtifacts`. Reject unknown
+string or symbol keys and missing required own keys; evaluate each accepted
+getter exactly once. Bind adapter A at capability creation, require all journal
+and lock operations to use it, and reject a distinct adapter B before mutation.
+The held-lock state and every append must reference the same frozen adapter.
+
+- [ ] **Step C2: Run RED**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-journal.test.ts
+```
+
+Expected: FAIL because the public functions currently destructure open option
+records and select per-call adapters.
+
+- [ ] **Step C3: Implement snapshots and bound journal lookup**
+
+Change the five public functions to snapshot exact allowed and required keys
+synchronously, then resolve the capability binding. Keep `fsApi` as an optional
+source-identity assertion only. Route recovery and terminal cleanup through
+private cores rather than re-entering a public API with a normalized adapter.
+Preserve the journal module's complete existing export set.
+
+- [ ] **Step C4: Verify and commit**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-journal.test.ts
+git diff --check
+git add scripts/quarantine-journal.mjs __tests__/scripts/quarantine-journal.test.ts
+git commit -m "fix: close journal writer inputs"
+```
+
+#### Slice D: Revalidate durable journal phases and exact modes
+
+- [ ] **Step D1: Write durability and mode RED tests**
+
+Require journal, live lock, stale lock, and tombstone reads to reject every mode
+other than exact `0600`, including special bits, without changing evidence.
+Require newly opened journal and lock files to be changed to and verified at
+`0600` through handle and path identities. Instrument sync ordering so append
+`after-sync` occurs only after the journal parent sync. Require a torn-tail
+truncate phase and every stale-lock rename or owned-artifact removal to have
+matching capability checks before mutation and after parent sync. At each
+identity-change seam, require failure without deleting an unproved artifact.
+
+- [ ] **Step D2: Run RED**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-journal.test.ts
+```
+
+Expected: FAIL because append currently revalidates before its last parent
+sync, cleanup removals lack complete phase boundaries, and journal artifacts are
+not uniformly checked for exact mode `0600`.
+
+- [ ] **Step D3: Implement the journal phase order**
+
+Use this order for an append mutation: held-lock check, capability
+`before-mutation`, journal mutation, file sync, parent sync, capability
+`after-sync`, then journal and held-lock identity/mode checks. Revalidate a
+durable torn-tail truncation before continuing. Prevalidate every cleanup
+artifact, then wrap each rename/removal in its own before-mutation, parent-sync,
+and after-sync boundary. Preserve primary, cleanup, and indeterminate error
+semantics and never remove a foreign replacement.
+
+- [ ] **Step D4: Verify and commit**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-journal.test.ts
+git diff --check
+git add scripts/quarantine-journal.mjs __tests__/scripts/quarantine-journal.test.ts
+git commit -m "fix: revalidate durable journal phases"
+```
+
+#### Slice E: Verify manifest targets after their last sync
+
+- [ ] **Step E1: Write manifest binding and identity RED tests**
+
+Require adapter A bound at capability creation to serve every manifest read,
+temporary, generation, pointer, and cleanup operation; reject adapter B before
+mutation. After generation-directory sync, require a newly linked generation
+to retain the temporary identity and exact mode `0600`, or an adopted generation
+to retain its bounded-read identity and mode. During activation retain and
+recheck the selected generation identity across its directory sync before
+`appendValidated`. After pointer rename and quarantine-root sync, require
+`current` to retain the pointer temporary identity and exact mode `0600`.
+Identity or mode changes fail closed with available evidence preserved. Assert
+the manifest module still exposes exactly its existing five exports.
+
+- [ ] **Step E2: Run RED**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-manifest.test.ts
+```
+
+Expected: FAIL because manifest APIs normalize per-call adapters and current
+post-sync checks validate parents but not every published target identity.
+
+- [ ] **Step E3: Implement bound manifest I/O and retained identities**
+
+Resolve the capability adapter at each public entry. Add a private bounded
+generation snapshot returning its validated manifest, path, and identity; the
+public reader still returns only the manifest. Carry the linked or adopted
+generation identity through parent sync and carry the pointer temporary
+identity through root sync. Revalidate capability containment and exact target
+identity/mode before advancing or returning. Keep existing aggregate cleanup
+behavior and all five public exports unchanged.
+
+- [ ] **Step E4: Verify and commit**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-manifest.test.ts
+git diff --check
+git add scripts/quarantine-manifest.mjs __tests__/scripts/quarantine-manifest.test.ts
+git commit -m "fix: verify durable manifest identities"
+```
+
+- [ ] **Final mandatory primitive gate and independent review**
+
+```bash
+npm test -- --runInBand \
+  __tests__/scripts/quarantine-run-capability.test.ts \
+  __tests__/scripts/quarantine-path-policy.test.ts \
+  __tests__/scripts/quarantine-journal.test.ts \
+  __tests__/scripts/quarantine-manifest.test.ts \
+  __tests__/scripts/quarantine-inventory.test.ts \
+  __tests__/scripts/quarantine-numbered-copies.test.ts
+npm test -- --runInBand --no-cache
+git diff --check
+```
+
+Give the amended design, Slices A-E commits, exact focused/full output, adapter
+binding evidence, journal phase-order evidence, and manifest post-sync identity
+evidence to independent specification and quality reviewers. Repeat the owning
+RED/GREEN slice and both reviews for every finding. Task 2 may begin only when
+all commands pass and the final aggregate report contains exactly Critical 0,
+Important 0, and Minor 0.
 
 ### Task 2: Replace transaction orchestration, restore, and CLI; then quarantine
 
