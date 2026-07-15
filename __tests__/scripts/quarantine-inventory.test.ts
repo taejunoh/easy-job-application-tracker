@@ -86,6 +86,22 @@ const baseFsApi = {
   realpathSync,
   readFile: async () => { throw new Error("payload readFile is forbidden"); },
 };
+const capabilityFsMethods = [
+  "lstat", "realpath", "mkdir", "open", "readdir", "rm", "rename", "unlink", "link",
+  "opendir", "readlink", "createReadStream", "lstatSync", "realpathSync",
+];
+
+function instrumentedAdapter() {
+  const counts = Object.fromEntries(capabilityFsMethods.map((method) => [method, 0]));
+  const adapter = Object.fromEntries(capabilityFsMethods.map((method) => [
+    method,
+    (...args) => {
+      counts[method] += 1;
+      return Reflect.apply(baseFsApi[method], baseFsApi, args);
+    },
+  ]));
+  return { adapter, counts };
+}
 
 async function withCapability(callback, fsApi = baseFsApi) {
   return withQuarantineRunCapability({
@@ -174,25 +190,25 @@ try {
       };
     });
   } else if (request.operation === "fsync") {
+    const events = [];
+    const fsApi = {
+      ...baseFsApi,
+      open: async (path, flags, mode) => {
+        events.push(["open", path]);
+        const handle = await fsPromises.open(path, flags, mode);
+        return new Proxy(handle, {
+          get(target, property, receiver) {
+            if (property === "sync") return async () => {
+              events.push(["sync", path]);
+              return target.sync();
+            };
+            return Reflect.get(target, property, receiver);
+          },
+        });
+      },
+    };
     result = await withCapability(async (capability) => {
       const root = deriveRunPath(capability, { purpose: "payload", id: "generated-next" });
-      const events = [];
-      const fsApi = {
-        ...baseFsApi,
-        open: async (path, flags, mode) => {
-          events.push(["open", path]);
-          const handle = await fsPromises.open(path, flags, mode);
-          return new Proxy(handle, {
-            get(target, property, receiver) {
-              if (property === "sync") return async () => {
-                events.push(["sync", path]);
-                return target.sync();
-              };
-              return Reflect.get(target, property, receiver);
-            },
-          });
-        },
-      };
       const metrics = {};
       await inventory.fsyncTree({
         capability,
@@ -203,7 +219,66 @@ try {
         metrics,
       });
       return { events, metrics };
-    });
+    }, fsApi);
+  } else if (request.operation === "bound-adapter-contract") {
+    const sourceA = instrumentedAdapter();
+    const sourceB = instrumentedAdapter();
+    result = await withCapability(async (capability) => {
+      const root = request.writer === "write"
+        ? request.root
+        : deriveRunPath(capability, { purpose: "payload", id: "generated-next" });
+      const before = { ...sourceA.counts };
+      if (request.mutateSource) {
+        for (const method of capabilityFsMethods) {
+          sourceA.adapter[method] = () => { throw new Error("mutated source method used: " + method); };
+        }
+      }
+      const options = request.writer === "write"
+        ? {
+            capability,
+            root,
+            entryId: "generated-next",
+            phase: "pre",
+            metrics: {},
+          }
+        : {
+            capability,
+            root,
+            entryId: "generated-next",
+            purpose: "payload",
+            metrics: {},
+          };
+      if (request.adapterMode === "same") options.fsApi = sourceA.adapter;
+      if (request.adapterMode === "distinct") options.fsApi = sourceB.adapter;
+      if (request.adapterMode === "undefined") options.fsApi = undefined;
+      let outcome;
+      try {
+        outcome = {
+          ok: true,
+          value: request.writer === "write"
+            ? await inventory.writeInventoryJsonl(options)
+            : await inventory.fsyncTree(options),
+        };
+      } catch (error) {
+        outcome = { ok: false, error: { message: error?.message ?? String(error) } };
+      }
+      return {
+        outcome,
+        before,
+        after: { ...sourceA.counts },
+        distinctCalls: { ...sourceB.counts },
+        outputNames: await fsPromises.readdir(join(
+          request.quarantineRoot,
+          request.transactionId,
+          "inventories/pre",
+        )),
+        workNames: await fsPromises.readdir(join(
+          request.quarantineRoot,
+          request.transactionId,
+          "inventories/work",
+        )),
+      };
+    }, sourceA.adapter);
   } else if (request.operation === "deep-fsync") {
     const depth = request.depth;
     const root = join(realpathSync(request.quarantineRoot), request.transactionId, "payload/generated/.next");
@@ -668,6 +743,8 @@ try {
         workNames: await fsPromises.readdir(join(workProbe, "..")),
       };
     }, fsApi);
+  } else if (request.operation === "public-exports") {
+    result = Object.keys(inventory).sort();
   } else if (request.operation === "hash") {
     let handles = 0;
     let maxHandles = 0;
@@ -1035,6 +1112,155 @@ describe("bounded quarantine inventory", () => {
       maxHandles: 1,
     });
   });
+
+  it("keeps the inventory public surface at exactly six exports", () => {
+    expect(runWorker({ operation: "public-exports" }).result).toEqual([
+      "compareInventorySummary",
+      "fsyncTree",
+      "hashFileStream",
+      "parseInventoryRecord",
+      "parseInventorySummary",
+      "writeInventoryJsonl",
+    ]);
+  });
+
+  it.each(["write", "fsync"])(
+    "%s uses the capability-bound adapter when fsApi is omitted and ignores later source mutation",
+    (writer) => {
+      const nextTransaction = `inventory-bound-omit-${writer}`;
+      const nextRun = createRun(quarantineRoot, nextTransaction);
+      const source = writer === "write"
+        ? join(repoRoot, `bound-omit-${writer}`)
+        : join(nextRun, "payload/generated/.next");
+      privateDirectory(source);
+      writeFileSync(join(source, "file"), "bound");
+      if (writer === "write") symlinkSync("file", join(source, "link"));
+      const result = runWorker({
+        operation: "bound-adapter-contract",
+        adapterMode: "omit",
+        mutateSource: true,
+        writer,
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        root: source,
+      }).result as {
+        outcome: { ok: boolean };
+        before: Record<string, number>;
+        after: Record<string, number>;
+        outputNames: string[];
+        workNames: string[];
+      };
+      expect(result.outcome.ok).toBe(true);
+      const required = writer === "write"
+        ? ["lstat", "opendir", "readlink", "open", "link", "unlink", "createReadStream"]
+        : ["lstat", "opendir", "open", "unlink", "createReadStream"];
+      for (const method of required) {
+        expect(result.after[method]).toBeGreaterThan(result.before[method]);
+      }
+      expect(result.workNames).toEqual([]);
+      expect(result.outputNames).toEqual(writer === "write" ? ["generated-next.jsonl"] : []);
+    },
+  );
+
+  it.each(["write", "fsync"])(
+    "%s accepts only the exact capability source when fsApi is present",
+    (writer) => {
+      const nextTransaction = `inventory-bound-same-${writer}`;
+      const nextRun = createRun(quarantineRoot, nextTransaction);
+      const source = writer === "write"
+        ? join(repoRoot, `bound-same-${writer}.txt`)
+        : join(nextRun, "payload/generated/.next");
+      if (writer === "write") writeFileSync(source, "same");
+      else {
+        privateDirectory(source);
+        writeFileSync(join(source, "file"), "same");
+      }
+      const result = runWorker({
+        operation: "bound-adapter-contract",
+        adapterMode: "same",
+        writer,
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        root: source,
+      }).result as { outcome: { ok: boolean }; workNames: string[] };
+      expect(result.outcome.ok).toBe(true);
+      expect(result.workNames).toEqual([]);
+    },
+  );
+
+  it.each(["write", "fsync"])(
+    "%s rejects an equal-looking distinct adapter before traversal or mutation",
+    (writer) => {
+      const nextTransaction = `inventory-bound-distinct-${writer}`;
+      const nextRun = createRun(quarantineRoot, nextTransaction);
+      const source = writer === "write"
+        ? join(repoRoot, `bound-distinct-${writer}.txt`)
+        : join(nextRun, "payload/generated/.next");
+      if (writer === "write") writeFileSync(source, "distinct");
+      else {
+        privateDirectory(source);
+        writeFileSync(join(source, "file"), "distinct");
+      }
+      const result = runWorker({
+        operation: "bound-adapter-contract",
+        adapterMode: "distinct",
+        writer,
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        root: source,
+      }).result as {
+        outcome: { ok: boolean; error: { message: string } };
+        distinctCalls: Record<string, number>;
+        outputNames: string[];
+        workNames: string[];
+      };
+      expect(result.outcome).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/filesystem|source|context/i) },
+      });
+      expect(Object.values(result.distinctCalls).every((count) => count === 0)).toBe(true);
+      expect(result.outputNames).toEqual([]);
+      expect(result.workNames).toEqual([]);
+    },
+  );
+
+  it.each(["write", "fsync"])(
+    "%s rejects explicit undefined fsApi instead of treating it as omitted",
+    (writer) => {
+      const nextTransaction = `inventory-bound-undefined-${writer}`;
+      const nextRun = createRun(quarantineRoot, nextTransaction);
+      const source = writer === "write"
+        ? join(repoRoot, `bound-undefined-${writer}.txt`)
+        : join(nextRun, "payload/generated/.next");
+      if (writer === "write") writeFileSync(source, "undefined");
+      else {
+        privateDirectory(source);
+        writeFileSync(join(source, "file"), "undefined");
+      }
+      const result = runWorker({
+        operation: "bound-adapter-contract",
+        adapterMode: "undefined",
+        writer,
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        root: source,
+      }).result as {
+        outcome: { ok: boolean; error: { message: string } };
+        outputNames: string[];
+        workNames: string[];
+      };
+      expect(result.outcome).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/filesystem|source|context/i) },
+      });
+      expect(result.outputNames).toEqual([]);
+      expect(result.workNames).toEqual([]);
+    },
+  );
 
   it("fsyncs files before nested directories and skips symlink targets", () => {
     const nextTransaction = "inventory-fsync";

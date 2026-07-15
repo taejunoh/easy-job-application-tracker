@@ -8,6 +8,7 @@ import {
   deriveRunPath,
   revalidateRunCapability,
 } from "./quarantine-run-capability.mjs";
+import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
 
 const MAX_WORK_REFERENCES = 4096;
 const DEFAULT_LIMITS = Object.freeze({
@@ -327,6 +328,25 @@ async function createPrivateFile(context, writer, onOwned) {
   return { value, identity: opened.identity };
 }
 
+async function hashFileStreamCore(absolutePath, fsApi, onHandleCount) {
+  const hash = createHash("sha256");
+  let bytes = 0;
+  let openHandles = 1;
+  onHandleCount?.(openHandles);
+  const stream = fsApi.createReadStream(absolutePath, { highWaterMark: 64 * 1024 });
+  try {
+    for await (const chunk of stream) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      hash.update(buffer);
+      bytes += buffer.length;
+    }
+  } finally {
+    openHandles -= 1;
+    onHandleCount?.(openHandles);
+  }
+  return { sha256: hash.digest("hex"), bytes };
+}
+
 export async function hashFileStream(absolutePath, options = {}) {
   assertAbsolutePath(absolutePath, "hash path");
   const input = snapshotRecord(
@@ -339,22 +359,7 @@ export async function hashFileStream(absolutePath, options = {}) {
     throw new TypeError("hash handle-count callback must be a function");
   }
   const fsApi = normalizeFsApi(input.fsApi, ["createReadStream"]);
-  const hash = createHash("sha256");
-  let bytes = 0;
-  let openHandles = 1;
-  input.onHandleCount?.(openHandles);
-  const stream = fsApi.createReadStream(absolutePath, { highWaterMark: 64 * 1024 });
-  try {
-    for await (const chunk of stream) {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      hash.update(buffer);
-      bytes += buffer.length;
-    }
-  } finally {
-    openHandles -= 1;
-    input.onHandleCount?.(openHandles);
-  }
-  return { sha256: hash.digest("hex"), bytes };
+  return hashFileStreamCore(absolutePath, fsApi, input.onHandleCount);
 }
 
 function assertExactRecordKeys(value, expectedKeys) {
@@ -518,10 +523,11 @@ async function inventoryRecord(item, fsApi, handleMetrics) {
     };
   }
   if (stat.isFile()) {
-    const hashed = await hashFileStream(absolutePath, {
+    const hashed = await hashFileStreamCore(
+      absolutePath,
       fsApi,
-      onHandleCount: (count) => handleMetrics.hashCount(count),
-    });
+      (count) => handleMetrics.hashCount(count),
+    );
     if (hashed.bytes !== stat.size) {
       throw new Error(`file changed while being inventoried: ${relativePath ?? "<root>"}`);
     }
@@ -926,7 +932,7 @@ async function inventoryFileMatches(path, expected, fsApi, label) {
     throw error;
   }
   assertPrivateRegularFile(before, label);
-  const hashed = await hashFileStream(path, { fsApi });
+  const hashed = await hashFileStreamCore(path, fsApi);
   const after = await fsApi.lstat(path);
   assertPrivateRegularFile(after, label);
   if (!sameIdentity(before, after) || before.size !== after.size) {
@@ -1167,18 +1173,12 @@ export async function writeInventoryJsonl(options) {
     ["capability", "root", "entryId", "phase"],
     "inventory write options",
   );
+  const fsApi = Object.hasOwn(input, "fsApi")
+    ? getRunFsContext(input.capability, input.fsApi)
+    : getRunFsContext(input.capability);
   const root = assertAbsolutePath(input.root, "inventory root");
   const limits = normalizeLimits(input.limits);
   const metrics = normalizeMetrics(input.metrics, limits);
-  const fsApi = normalizeFsApi(input.fsApi, [
-    "lstat",
-    "opendir",
-    "readlink",
-    "open",
-    "link",
-    "unlink",
-    "createReadStream",
-  ]);
   const outputPath = deriveRunPath(input.capability, {
     purpose: "inventory",
     id: input.entryId,
@@ -1270,6 +1270,9 @@ export async function fsyncTree(options) {
     ["capability", "root", "entryId", "purpose"],
     "fsync tree options",
   );
+  const fsApi = Object.hasOwn(input, "fsApi")
+    ? getRunFsContext(input.capability, input.fsApi)
+    : getRunFsContext(input.capability);
   const root = assertAbsolutePath(input.root, "fsync tree root");
   if (input.purpose !== "payload") {
     throw new TypeError("fsync tree purpose must be payload");
@@ -1283,13 +1286,6 @@ export async function fsyncTree(options) {
   }
   const limits = normalizeLimits(input.limits);
   const metrics = normalizeMetrics(input.metrics, limits);
-  const fsApi = normalizeFsApi(input.fsApi, [
-    "lstat",
-    "opendir",
-    "open",
-    "unlink",
-    "createReadStream",
-  ]);
   const handles = createHandleMetrics(metrics);
   const work = createWorkManager({ capability: input.capability, fsApi, metrics });
   const postorderChunks = [];
