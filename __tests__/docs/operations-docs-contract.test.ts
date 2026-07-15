@@ -100,6 +100,15 @@ describe("production operations documentation contract", () => {
       "utf8",
     );
     const normalizedSmokeRunbook = smokeRunbook.replace(/\s+/gu, " ");
+    const productionChromeHeading = "## Production system Chrome smoke";
+    const productionChromeSectionStart = normalizedSmokeRunbook.indexOf(
+      productionChromeHeading,
+    );
+
+    expect(productionChromeSectionStart).not.toBe(-1);
+    const normalizedProductionChromeSmokeRunbook = normalizedSmokeRunbook.slice(
+      productionChromeSectionStart,
+    );
 
     for (const requiredText of [
       "npm run test:extension:e2e:local",
@@ -134,6 +143,18 @@ describe("production operations documentation contract", () => {
       "credential cleanup",
     ]) {
       expect(normalizedSmokeRunbook).toContain(requiredText);
+    }
+
+    for (const requiredText of [
+      "The visible token input is cleared after successful pairing by design",
+      "confirm no cleanup warning is shown in the popup connection-status area",
+      "Reload the extension in `chrome://extensions`, return to the job tab, and click the JobTracker toolbar icon",
+      "The reopened popup after reload must remain disconnected; confirm that it does",
+      "The system-Chrome evidence below was observed in Chrome 150 (the verified version); do not generalize browser UI or Site access behavior to other versions without re-verification",
+      "The exact runtime-requested origin may remain listed under Site access after removal in Chrome 150 (the verified version); its toggle must be off",
+      "Mere list presence does not mean host access remains granted",
+    ]) {
+      expect(normalizedProductionChromeSmokeRunbook).toContain(requiredText);
     }
   });
 });
