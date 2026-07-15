@@ -348,7 +348,7 @@ function assertRegularFile(stat, label) {
   if (stat.isSymbolicLink() || !stat.isFile()) {
     throw new Error(`${label} must be a non-symlink regular file`);
   }
-  if ((stat.mode & 0o777) !== 0o600) {
+  if ((stat.mode & 0o7777) !== 0o600) {
     throw new Error(`${label} must have private mode 0600`);
   }
 }

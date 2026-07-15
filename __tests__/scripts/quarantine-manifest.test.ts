@@ -253,8 +253,9 @@ const result = await (async () => {
       const prior = Buffer.from(JSON.stringify(built) + "\\n");
       const digest = createHash("sha256").update(prior).digest("hex");
       const path = deriveRunPath(capability, { purpose: "manifest-generation", id: digest });
-      await fsPromises.writeFile(path, prior, { mode: 0o644 });
-      await fsPromises.chmod(path, 0o644);
+      const requestedMode = request.mode ?? 0o644;
+      await fsPromises.writeFile(path, prior, { mode: requestedMode });
+      await fsPromises.chmod(path, requestedMode);
       const outcome = await capture(() => manifestApi.writeManifestGeneration({
         capability,
         manifest: built,
@@ -263,7 +264,7 @@ const result = await (async () => {
       const after = await fsPromises.lstat(path);
       return {
         outcome,
-        mode: after.mode & 0o777,
+        mode: after.mode & 0o7777,
         unchanged: (await fsPromises.readFile(path)).equals(prior),
       };
     }
@@ -286,8 +287,9 @@ const result = await (async () => {
         id: written.manifestSha256,
       });
       const currentPath = deriveRunPath(capability, { purpose: "current-pointer" });
-      await fsPromises.chmod(generationPath, 0o644);
-      await fsPromises.chmod(currentPath, 0o644);
+      const requestedMode = request.mode ?? 0o644;
+      await fsPromises.chmod(generationPath, requestedMode);
+      await fsPromises.chmod(currentPath, requestedMode);
       return {
         generation: await capture(() => manifestApi.readManifestGeneration({
           capability,
@@ -298,8 +300,8 @@ const result = await (async () => {
           capability,
           fsApi,
         })),
-        generationMode: (await fsPromises.lstat(generationPath)).mode & 0o777,
-        pointerMode: (await fsPromises.lstat(currentPath)).mode & 0o777,
+        generationMode: (await fsPromises.lstat(generationPath)).mode & 0o7777,
+        pointerMode: (await fsPromises.lstat(currentPath)).mode & 0o7777,
       };
     }
     if (request.operation === "mismatched-transaction") {
@@ -682,6 +684,42 @@ describe("immutable quarantine manifest generations", () => {
       error: { message: expect.stringMatching(/mode|0600|private/i) },
     });
     expect(result.mode).toBe(0o644);
+    expect(result.unchanged).toBe(true);
+  });
+
+  it.each([
+    ["setuid", 0o4600],
+    ["setgid", 0o2600],
+    ["sticky", 0o1600],
+  ])("rejects %s mode bits on current and generation readers", (_label, mode) => {
+    const result = invoke({ operation: "public-mode-readers", value: validManifest, mode });
+    expect(result.pointer).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/mode|0600|private/i) },
+    });
+    expect(result.generation).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/mode|0600|private/i) },
+    });
+    expect(result.pointerMode).toBe(mode);
+    expect(result.generationMode).toBe(mode);
+  });
+
+  it.each([
+    ["setuid", 0o4600],
+    ["setgid", 0o2600],
+    ["sticky", 0o1600],
+  ])("rejects identical EEXIST generation bytes with %s mode without repair", (_label, mode) => {
+    const result = invoke({
+      operation: "existing-public-mode",
+      value: validManifest,
+      mode,
+    });
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/mode|0600|private/i) },
+    });
+    expect(result.mode).toBe(mode);
     expect(result.unchanged).toBe(true);
   });
 
