@@ -165,9 +165,10 @@ The root-level `current` file contains exactly
 transaction ID selects the validated run directory and its lowercase
 64-character digest selects the immutable generation. The combined
 write-and-activate protocol writes and syncs the generation temporary file,
-renames it to its digest name without replacement, and syncs the generation
-directory. Activation then appends and syncs the journal event that makes that
-generation eligible, writes and syncs a pointer temporary file, renames it over
+publishes its digest name with a deterministic same-filesystem hard link that
+never replaces an existing generation, and syncs the generation directory.
+Activation then appends and syncs the journal event that makes that generation
+eligible, writes and syncs a pointer temporary file, renames that pointer over
 `current`, and syncs the quarantine root. Readers therefore resolve either the
 previous complete generation or the new complete generation, never a partially
 published manifest. Prior generations remain readable audit evidence.
@@ -181,7 +182,9 @@ revalidates it before appending `VALIDATED`. After pointer rename and quarantine
 root sync, `current` must still have the pointer temporary's recorded
 device/inode and exact mode `0600` before activation returns. An identity or
 mode mismatch fails closed and preserves the available generation, pointer, and
-temporary evidence.
+temporary evidence. In particular, once generation hard-link publication has
+begun, a post-link or post-sync generation identity/mode failure must not delete
+the owned generation temporary; it remains evidence for explicit reconciliation.
 
 An existing generation at the requested digest is accepted only when its exact
 canonical bytes are identical; the same digest name with different bytes is a
@@ -677,11 +680,12 @@ the assertions:
    root/run with a different device/inode. Each case fails, follows no swapped
    link, and leaves a sentinel external victim byte-for-byte unchanged.
 3. **Manifest-generation crash matrix:** interrupt immediately after generation
-   temporary-file sync, generation rename, generation-directory sync, pointer
-   temporary-file sync, pointer rename, and quarantine-root sync. After each
-   interruption, a reader returns only the previous or new complete validated
-   generation, and the prior generation remains readable. An existing digest
-   filename containing different bytes is always rejected.
+   temporary-file sync, deterministic generation hard-link publication,
+   generation-directory sync, pointer temporary-file sync, pointer rename, and
+   quarantine-root sync. After each interruption, a reader returns only the
+   previous or new complete validated generation, and the prior generation
+   remains readable. An existing digest filename containing different bytes is
+   always rejected.
 4. **Ordinary append lock replacement:** replace the lock before journal
    mutation, after journal mutation/sync, and immediately before cleanup. The
    pre-mutation case leaves journal bytes unchanged. Each post-mutation case

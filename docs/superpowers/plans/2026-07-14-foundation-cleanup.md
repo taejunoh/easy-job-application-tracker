@@ -283,15 +283,18 @@ mismatch, and an existing digest filename with different bytes. Require pure
 cross-field invariants, unique and bytewise-sorted IDs/paths, deterministic
 `copy-NNNN` IDs, and both fixed generated roots.
 
-Inject a crash after each boundary: generation temporary-file sync, generation
-rename, generation-directory sync, pointer temporary-file sync, pointer rename,
-and quarantine-root sync. After each crash, `readCurrentManifestPointer` plus
-`readManifestGeneration` must return the old or new complete generation, and
-the old generation must remain readable. Assert `appendValidated` is called
-exactly once after the generation directory sync and before pointer temporary
-write, with `{ manifestSha256 }`. Inject temporary cleanup failure and require
-the primary publication error plus cleanup error to be preserved without
-deleting an existing generation or pointer.
+Inject a crash after each boundary: generation temporary-file sync,
+deterministic generation hard-link publication, generation-directory sync,
+pointer temporary-file sync, pointer rename, and quarantine-root sync. After
+each crash, `readCurrentManifestPointer` plus `readManifestGeneration` must
+return the old or new complete generation, and the old generation must remain
+readable. Assert `appendValidated` is called exactly once after the generation
+directory sync and before pointer temporary write, with `{ manifestSha256 }`.
+Inject temporary cleanup failure and require the primary publication error plus
+cleanup error to be preserved without deleting an existing generation or
+pointer. After generation hard-link publication begins, inject post-link and
+post-sync identity/mode failures and require the owned generation temporary to
+remain as reconciliation evidence.
 
 ```ts
 expect(publicationError).toBeInstanceOf(AggregateError);
@@ -311,14 +314,17 @@ immutable-generation APIs.
 
 Canonicalize the pure builder result, hash those exact bytes, and derive
 `manifests/<sha256>.json` through the live capability. Create/sync a mode-`0600`
-temporary, rename without replacing a different generation, and sync the
-manifest directory. Activation then calls `appendValidated` and publishes the
-canonical pointer via a mode-`0600` temporary, rename-over-`current`, and root
-sync. Revalidate capability identity before each mutation phase and after its
-last sync. Readers derive paths from the validated digest, enforce byte limits
-before parsing, compare filename/content digest, and rerun the closed builder.
-Delete the pre-amendment mutable generation, checksum-sidecar, ID-only pointer,
-and run-local pointer protocol.
+temporary, publish the digest-named generation with a deterministic
+same-filesystem hard link that never replaces an existing generation, and sync
+the manifest directory. After hard-link publication begins, preserve the owned
+temporary on any post-link or post-sync identity/mode failure. Activation then
+calls `appendValidated` and publishes the canonical pointer via a mode-`0600`
+temporary, rename-over-`current`, and root sync. Revalidate capability identity
+before each mutation phase and after its last sync. Readers derive paths from
+the validated digest, enforce byte limits before parsing, compare
+filename/content digest, and rerun the closed builder. Delete the pre-amendment
+mutable generation, checksum-sidecar, ID-only pointer, and run-local pointer
+protocol.
 
 - [ ] **Step 4: Run manifest GREEN and commit**
 
@@ -655,8 +661,10 @@ to retain its bounded-read identity and mode. During activation retain and
 recheck the selected generation identity across its directory sync before
 `appendValidated`. After pointer rename and quarantine-root sync, require
 `current` to retain the pointer temporary identity and exact mode `0600`.
-Identity or mode changes fail closed with available evidence preserved. Assert
-the manifest module still exposes exactly its existing five exports.
+Identity or mode changes fail closed with available evidence preserved; a
+post-link or post-sync generation failure must leave the owned generation
+temporary intact. Assert the manifest module still exposes exactly its existing
+five exports.
 
 - [ ] **Step E2: Run RED**
 
@@ -674,8 +682,12 @@ generation snapshot returning its validated manifest, path, and identity; the
 public reader still returns only the manifest. Carry the linked or adopted
 generation identity through parent sync and carry the pointer temporary
 identity through root sync. Revalidate capability containment and exact target
-identity/mode before advancing or returning. Keep existing aggregate cleanup
-behavior and all five public exports unchanged.
+identity/mode before advancing or returning. After generation hard-link
+publication begins, do not clean up the owned temporary when post-link or
+post-sync identity/mode verification fails. Preserve existing primary-before-
+cleanup error ordering for cleanup attempts that remain eligible; “aggregate
+cleanup behavior” means only that error ordering and does not authorize removal
+of required publication evidence. Keep all five public exports unchanged.
 
 - [ ] **Step E4: Verify and commit**
 
