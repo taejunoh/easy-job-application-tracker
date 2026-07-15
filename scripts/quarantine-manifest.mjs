@@ -348,6 +348,9 @@ function assertRegularFile(stat, label) {
   if (stat.isSymbolicLink() || !stat.isFile()) {
     throw new Error(`${label} must be a non-symlink regular file`);
   }
+  if ((stat.mode & 0o777) !== 0o600) {
+    throw new Error(`${label} must have private mode 0600`);
+  }
 }
 
 function throwPrimaryAndCleanup(primaryError, cleanupErrors, label) {
@@ -403,8 +406,12 @@ async function readBoundedFile(path, fsApi, maxBytes, label) {
   return withHandle(handle, async (opened) => {
     const first = await opened.stat();
     assertRegularFile(first, label);
-    if (!sameIdentity(before, first) || first.size !== before.size) {
-      throw new Error(`${label} identity or size changed while being opened`);
+    if (
+      !sameIdentity(before, first) ||
+      first.size !== before.size ||
+      first.mode !== before.mode
+    ) {
+      throw new Error(`${label} identity, size, or mode changed while being opened`);
     }
     if (first.size > maxBytes) throw new Error(`${label} is too large`);
     const bytes = Buffer.alloc(first.size);
@@ -416,8 +423,12 @@ async function readBoundedFile(path, fsApi, maxBytes, label) {
     }
     const after = await opened.stat();
     assertRegularFile(after, label);
-    if (!sameIdentity(first, after) || after.size !== first.size) {
-      throw new Error(`${label} changed while being read`);
+    if (
+      !sameIdentity(first, after) ||
+      after.size !== first.size ||
+      after.mode !== first.mode
+    ) {
+      throw new Error(`${label} identity, size, or mode changed while being read`);
     }
     return bytes;
   }, `${label} read and close both failed`);
@@ -439,7 +450,9 @@ async function removeOwnedTemporary({
   });
   const current = await fsApi.lstat(path);
   assertRegularFile(current, "manifest temporary file");
-  if (!sameIdentity(current, identity)) throw new Error("manifest temporary file ownership changed");
+  if (!sameIdentity(current, identity) || current.mode !== identity.mode) {
+    throw new Error("manifest temporary file ownership or mode changed");
+  }
   await fsApi.unlink(path);
   await fsyncDirectory(parent, fsApi);
   await revalidateRunCapability(capability, {

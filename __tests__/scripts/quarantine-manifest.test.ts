@@ -212,7 +212,8 @@ const result = await (async () => {
     }
     if (request.operation === "read-pointer-bytes") {
       const path = deriveRunPath(capability, { purpose: "current-pointer" });
-      await fsPromises.writeFile(path, Buffer.from(request.bytes, "base64"));
+      await fsPromises.writeFile(path, Buffer.from(request.bytes, "base64"), { mode: 0o600 });
+      await fsPromises.chmod(path, 0o600);
       return capture(() => manifestApi.readCurrentManifestPointer({
         capability,
         fsApi,
@@ -224,7 +225,8 @@ const result = await (async () => {
         purpose: "manifest-generation",
         id: request.digest,
       });
-      await fsPromises.writeFile(path, Buffer.from(request.bytes, "base64"));
+      await fsPromises.writeFile(path, Buffer.from(request.bytes, "base64"), { mode: 0o600 });
+      await fsPromises.chmod(path, 0o600);
       return capture(() => manifestApi.readManifestGeneration({
         capability,
         manifestSha256: request.digest,
@@ -245,6 +247,60 @@ const result = await (async () => {
         fsApi,
       }));
       return { outcome, unchanged: (await fsPromises.readFile(path)).equals(prior) };
+    }
+    if (request.operation === "existing-public-mode") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const prior = Buffer.from(JSON.stringify(built) + "\\n");
+      const digest = createHash("sha256").update(prior).digest("hex");
+      const path = deriveRunPath(capability, { purpose: "manifest-generation", id: digest });
+      await fsPromises.writeFile(path, prior, { mode: 0o644 });
+      await fsPromises.chmod(path, 0o644);
+      const outcome = await capture(() => manifestApi.writeManifestGeneration({
+        capability,
+        manifest: built,
+        fsApi,
+      }));
+      const after = await fsPromises.lstat(path);
+      return {
+        outcome,
+        mode: after.mode & 0o777,
+        unchanged: (await fsPromises.readFile(path)).equals(prior),
+      };
+    }
+    if (request.operation === "public-mode-readers") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const written = await manifestApi.writeManifestGeneration({
+        capability,
+        manifest: built,
+        fsApi,
+      });
+      await manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: written.manifestSha256,
+        appendValidated: async () => {},
+        fsApi,
+      });
+      const generationPath = deriveRunPath(capability, {
+        purpose: "manifest-generation",
+        id: written.manifestSha256,
+      });
+      const currentPath = deriveRunPath(capability, { purpose: "current-pointer" });
+      await fsPromises.chmod(generationPath, 0o644);
+      await fsPromises.chmod(currentPath, 0o644);
+      return {
+        generation: await capture(() => manifestApi.readManifestGeneration({
+          capability,
+          manifestSha256: written.manifestSha256,
+          fsApi,
+        })),
+        pointer: await capture(() => manifestApi.readCurrentManifestPointer({
+          capability,
+          fsApi,
+        })),
+        generationMode: (await fsPromises.lstat(generationPath)).mode & 0o777,
+        pointerMode: (await fsPromises.lstat(currentPath)).mode & 0o777,
+      };
     }
     if (request.operation === "mismatched-transaction") {
       return capture(() => manifestApi.writeManifestGeneration({
@@ -392,7 +448,8 @@ const result = await (async () => {
         manifestSha256: "a".repeat(64),
       }) + "\\n");
       const path = deriveRunPath(capability, { purpose: "current-pointer" });
-      await fsPromises.writeFile(path, pointer);
+      await fsPromises.writeFile(path, pointer, { mode: 0o600 });
+      await fsPromises.chmod(path, 0o600);
       const mismatchFs = {
         ...fsApi,
         async open(openPath, flags) {
@@ -602,6 +659,30 @@ describe("immutable quarantine manifest generations", () => {
       outcome: { ok: false, error: expect.objectContaining({ message: expect.any(String) }) },
       unchanged: true,
     });
+  });
+
+  it("rejects 0644 current and generation files without repairing their modes", () => {
+    const result = invoke({ operation: "public-mode-readers", value: validManifest });
+    expect(result.pointer).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/mode|0600|private/i) },
+    });
+    expect(result.generation).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/mode|0600|private/i) },
+    });
+    expect(result.pointerMode).toBe(0o644);
+    expect(result.generationMode).toBe(0o644);
+  });
+
+  it("rejects identical EEXIST generation bytes at 0644 without repair or replacement", () => {
+    const result = invoke({ operation: "existing-public-mode", value: validManifest });
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/mode|0600|private/i) },
+    });
+    expect(result.mode).toBe(0o644);
+    expect(result.unchanged).toBe(true);
   });
 
   it("rejects a manifest transaction ID that differs from the live capability", () => {
