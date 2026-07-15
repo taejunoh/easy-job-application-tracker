@@ -47,6 +47,15 @@ try {
       fsApi,
     });
     result = { first, second };
+  } else if (request.operation === "one-pass") {
+    result = await inventory.writeInventoryJsonl({
+      root: request.root,
+      outputPath: request.outputPath,
+      fsApi: {
+        ...fsPromises,
+        readFile: async () => { throw new Error("payload readFile is forbidden"); },
+      },
+    });
   } else if (request.operation === "hash") {
     result = await inventory.hashFileStream(request.path);
   } else if (request.operation === "compare") {
@@ -198,5 +207,40 @@ describe("streaming quarantine inventory", () => {
     ]) {
       expect(() => runWorker({ operation: "parse-summary", value })).toThrow(/summary/u);
     }
+  });
+
+  it("streams a regular-file root as one canonical dot-path entry", () => {
+    const source = join(fixture, "single-source 2.ts");
+    const outputPath = join(fixture, "single-source.jsonl");
+    writeFileSync(source, "source-body");
+    chmodSync(source, 0o640);
+
+    const result = runWorker({ operation: "one-pass", root: source, outputPath }).result;
+    expect(result).toEqual({
+      sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      entries: 1,
+      bytes: 11,
+    });
+    expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual({
+      path: ".",
+      type: "file",
+      mode: 0o640,
+      size: 11,
+      sha256: "503419c10318bf558f3f23a748378b6954027b3b8af93ff609da5313ab624b6b",
+    });
+  });
+
+  it("rejects a symlink inventory root without following it", () => {
+    const source = join(fixture, "symlink-source.txt");
+    const link = join(fixture, "symlink-root");
+    writeFileSync(source, "secret");
+    symlinkSync(source, link);
+    expect(() =>
+      runWorker({
+        operation: "one-pass",
+        root: link,
+        outputPath: join(fixture, "symlink-root.jsonl"),
+      }),
+    ).toThrow(/non-symlink|root/u);
   });
 });

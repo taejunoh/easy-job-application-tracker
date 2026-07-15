@@ -177,6 +177,11 @@ construct runtime entry plans and journal references, but those objects refer
 back to the manifest entry ID and summary; they do not replace or duplicate the
 authoritative enriched manifest entry.
 
+Directory inventories exclude the directory root and record only descendants.
+A regular-file inventory root emits exactly one record whose path is `"."`, so
+the inventory remains stable when the quarantined destination basename is the
+validated entry ID. A symlink inventory root is always rejected.
+
 Unified diffs and verified Git-history matches for all four divergent files are
 stored in `divergent-diffs/`. No divergent content is automatically merged into
 canonical files.
@@ -198,7 +203,11 @@ append-only sequence of length-framed canonical JSON records. Every record has a
 monotonic sequence, previous-record hash, payload, and record hash. Each append
 is flushed and `fsync`ed before the corresponding destructive transition; new
 files and rename operations also `fsync` their containing directories. A torn
-final frame is ignored during replay. Any malformed non-final frame, sequence
+final frame is ignored during replay. Before a later append, the appender holds
+an exclusive fail-closed journal lock, replays through the same open handle,
+truncates only a recognized torn final frame to the last valid offset, and
+`fsync`s the file and parent directory before appending. Lock removal is also
+directory-`fsync`ed. Any malformed non-final frame, sequence
 gap, hash-chain break, unknown field, or illegal state transition is fatal.
 The envelope schema and event payload schema are separate closed boundaries.
 Every event in the transition table has an exact payload parser on both append

@@ -132,6 +132,10 @@ inject payload `readFile` to throw, proving regular-file bodies are consumed via
 `createReadStream`. Require bytewise path order, mode/type/size/hash/link-target
 coverage, no symlink traversal, mode `0600`, and a manifest-sized summary of
 only `{ sha256, entries, bytes }`.
+Directory inventories exclude the root itself. A regular-file root must emit
+one canonical record at path `"."` with its mode, size, and SHA-256, while a
+symlink root remains rejected; this keeps source-copy inventories stable after
+moving to an ID-derived destination basename.
 
 - [ ] **Step 6: Verify inventory RED, implement streaming inventory, and verify GREEN**
 
@@ -237,7 +241,11 @@ type JournalFrame = {
 
 Hash the canonical envelope without `recordHash`, append one complete frame,
 `sync()` the handle, and fsync its directory. Replay ignores only an incomplete
-final length/body pair and validates every complete frame, event-specific
+final length/body pair and reports the last valid byte offset. Appends use an
+exclusive fail-closed lock and the same open handle to revalidate, truncate only
+that recognized torn tail, sync the truncation and parent, and then append; they
+must never truncate malformed complete frames or race concurrent appenders.
+Replay validates every complete frame, event-specific
 payload, and lifecycle edge. Implement an exact payload-parser table keyed by
 event and invoke it during both append and replay; accepting an arbitrary plain
 object after canonicalization is forbidden. Task 2 may add fields only by first

@@ -287,25 +287,24 @@ function validateFrame(record, rawBody, expectedSequence, expectedPreviousHash, 
   return { record: canonicalRecord, state: validateTransition(state, record.event) };
 }
 
-export async function replayJournal(journalPath, fsApi = fsPromises) {
-  let input;
-  try {
-    input = await fsApi.readFile(journalPath);
-  } catch (error) {
-    if (error?.code === "ENOENT") return { records: [], state: null };
-    throw error;
-  }
-
+function replayJournalBuffer(input) {
   const records = [];
   let state = null;
   let offset = 0;
+  let truncatedTail = false;
   while (offset < input.length) {
-    if (input.length - offset < 4) break;
+    if (input.length - offset < 4) {
+      truncatedTail = true;
+      break;
+    }
     const frameLength = input.readUInt32BE(offset);
     if (frameLength > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
     const bodyStart = offset + 4;
     const bodyEnd = bodyStart + frameLength;
-    if (bodyEnd > input.length) break;
+    if (bodyEnd > input.length) {
+      truncatedTail = true;
+      break;
+    }
     const rawBody = input.subarray(bodyStart, bodyEnd);
     let parsed;
     try {
@@ -326,7 +325,20 @@ export async function replayJournal(journalPath, fsApi = fsPromises) {
     state = validated.state;
     offset = bodyEnd;
   }
-  return { records, state };
+  return { records, state, validEndOffset: offset, truncatedTail };
+}
+
+export async function replayJournal(journalPath, fsApi = fsPromises) {
+  let input;
+  try {
+    input = await fsApi.readFile(journalPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { records: [], state: null, validEndOffset: 0, truncatedTail: false };
+    }
+    throw error;
+  }
+  return replayJournalBuffer(input);
 }
 
 async function writeComplete(handle, buffer) {
@@ -335,6 +347,29 @@ async function writeComplete(handle, buffer) {
     const { bytesWritten } = await handle.write(buffer.subarray(offset));
     if (bytesWritten <= 0) throw new Error("journal append made no progress");
     offset += bytesWritten;
+  }
+}
+
+async function readCompleteFile(handle) {
+  const before = await handle.stat();
+  const input = Buffer.alloc(before.size);
+  let offset = 0;
+  while (offset < input.length) {
+    const { bytesRead } = await handle.read(input, offset, input.length - offset, offset);
+    if (bytesRead <= 0) throw new Error("journal changed while being read");
+    offset += bytesRead;
+  }
+  const after = await handle.stat();
+  if (after.size !== before.size) throw new Error("journal changed while being read");
+  return input;
+}
+
+async function fsyncDirectory(path, fsApi) {
+  const parent = await fsApi.open(path, "r");
+  try {
+    await parent.sync();
+  } finally {
+    await parent.close();
   }
 }
 
@@ -348,39 +383,62 @@ export async function appendJournalRecord({
     throw new TypeError("journal path is required");
   }
   if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
-  const replayed = await replayJournal(journalPath, fsApi);
-  validateTransition(replayed.state, event);
-  const canonicalPayload = canonicalize(parseEventPayload(event, payload));
-  const sequence = replayed.records.length + 1;
-  const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
-  const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
-  const record = {
-    sequence,
-    previousHash,
-    event,
-    payload: canonicalPayload,
-    recordHash,
-  };
-  const body = Buffer.from(JSON.stringify(record));
-  if (body.length > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
-  const length = Buffer.alloc(4);
-  length.writeUInt32BE(body.length);
-
   await fsApi.mkdir(dirname(journalPath), { recursive: true, mode: 0o700 });
-  const handle = await fsApi.open(journalPath, "a", 0o600);
+  const lockPath = `${journalPath}.lock`;
+  let lockAcquired = false;
   try {
-    await handle.chmod(0o600);
-    await writeComplete(handle, Buffer.concat([length, body]));
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
+    let lockHandle;
+    try {
+      lockHandle = await fsApi.open(lockPath, "wx", 0o600);
+      lockAcquired = true;
+      await lockHandle.chmod(0o600);
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        throw new Error("journal append lock already exists", { cause: error });
+      }
+      throw error;
+    } finally {
+      await lockHandle?.close();
+    }
 
-  const parent = await fsApi.open(dirname(journalPath), "r");
-  try {
-    await parent.sync();
+    const handle = await fsApi.open(journalPath, "a+", 0o600);
+    let record;
+    try {
+      await handle.chmod(0o600);
+      const replayed = replayJournalBuffer(await readCompleteFile(handle));
+      validateTransition(replayed.state, event);
+      const canonicalPayload = canonicalize(parseEventPayload(event, payload));
+      const sequence = replayed.records.length + 1;
+      const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
+      const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
+      record = {
+        sequence,
+        previousHash,
+        event,
+        payload: canonicalPayload,
+        recordHash,
+      };
+      const body = Buffer.from(JSON.stringify(record));
+      if (body.length > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
+      const length = Buffer.alloc(4);
+      length.writeUInt32BE(body.length);
+
+      if (replayed.truncatedTail) {
+        await handle.truncate(replayed.validEndOffset);
+        await handle.sync();
+        await fsyncDirectory(dirname(journalPath), fsApi);
+      }
+      await writeComplete(handle, Buffer.concat([length, body]));
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fsyncDirectory(dirname(journalPath), fsApi);
+    return record;
   } finally {
-    await parent.close();
+    if (lockAcquired) {
+      await fsApi.rm(lockPath, { force: true });
+      await fsyncDirectory(dirname(journalPath), fsApi);
+    }
   }
-  return record;
 }

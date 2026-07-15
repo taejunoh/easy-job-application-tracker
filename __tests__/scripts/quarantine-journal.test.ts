@@ -3,9 +3,15 @@ import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -29,7 +35,8 @@ let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
 const durabilityEvents = [];
-const wrappedFs = request.trackDurability ? {
+const needsWrappedFs = request.trackDurability || request.failAt;
+const wrappedFs = needsWrappedFs ? {
   ...fsPromises,
   open: async (path, flags, mode) => {
     const handle = await fsPromises.open(path, flags, mode);
@@ -37,8 +44,25 @@ const wrappedFs = request.trackDurability ? {
       get(target, property) {
         if (property === "sync") return async () => {
           durabilityEvents.push(path === dirname(request.journalPath) ? "directory-sync" : "file-sync");
-          return target.sync();
+          const result = await target.sync();
+          if (request.failAt === "frame-fsync" && path === request.journalPath) {
+            throw new Error("injected crash after frame fsync");
+          }
+          if (request.failAt === "parent-fsync" && path === dirname(request.journalPath)) {
+            throw new Error("injected crash after parent fsync");
+          }
+          return result;
         };
+        if (property === "write" && request.failAt === "file-create") {
+          return async () => { throw new Error("injected crash after file create"); };
+        }
+        if (property === "write" && request.failAt === "partial-frame") {
+          return async (buffer) => {
+            const partial = buffer.subarray(0, Math.max(1, Math.floor(buffer.length / 2)));
+            await target.write(partial);
+            throw new Error("injected crash during frame append");
+          };
+        }
         const value = Reflect.get(target, property, target);
         return typeof value === "function" ? value.bind(target) : value;
       },
@@ -57,6 +81,34 @@ try {
         ...(wrappedFs ? { fsApi: wrappedFs } : {}),
       }));
     }
+  } else if (request.operation === "append-one") {
+    result = await journal.appendJournalRecord({
+      journalPath: request.journalPath,
+      event: request.record.event,
+      payload: request.record.payload,
+      ...(wrappedFs ? { fsApi: wrappedFs } : {}),
+    });
+  } else if (request.operation === "concurrent") {
+    const slowFs = {
+      ...fsPromises,
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (path.endsWith(".lock") || path === request.journalPath) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        return handle;
+      },
+    };
+    const options = {
+      journalPath: request.journalPath,
+      event: request.record.event,
+      payload: request.record.payload,
+    };
+    const settled = await Promise.allSettled([
+      journal.appendJournalRecord({ ...options, fsApi: slowFs }),
+      journal.appendJournalRecord(options),
+    ]);
+    result = settled.map((item) => item.status);
   } else if (request.operation === "replay") {
     result = await journal.replayJournal(request.journalPath);
   } else if (request.operation === "transition") {
@@ -73,7 +125,9 @@ try {
       input: JSON.stringify(request),
     }),
   );
-  if (!result.ok) throw new Error(result.error);
+  if (!result.ok) {
+    throw Object.assign(new Error(result.error), { durabilityEvents: result.durabilityEvents });
+  }
   return result;
 }
 
@@ -98,6 +152,69 @@ function appendMany(journalPath: string, records = happyRecords, trackDurability
 
 function replay(journalPath: string) {
   return invokeJournal({ operation: "replay", journalPath }).result;
+}
+
+function syncPath(path: string) {
+  const descriptor = openSync(path, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function runMoveBoundary(fixture: string, boundary: string) {
+  const root = join(fixture, `move-${boundary.replaceAll(" ", "-")}`);
+  const sourceParent = join(root, "source");
+  const destinationParent = join(root, "destination");
+  const source = join(sourceParent, "entry");
+  const destination = join(destinationParent, "entry");
+  const journalPath = join(root, "journal", "journal.log");
+  mkdirSync(sourceParent, { recursive: true });
+  mkdirSync(destinationParent, { recursive: true });
+  writeFileSync(source, "payload");
+  appendMany(journalPath, happyRecords.slice(0, 3));
+  const completedSteps: string[] = [];
+
+  renameSync(source, destination);
+  completedSteps.push("payload rename");
+  if (boundary !== "payload rename") {
+    syncPath(destination);
+    completedSteps.push("payload fsync");
+  }
+  if (!["payload rename", "payload fsync"].includes(boundary)) {
+    syncPath(destinationParent);
+    completedSteps.push("destination-parent fsync");
+  }
+  if (!["payload rename", "payload fsync", "destination-parent fsync"].includes(boundary)) {
+    syncPath(sourceParent);
+    completedSteps.push("source-parent fsync");
+  }
+  if (
+    ![
+      "payload rename",
+      "payload fsync",
+      "destination-parent fsync",
+      "source-parent fsync",
+    ].includes(boundary)
+  ) {
+    const observed = createHash("sha256").update(readFileSync(destination)).digest("hex");
+    expect(observed).toBe("239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5");
+    completedSteps.push("verification");
+  }
+  if (boundary === "MOVED append") {
+    appendMany(journalPath, [
+      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+    ]);
+    completedSteps.push("MOVED append");
+  }
+
+  return {
+    completedSteps,
+    destinationExists: existsSync(destination),
+    sourceExists: existsSync(source),
+    replayed: replay(journalPath),
+  };
 }
 
 function rawFrames(path: string) {
@@ -148,7 +265,11 @@ describe("durable quarantine journal", () => {
     const appended = appendMany(path, happyRecords.slice(0, 1), true);
     expect(readFileSync(path).readUInt32BE(0)).toBe(rawFrames(path).frames[0].body.length);
     expect(lstatSync(path).mode & 0o777).toBe(0o600);
-    expect(appended.durabilityEvents).toEqual(["file-sync", "directory-sync"]);
+    expect(appended.durabilityEvents).toEqual([
+      "file-sync",
+      "directory-sync",
+      "directory-sync",
+    ]);
 
     chmodSync(path, 0o666);
     appendMany(path, [{ event: "MOVING", payload: {} }]);
@@ -194,27 +315,149 @@ describe("durable quarantine journal", () => {
     );
   });
 
-  it("keeps MOVE_INTENT authoritative across all pre-MOVED interruption boundaries", () => {
-    const path = join(fixture, "boundaries", "journal.log");
-    appendMany(path, happyRecords.slice(0, 3));
-    const intentBytes = readFileSync(path);
+  it.each([
+    ["file create", "file-create", [], happyRecords[0], 0, false, ["directory-sync"]],
+    [
+      "partial frame append",
+      "partial-frame",
+      [happyRecords[0]],
+      happyRecords[1],
+      1,
+      true,
+      ["directory-sync"],
+    ],
+    [
+      "frame fsync",
+      "frame-fsync",
+      [happyRecords[0]],
+      happyRecords[1],
+      2,
+      false,
+      ["file-sync", "directory-sync"],
+    ],
+    [
+      "parent fsync",
+      "parent-fsync",
+      [happyRecords[0]],
+      happyRecords[1],
+      2,
+      false,
+      ["file-sync", "directory-sync", "directory-sync"],
+    ],
+  ])(
+    "replays the durable invariant after interruption at %s",
+    (label, failAt, prefix, record, expectedRecords, truncatedTail, expectedSyncs) => {
+      const path = join(fixture, `primitive-${String(label).replaceAll(" ", "-")}`, "journal.log");
+      if ((prefix as typeof happyRecords).length > 0) appendMany(path, prefix as typeof happyRecords);
+      let durabilityEvents: string[] = [];
+      try {
+        invokeJournal({
+          operation: "append-one",
+          journalPath: path,
+          record,
+          failAt,
+        });
+        throw new Error("fault injection did not interrupt append");
+      } catch (error) {
+        expect((error as Error).message).toMatch(/injected crash/u);
+        durabilityEvents = (error as Error & { durabilityEvents?: string[] }).durabilityEvents ?? [];
+      }
+      const replayed = replay(path);
+      expect(replayed.records).toHaveLength(expectedRecords);
+      expect(replayed.truncatedTail).toBe(truncatedTail);
+      expect(durabilityEvents).toEqual(expectedSyncs);
+      expect(existsSync(path)).toBe(true);
+    },
+  );
 
-    for (const boundary of [
-      "payload rename",
-      "payload fsync",
-      "source-parent fsync",
+  it.each([
+    ["payload rename", ["payload rename"]],
+    ["payload fsync", ["payload rename", "payload fsync"]],
+    [
       "destination-parent fsync",
+      ["payload rename", "payload fsync", "destination-parent fsync"],
+    ],
+    [
+      "source-parent fsync",
+      [
+        "payload rename",
+        "payload fsync",
+        "destination-parent fsync",
+        "source-parent fsync",
+      ],
+    ],
+    [
       "verification",
-    ]) {
-      writeFileSync(path, intentBytes);
-      expect(replay(path).records.at(-1)).toMatchObject({ event: "MOVE_INTENT" });
-      expect(boundary).toBeTruthy();
-    }
+      [
+        "payload rename",
+        "payload fsync",
+        "destination-parent fsync",
+        "source-parent fsync",
+        "verification",
+      ],
+    ],
+    [
+      "MOVED append",
+      [
+        "payload rename",
+        "payload fsync",
+        "destination-parent fsync",
+        "source-parent fsync",
+        "verification",
+        "MOVED append",
+      ],
+    ],
+  ])("proves the transaction-like boundary after %s", (boundary, expectedSteps) => {
+    const result = runMoveBoundary(fixture, boundary as string);
+    expect(result.completedSteps).toEqual(expectedSteps);
+    expect(result.sourceExists).toBe(false);
+    expect(result.destinationExists).toBe(true);
+    expect(result.replayed.records.at(-1)?.event).toBe(
+      boundary === "MOVED append" ? "MOVED" : "MOVE_INTENT",
+    );
+  });
 
-    appendMany(path, [
-      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+  it("truncates and durably replaces a torn tail before appending the next record", () => {
+    const path = join(fixture, "torn-then-append", "journal.log");
+    appendMany(path, happyRecords.slice(0, 2));
+    const validEndOffset = readFileSync(path).length;
+    const body = rawFrames(path).frames.at(-1)!.body;
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(body.length);
+    appendFileSync(path, Buffer.concat([length, body.subarray(0, 7)]));
+    expect(replay(path)).toMatchObject({ validEndOffset, truncatedTail: true });
+
+    appendMany(path, [happyRecords[2]]);
+    const replayed = replay(path);
+    expect(replayed.truncatedTail).toBe(false);
+    expect(replayed.records).toHaveLength(3);
+    expect(replayed.records.at(-1)).toMatchObject({ sequence: 3, event: "MOVE_INTENT" });
+    expect(rawFrames(path).frames).toHaveLength(3);
+  });
+
+  it("never truncates a malformed complete middle frame during append", () => {
+    const path = join(fixture, "malformed-append", "journal.log");
+    appendMany(path, happyRecords.slice(0, 3));
+    const { input, frames } = rawFrames(path);
+    input[frames[1].start + 4] = 0xff;
+    writeFileSync(path, input);
+    const corrupted = readFileSync(path);
+    expect(() => appendMany(path, [happyRecords[3]])).toThrow(/malformed/u);
+    expect(readFileSync(path)).toEqual(corrupted);
+  });
+
+  it("fails one overlapping append closed instead of creating duplicate sequences", () => {
+    const path = join(fixture, "concurrent-append", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    const statuses = invokeJournal({
+      operation: "concurrent",
+      journalPath: path,
+      record: happyRecords[1],
+    }).result;
+    expect(statuses.sort()).toEqual(["fulfilled", "rejected"]);
+    expect(replay(path).records.map((record: { sequence: number }) => record.sequence)).toEqual([
+      1, 2,
     ]);
-    expect(replay(path).records.at(-1)).toMatchObject({ event: "MOVED" });
   });
 
   it("ignores only a torn final length or body", () => {

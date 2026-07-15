@@ -200,8 +200,8 @@ async function reduceMergeFiles(paths, temporaryDirectory, fsApi) {
 
 export async function writeInventoryJsonl({ root, outputPath, fsApi = fsPromises }) {
   const rootStat = await fsApi.lstat(root);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
-    throw new Error("inventory root must be a non-symlink directory");
+  if (rootStat.isSymbolicLink() || (!rootStat.isDirectory() && !rootStat.isFile())) {
+    throw new Error("inventory root must be a non-symlink regular file or directory");
   }
 
   await fsApi.mkdir(dirname(outputPath), { recursive: true });
@@ -214,7 +214,10 @@ export async function writeInventoryJsonl({ root, outputPath, fsApi = fsPromises
   let bytes = 0;
 
   try {
-    for await (const item of walkTree(root, fsApi)) {
+    const inventoryItems = rootStat.isFile()
+      ? [{ absolutePath: root, relativePath: ".", stat: rootStat }]
+      : walkTree(root, fsApi);
+    for await (const item of inventoryItems) {
       const inventoried = await inventoryRecord(
         item.absolutePath,
         item.relativePath,
