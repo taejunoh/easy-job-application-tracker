@@ -290,6 +290,10 @@ truncate or frame write begins is an exported
 retry that event: it explicitly replays, accepts the candidate at most once,
 and either records a missing candidate or advances with only the next legal
 event. Indeterminate recovery preserves its current lock and tombstones.
+If closing that recovery lock also fails, the indeterminate error remains the
+primary error and the close failure is supplemental `AggregateError` cause
+metadata; a lone close failure is surfaced normally. Both cases preserve the
+lock and tombstones.
 
 Sequential awaited appends inside the callback remain valid; stored
 capabilities are rejected. Successful later recovery revalidates and removes

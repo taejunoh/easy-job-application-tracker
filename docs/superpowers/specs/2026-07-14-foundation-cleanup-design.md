@@ -247,6 +247,11 @@ blindly retries the same event. The next explicit attested recovery replays the
 journal, accepts the candidate zero or one time, appends it only if absent, or
 advances with the next legal event if present. Partial and complete-frame
 `SIGKILL` cases must finish with that candidate exactly once.
+If recovery-lock close also fails, the original indeterminate error retains its
+code and candidate identity while the close error is attached as supplemental
+`AggregateError` cause metadata. Without a primary recovery error, the close
+error is surfaced directly. Cleanup does not remove the lock or tombstones in
+either close-failure case.
 
 Sequential awaited callback appends are allowed; leaked capabilities are
 rejected. On success, recovery revalidates and removes the current lock and all

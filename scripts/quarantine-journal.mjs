@@ -41,6 +41,27 @@ export class IndeterminateJournalAppendError extends Error {
   }
 }
 
+function attachCleanupError(primaryError, cleanupError) {
+  if (!(primaryError instanceof Error)) {
+    return new AggregateError(
+      [primaryError, cleanupError],
+      "journal recovery and lock cleanup both failed",
+    );
+  }
+  const causes =
+    primaryError.cause instanceof AggregateError
+      ? [...primaryError.cause.errors, cleanupError]
+      : primaryError.cause === undefined
+        ? [cleanupError]
+        : [primaryError.cause, cleanupError];
+  primaryError.cause = new AggregateError(
+    causes,
+    "journal recovery and lock cleanup both failed",
+  );
+  primaryError.cleanupError = cleanupError;
+  return primaryError;
+}
+
 const TRANSITIONS = new Map([
   ["<START>", new Map([["PREPARED", "PREPARED"]])],
   ["PREPARED", new Map([["MOVING", "MOVING"]])],
@@ -761,6 +782,8 @@ export async function reclaimJournalLock({
 
   let recoveryLock;
   let recoverySucceeded = false;
+  let result;
+  let primaryError;
   try {
     recoveryLock = await createJournalLock(lockPath, fsApi);
     const capability = { active: true };
@@ -795,7 +818,6 @@ export async function reclaimJournalLock({
         appendInProgress = false;
       }
     };
-    let result;
     try {
       result = await recovery({
         append,
@@ -813,14 +835,27 @@ export async function reclaimJournalLock({
     }
     await assertHeldLockOwnership(lockPath, recoveryLock.handle, fsApi);
     recoverySucceeded = true;
-    return result;
-  } finally {
-    await recoveryLock?.handle.close();
-    if (recoverySucceeded) {
-      await removeValidatedLockResidues(
-        [lockPath, tombstonePath, ...priorTombstones],
-        fsApi,
-      );
-    }
+  } catch (error) {
+    primaryError = error;
   }
+
+  let closeError;
+  try {
+    await recoveryLock?.handle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (primaryError !== undefined) {
+    throw closeError === undefined
+      ? primaryError
+      : attachCleanupError(primaryError, closeError);
+  }
+  if (closeError !== undefined) throw closeError;
+  if (recoverySucceeded) {
+    await removeValidatedLockResidues(
+      [lockPath, tombstonePath, ...priorTombstones],
+      fsApi,
+    );
+  }
+  return result;
 }

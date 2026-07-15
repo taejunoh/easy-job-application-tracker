@@ -80,6 +80,11 @@ const errorDetails = (error) => ({
   message: error.message,
   expectedSequence: error.expectedSequence ?? null,
   expectedRecordHash: error.expectedRecordHash ?? null,
+  cleanupError: error.cleanupError?.message ?? null,
+  causeName: error.cause?.name ?? null,
+  causeErrors: error.cause instanceof AggregateError
+    ? error.cause.errors.map((cause) => cause.message)
+    : [],
 });
 const listLockResidues = async () => {
   const directory = dirname(request.journalPath);
@@ -289,13 +294,31 @@ try {
       ...fsPromises,
       open: async (path, flags, mode) => {
         const handle = await fsPromises.open(path, flags, mode);
+        if (
+          request.failRecoveryLockClose &&
+          path === request.journalPath + ".lock" &&
+          flags === "wx"
+        ) {
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === "close") {
+                return async () => {
+                  await target.close();
+                  throw new Error("injected recovery lock close failure");
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        }
         if (path !== request.journalPath) return handle;
         return new Proxy(handle, {
           get(target, property) {
             if (property === "sync") {
               return async () => {
                 const synced = await target.sync();
-                if (!injected) {
+                if (request.injectJournalSyncFailure !== false && !injected) {
                   injected = true;
                   throw new Error("injected failure after journal sync");
                 }
@@ -1198,6 +1221,9 @@ describe("durable quarantine journal", () => {
       message: expect.stringMatching(/indeterminate/u),
       expectedSequence: 2,
       expectedRecordHash: candidates[0].recordHash,
+      cleanupError: null,
+      causeName: "Error",
+      causeErrors: [],
     });
     expect(result.rawBytesUnchanged).toBe(false);
     expect(candidates).toHaveLength(1);
@@ -1233,11 +1259,79 @@ describe("durable quarantine journal", () => {
       message: expect.stringMatching(/indeterminate/u),
       expectedSequence: 2,
       expectedRecordHash: candidate.recordHash,
+      cleanupError: null,
+      causeName: "Error",
+      causeErrors: [],
     });
     expect(candidate).toMatchObject({ sequence: 2, event: "MOVING" });
     expect(result.destructiveSeamCalls).toBe(0);
     expect(existsSync(seamSource)).toBe(true);
     expect(existsSync(seamDestination)).toBe(false);
+    expect(result.lockExists).toBe(true);
+    expect(result.residues).toHaveLength(1);
+  });
+
+  it("preserves indeterminate identity when recovery lock close also fails", () => {
+    const path = join(fixture, "indeterminate-plus-close-failure", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    writeFileSync(
+      `${path}.lock`,
+      encodeJournalLock("12121212-1212-4212-8212-121212121212", process.pid),
+      { mode: 0o600 },
+    );
+
+    const result = invokeJournal({
+      operation: "reclaim-indeterminate-sync",
+      journalPath: path,
+      record: happyRecords[1],
+      failRecoveryLockClose: true,
+    }).result;
+    const candidate = result.replayed.records[1];
+    expect(result.caught).toEqual({
+      name: "IndeterminateJournalAppendError",
+      code: "ERR_INDETERMINATE_JOURNAL_APPEND",
+      message: expect.stringMatching(/indeterminate/u),
+      expectedSequence: 2,
+      expectedRecordHash: candidate.recordHash,
+      cleanupError: "injected recovery lock close failure",
+      causeName: "AggregateError",
+      causeErrors: [
+        "injected failure after journal sync",
+        "injected recovery lock close failure",
+      ],
+    });
+    expect(result.lockExists).toBe(true);
+    expect(result.residues).toHaveLength(1);
+  });
+
+  it("surfaces a lone recovery lock close failure normally and preserves recovery artifacts", () => {
+    const path = join(fixture, "close-failure-only", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    writeFileSync(
+      `${path}.lock`,
+      encodeJournalLock("34343434-3434-4434-8434-343434343434", process.pid),
+      { mode: 0o600 },
+    );
+
+    const result = invokeJournal({
+      operation: "reclaim-indeterminate-sync",
+      journalPath: path,
+      record: happyRecords[1],
+      injectJournalSyncFailure: false,
+      failRecoveryLockClose: true,
+    }).result;
+    expect(result.caught).toEqual({
+      name: "Error",
+      code: null,
+      message: "injected recovery lock close failure",
+      expectedSequence: null,
+      expectedRecordHash: null,
+      cleanupError: null,
+      causeName: null,
+      causeErrors: [],
+    });
+    expect(result.replayed.records[1]).toMatchObject({ sequence: 2, event: "MOVING" });
+    expect(result.destructiveSeamCalls).toBe(1);
     expect(result.lockExists).toBe(true);
     expect(result.residues).toHaveLength(1);
   });
