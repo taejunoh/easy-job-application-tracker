@@ -5,6 +5,7 @@ import {
   copyFile,
   lstat,
   mkdir,
+  open,
   readFile,
   readlink,
   readdir,
@@ -27,6 +28,7 @@ import {
 
 const NUMBERED_COPY_PATTERN = /^(.*) ([2-9][0-9]*)(\.[^/]+)$/u;
 const GENERATED_NUMBERED_COPY_PATTERN = / [2-9][0-9]*(?:\.[^/]+)?$/u;
+const MANIFEST_GENERATION_PATTERN = /^gen-([0-9]{6})$/u;
 const GENERATED_TREE_PATHS = [".next", "node_modules"];
 const RETENTION_DAYS = 4;
 
@@ -123,7 +125,7 @@ export async function inspectWorkspace(options, dependencies = {}) {
     (await apparentSize(join(repositoryRoot, ".next")));
   const stats = await runStatfs(quarantineRoot);
   const availableBytes = Number(stats.bavail) * Number(stats.bsize);
-  if (!Number.isFinite(availableBytes) || availableBytes < requiredBytes) {
+  if (!Number.isFinite(availableBytes) || availableBytes <= requiredBytes) {
     throw new Error("Quarantine filesystem has insufficient available space");
   }
 
@@ -227,12 +229,29 @@ export async function quarantineWorkspace(options, dependencies = {}) {
       requireMatchingInventory(tree.inventory, archiveInventory, tree.path);
     }
 
-    for (const copy of manifest.copies) {
-      await removePath(join(inspection.repositoryRoot, copy.originalPath));
-    }
-    for (const tree of generatedTrees) {
-      await removePath(join(inspection.repositoryRoot, tree.path));
-    }
+    await dependencies.beforeDeletionPreflight?.({
+      repositoryRoot: inspection.repositoryRoot,
+    });
+    const deletionEntries = [
+      ...manifest.copies.map((copy) => ({
+        type: "file",
+        relativePath: copy.originalPath,
+        quarantinePath: copy.quarantinePath,
+        expected: copy,
+      })),
+      ...[...generatedTrees].reverse().map((tree) => ({
+        type: "tree",
+        relativePath: tree.path,
+        quarantinePath: tree.quarantinePath,
+        expected: tree.inventory,
+      })),
+    ];
+    await removeOriginalsTransactionally(
+      inspection.repositoryRoot,
+      runDirectory,
+      deletionEntries,
+      dependencies,
+    );
 
     manifest = {
       ...manifest,
@@ -505,6 +524,69 @@ async function copyRegularFile(source, destination, mode) {
   await chmod(destination, mode);
 }
 
+async function removeOriginalsTransactionally(
+  repositoryRoot,
+  runDirectory,
+  entries,
+  dependencies,
+) {
+  for (const entry of entries) {
+    await requireOriginalMatch(repositoryRoot, entry);
+  }
+
+  const attempted = [];
+  try {
+    for (const entry of entries) {
+      attempted.push(entry);
+      await dependencies.beforeOriginalRemoval?.({
+        relativePath: entry.relativePath,
+        repositoryRoot,
+      });
+      await requireOriginalMatch(repositoryRoot, entry);
+      await removePath(join(repositoryRoot, entry.relativePath));
+    }
+  } catch (error) {
+    for (const entry of attempted.reverse()) {
+      if (await originalMatches(repositoryRoot, entry)) continue;
+      const originalPath = join(repositoryRoot, entry.relativePath);
+      await removePath(originalPath);
+      if (entry.type === "file") {
+        await copyRegularFile(
+          join(runDirectory, entry.quarantinePath),
+          originalPath,
+          entry.expected.mode,
+        );
+      } else {
+        await copyTree(join(runDirectory, entry.quarantinePath), originalPath);
+      }
+      await requireOriginalMatch(repositoryRoot, entry);
+    }
+    throw error;
+  }
+}
+
+async function originalMatches(repositoryRoot, entry) {
+  try {
+    await requireOriginalMatch(repositoryRoot, entry);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function requireOriginalMatch(repositoryRoot, entry) {
+  const originalPath = join(repositoryRoot, entry.relativePath);
+  if (entry.type === "file") {
+    await requireFileMatch(originalPath, entry.expected);
+    return;
+  }
+  requireMatchingInventory(
+    entry.expected,
+    await inventoryTree(originalPath),
+    entry.relativePath,
+  );
+}
+
 async function removePath(path) {
   const metadata = await pathMetadata(path);
   if (metadata.type === "missing") return;
@@ -569,25 +651,63 @@ async function writePrivateFile(path, contents) {
 
 async function writeManifest(runDirectory, manifest) {
   const contents = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
-  const manifestPath = join(runDirectory, "manifest.json");
-  const checksumPath = join(runDirectory, "manifest.sha256");
-  const temporaryManifestPath = `${manifestPath}.tmp`;
-  const temporaryChecksumPath = `${checksumPath}.tmp`;
-  await writePrivateFile(temporaryManifestPath, contents);
-  await writePrivateFile(
-    temporaryChecksumPath,
+  const generationsDirectory = join(runDirectory, "manifest-generations");
+  await mkdir(generationsDirectory, { recursive: true, mode: 0o700 });
+  await chmod(generationsDirectory, 0o700);
+
+  const generationName = await nextGenerationName(generationsDirectory);
+  const generationDirectory = join(generationsDirectory, generationName);
+  const temporaryGenerationDirectory = join(
+    generationsDirectory,
+    `.${generationName}.tmp-${process.pid}-${Date.now()}`,
+  );
+  await mkdir(temporaryGenerationDirectory, { mode: 0o700 });
+  await writeDurablePrivateFile(
+    join(temporaryGenerationDirectory, "manifest.json"),
+    contents,
+  );
+  await writeDurablePrivateFile(
+    join(temporaryGenerationDirectory, "manifest.sha256"),
     `${sha256(contents)}  manifest.json\n`,
   );
-  await rename(temporaryManifestPath, manifestPath);
-  await rename(temporaryChecksumPath, checksumPath);
-  await chmod(manifestPath, 0o600);
-  await chmod(checksumPath, 0o600);
+  await readManifestPair(temporaryGenerationDirectory);
+  await syncDirectory(temporaryGenerationDirectory);
+  await rename(temporaryGenerationDirectory, generationDirectory);
+  await syncDirectory(generationsDirectory);
+
+  const pointerContents = `${generationName}\n`;
+  const temporaryPointerPath = join(
+    runDirectory,
+    `.current.tmp-${process.pid}-${generationName}`,
+  );
+  await writeDurablePrivateFile(temporaryPointerPath, pointerContents);
+  if ((await readFile(temporaryPointerPath, "utf8")) !== pointerContents) {
+    throw new Error("Manifest pointer verification failed");
+  }
+  await rename(temporaryPointerPath, join(runDirectory, "current"));
+  await syncDirectory(runDirectory);
 }
 
 async function readVerifiedManifest(runDirectory) {
-  const manifestContents = await readFile(join(runDirectory, "manifest.json"));
+  const pointer = await readFile(join(runDirectory, "current"), "utf8");
+  if (!pointer.endsWith("\n") || pointer.indexOf("\n") !== pointer.length - 1) {
+    throw new Error("Manifest pointer is invalid");
+  }
+  const generationName = pointer.slice(0, -1);
+  if (!MANIFEST_GENERATION_PATTERN.test(generationName)) {
+    throw new Error("Manifest pointer is invalid");
+  }
+  return readManifestPair(
+    join(runDirectory, "manifest-generations", generationName),
+  );
+}
+
+async function readManifestPair(generationDirectory) {
+  const manifestContents = await readFile(
+    join(generationDirectory, "manifest.json"),
+  );
   const checksum = await readFile(
-    join(runDirectory, "manifest.sha256"),
+    join(generationDirectory, "manifest.sha256"),
     "utf8",
   );
   if (checksum.trim() !== `${sha256(manifestContents)}  manifest.json`) {
@@ -598,6 +718,38 @@ async function readVerifiedManifest(runDirectory) {
     throw new Error("Manifest schema is invalid");
   }
   return manifest;
+}
+
+async function nextGenerationName(generationsDirectory) {
+  let highest = 0;
+  for (const name of await readdir(generationsDirectory)) {
+    const match = MANIFEST_GENERATION_PATTERN.exec(name);
+    if (match) highest = Math.max(highest, Number(match[1]));
+  }
+  if (highest >= 999_999) {
+    throw new Error("Manifest generation limit reached");
+  }
+  return `gen-${String(highest + 1).padStart(6, "0")}`;
+}
+
+async function writeDurablePrivateFile(path, contents) {
+  const handle = await open(path, "wx", 0o600);
+  try {
+    await handle.writeFile(contents);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await chmod(path, 0o600);
+}
+
+async function syncDirectory(path) {
+  const handle = await open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 function requireManifestRepository(manifest, repositoryRoot) {
@@ -651,6 +803,7 @@ async function fileMetadata(path) {
 function historicalMatch(repositoryRoot, canonicalPath, expectedHash) {
   const revisions = gitText(repositoryRoot, [
     "log",
+    "--all",
     "--format=%H",
     "--",
     canonicalPath,

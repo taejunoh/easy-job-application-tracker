@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -95,6 +96,54 @@ describe("numbered-copy workspace inventory", () => {
     }
   });
 
+  it("searches every ref for a divergent copy's historical canonical contents", () => {
+    const fixture = createRepository();
+    try {
+      writeFixture(fixture.root, "src/canonical.ts", "main-version\n");
+      commitAll(fixture.root, "add canonical on main");
+      git(fixture.root, ["checkout", "-b", "archived-copy"]);
+      writeFixture(fixture.root, "src/canonical.ts", "archived-version\n");
+      commitAll(fixture.root, "archive matching version");
+      const archivedHead = git(fixture.root, ["rev-parse", "HEAD"]);
+      git(fixture.root, ["checkout", "main"]);
+      writeFixture(fixture.root, "src/canonical 2.ts", "archived-version\n");
+
+      const inspection = invokeSupport<WorkspaceInspection>(
+        "inspectWorkspace",
+        [approvedOptions(fixture, 1)],
+        { availableBytes: 4_096_000_000 },
+      );
+
+      expect(inspection.copies[0].historyMatch).toBe(archivedHead);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("requires available space to be strictly greater than the archive size", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      const requiredBytes =
+        statSync(join(fixture.root, "src/identical 2.ts")).size +
+        statSync(join(fixture.root, "src/divergent 3.ts")).size +
+        apparentFixtureSize(join(fixture.root, "node_modules")) +
+        apparentFixtureSize(join(fixture.root, ".next"));
+
+      expect(() =>
+        invokeSupport("inspectWorkspace", [approvedOptions(fixture, 2)], {
+          availableBytes: requiredBytes,
+        }),
+      ).toThrow();
+      expect(() =>
+        invokeSupport("inspectWorkspace", [approvedOptions(fixture, 2)], {
+          availableBytes: requiredBytes + 1,
+        }),
+      ).not.toThrow();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it("rejects every unapproved workspace or storage precondition", () => {
     const cases: Array<{
       name: string;
@@ -174,14 +223,18 @@ describe("verified workspace quarantine transaction", () => {
         { availableBytes: 4_096_000_000 },
       );
       const manifest = readManifest(result.runDirectory);
+      const manifestDirectory = currentGenerationDirectory(result.runDirectory);
 
       expect(manifest.state).toBe("quarantined");
       expect(statSync(result.runDirectory).mode & 0o777).toBe(0o700);
+      expect(statSync(join(result.runDirectory, "current")).mode & 0o777).toBe(
+        0o600,
+      );
       expect(
-        statSync(join(result.runDirectory, "manifest.json")).mode & 0o777,
+        statSync(join(manifestDirectory, "manifest.json")).mode & 0o777,
       ).toBe(0o600);
       expect(
-        statSync(join(result.runDirectory, "manifest.sha256")).mode & 0o777,
+        statSync(join(manifestDirectory, "manifest.sha256")).mode & 0o777,
       ).toBe(0o600);
       expectManifestChecksum(result.runDirectory);
 
@@ -223,6 +276,114 @@ describe("verified workspace quarantine transaction", () => {
         "divergent-private-body",
       );
       expect(JSON.stringify(manifest)).not.toContain("divergent-private-body");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("ignores an interrupted unpointed manifest generation", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      const quarantined = invokeSupport<QuarantineResult>(
+        "quarantineWorkspace",
+        [approvedOptions(fixture, 2)],
+        { availableBytes: 4_096_000_000 },
+      );
+      expect(
+        readFileSync(join(quarantined.runDirectory, "current"), "utf8"),
+      ).toMatch(/^gen-[0-9]{6}\n$/u);
+      const interruptedGeneration = join(
+        quarantined.runDirectory,
+        "manifest-generations/gen-000000",
+      );
+      mkdirSync(interruptedGeneration, { recursive: true });
+      writeFileSync(join(interruptedGeneration, "manifest.json"), "{}\n");
+      writeFileSync(
+        join(interruptedGeneration, "manifest.sha256"),
+        `${"0".repeat(64)}  manifest.json\n`,
+      );
+
+      writeFixture(fixture.root, "node_modules/package.json", "{}\n");
+      writeFixture(fixture.root, ".next/build.txt", "fresh\n");
+      const validated = invokeSupport<QuarantineManifest>(
+        "markQuarantineValidated",
+        [
+          {
+            repositoryRoot: fixture.root,
+            runDirectory: quarantined.runDirectory,
+            now: "2026-07-15T08:30:00.000Z",
+          },
+        ],
+      );
+
+      expect(validated.state).toBe("validated");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("removes nothing when a live source changes after archive verification", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      expect(() =>
+        invokeSupport("quarantineWorkspace", [approvedOptions(fixture, 2)], {
+          availableBytes: 4_096_000_000,
+          mutateBeforeRemoval: {
+            path: "src/identical 2.ts",
+            contents: "newer-live-bytes\n",
+          },
+        }),
+      ).toThrow();
+
+      const runDirectory = onlyRunDirectory(fixture.quarantineRoot);
+      expect(readManifest(runDirectory).state).toBe("incomplete");
+      expect(
+        readFileSync(join(fixture.root, "src/identical 2.ts"), "utf8"),
+      ).toBe("newer-live-bytes\n");
+      for (const relativePath of [
+        "src/divergent 3.ts",
+        "node_modules/package.json",
+        ".next/build.txt",
+      ]) {
+        expect(existsSync(join(fixture.root, relativePath))).toBe(true);
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("restores every removed original when a later removal fails", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      expect(() =>
+        invokeSupport("quarantineWorkspace", [approvedOptions(fixture, 2)], {
+          availableBytes: 4_096_000_000,
+          failBeforeRemoval: ".next",
+          onlyFailIfMissing: "node_modules",
+        }),
+      ).toThrow();
+
+      const runDirectory = onlyRunDirectory(fixture.quarantineRoot);
+      expect(readManifest(runDirectory).state).toBe("incomplete");
+      expect(
+        readFileSync(join(fixture.root, "src/identical 2.ts"), "utf8"),
+      ).toBe("same\n");
+      expect(
+        statSync(join(fixture.root, "src/identical 2.ts")).mode & 0o777,
+      ).toBe(0o640);
+      expect(
+        readFileSync(join(fixture.root, "src/divergent 3.ts"), "utf8"),
+      ).toBe("divergent-private-body\n");
+      expect(
+        readFileSync(join(fixture.root, "node_modules/package.json"), "utf8"),
+      ).toBe("old\n");
+      expect(readlinkSync(join(fixture.root, "node_modules/.bin/tool"))).toBe(
+        "../tool.js",
+      );
+      expect(readFileSync(join(fixture.root, ".next/build.txt"), "utf8")).toBe(
+        "old-build\n",
+      );
+      expectManifestChecksum(runDirectory);
     } finally {
       fixture.cleanup();
     }
@@ -349,7 +510,13 @@ describe("verified workspace quarantine transaction", () => {
         { availableBytes: 4_096_000_000 },
       );
       writeFixture(fixture.root, "node_modules/new-package.json", "fresh\n");
-      writeFileSync(join(quarantined.runDirectory, "manifest.json"), "{}\n");
+      writeFileSync(
+        join(
+          currentGenerationDirectory(quarantined.runDirectory),
+          "manifest.json",
+        ),
+        "{}\n",
+      );
 
       expect(() =>
         invokeSupport("restoreQuarantine", [
@@ -437,6 +604,7 @@ type WorkspaceInspection = Readonly<{
     originalPath: string;
     canonicalPath: string;
     classification: "identical" | "divergent";
+    historyMatch: string | null;
   }>;
 }>;
 
@@ -463,11 +631,14 @@ function invokeSupport<T>(
   seams: Readonly<{
     availableBytes?: number;
     corruptAfterCopy?: string;
+    failBeforeRemoval?: string;
+    mutateBeforeRemoval?: Readonly<{ path: string; contents: string }>;
+    onlyFailIfMissing?: string;
   }> = {},
 ): T {
   const source = `
 import * as support from ${JSON.stringify(supportModule)};
-import { writeFile } from "node:fs/promises";
+import { lstat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
@@ -483,6 +654,28 @@ try {
           join(runDirectory, request.seams.corruptAfterCopy),
           "corrupted-after-copy",
         );
+      },
+    }),
+    ...(request.seams.mutateBeforeRemoval === undefined ? {} : {
+      beforeDeletionPreflight: async ({ repositoryRoot }) => {
+        await writeFile(
+          join(repositoryRoot, request.seams.mutateBeforeRemoval.path),
+          request.seams.mutateBeforeRemoval.contents,
+        );
+      },
+    }),
+    ...(request.seams.failBeforeRemoval === undefined ? {} : {
+      beforeOriginalRemoval: async ({ relativePath, repositoryRoot }) => {
+        if (relativePath !== request.seams.failBeforeRemoval) return;
+        if (request.seams.onlyFailIfMissing !== undefined) {
+          try {
+            await lstat(join(repositoryRoot, request.seams.onlyFailIfMissing));
+            return;
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+          }
+        }
+        throw new Error("Injected original-removal failure");
       },
     }),
   };
@@ -550,24 +743,46 @@ function onlyRunDirectory(quarantineRoot: string): string {
 
 function readManifest(runDirectory: string): QuarantineManifest {
   return JSON.parse(
-    readFileSync(join(runDirectory, "manifest.json"), "utf8"),
+    readFileSync(
+      join(currentGenerationDirectory(runDirectory), "manifest.json"),
+      "utf8",
+    ),
   ) as QuarantineManifest;
 }
 
 function expectManifestChecksum(runDirectory: string) {
-  const contents = readFileSync(join(runDirectory, "manifest.json"));
+  const generationDirectory = currentGenerationDirectory(runDirectory);
+  const contents = readFileSync(join(generationDirectory, "manifest.json"));
   const expected = createHash("sha256").update(contents).digest("hex");
   const checksum = readFileSync(
-    join(runDirectory, "manifest.sha256"),
+    join(generationDirectory, "manifest.sha256"),
     "utf8",
   ).trim();
   expect(checksum).toBe(`${expected}  manifest.json`);
+}
+
+function currentGenerationDirectory(runDirectory: string): string {
+  const generation = readFileSync(join(runDirectory, "current"), "utf8").trim();
+  expect(generation).toMatch(/^gen-[0-9]{6}$/u);
+  return join(runDirectory, "manifest-generations", generation);
 }
 
 function writeFixture(root: string, relativePath: string, contents: string) {
   const path = join(root, relativePath);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, contents);
+}
+
+function apparentFixtureSize(path: string): number {
+  const stats = lstatSync(path);
+  if (!stats.isDirectory()) return stats.size;
+  return (
+    stats.size +
+    readdirSync(path).reduce(
+      (total, name) => total + apparentFixtureSize(join(path, name)),
+      0,
+    )
+  );
 }
 
 function commitAll(root: string, message: string) {
