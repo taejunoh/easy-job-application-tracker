@@ -763,8 +763,9 @@ Minor 0; every finding returns to that slice's RED/GREEN cycle.
 - Preserve every current Task 1F export and filesystem-binding rule.
 - Add no export to the run-capability, inventory, or journal modules.
 - `restore-active` accepts only `generated-next` and
-  `generated-node-modules`, producing
-  `inventories/restore-active/<generated-entry-id>.jsonl`.
+  `generated-node-modules`; it produces
+  `inventories/restore-active/<generated-entry-id>.jsonl` only when that active
+  root exists and produces no JSONL for an absent root.
 - Add `validation-pass-1` and `validation-pass-2` for those same IDs.
 - Add run purpose `{ purpose: "rollback-entry", id: restoreId,
   phase: generatedEntryId }`, deriving only `.next` or `node_modules` under
@@ -778,7 +779,9 @@ Minor 0; every finding returns to that slice's RED/GREEN cycle.
   non-empty and equals the sorted unresolved IDs.
 - Change `RESTORE_PREPARED` from `{}` to the design's exact
   `{ restoreId, activeGenerated }` payload, with fixed generated IDs and each
-  durable pre-restore inventory summary or explicit null absence.
+  durable pre-restore inventory summary or exact null absence. Both IDs are
+  always present in fixed bytewise-sorted order; null is the first durable
+  absence record.
 
 - [ ] **Step 0.1: Write the primitive RED tests**
 
@@ -811,7 +814,14 @@ first entry intent: empty recovery IDs may resume, roll back, or abort without
 inventing an entry event. The same empty array after one durable intent is fatal.
 Require `RESTORE_PREPARED` to reject swapped IDs, sparse/custom arrays, unknown
 keys, a non-null summary without its matching durable restore-active inventory,
-and any digest/count/byte mismatch.
+null for a present root, non-null for an absent root, and any
+digest/count/byte mismatch. For each absent generated root, assert no
+`restore-active` JSONL exists, require a fresh independent absence check
+immediately before `RESTORE_PREPARED`, and fail without appending if the root is
+recreated at that seam. Likewise, remove a previously inventoried root before
+the event and require non-null/absence mismatch failure without append. For
+every presence combination, require the dense two-record array in fixed
+bytewise-sorted ID order.
 
 - [ ] **Step 0.2: Verify RED**
 
@@ -1154,13 +1164,17 @@ export async function recoverRestore({
 - [ ] **Step 5.1: Write restore and actual-SIGKILL RED matrices**
 
 Derive one deterministic version-4-shaped restore ID from the transaction ID.
-Publish and `fsync` both fixed generated `restore-active` inventories first,
-capture their two summaries or durable absences, and only then append
-`RESTORE_PREPARED` referencing them and enter `RESTORING`. For each generated
-entry, append one `RESTORE_INTENT`, rename active to its fixed rollback-entry,
-sync the tree and both parents, rename original payload to active, sync the
-restored payload and both parents, then append `RESTORED_ENTRY`. Source copies
-use one payload-to-source move.
+For each existing generated root, write and `fsync` its fixed `restore-active`
+inventory; for an absent root, write no inventory JSONL and independently
+recheck absence immediately before the event. Then append `RESTORE_PREPARED`
+with both fixed IDs in bytewise-sorted order and each exact summary or null, and
+enter `RESTORING`. For each generated entry, append one `RESTORE_INTENT`, rename
+active to its fixed rollback-entry, sync the tree and both parents, rename
+original payload to active, sync the restored payload and both parents, then
+append `RESTORED_ENTRY`. Source copies use one payload-to-source move.
+Assert `after-inventory:restore-active:${generatedEntryId}` occurs exactly once
+for each present root and never for an absent root; the absent case first
+becomes durable only in the following `RESTORE_PREPARED` null.
 
 Kill after every append, active rename, tree/payload sync, parent sync, and
 original rename. Include separate hooks after original `A -> P` rename, payload
@@ -1324,11 +1338,18 @@ closed `ERR_CONFLICT` stderr record and exit 3; it must not label a conflict
 `ok: true` or print the conflict IDs.
 
 For every error class assert exactly
-`{ ok: false, command: string|null, code, message }` on stderr, empty stdout
-unless apply already flushed STARTING, and the design's exit code mapping:
-usage/preflight 2, recovery/conflict/integrity/EXDEV 3, indeterminate append 4,
-and sanitized internal failure 1. No record may contain a stack, file body,
-diff, credential, URL, authorization value, or production response.
+`{ ok: false, command: ErrorCommand, code, message }` on stderr, where
+`ErrorCommand` is exactly
+`"inspect"|"apply"|"recover"|"mark-validated"|"restore"|null`. Assert empty
+stdout unless apply already flushed STARTING, and the design's exit code
+mapping: usage/preflight 2, recovery/conflict/integrity/EXDEV 3, indeterminate
+append 4, and sanitized internal failure 1. Missing, unknown, malformed, or
+otherwise invalid command tokens must always serialize as null and must never
+be echoed. A recognized command with invalid arguments may retain only its
+canonical value. Parameterize arbitrary path-, URL-, credential-, Unicode-, and
+flag-shaped unknown tokens and assert their raw bytes are absent from stdout and
+stderr. No record may contain a stack, file body, diff, credential, URL,
+authorization value, or production response.
 
 - [ ] **Step 6.3: Implement facade, CLI, package script, and verify**
 

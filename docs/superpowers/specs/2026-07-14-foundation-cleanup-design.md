@@ -476,7 +476,7 @@ plain canonical JSON is never an accepted journal payload.
 `RESTORE_PREPARED` accepts exactly
 `{ restoreId, activeGenerated }`. `restoreId` is the deterministic validated
 restore ID derived from the transaction. `activeGenerated` is a dense array of
-exactly these two records in this order:
+exactly these two records in this bytewise-sorted order:
 
 ```text
 { id: "generated-next", inventory: InventorySummary|null }
@@ -484,16 +484,21 @@ exactly these two records in this order:
 ```
 
 A non-null summary names the already durable matching `restore-active`
-inventory; null proves that the corresponding active root was absent during
-the attested restore preflight. Unknown fields, another order/ID, an absent
-inventory for a non-null summary, or an inventory mismatch fails before
+inventory for an existing active root. For an absent active root, no inventory
+JSONL is created: its absence is independently attested immediately before
+`RESTORE_PREPARED`, and the event's exact null is the first durable
+representation of that absence. Both fixed IDs remain present in the dense
+array in the bytewise-sorted order above regardless of presence. Unknown fields,
+another order/ID, null for a present root, non-null for an absent root, an
+absent inventory for a non-null summary, or an inventory mismatch fails before
 `RESTORE_PREPARED` is appended.
 
-Restore preparation publishes and `fsync`s both fixed generated
-`restore-active` inventories first, using an explicit durable absence result
-for an absent root. It captures those two immutable summaries in the fixed
-order above and only then appends `RESTORE_PREPARED` referencing them. No
-inventory may be created or replaced after that event to satisfy its payload.
+Restore preparation writes and `fsync`s `restore-active` inventory JSONL only
+for generated roots that exist, captures those immutable summaries, then
+performs a fresh independent absence check for every null entry immediately
+before appending `RESTORE_PREPARED`. It appends the event only after assembling
+the complete fixed two-record `activeGenerated` array. No inventory may be
+created or replaced after that event to satisfy its payload.
 
 The durable lifecycle is:
 
@@ -650,13 +655,17 @@ locations and state transitions required to compose those primitives into a
 recoverable transaction.
 
 The `restore-active` inventory phase accepts exactly
-`generated-next` or `generated-node-modules` as its ID and writes respectively
-to:
+`generated-next` or `generated-node-modules` as its ID and, only for an existing
+active root, writes respectively to:
 
 ```text
 inventories/restore-active/generated-next.jsonl
 inventories/restore-active/generated-node-modules.jsonl
 ```
+
+An absent active root does not invoke this writer and has no corresponding
+JSONL. Its independently rechecked absence is first made durable as the exact
+null for its fixed ID in `RESTORE_PREPARED.activeGenerated`.
 
 The two validation phases accept the same two generated IDs and write to:
 
@@ -916,7 +925,20 @@ restore:
 
 The CLI supplies current canonical UTC strings for `createdAt` and
 `validatedAt`. A failure writes exactly
-`{ ok: false, command: string|null, code, message }` to stderr and nothing else.
+`{ ok: false, command: ErrorCommand, code, message }` to stderr and nothing
+else, where:
+
+```text
+ErrorCommand = "inspect" | "apply" | "recover" | "mark-validated" |
+               "restore" | null
+```
+
+The field is a known canonical command only after the parser recognizes that
+exact command token. A missing, unknown, or malformed/invalid command token
+always produces `command: null`; the CLI never copies an untrusted raw token
+into JSON. Argument errors after a recognized command may retain that known
+canonical value.
+
 `ERR_USAGE` and `ERR_PREFLIGHT` exit 2;
 `ERR_RECOVERY_REQUIRED`, `ERR_CONFLICT`, `ERR_INTEGRITY`, and `ERR_EXDEV` exit 3;
 `ERR_INDETERMINATE_JOURNAL_APPEND` exits 4; an unexpected sanitized
@@ -946,19 +968,21 @@ ends at `ROLLED_BACK` or `INCOMPLETE_CONFLICT`.
 The restore ID is deterministically derived from the transaction ID as a
 version-4-shaped UUID, so every retry selects the same validated rollback
 paths without persisting a free-form destination. For a generated entry,
-restore publishes and `fsync`s both generated `restore-active` inventories,
-captures their summaries in one durable `RESTORE_PREPARED`, enters
-`RESTORING`, records one `RESTORE_INTENT`, moves that tree to its
-`rollback-entry`, then moves the quarantined original payload to the active
-path. Both moves use payload/tree sync, destination-parent sync, and
-source-parent sync in that order.
+restore writes and `fsync`s `restore-active` inventory only for each existing
+generated root, independently rechecks every absent root immediately before the
+event, and captures both fixed IDs as summary-or-null records in one durable
+`RESTORE_PREPARED`. It then enters `RESTORING`, records one `RESTORE_INTENT`,
+moves that tree to its `rollback-entry`, and moves the quarantined original
+payload to the active path. Both moves use payload/tree sync,
+destination-parent sync, and source-parent sync in that order.
 
 Generated restore recovery treats active (`A`), rollback-entry (`R`), and
 quarantined payload (`P`) as three independent locations. `O` is the canonical
 original summary from the manifest; `G` is the canonical regenerated summary
-and presence bit recorded by `restore-active` before the first intent. A dash is
-absence. After a durable `RESTORE_INTENT`, the exhaustive practical matching
-matrix is:
+when present. The presence bit and summary-or-null are persisted by
+`RESTORE_PREPARED.activeGenerated` before the first intent; every non-null
+summary is backed by its durable `restore-active` inventory. A dash is absence.
+After a durable `RESTORE_INTENT`, the exhaustive practical matching matrix is:
 
 | A | R | P | Resume | Rollback |
 |---|---|---|---|---|
@@ -968,12 +992,12 @@ matrix is:
 | `-` | `-` | `O` | restore `P` to `A` when the active tree was originally absent | no move; abort restore |
 | `O` | `-` | `-` | record complete when the active tree was originally absent | move `A` to `P`; abort restore |
 
-The last two rows are legal only when the persisted restore-active presence bit
-was false. `O` and `G` are persisted roles, not labels inferred by counting
+The last two rows are legal only when the persisted `activeGenerated` presence
+bit was false. `O` and `G` are persisted roles, not labels inferred by counting
 matching summary bytes. When `O == G`, the durable ledger phase, persisted
-restore-active presence bit, authorized path, and observed inode/location assign
-the role; all five rows above remain legal even when the two summaries are
-byte-equal. Two authorized locations in one listed row are not a duplicate
+`activeGenerated` presence bit, authorized path, and observed inode/location
+assign the role; all five rows above remain legal even when the two summaries
+are byte-equal. Two authorized locations in one listed row are not a duplicate
 conflict merely because their content digests match.
 
 If `O` exists nowhere, or a previously present `G` required for rollback exists
@@ -1069,9 +1093,11 @@ deletion removes them as well.
 - Source rollback atomically moves quarantined files to their exact validated
   original relative paths and modes in reverse journal order. It never merges
   them into canonical files and never overwrites a concurrently recreated path.
-- Generated restore first publishes and `fsync`s the active regenerated
-  `.next` and `node_modules` inventories separately, captures both summaries or
-  explicit absences, then appends `RESTORE_PREPARED` referencing them. It
+- Generated restore first writes and `fsync`s separate inventories for each
+  existing active regenerated `.next` and `node_modules` root. It creates no
+  JSONL for an absent root, independently rechecks each absence immediately
+  before the event, then appends `RESTORE_PREPARED` with both fixed IDs and each
+  exact summary or null. It
   atomically moves each tree into its derived child under
   `rollback/regenerated-before-restore/<restore-id>/`. It fsyncs and records
   each move before atomically moving the corresponding quarantined original
@@ -1091,6 +1117,8 @@ deletion removes them as well.
 
 - Never print file bodies, credentials, database URLs, authorization headers,
   or production response bodies.
+- Never echo an unknown or invalid CLI command token. Error JSON exposes only
+  one of the five canonical command values or null.
 - Use NUL-safe path enumeration and argument arrays; do not evaluate filenames
   as shell code.
 - Treat manifests, inventories, journal frames, current pointers, and restore
@@ -1205,9 +1233,11 @@ the assertions:
    sequence/hash/event/state, unknown key, non-allowlisted pair, changed tip,
    missing or foreign owned evidence, or torn tail preserves all artifacts. The
    three terminal outcomes use cleanup-only and reject settlement variants.
-10. **Restore and reverse restore:** publish and sync both active generated
-    inventory results before `RESTORE_PREPARED`, then interrupt after every
-    intent, active-tree move, original-tree move, and durability sync. Prove
+10. **Restore and reverse restore:** write and sync inventory JSONL for each
+    existing active generated root, write none for absence, independently
+    recheck each absence immediately before the fixed two-ID
+    `RESTORE_PREPARED`, then interrupt after every intent, active-tree move,
+    original-tree move, and durability sync. Prove
     resume reaches `RESTORED` and rollback returns
     to the exact prior `QUARANTINED` or `VALIDATED` state. Concurrent or mutated
     evidence remains in place and yields `INCOMPLETE_CONFLICT`; a completed
@@ -1223,6 +1253,10 @@ the assertions:
     content, and no automatic deletion path. An already-`VALIDATED` retry uses
     the journal-named immutable generation and returns its stored timestamps;
     a different supplied timestamp never creates a second digest.
+12. **Closed CLI errors:** exercise each of the five canonical command values,
+    plus missing, unknown, and malformed command tokens. Only a recognized
+    canonical command may appear in error JSON; every other token produces null
+    and its raw bytes are absent from stdout and stderr.
 
 ## Success criteria
 
