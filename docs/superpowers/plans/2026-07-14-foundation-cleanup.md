@@ -813,15 +813,13 @@ Also test PREPARED/MOVING and RESTORE_PREPARED/RESTORING crashes before the
 first entry intent: empty recovery IDs may resume, roll back, or abort without
 inventing an entry event. The same empty array after one durable intent is fatal.
 Require `RESTORE_PREPARED` to reject swapped IDs, sparse/custom arrays, unknown
-keys, a non-null summary without its matching durable restore-active inventory,
-null for a present root, non-null for an absent root, and any
-digest/count/byte mismatch. For each absent generated root, assert no
-`restore-active` JSONL exists, require a fresh independent absence check
-immediately before `RESTORE_PREPARED`, and fail without appending if the root is
-recreated at that seam. Likewise, remove a previously inventoried root before
-the event and require non-null/absence mismatch failure without append. For
-every presence combination, require the dense two-record array in fixed
-bytewise-sorted ID order.
+keys, a value other than exact null or a closed `InventorySummary`, a non-null
+summary without its matching already-durable restore-active inventory, and any
+digest/count/byte mismatch. Require the dense two-record array in fixed
+bytewise-sorted ID order and accept exact null without an inventory backing
+record. These primitive journal tests do not inspect the live repository active
+root, infer whether null is truthful, or own recreation/removal seam tests;
+Slice 5 restore/runtime tests own those checks.
 
 - [ ] **Step 0.2: Verify RED**
 
@@ -1175,6 +1173,16 @@ append `RESTORED_ENTRY`. Source copies use one payload-to-source move.
 Assert `after-inventory:restore-active:${generatedEntryId}` occurs exactly once
 for each present root and never for an absent root; the absent case first
 becomes durable only in the following `RESTORE_PREPARED` null.
+Parameterize all four current-repository presence combinations for `.next` and
+`node_modules`. For every present root, require a durable inventory and the
+exact matching non-null payload summary. For every absent root, require no
+inventory JSONL and exact null. Immediately before `RESTORE_PREPARED`, perform
+an independent live `repoRoot` presence check for both fixed IDs and require it
+to match the assembled null/non-null payload. Recreate an absent root and remove
+a previously inventoried root at that seam in separate cases; both must fail
+without appending `RESTORE_PREPARED` or entering `RESTORING`. These
+presence-consistency and TOCTOU cases belong to the restore/runtime suites, not
+the Slice 0 journal suite.
 
 Kill after every append, active rename, tree/payload sync, parent sync, and
 original rename. Include separate hooks after original `A -> P` rename, payload
