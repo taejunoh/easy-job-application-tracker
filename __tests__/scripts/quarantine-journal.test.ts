@@ -788,6 +788,8 @@ const result = await withQuarantineRunCapability({
     const journalPath = deriveRunPath(capability, { purpose: "journal" });
     const before = await fsPromises.readFile(journalPath);
     let getterReads = 0;
+    let ownKeysReads = 0;
+    let elementReads = 0;
     let values;
     if (request.shape === "sparse") {
       values = new Array(1);
@@ -819,6 +821,35 @@ const result = await withQuarantineRunCapability({
       const prototype = Object.create(Array.prototype);
       prototype[0] = "copy-0001";
       Object.setPrototypeOf(values, prototype);
+    } else if (
+      request.shape === "huge-sparse" ||
+      request.shape === "dense-over-cap" ||
+      request.shape === "boundary"
+    ) {
+      const length = request.shape === "huge-sparse"
+        ? 100_000_000
+        : request.shape === "dense-over-cap"
+          ? 4097
+          : 4096;
+      const target = request.shape === "huge-sparse"
+        ? new Array(length)
+        : Array.from({ length }, (_, index) =>
+          "copy-" + String(index + 1).padStart(4, "0"));
+      values = new Proxy(target, {
+        ownKeys(inner) {
+          ownKeysReads += 1;
+          if (request.shape !== "boundary") {
+            throw new Error("ownKeys reached before journal entry-ID cap");
+          }
+          return Reflect.ownKeys(inner);
+        },
+        get(inner, property, receiver) {
+          if (typeof property === "string" && /^[0-9]+$/u.test(property)) {
+            elementReads += 1;
+          }
+          return Reflect.get(inner, property, receiver);
+        },
+      });
     } else {
       throw new Error("unknown adversarial array shape");
     }
@@ -830,6 +861,8 @@ const result = await withQuarantineRunCapability({
     return {
       outcome,
       getterReads,
+      ownKeysReads,
+      elementReads,
       bytesUnchanged: before.equals(await fsPromises.readFile(journalPath)),
     };
   }
@@ -1963,6 +1996,51 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.outcome.ok).toBe(false);
     expect(result.bytesUnchanged).toBe(true);
     if (shape === "accessor") expect(result.getterReads).toBe(0);
+  });
+
+  it.each([
+    ["RECOVERY_REQUIRED", [records.prepared, records.moving, records.moveIntent]],
+    ["INCOMPLETE_CONFLICT", [records.prepared, records.moving]],
+  ])("rejects huge sparse %s IDs before ownKeys or element access", (event, prefix) => {
+    const result = invoke(join(fixture, `huge-entry-ids-${event}`), {
+      operation: "adversarial-id-array",
+      shape: "huge-sparse",
+      event,
+      prefix,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.ownKeysReads).toBe(0);
+    expect(result.elementReads).toBe(0);
+    expect(result.bytesUnchanged).toBe(true);
+  });
+
+  it.each([
+    ["RECOVERY_REQUIRED", [records.prepared, records.moving, records.moveIntent]],
+    ["INCOMPLETE_CONFLICT", [records.prepared, records.moving]],
+  ])("rejects 4097 dense %s IDs before ownKeys or element access", (event, prefix) => {
+    const result = invoke(join(fixture, `over-cap-entry-ids-${event}`), {
+      operation: "adversarial-id-array",
+      shape: "dense-over-cap",
+      event,
+      prefix,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.ownKeysReads).toBe(0);
+    expect(result.elementReads).toBe(0);
+    expect(result.bytesUnchanged).toBe(true);
+  });
+
+  it("accepts the exact 4096-ID boundary and reads ownKeys once", () => {
+    const result = invoke(join(fixture, "entry-ids-boundary"), {
+      operation: "adversarial-id-array",
+      shape: "boundary",
+      event: "INCOMPLETE_CONFLICT",
+      prefix: [records.prepared, records.moving],
+    });
+    expect(result.outcome.ok).toBe(true);
+    expect(result.ownKeysReads).toBe(1);
+    expect(result.elementReads).toBe(0);
+    expect(result.bytesUnchanged).toBe(false);
   });
 
   it.each([

@@ -41,6 +41,7 @@ const RESTORE_ID =
   /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 const GENERATED_IDS = Object.freeze(["generated-next", "generated-node-modules"]);
 const MAX_INVENTORY_LINE_BYTES = 1024 * 1024;
+const MAX_JOURNAL_ENTRY_IDS = 4096;
 
 export class IndeterminateJournalAppendError extends Error {
   constructor({ cause, expectedSequence, expectedRecordHash }) {
@@ -286,28 +287,34 @@ function snapshotDenseArray(value, label, expectedLength) {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     throw new TypeError(`${label} must be an exact Array`);
   }
-  const keys = Reflect.ownKeys(value);
   const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
   if (
     lengthDescriptor === undefined ||
     !Object.hasOwn(lengthDescriptor, "value") ||
     lengthDescriptor.enumerable ||
     !Number.isSafeInteger(lengthDescriptor.value) ||
-    lengthDescriptor.value < 0 ||
-    (expectedLength !== undefined && lengthDescriptor.value !== expectedLength)
+    lengthDescriptor.value < 0
   ) {
     throw new TypeError(`${label} length descriptor is invalid`);
   }
   const length = lengthDescriptor.value;
-  const expectedKeys = [
-    ...Array.from({ length }, (_, index) => String(index)),
-    "length",
-  ];
-  if (
-    keys.length !== expectedKeys.length ||
-    keys.some((key, index) => key !== expectedKeys[index])
-  ) {
+  if (length > MAX_JOURNAL_ENTRY_IDS) {
+    throw new TypeError(`${label} exceeds the ${MAX_JOURNAL_ENTRY_IDS} entry-ID limit`);
+  }
+  if (expectedLength !== undefined && length !== expectedLength) {
+    throw new TypeError(`${label} length descriptor is invalid`);
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== length + 1) {
     throw new TypeError(`${label} must be dense and have no custom keys`);
+  }
+  for (let index = 0; index < length; index += 1) {
+    if (keys[index] !== String(index)) {
+      throw new TypeError(`${label} must be dense and have no custom keys`);
+    }
+  }
+  if (keys[length] !== "length") {
+    throw new TypeError(`${label} must have one non-enumerable length property`);
   }
   const snapshot = [];
   for (let index = 0; index < length; index += 1) {
