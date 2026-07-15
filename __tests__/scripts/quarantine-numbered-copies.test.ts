@@ -265,6 +265,7 @@ describe("verified workspace quarantine transaction", () => {
         ".next",
         "node_modules",
       ]);
+      expect(findDeletionStagingPaths(fixture.root)).toEqual([]);
 
       const divergent = manifest.copies.find(
         (copy) => copy.classification === "divergent",
@@ -417,6 +418,68 @@ describe("verified workspace quarantine transaction", () => {
       expect(readFileSync(join(fixture.root, ".next/build.txt"), "utf8")).toBe(
         "old-build\n",
       );
+      expectManifestChecksum(runDirectory);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("preserves concurrent originals and records residue after staged tree deletion fails", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      expect(() =>
+        invokeSupport("quarantineWorkspace", [approvedOptions(fixture, 2)], {
+          availableBytes: 4_096_000_000,
+          failStagedRemovalFor: "node_modules",
+        }),
+      ).toThrow();
+
+      const runDirectory = onlyRunDirectory(fixture.quarantineRoot);
+      const manifest = readManifest(runDirectory);
+      expect(manifest.state).toBe("incomplete");
+      expect(manifest.deletionStagingResidues).toHaveLength(1);
+      const residuePath = join(
+        fixture.root,
+        manifest.deletionStagingResidues![0],
+      );
+      expect(existsSync(residuePath)).toBe(true);
+      expect(
+        readFileSync(
+          join(residuePath, "node_modules/concurrent-residue.txt"),
+          "utf8",
+        ),
+      ).toBe("staging-residue\n");
+
+      expect(
+        readFileSync(join(fixture.root, "node_modules/concurrent.txt"), "utf8"),
+      ).toBe("newer-concurrent-tree\n");
+      expect(existsSync(join(fixture.root, "node_modules/package.json"))).toBe(
+        false,
+      );
+      expect(
+        readFileSync(
+          join(runDirectory, "generated/node_modules/package.json"),
+          "utf8",
+        ),
+      ).toBe("old\n");
+      expect(
+        readlinkSync(join(runDirectory, "generated/node_modules/.bin/tool")),
+      ).toBe("../tool.js");
+
+      expect(
+        readFileSync(join(fixture.root, "src/identical 2.ts"), "utf8"),
+      ).toBe("same\n");
+      expect(
+        statSync(join(fixture.root, "src/identical 2.ts")).mode & 0o777,
+      ).toBe(0o640);
+      expect(
+        readFileSync(join(fixture.root, "src/divergent 3.ts"), "utf8"),
+      ).toBe("divergent-private-body\n");
+      expect(readFileSync(join(fixture.root, ".next/build.txt"), "utf8")).toBe(
+        "old-build\n",
+      );
+      expect(JSON.stringify(manifest)).not.toContain("newer-concurrent-tree");
+      expect(JSON.stringify(manifest)).not.toContain("staging-residue");
       expectManifestChecksum(runDirectory);
     } finally {
       fixture.cleanup();
@@ -647,6 +710,7 @@ type QuarantineResult = Readonly<{
 }>;
 
 type QuarantineManifest = Readonly<{
+  deletionStagingResidues?: ReadonlyArray<string>;
   state: string;
   validationAt: string | null;
   retentionDays?: number;
@@ -666,6 +730,7 @@ function invokeSupport<T>(
     availableBytes?: number;
     corruptAfterCopy?: string;
     failBeforeRemoval?: string;
+    failStagedRemovalFor?: string;
     mutateBeforeRemoval?: Readonly<{ path: string; contents: string }>;
     mutateBeforeRecheck?: Readonly<{ path: string; contents: string }>;
     onlyFailIfMissing?: string;
@@ -673,7 +738,7 @@ function invokeSupport<T>(
 ): T {
   const source = `
 import * as support from ${JSON.stringify(supportModule)};
-import { lstat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
@@ -720,6 +785,28 @@ try {
           join(repositoryRoot, request.seams.mutateBeforeRecheck.path),
           request.seams.mutateBeforeRecheck.contents,
         );
+      },
+    }),
+    ...(request.seams.failStagedRemovalFor === undefined ? {} : {
+      afterOriginalStaged: async ({ relativePath, repositoryRoot }) => {
+        if (relativePath !== request.seams.failStagedRemovalFor) return;
+        const recreatedOriginal = join(repositoryRoot, relativePath);
+        await mkdir(recreatedOriginal, { recursive: true });
+        await writeFile(
+          join(recreatedOriginal, "concurrent.txt"),
+          "newer-concurrent-tree\\n",
+        );
+      },
+      beforeStagingDirectoryRemoval: async ({
+        relativePath,
+        path,
+        stagingPath,
+      }) => {
+        if (
+          relativePath !== request.seams.failStagedRemovalFor ||
+          path !== stagingPath
+        ) return;
+        await writeFile(join(path, "concurrent-residue.txt"), "staging-residue\\n");
       },
     }),
   };
@@ -827,6 +914,21 @@ function apparentFixtureSize(path: string): number {
       0,
     )
   );
+}
+
+function findDeletionStagingPaths(path: string): string[] {
+  const matches: string[] = [];
+  for (const name of readdirSync(path)) {
+    const child = join(path, name);
+    if (name.startsWith(".quarantine-delete-")) {
+      matches.push(child);
+      continue;
+    }
+    if (lstatSync(child).isDirectory()) {
+      matches.push(...findDeletionStagingPaths(child));
+    }
+  }
+  return matches.sort();
 }
 
 function commitAll(root: string, message: string) {

@@ -5,6 +5,7 @@ import {
   copyFile,
   lstat,
   mkdir,
+  mkdtemp,
   open,
   readFile,
   readlink,
@@ -157,6 +158,7 @@ export async function quarantineWorkspace(options, dependencies = {}) {
   let manifest = {
     ...inspection,
     state: "copying",
+    deletionStagingResidues: [],
     generatedTrees: [],
     copies: inspection.copies.map((copy) => ({ ...copy, diffPath: null })),
   };
@@ -265,6 +267,9 @@ export async function quarantineWorkspace(options, dependencies = {}) {
       ...manifest,
       state: "incomplete",
       failure: "Quarantine transaction did not complete",
+      deletionStagingResidues: Array.isArray(error?.deletionStagingResidues)
+        ? error.deletionStagingResidues
+        : manifest.deletionStagingResidues,
     };
     await writeManifest(runDirectory, manifest);
     throw error;
@@ -535,6 +540,7 @@ async function removeOriginalsTransactionally(
   }
 
   const removed = [];
+  const stagingContainers = [];
   try {
     for (const entry of entries) {
       await dependencies.beforeOriginalRemoval?.({
@@ -543,18 +549,34 @@ async function removeOriginalsTransactionally(
       });
       await requireOriginalMatch(repositoryRoot, entry);
       const originalPath = join(repositoryRoot, entry.relativePath);
+      const stagingContainer = await mkdtemp(
+        join(dirname(originalPath), ".quarantine-delete-"),
+      );
+      await chmod(stagingContainer, 0o700);
+      stagingContainers.push(stagingContainer);
+      const stagingPath = join(stagingContainer, basename(originalPath));
       try {
-        await removePath(originalPath);
-        removed.push(entry);
+        await rename(originalPath, stagingPath);
       } catch (error) {
-        if ((await pathMetadata(originalPath)).type === "missing") {
-          removed.push(entry);
+        try {
+          await rmdir(stagingContainer);
+        } catch {
+          // The residue is recorded by the transaction catch below.
         }
         throw error;
       }
+      const removedEntry = { entry, stagingContainer, stagingPath };
+      removed.push(removedEntry);
+      await dependencies.afterOriginalStaged?.({
+        relativePath: entry.relativePath,
+        repositoryRoot,
+        stagingPath,
+      });
+      await removeStagedPath(stagingPath, removedEntry, dependencies);
+      await rmdir(stagingContainer);
     }
   } catch (error) {
-    for (const entry of removed.reverse()) {
+    for (const { entry } of removed.reverse()) {
       const originalPath = join(repositoryRoot, entry.relativePath);
       if ((await pathMetadata(originalPath)).type !== "missing") continue;
       if (entry.type === "file") {
@@ -568,8 +590,39 @@ async function removeOriginalsTransactionally(
       }
       await requireOriginalMatch(repositoryRoot, entry);
     }
-    throw error;
+    const deletionStagingResidues = [];
+    for (const path of stagingContainers) {
+      if ((await pathMetadata(path)).type !== "missing") {
+        deletionStagingResidues.push(relative(repositoryRoot, path));
+      }
+    }
+    deletionStagingResidues.sort(compareBytes);
+    const transactionError = new Error("Original removal transaction failed", {
+      cause: error,
+    });
+    transactionError.deletionStagingResidues = deletionStagingResidues;
+    throw transactionError;
   }
+}
+
+async function removeStagedPath(path, removedEntry, dependencies) {
+  const metadata = await pathMetadata(path);
+  if (metadata.type === "missing") return;
+  if (metadata.type === "directory") {
+    const names = await readdir(path);
+    names.sort(compareBytes);
+    for (const name of names) {
+      await removeStagedPath(join(path, name), removedEntry, dependencies);
+    }
+    await dependencies.beforeStagingDirectoryRemoval?.({
+      relativePath: removedEntry.entry.relativePath,
+      path,
+      stagingPath: removedEntry.stagingPath,
+    });
+    await rmdir(path);
+    return;
+  }
+  await unlink(path);
 }
 
 async function requireOriginalMatch(repositoryRoot, entry) {
