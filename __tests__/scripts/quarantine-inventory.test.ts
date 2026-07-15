@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -13,14 +14,51 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const moduleUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-inventory.mjs")).href;
+const inventoryUrl = pathToFileURL(
+  join(__dirname, "../../scripts/quarantine-inventory.mjs"),
+).href;
+const capabilityUrl = pathToFileURL(
+  join(__dirname, "../../scripts/quarantine-run-capability.mjs"),
+).href;
 
-type InventorySummary = Readonly<{ sha256: string; entries: number; bytes: number }>;
+const RUN_DIRECTORIES = [
+  "inventories/pre",
+  "inventories/moved-pass-1",
+  "inventories/moved-pass-2",
+  "inventories/restore-active",
+  "inventories/work",
+  "payload/source-copies",
+  "payload/generated",
+];
 
-function runWorker(request: Record<string, unknown>) {
+type WorkerResult = {
+  result: unknown;
+  peakRssBytes: number;
+};
+
+function privateDirectory(path: string) {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  chmodSync(path, 0o700);
+}
+
+function createRun(quarantineRoot: string, transactionId: string) {
+  const runRoot = join(quarantineRoot, transactionId);
+  privateDirectory(runRoot);
+  for (const path of RUN_DIRECTORIES) privateDirectory(join(runRoot, path));
+  return runRoot;
+}
+
+function runWorker(request: Record<string, unknown>): WorkerResult {
   const source = `
-import * as inventory from ${JSON.stringify(moduleUrl)};
+import * as inventory from ${JSON.stringify(inventoryUrl)};
+import {
+  deriveRunPath,
+  withQuarantineRunCapability,
+} from ${JSON.stringify(capabilityUrl)};
+import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
+import { join } from "node:path";
+
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
@@ -28,288 +66,461 @@ let peakRssBytes = process.memoryUsage().rss;
 const sampler = setInterval(() => {
   peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
 }, 2);
+const baseFsApi = {
+  ...fsPromises,
+  createReadStream,
+  lstatSync,
+  realpathSync,
+  readFile: async () => { throw new Error("payload readFile is forbidden"); },
+};
+
+async function withCapability(callback, fsApi = baseFsApi) {
+  return withQuarantineRunCapability({
+    repoRoot: request.repoRoot,
+    quarantineRoot: request.quarantineRoot,
+    transactionId: request.transactionId,
+    writersStopped: true,
+    fsApi,
+  }, callback);
+}
+
 try {
   if (global.gc) global.gc();
   let result;
   if (request.operation === "two-passes") {
-    const fsApi = {
-      ...fsPromises,
-      readFile: async () => { throw new Error("payload readFile is forbidden"); },
-    };
-    const first = await inventory.writeInventoryJsonl({
-      root: request.root,
-      outputPath: request.firstOutput,
-      fsApi,
+    result = await withCapability(async (capability) => {
+      const firstMetrics = {};
+      const secondMetrics = {};
+      const first = await inventory.writeInventoryJsonl({
+        capability,
+        root: request.root,
+        entryId: "generated-next",
+        phase: "pre",
+        fsApi: baseFsApi,
+        metrics: firstMetrics,
+      });
+      const second = await inventory.writeInventoryJsonl({
+        capability,
+        root: request.root,
+        entryId: "generated-next",
+        phase: "moved-pass-1",
+        fsApi: baseFsApi,
+        metrics: secondMetrics,
+      });
+      return {
+        first,
+        second,
+        firstMetrics,
+        secondMetrics,
+        firstOutput: deriveRunPath(capability, {
+          purpose: "inventory", id: "generated-next", phase: "pre",
+        }),
+        secondOutput: deriveRunPath(capability, {
+          purpose: "inventory", id: "generated-next", phase: "moved-pass-1",
+        }),
+      };
     });
-    const second = await inventory.writeInventoryJsonl({
-      root: request.root,
-      outputPath: request.secondOutput,
-      fsApi,
-    });
-    result = { first, second };
   } else if (request.operation === "one-pass") {
-    result = await inventory.writeInventoryJsonl({
-      root: request.root,
-      outputPath: request.outputPath,
-      fsApi: {
-        ...fsPromises,
-        readFile: async () => { throw new Error("payload readFile is forbidden"); },
-      },
+    result = await withCapability(async (capability) => {
+      const metrics = {};
+      const summary = await inventory.writeInventoryJsonl({
+        capability,
+        root: request.root,
+        entryId: request.entryId ?? "generated-next",
+        phase: request.phase ?? "pre",
+        fsApi: baseFsApi,
+        limits: request.limits,
+        metrics,
+        ...(request.injectOutput ? { outputPath: request.injectOutput } : {}),
+      });
+      const output = deriveRunPath(capability, {
+        purpose: "inventory",
+        id: request.entryId ?? "generated-next",
+        phase: request.phase ?? "pre",
+      });
+      return { summary, metrics, output };
     });
+  } else if (request.operation === "fsync") {
+    result = await withCapability(async (capability) => {
+      const root = deriveRunPath(capability, { purpose: "payload", id: "generated-next" });
+      const events = [];
+      const fsApi = {
+        ...baseFsApi,
+        open: async (path, flags, mode) => {
+          events.push(["open", path]);
+          const handle = await fsPromises.open(path, flags, mode);
+          return new Proxy(handle, {
+            get(target, property, receiver) {
+              if (property === "sync") return async () => {
+                events.push(["sync", path]);
+                return target.sync();
+              };
+              return Reflect.get(target, property, receiver);
+            },
+          });
+        },
+      };
+      const metrics = {};
+      await inventory.fsyncTree({
+        capability,
+        root,
+        entryId: "generated-next",
+        purpose: "payload",
+        fsApi,
+        metrics,
+      });
+      return { events, metrics };
+    });
+  } else if (request.operation === "deep-fsync") {
+    const depth = request.depth;
+    const root = join(realpathSync(request.quarantineRoot), request.transactionId, "payload/generated/.next");
+    const fakeDirectoryStat = (level) => ({
+      dev: 1, ino: level + 100, mode: 0o40700, size: 0,
+      isDirectory: () => true,
+      isFile: () => false,
+      isSymbolicLink: () => false,
+    });
+    const realPrefix = request.quarantineRoot;
+    const levelOf = (path) => path === root ? 0 : path.slice(root.length + 1).split("/").length;
+    let openDirectories = 0;
+    const hybrid = {
+      ...baseFsApi,
+      lstat: async (path) => path.startsWith(root) ? fakeDirectoryStat(levelOf(path)) : fsPromises.lstat(path),
+      opendir: async (path) => {
+        const level = levelOf(path);
+        openDirectories += 1;
+        let yielded = false;
+        let closed = false;
+        return {
+          async next() {
+            if (!yielded && level < depth) {
+              yielded = true;
+              return { done: false, value: { name: "d", isDirectory: () => true } };
+            }
+            if (!closed) { closed = true; openDirectories -= 1; }
+            return { done: true };
+          },
+          async return() { if (!closed) { closed = true; openDirectories -= 1; } return { done: true }; },
+          [Symbol.asyncIterator]() { return this; },
+        };
+      },
+      open: async (path, flags, mode) => {
+        if (path.startsWith(root)) return { sync: async () => {}, close: async () => {} };
+        return fsPromises.open(path, flags, mode);
+      },
+    };
+    result = await withCapability(async (capability) => {
+      const metrics = {};
+      await inventory.fsyncTree({
+        capability, root, entryId: "generated-next", purpose: "payload", fsApi: hybrid, metrics,
+      });
+      return { metrics, openDirectories };
+    }, hybrid);
+  } else if (request.operation === "cleanup-replacement") {
+    let firstWorkPath;
+    const workLstatCounts = new Map();
+    const fsApi = {
+      ...baseFsApi,
+      lstat: async (path) => {
+        if (path.includes("/inventories/work/") && !path.endsWith(".owned")) {
+          const count = (workLstatCounts.get(path) ?? 0) + 1;
+          workLstatCounts.set(path, count);
+          firstWorkPath ??= path;
+          if (path === firstWorkPath && count === 3) {
+            await fsPromises.rename(path, path + ".owned");
+            await fsPromises.writeFile(path, "foreign", { mode: 0o600 });
+            await fsPromises.chmod(path, 0o600);
+          }
+        }
+        return fsPromises.lstat(path);
+      },
+      open: async (path, flags, mode) => {
+        if (path.endsWith(".jsonl")) throw new Error("primary publish failure");
+        return fsPromises.open(path, flags, mode);
+      },
+    };
+    result = await withCapability(async (capability) => {
+      let failure;
+      try {
+        await inventory.writeInventoryJsonl({
+          capability, root: request.root, entryId: "generated-next", phase: "pre",
+          fsApi, limits: { sortChunkRecords: 1 }, metrics: {},
+        });
+      } catch (error) {
+        failure = {
+          message: error.message,
+          errors: error.errors?.map((item) => item.message) ?? [error.message],
+        };
+      }
+      return {
+        failure,
+        foreignBytes: await fsPromises.readFile(firstWorkPath, "utf8"),
+        ownedBytes: await fsPromises.readFile(firstWorkPath + ".owned", "utf8"),
+      };
+    }, fsApi);
   } else if (request.operation === "hash") {
-    result = await inventory.hashFileStream(request.path);
-  } else if (request.operation === "compare") {
-    result = await inventory.compareInventorySummary(request.expected, request.observed);
-  } else if (request.operation === "parse-summary") {
-    result = inventory.parseInventorySummary(request.value);
+    let handles = 0;
+    let maxHandles = 0;
+    result = await inventory.hashFileStream(request.root, {
+      fsApi: baseFsApi,
+      onHandleCount: (count) => { handles = count; maxHandles = Math.max(maxHandles, count); },
+    });
+    result = { ...result, handles, maxHandles };
   } else if (request.operation === "parse-record") {
     result = inventory.parseInventoryRecord(request.value);
+  } else if (request.operation === "parse-summary") {
+    result = inventory.parseInventorySummary(request.value);
+  } else if (request.operation === "compare") {
+    result = await inventory.compareInventorySummary(request.expected, request.observed);
   }
   if (global.gc) global.gc();
   peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
   process.stdout.write(JSON.stringify({ ok: true, result, peakRssBytes }));
 } catch (error) {
-  process.stdout.write(JSON.stringify({ ok: false, error: error.message, peakRssBytes }));
+  process.stdout.write(JSON.stringify({
+    ok: false,
+    error: { message: error?.message ?? String(error), errors: error?.errors?.map((item) => item.message) },
+    peakRssBytes,
+  }));
 } finally {
   clearInterval(sampler);
 }
 `;
-  const result = JSON.parse(
+  const child = JSON.parse(
     execFileSync(process.execPath, ["--expose-gc", "--input-type=module", "--eval", source], {
       encoding: "utf8",
       input: JSON.stringify(request),
-      maxBuffer: 10 * 1024 * 1024,
+      maxBuffer: 64 * 1024 * 1024,
     }),
   );
-  if (!result.ok) throw new Error(result.error);
-  return result;
+  if (!child.ok) {
+    const error = new Error(child.error.message);
+    Object.assign(error, child.error);
+    throw error;
+  }
+  return child;
 }
 
-describe("streaming quarantine inventory", () => {
+describe("bounded quarantine inventory", () => {
   const fixture = mkdtempSync(join(tmpdir(), "quarantine-inventory-"));
-  const root = join(fixture, "payload");
-  const leafDirectory = join(root, "files", "nested");
-  const firstOutput = join(fixture, "inventory-first.jsonl");
-  const secondOutput = join(fixture, "inventory-second.jsonl");
-  let workerResult: {
-    result: { first: InventorySummary; second: InventorySummary };
-    peakRssBytes: number;
-  };
+  const repoRoot = join(fixture, "repo");
+  const quarantineRoot = join(fixture, "quarantine");
+  const transactionId = "inventory-main";
+  const root = join(repoRoot, "payload");
+  const leaf = join(root, "files", "nested");
+  let twoPasses: WorkerResult;
 
   beforeAll(() => {
-    mkdirSync(leafDirectory, { recursive: true });
+    privateDirectory(repoRoot);
+    privateDirectory(quarantineRoot);
+    createRun(quarantineRoot, transactionId);
+    mkdirSync(leaf, { recursive: true });
     for (let index = 0; index < 40_000; index += 1) {
-      const name = `file-${index.toString().padStart(5, "0")}.txt`;
-      writeFileSync(join(leafDirectory, name), "x");
+      writeFileSync(join(leaf, `file-${String(index).padStart(5, "0")}.txt`), "x");
     }
-    chmodSync(join(leafDirectory, "file-00000.txt"), 0o640);
-    symlinkSync("../../../outside-must-not-be-followed", join(leafDirectory, "leaf-link"));
-
-    workerResult = runWorker({
-      operation: "two-passes",
-      root,
-      firstOutput,
-      secondOutput,
+    chmodSync(join(leaf, "file-00000.txt"), 0o640);
+    symlinkSync("../../../outside-must-not-be-followed", join(leaf, "leaf-link"));
+    twoPasses = runWorker({
+      operation: "two-passes", repoRoot, quarantineRoot, transactionId, root,
     });
   }, 120_000);
 
   afterAll(() => rmSync(fixture, { recursive: true, force: true }));
 
-  it("writes deterministic bytewise-sorted JSONL with a manifest-sized summary", () => {
-    expect(workerResult.result.second).toEqual(workerResult.result.first);
-    expect(workerResult.result.second).toMatchObject({ entries: 40_003, bytes: 40_037 });
-    expect(Object.keys(workerResult.result.second).sort()).toEqual(["bytes", "entries", "sha256"]);
-    expect(workerResult.result.second.sha256).toMatch(/^[a-f0-9]{64}$/u);
-
-    const first = readFileSync(firstOutput, "utf8");
-    const second = readFileSync(secondOutput, "utf8");
-    expect(second).toBe(first);
-    const records = second.trimEnd().split("\n").map((line) => JSON.parse(line));
-    expect(records).toHaveLength(40_003);
-    expect(records[0]).toMatchObject({ scope: "relative", path: "files", type: "directory" });
+  it("writes identical deterministic JSONL twice below 160 MiB without payload readFile", () => {
+    const result = twoPasses.result as {
+      first: { sha256: string; entries: number; bytes: number };
+      second: { sha256: string; entries: number; bytes: number };
+      firstOutput: string;
+      secondOutput: string;
+      firstMetrics: Record<string, number>;
+      secondMetrics: Record<string, number>;
+    };
+    expect(result.second).toEqual(result.first);
+    expect(result.second).toMatchObject({ entries: 40_003, bytes: 40_037 });
+    expect(readFileSync(result.secondOutput)).toEqual(readFileSync(result.firstOutput));
+    expect(result.second.sha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(twoPasses.peakRssBytes).toBeLessThan(160 * 1024 * 1024);
+    expect(result.firstMetrics.maxOpenDirectoryHandles).toBeLessThanOrEqual(1);
+    expect(result.firstMetrics.maxTraversalAndHashHandles).toBeLessThanOrEqual(2);
+    expect(result.firstMetrics.maxMergeReaders).toBeLessThanOrEqual(32);
+    expect(result.firstMetrics.sortChunkRecordLimit).toBe(4096);
+    expect(result.firstMetrics.sortChunkByteLimit).toBe(8 * 1024 * 1024);
+    expect(result.firstMetrics.frontierRecordLimit).toBe(1024);
+    expect(result.firstMetrics.frontierByteLimit).toBe(8 * 1024 * 1024);
+    expect(lstatSync(result.firstOutput).mode & 0o7777).toBe(0o600);
+    const records = readFileSync(result.firstOutput, "utf8").trimEnd().split("\n").map(JSON.parse);
     const paths = records.map((record) => record.path);
-    const sortedPaths = [...paths].sort((left, right) =>
-      Buffer.compare(Buffer.from(left), Buffer.from(right)),
-    );
-    expect(paths).toEqual(sortedPaths);
-  });
-
-  it("records mode, type, size, hashes, and a no-follow symlink target", () => {
-    const records = readFileSync(secondOutput, "utf8")
-      .trimEnd()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-    const file = records.find((record) => record.path.endsWith("file-00000.txt"));
-    expect(file).toEqual({
-      scope: "relative",
-      path: "files/nested/file-00000.txt",
-      type: "file",
-      mode: 0o640,
-      size: 1,
-      sha256: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+    expect(paths).toEqual([...paths].sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right))));
+    expect(records.find((record) => record.path.endsWith("leaf-link"))).toMatchObject({
+      type: "symlink", linkTarget: "../../../outside-must-not-be-followed",
     });
-    const link = records.find((record) => record.path.endsWith("leaf-link"));
-    expect(link).toEqual({
-      scope: "relative",
-      path: "files/nested/leaf-link",
-      type: "symlink",
-      mode: lstatSync(join(leafDirectory, "leaf-link")).mode & 0o7777,
-      size: 37,
-      linkTarget: "../../../outside-must-not-be-followed",
-    });
-    expect(records.some((record) => record.path.includes("outside-must-not-be-followed/"))).toBe(
-      false,
-    );
   });
 
-  it("creates mode-0600 output without loading payload bodies through readFile", () => {
-    expect(lstatSync(firstOutput).mode & 0o777).toBe(0o600);
-    expect(lstatSync(secondOutput).mode & 0o777).toBe(0o600);
+  it("accepts only the exact RootFileRecord and safe RelativeRecord union", () => {
+    const rootFile = { scope: "root", type: "file", mode: 0o640, size: 1, sha256: "a".repeat(64) };
+    const relative = { ...rootFile, scope: "relative", path: "src/file.ts" };
+    for (const value of [
+      rootFile,
+      relative,
+      { scope: "relative", path: "src", type: "directory", mode: 0o755, size: 0 },
+      { scope: "relative", path: "src/link", type: "symlink", mode: 0o777, size: 1, linkTarget: "x" },
+    ]) expect(runWorker({ operation: "parse-record", value }).result).toEqual(value);
+    for (const value of [
+      { ...rootFile, path: "x" },
+      { ...rootFile, type: "unknown" },
+      { ...relative, scope: undefined },
+      { ...relative, path: undefined },
+      { ...relative, path: "" },
+      { ...relative, path: "." },
+      { ...relative, path: ".." },
+      { ...relative, path: "a/../b" },
+      { ...relative, path: "/tmp/x" },
+      { ...relative, path: "a\\b" },
+      { ...relative, path: "a\0b" },
+      { ...relative, path: "a//b" },
+      { ...relative, path: "cafe\u0301" },
+    ]) expect(() => runWorker({ operation: "parse-record", value })).toThrow(/inventory record/u);
   });
 
-  it("keeps the worker peak RSS below 160 MiB", () => {
-    expect(workerResult.peakRssBytes).toBeLessThan(160 * 1024 * 1024);
+  it("parses and compares only exact inventory summaries", () => {
+    const summary = { sha256: "b".repeat(64), entries: 1, bytes: 2 };
+    expect(runWorker({ operation: "parse-summary", value: summary }).result).toEqual(summary);
+    expect(runWorker({ operation: "compare", expected: summary, observed: summary }).result).toBe(true);
+    expect(() => runWorker({ operation: "parse-summary", value: { ...summary, extra: true } })).toThrow(/summary/u);
+    expect(() => runWorker({ operation: "compare", expected: summary, observed: { ...summary, bytes: 3 } })).toThrow(/summary/u);
   });
 
-  it("hashes regular files incrementally and compares exact summaries", () => {
-    const result = runWorker({ operation: "hash", path: join(leafDirectory, "file-00001.txt") });
-    expect(result.result).toEqual({
+  it("derives output from capability, entry ID, and phase and rejects caller output paths", () => {
+    const nextTransaction = "inventory-output-injection";
+    createRun(quarantineRoot, nextTransaction);
+    const sentinel = join(fixture, "external-sentinel");
+    writeFileSync(sentinel, "sentinel");
+    expect(() => runWorker({
+      operation: "one-pass", repoRoot, quarantineRoot, transactionId: nextTransaction,
+      root, injectOutput: sentinel,
+    })).toThrow(/unknown|invalid|output/i);
+    expect(readFileSync(sentinel, "utf8")).toBe("sentinel");
+  });
+
+  it("limits a multipass merge to 32 readers", () => {
+    const nextTransaction = "inventory-many-chunks";
+    createRun(quarantineRoot, nextTransaction);
+    const result = runWorker({
+      operation: "one-pass", repoRoot, quarantineRoot, transactionId: nextTransaction,
+      root: leaf, limits: { sortChunkRecords: 1000 },
+    }).result as { metrics: Record<string, number> };
+    expect(result.metrics.chunkFiles).toBeGreaterThan(32);
+    expect(result.metrics.maxMergeReaders).toBeLessThanOrEqual(32);
+    expect(result.metrics.mergePasses).toBeGreaterThan(1);
+  }, 120_000);
+
+  it("hashes file bodies through createReadStream and reports handle counts", () => {
+    expect(runWorker({ operation: "hash", root: join(leaf, "file-00001.txt") }).result).toEqual({
       sha256: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
       bytes: 1,
-    });
-    expect(
-      runWorker({
-        operation: "compare",
-        expected: workerResult.result.first,
-        observed: workerResult.result.second,
-      }).result,
-    ).toBe(true);
-    expect(() =>
-      runWorker({
-        operation: "compare",
-        expected: workerResult.result.first,
-        observed: { ...workerResult.result.second, entries: 1 },
-      }),
-    ).toThrow(/summary/u);
-  });
-
-  it("parses only an exact closed inventory summary", () => {
-    const valid = {
-      sha256: "a".repeat(64),
-      entries: 0,
-      bytes: Number.MAX_SAFE_INTEGER,
-    };
-    expect(runWorker({ operation: "parse-summary", value: valid }).result).toEqual(valid);
-    for (const value of [
-      { ...valid, attackerPath: "../victim" },
-      { ...valid, sha256: "A".repeat(64) },
-      { ...valid, sha256: "a".repeat(63) },
-      { ...valid, entries: -1 },
-      { ...valid, entries: Number.MAX_SAFE_INTEGER + 1 },
-      { ...valid, bytes: -1 },
-      { ...valid, bytes: 1.5 },
-    ]) {
-      expect(() => runWorker({ operation: "parse-summary", value })).toThrow(/summary/u);
-    }
-  });
-
-  it("streams equal regular-file roots identically without encoding their basenames", () => {
-    const firstSource = join(fixture, "single-source 1.ts");
-    const secondSource = join(fixture, "renamed-source 2.ts");
-    const firstRootOutput = join(fixture, "single-source-first.jsonl");
-    const secondRootOutput = join(fixture, "single-source-second.jsonl");
-    writeFileSync(firstSource, "source-body");
-    writeFileSync(secondSource, "source-body");
-    chmodSync(firstSource, 0o640);
-    chmodSync(secondSource, 0o640);
-
-    const first = runWorker({
-      operation: "one-pass",
-      root: firstSource,
-      outputPath: firstRootOutput,
-    }).result;
-    const second = runWorker({
-      operation: "one-pass",
-      root: secondSource,
-      outputPath: secondRootOutput,
-    }).result;
-    expect(second).toEqual(first);
-    expect(first).toEqual({
-      sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-      entries: 1,
-      bytes: 11,
-    });
-    expect(readFileSync(secondRootOutput)).toEqual(readFileSync(firstRootOutput));
-    expect(JSON.parse(readFileSync(firstRootOutput, "utf8"))).toEqual({
-      scope: "root",
-      type: "file",
-      mode: 0o640,
-      size: 11,
-      sha256: "503419c10318bf558f3f23a748378b6954027b3b8af93ff609da5313ab624b6b",
+      handles: 0,
+      maxHandles: 1,
     });
   });
 
-  it("parses only the exact root-file and safe relative-record union", () => {
-    const rootFile = {
-      scope: "root",
-      type: "file",
-      mode: 0o640,
-      size: 11,
-      sha256: "a".repeat(64),
-    };
-    const relativeFile = { ...rootFile, scope: "relative", path: "src/file.ts" };
-    const relativeDirectory = {
-      scope: "relative",
-      path: "src",
-      type: "directory",
-      mode: 0o755,
-      size: 0,
-    };
-    const relativeSymlink = {
-      scope: "relative",
-      path: "src/link",
-      type: "symlink",
-      mode: 0o777,
-      size: 9,
-      linkTarget: "../target",
-    };
-
-    for (const value of [rootFile, relativeFile, relativeDirectory, relativeSymlink]) {
-      expect(runWorker({ operation: "parse-record", value }).result).toEqual(value);
-    }
-
-    for (const value of [
-      { ...rootFile, path: "file.ts" },
-      { ...rootFile, type: "directory" },
-      { ...rootFile, attackerPath: "../victim" },
-      { ...relativeFile, path: undefined },
-      { ...relativeFile, path: "" },
-      { ...relativeFile, path: "." },
-      { ...relativeFile, path: ".." },
-      { ...relativeFile, path: "../victim" },
-      { ...relativeFile, path: "/tmp/victim" },
-      { ...relativeFile, path: "src/../victim" },
-      { ...relativeFile, path: "src/./victim" },
-      { ...relativeFile, path: "src\\victim" },
-      { ...relativeFile, path: "src//victim" },
-      { ...relativeFile, path: "src/\0victim" },
-      { ...relativeFile, path: "src/cafe\u0301.ts" },
-    ]) {
-      expect(() => runWorker({ operation: "parse-record", value })).toThrow(/inventory record/u);
-    }
+  it("fsyncs files before nested directories and skips symlink targets", () => {
+    const nextTransaction = "inventory-fsync";
+    const nextRun = createRun(quarantineRoot, nextTransaction);
+    const payload = join(nextRun, "payload/generated/.next");
+    const nested = join(payload, "nested");
+    const external = join(fixture, "external-target");
+    privateDirectory(nested);
+    writeFileSync(join(nested, "file"), "x");
+    writeFileSync(external, "external");
+    symlinkSync(external, join(nested, "link"));
+    const result = runWorker({
+      operation: "fsync", repoRoot, quarantineRoot, transactionId: nextTransaction, root: payload,
+    }).result as { events: [string, string][]; metrics: Record<string, number> };
+    const canonicalPayload = realpathSync(payload);
+    const canonicalNested = join(canonicalPayload, "nested");
+    const synced = result.events.filter(([event]) => event === "sync").map(([, path]) => path);
+    expect(synced).toEqual([join(canonicalNested, "file"), canonicalNested, canonicalPayload]);
+    expect(result.events.some(([, path]) => path === join(canonicalNested, "link"))).toBe(false);
+    expect(result.events.some(([, path]) => path === external)).toBe(false);
+    expect(result.metrics.maxOpenDirectoryHandles).toBeLessThanOrEqual(1);
   });
 
-  it("rejects a symlink inventory root without following it", () => {
-    const source = join(fixture, "symlink-source.txt");
-    const link = join(fixture, "symlink-root");
+  it("handles a virtual 10,000-deep tree without recursion or leaked directory handles", () => {
+    const nextTransaction = "inventory-deep";
+    createRun(quarantineRoot, nextTransaction);
+    const result = runWorker({
+      operation: "deep-fsync", repoRoot, quarantineRoot, transactionId: nextTransaction, depth: 10_000,
+    }).result as { metrics: Record<string, number>; openDirectories: number };
+    expect(result.openDirectories).toBe(0);
+    expect(result.metrics.maxOpenDirectoryHandles).toBeLessThanOrEqual(1);
+    expect(result.metrics.maxTraversalAndHashHandles).toBeLessThanOrEqual(2);
+  }, 120_000);
+
+  it("rejects a symlink root and an output-parent symlink without touching external data", () => {
+    const source = join(fixture, "symlink-source");
+    const rootLink = join(fixture, "symlink-root");
     writeFileSync(source, "secret");
-    symlinkSync(source, link);
-    expect(() =>
-      runWorker({
-        operation: "one-pass",
-        root: link,
-        outputPath: join(fixture, "symlink-root.jsonl"),
-      }),
-    ).toThrow(/non-symlink|root/u);
+    symlinkSync(source, rootLink);
+    const rootTransaction = "inventory-root-link";
+    createRun(quarantineRoot, rootTransaction);
+    expect(() => runWorker({
+      operation: "one-pass", repoRoot, quarantineRoot, transactionId: rootTransaction, root: rootLink,
+    })).toThrow(/root|symlink/i);
+
+    const parentTransaction = "inventory-parent-link";
+    const parentRun = createRun(quarantineRoot, parentTransaction);
+    const external = join(fixture, "external-output");
+    privateDirectory(external);
+    writeFileSync(join(external, "sentinel"), "sentinel");
+    rmSync(join(parentRun, "inventories/pre"), { recursive: true });
+    symlinkSync(external, join(parentRun, "inventories/pre"));
+    expect(() => runWorker({
+      operation: "one-pass", repoRoot, quarantineRoot, transactionId: parentTransaction, root,
+    })).toThrow(/parent|symlink|identity/i);
+    expect(readFileSync(join(external, "sentinel"), "utf8")).toBe("sentinel");
+  });
+
+  it("normalizes output and work files to exact 0600 even under umask 0777", () => {
+    const nextTransaction = "inventory-private-modes";
+    createRun(quarantineRoot, nextTransaction);
+    const oldUmask = process.umask(0o777);
+    try {
+      const result = runWorker({
+        operation: "one-pass", repoRoot, quarantineRoot, transactionId: nextTransaction,
+        root: leaf, limits: { sortChunkRecords: 1000 },
+      }).result as { output: string; metrics: Record<string, number> };
+      expect(lstatSync(result.output).mode & 0o7777).toBe(0o600);
+      expect(result.metrics.maxWorkFileMode).toBe(0o600);
+      expect(result.metrics.minWorkFileMode).toBe(0o600);
+    } finally {
+      process.umask(oldUmask);
+    }
+  }, 120_000);
+
+  it("preserves a foreign work-file replacement and the primary failure", () => {
+    const nextTransaction = "inventory-cleanup-ownership";
+    createRun(quarantineRoot, nextTransaction);
+    const smallRoot = join(repoRoot, "cleanup-root");
+    privateDirectory(smallRoot);
+    writeFileSync(join(smallRoot, "a"), "a");
+    writeFileSync(join(smallRoot, "b"), "b");
+    const result = runWorker({
+      operation: "cleanup-replacement",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: smallRoot,
+    }).result as {
+      failure: { errors: string[] };
+      foreignBytes: string;
+      ownedBytes: string;
+    };
+    expect(result.failure.errors).toEqual([
+      "primary publish failure",
+      expect.stringMatching(/ownership|foreign replacement/i),
+    ]);
+    expect(result.foreignBytes).toBe("foreign");
+    expect(result.ownedBytes).toContain('"path":"a"');
   });
 });
