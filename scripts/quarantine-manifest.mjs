@@ -344,10 +344,14 @@ function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function assertRegularFile(stat, label) {
+function assertOwnedRegularFile(stat, label) {
   if (stat.isSymbolicLink() || !stat.isFile()) {
     throw new Error(`${label} must be a non-symlink regular file`);
   }
+}
+
+function assertRegularFile(stat, label) {
+  assertOwnedRegularFile(stat, label);
   if ((stat.mode & 0o7777) !== 0o600) {
     throw new Error(`${label} must have private mode 0600`);
   }
@@ -449,9 +453,9 @@ async function removeOwnedTemporary({
     boundary: "before-mutation",
   });
   const current = await fsApi.lstat(path);
-  assertRegularFile(current, "manifest temporary file");
-  if (!sameIdentity(current, identity) || current.mode !== identity.mode) {
-    throw new Error("manifest temporary file ownership or mode changed");
+  assertOwnedRegularFile(current, "manifest temporary file");
+  if (!sameIdentity(current, identity)) {
+    throw new Error("manifest temporary file ownership changed");
   }
   await fsApi.unlink(path);
   await fsyncDirectory(parent, fsApi);
@@ -528,8 +532,18 @@ export async function writeManifestGeneration(options) {
     const handle = await fsApi.open(temporaryPath, "wx", 0o600);
     await withHandle(handle, async (opened) => {
       temporaryIdentity = await opened.stat();
-      assertRegularFile(temporaryIdentity, "manifest temporary file");
+      assertOwnedRegularFile(temporaryIdentity, "manifest temporary file");
+      const pathIdentity = await fsApi.lstat(temporaryPath);
+      assertOwnedRegularFile(pathIdentity, "manifest temporary file");
+      if (!sameIdentity(temporaryIdentity, pathIdentity)) {
+        throw new Error("manifest temporary file ownership changed after open");
+      }
       await opened.chmod(0o600);
+      const privateIdentity = await opened.stat();
+      assertRegularFile(privateIdentity, "manifest temporary file");
+      if (!sameIdentity(temporaryIdentity, privateIdentity)) {
+        throw new Error("manifest temporary file ownership changed during chmod");
+      }
       await writeComplete(opened, bytes);
       await opened.sync();
     }, "manifest temporary write and close both failed");
@@ -650,8 +664,18 @@ export async function activateManifestGeneration(options) {
     const handle = await fsApi.open(temporaryPath, "wx", 0o600);
     await withHandle(handle, async (opened) => {
       temporaryIdentity = await opened.stat();
-      assertRegularFile(temporaryIdentity, "current pointer temporary file");
+      assertOwnedRegularFile(temporaryIdentity, "current pointer temporary file");
+      const pathIdentity = await fsApi.lstat(temporaryPath);
+      assertOwnedRegularFile(pathIdentity, "current pointer temporary file");
+      if (!sameIdentity(temporaryIdentity, pathIdentity)) {
+        throw new Error("current pointer temporary file ownership changed after open");
+      }
       await opened.chmod(0o600);
+      const privateIdentity = await opened.stat();
+      assertRegularFile(privateIdentity, "current pointer temporary file");
+      if (!sameIdentity(temporaryIdentity, privateIdentity)) {
+        throw new Error("current pointer temporary file ownership changed during chmod");
+      }
       await writeComplete(opened, pointerBytes);
       await opened.sync();
     }, "current pointer temporary write and close both failed");

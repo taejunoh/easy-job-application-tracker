@@ -121,14 +121,43 @@ await fsPromises.chmod(runRoot, 0o700);
 await fsPromises.chmod(manifestsRoot, 0o700);
 const baseFsApi = { ...fsPromises, lstatSync, realpathSync };
 const adapterEvents = [];
-const adapterState = { failLink: false, failTemporaryUnlink: false };
+const adapterState = {
+  failLink: false,
+  failTemporaryUnlink: false,
+  temporaryTarget: null,
+  chmodBoundary: null,
+};
 const fsApi = {
   ...baseFsApi,
   async open(path, flags, mode) {
     if (request.operation === "activation-order" && path.includes("/.current.")) {
       adapterEvents.push("pointer-temp-open");
     }
-    return baseFsApi.open(path, flags, mode);
+    const handle = await baseFsApi.open(path, flags, mode);
+    const isSelectedTemporary =
+      flags === "wx" &&
+      ((adapterState.temporaryTarget === "generation" && path.includes("/manifests/.")) ||
+        (adapterState.temporaryTarget === "pointer" && path.includes("/.current.")));
+    if (!isSelectedTemporary || adapterState.chmodBoundary === null) return handle;
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === "chmod") return async (requestedMode) => {
+          if (adapterState.chmodBoundary === "before") {
+            throw new Error("chmod:before");
+          }
+          await target.chmod(requestedMode);
+          if (adapterState.chmodBoundary === "foreign-after") {
+            await baseFsApi.rename(path, path + ".owned");
+            await baseFsApi.writeFile(path, "foreign", { mode: 0o600 });
+            await baseFsApi.chmod(path, 0o600);
+            throw new Error("chmod:foreign-after");
+          }
+          throw new Error("chmod:after");
+        };
+        const member = Reflect.get(target, property, target);
+        return typeof member === "function" ? member.bind(target) : member;
+      },
+    });
   },
   async link(source, destination) {
     if (adapterState.failLink) throw new Error("primary publish failure");
@@ -310,6 +339,86 @@ const result = await (async () => {
         manifest: manifestApi.buildValidatedManifest(request.value),
         fsApi,
       }));
+    }
+    if (request.operation === "restrictive-umask-roundtrip") {
+      let written;
+      const previousUmask = process.umask(0o777);
+      const outcome = await capture(async () => {
+        try {
+          written = await manifestApi.writeManifestGeneration({
+            capability,
+            manifest: manifestApi.buildValidatedManifest(request.value),
+            fsApi,
+          });
+          await manifestApi.activateManifestGeneration({
+            capability,
+            transactionId,
+            manifestSha256: written.manifestSha256,
+            appendValidated: async () => {},
+            fsApi,
+          });
+        } finally {
+          process.umask(previousUmask);
+        }
+      });
+      const manifestNames = (await fsPromises.readdir(manifestsRoot)).sort();
+      const rootNames = (await fsPromises.readdir(quarantineRoot)).sort();
+      return {
+        outcome,
+        generationMode: written === undefined
+          ? null
+          : (await fsPromises.lstat(join(manifestsRoot, written.manifestSha256 + ".json"))).mode & 0o7777,
+        pointerMode: rootNames.includes("current")
+          ? (await fsPromises.lstat(join(quarantineRoot, "current"))).mode & 0o7777
+          : null,
+        temporaryNames: [
+          ...manifestNames.filter((name) => name.startsWith(".")),
+          ...rootNames.filter((name) => name.startsWith(".current.")),
+        ],
+      };
+    }
+    if (request.operation === "temporary-chmod-failure") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      let written;
+      if (request.target === "pointer") {
+        written = await manifestApi.writeManifestGeneration({
+          capability,
+          manifest: built,
+          fsApi,
+        });
+      }
+      adapterState.temporaryTarget = request.target;
+      adapterState.chmodBoundary = request.boundary;
+      const previousUmask = process.umask(0o777);
+      let outcome;
+      try {
+        outcome = await capture(() => request.target === "generation"
+          ? manifestApi.writeManifestGeneration({ capability, manifest: built, fsApi })
+          : manifestApi.activateManifestGeneration({
+              capability,
+              transactionId,
+              manifestSha256: written.manifestSha256,
+              appendValidated: async () => {},
+              fsApi,
+            }));
+      } finally {
+        process.umask(previousUmask);
+        adapterState.temporaryTarget = null;
+        adapterState.chmodBoundary = null;
+      }
+      const parent = request.target === "generation" ? manifestsRoot : quarantineRoot;
+      const prefix = request.target === "generation" ? "." : ".current.";
+      const names = (await fsPromises.readdir(parent)).filter((name) => name.startsWith(prefix)).sort();
+      const foreignName = names.some((name) => name.endsWith(".owned"))
+        ? names.find((name) => name.endsWith(".tmp"))
+        : undefined;
+      return {
+        outcome,
+        temporaryNames: names,
+        foreignBytes: foreignName === undefined
+          ? null
+          : await fsPromises.readFile(join(parent, foreignName), "utf8"),
+      };
     }
     if (request.operation === "fault-matrix") {
       const oldManifest = manifestApi.buildValidatedManifest(request.oldValue);
@@ -722,6 +831,61 @@ describe("immutable quarantine manifest generations", () => {
     expect(result.mode).toBe(mode);
     expect(result.unchanged).toBe(true);
   });
+
+  it("normalizes generation and pointer temporaries to 0600 under umask 0777", () => {
+    const result = invoke({ operation: "restrictive-umask-roundtrip", value: validManifest });
+    expect(result.outcome).toEqual({ ok: true });
+    expect(result.generationMode).toBe(0o600);
+    expect(result.pointerMode).toBe(0o600);
+    expect(result.temporaryNames).toEqual([]);
+  });
+
+  it.each([
+    ["generation", "before"],
+    ["generation", "after"],
+    ["pointer", "before"],
+    ["pointer", "after"],
+  ])("cleans its %s temporary after a %s-chmod failure under umask 0777", (target, boundary) => {
+    const result = invoke({
+      operation: "temporary-chmod-failure",
+      value: validManifest,
+      target,
+      boundary,
+    });
+    expect(result.outcome).toEqual({
+      ok: false,
+      error: {
+        name: "Error",
+        message: `chmod:${boundary}`,
+      },
+    });
+    expect(result.temporaryNames).toEqual([]);
+  });
+
+  it.each(["generation", "pointer"])(
+    "preserves a foreign replacement of the %s temporary after chmod",
+    (target) => {
+      const result = invoke({
+        operation: "temporary-chmod-failure",
+        value: validManifest,
+        target,
+        boundary: "foreign-after",
+      });
+      expect(result.outcome).toMatchObject({
+        ok: false,
+        error: {
+          name: "AggregateError",
+          errors: [
+            "chmod:foreign-after",
+            expect.stringMatching(/ownership|mode changed/i),
+          ],
+        },
+      });
+      expect(result.temporaryNames).toHaveLength(2);
+      expect(result.temporaryNames.some((name: string) => name.endsWith(".owned"))).toBe(true);
+      expect(result.foreignBytes).toBe("foreign");
+    },
+  );
 
   it("rejects a manifest transaction ID that differs from the live capability", () => {
     expect(invoke({
