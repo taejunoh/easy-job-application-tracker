@@ -1143,6 +1143,13 @@ async function writeFinalInventory({
     phase,
     boundary: "after-sync",
   });
+  const durableOutput = await fsApi.lstat(outputPath);
+  assertPrivateRegularFile(durableOutput, "durable published inventory");
+  if (!sameIdentity(temporary.identity, durableOutput)) {
+    throw new Error(
+      "durable published inventory ownership changed; foreign replacement and temporary evidence preserved",
+    );
+  }
   await removeOwnedInventoryOutput({
     capability,
     path: temporaryPath,

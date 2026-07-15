@@ -389,6 +389,63 @@ try {
         streamsClosed,
       };
     }, fsApi);
+  } else if (request.operation === "durable-output-replacement") {
+    let outputPath;
+    let publicationTempPath;
+    let workCreateCount = 0;
+    let replacementMade = false;
+    const fsApi = {
+      ...baseFsApi,
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (flags === "wx" && path.includes("/inventories/work/")) {
+          workCreateCount += 1;
+          if (workCreateCount === 2) publicationTempPath = path;
+        }
+        if (!path.endsWith("/inventories/pre") || flags !== "r") return handle;
+        return {
+          sync: async () => {
+            await handle.sync();
+            if (!replacementMade) {
+              replacementMade = true;
+              await fsPromises.unlink(outputPath);
+              await fsPromises.writeFile(outputPath, "foreign-durable", {
+                flag: "wx", mode: 0o600,
+              });
+              await fsPromises.chmod(outputPath, 0o600);
+            }
+          },
+          close: (...args) => handle.close(...args),
+        };
+      },
+    };
+    result = await withCapability(async (capability) => {
+      outputPath = deriveRunPath(capability, {
+        purpose: "inventory", id: "generated-next", phase: "pre",
+      });
+      let failure;
+      try {
+        await inventory.writeInventoryJsonl({
+          capability, root: request.root, entryId: "generated-next", phase: "pre",
+          fsApi, metrics: {},
+        });
+      } catch (error) {
+        failure = {
+          message: error.message,
+          errors: error.errors?.map((item) => item.message) ?? [error.message],
+        };
+      }
+      const readIfPresent = async (path) => {
+        try { return await fsPromises.readFile(path, "utf8"); }
+        catch (error) { if (error?.code === "ENOENT") return null; throw error; }
+      };
+      return {
+        failure,
+        foreignBytes: await readIfPresent(outputPath),
+        ownedBytes: await readIfPresent(publicationTempPath),
+        workNames: await fsPromises.readdir(join(publicationTempPath, "..")),
+      };
+    }, fsApi);
   } else if (request.operation === "work-setup-fault") {
     let faultActive = true;
     let workPath;
@@ -496,6 +553,11 @@ try {
         return handle;
       },
       link: async (source, destination) => {
+        if (request.boundary === "pre-link") {
+          await new Promise((resolve) => process.stdout.write("pre-link-kill-ready\\n", resolve));
+          process.kill(process.pid, "SIGKILL");
+          await new Promise(() => {});
+        }
         await fsPromises.link(source, destination);
         linked = true;
         if (request.boundary === "link") process.kill(process.pid, "SIGKILL");
@@ -644,7 +706,7 @@ try {
         maxBuffer: 64 * 1024 * 1024,
       },
     );
-    return { result: { signal: child.signal }, peakRssBytes: 0 };
+    return { result: { signal: child.signal, stdout: child.stdout }, peakRssBytes: 0 };
   }
   const child = JSON.parse(
     execFileSync(process.execPath, ["--expose-gc", "--input-type=module", "--eval", source], {
@@ -832,7 +894,7 @@ describe("bounded quarantine inventory", () => {
     expect(result.workNames).toEqual([]);
   });
 
-  it.each(["link", "temp-unlink"])(
+  it.each(["pre-link", "link", "temp-unlink"])(
     "recovers an exact inventory after a real SIGKILL at the %s boundary",
     (boundary) => {
       const nextTransaction = `inventory-crash-${boundary}`;
@@ -848,7 +910,11 @@ describe("bounded quarantine inventory", () => {
         transactionId: nextTransaction,
         root: source,
       });
-      expect((crashed.result as { signal: string }).signal).toBe("SIGKILL");
+      const crashResult = crashed.result as { signal: string; stdout: string };
+      expect(crashResult.signal).toBe("SIGKILL");
+      if (boundary === "pre-link") {
+        expect(crashResult.stdout).toContain("pre-link-kill-ready");
+      }
       const recovered = runWorker({
         operation: "one-pass",
         repoRoot,
@@ -864,6 +930,7 @@ describe("bounded quarantine inventory", () => {
       expect(recovered.summary.sha256).toMatch(/^[a-f0-9]{64}$/u);
       expect(recovered.workNames).toEqual([]);
       expect(readFileSync(recovered.output, "utf8").endsWith("\n")).toBe(true);
+      expect(readdirSync(join(recovered.output, ".."))).toEqual(["generated-next.jsonl"]);
     },
   );
 
@@ -1132,6 +1199,29 @@ describe("bounded quarantine inventory", () => {
     ]);
     expect(result.foreignBytes).toBe("foreign");
     expect(result.ownedBytes).toBe("");
+  });
+
+  it("rejects a foreign final replacement after parent sync and preserves publication evidence", () => {
+    const nextTransaction = "inventory-durable-output-replacement";
+    createRun(quarantineRoot, nextTransaction);
+    const source = join(repoRoot, "durable-output-replacement.txt");
+    writeFileSync(source, "source");
+    const result = runWorker({
+      operation: "durable-output-replacement",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: source,
+    }).result as {
+      failure?: { errors: string[] };
+      foreignBytes: string | null;
+      ownedBytes: string | null;
+      workNames: string[];
+    };
+    expect(result.failure?.errors[0]).toMatch(/published inventory|ownership|identity/i);
+    expect(result.foreignBytes).toBe("foreign-durable");
+    expect(result.ownedBytes).toContain('"type":"file"');
+    expect(result.workNames).toEqual([`${publicationId("generated-next", "pre")}.bin`]);
   });
 
   it.each(["chmod", "lstat"])(
