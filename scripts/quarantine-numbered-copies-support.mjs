@@ -158,6 +158,7 @@ export async function quarantineWorkspace(options, dependencies = {}) {
   let manifest = {
     ...inspection,
     state: "copying",
+    concurrentRecreatedPaths: [],
     deletionStagingResidues: [],
     generatedTrees: [],
     copies: inspection.copies.map((copy) => ({ ...copy, diffPath: null })),
@@ -267,6 +268,9 @@ export async function quarantineWorkspace(options, dependencies = {}) {
       ...manifest,
       state: "incomplete",
       failure: "Quarantine transaction did not complete",
+      concurrentRecreatedPaths: Array.isArray(error?.concurrentRecreatedPaths)
+        ? error.concurrentRecreatedPaths
+        : manifest.concurrentRecreatedPaths,
       deletionStagingResidues: Array.isArray(error?.deletionStagingResidues)
         ? error.deletionStagingResidues
         : manifest.deletionStagingResidues,
@@ -575,7 +579,33 @@ async function removeOriginalsTransactionally(
       await removeStagedPath(stagingPath, removedEntry, dependencies);
       await rmdir(stagingContainer);
     }
+
+    const concurrentRecreatedPaths = await recreatedOriginalPaths(
+      repositoryRoot,
+      removed,
+    );
+    const deletionStagingResidues = await existingStagingResidues(
+      repositoryRoot,
+      stagingContainers,
+    );
+    if (
+      concurrentRecreatedPaths.length > 0 ||
+      deletionStagingResidues.length > 0
+    ) {
+      const completionError = new Error(
+        "Quarantine completion verification failed",
+      );
+      completionError.concurrentRecreatedPaths = concurrentRecreatedPaths;
+      completionError.deletionStagingResidues = deletionStagingResidues;
+      throw completionError;
+    }
   } catch (error) {
+    const concurrentRecreatedPaths = uniqueSortedPaths([
+      ...(Array.isArray(error?.concurrentRecreatedPaths)
+        ? error.concurrentRecreatedPaths
+        : []),
+      ...(await recreatedOriginalPaths(repositoryRoot, removed)),
+    ]);
     for (const { entry } of removed.reverse()) {
       const originalPath = join(repositoryRoot, entry.relativePath);
       if ((await pathMetadata(originalPath)).type !== "missing") continue;
@@ -590,19 +620,46 @@ async function removeOriginalsTransactionally(
       }
       await requireOriginalMatch(repositoryRoot, entry);
     }
-    const deletionStagingResidues = [];
-    for (const path of stagingContainers) {
-      if ((await pathMetadata(path)).type !== "missing") {
-        deletionStagingResidues.push(relative(repositoryRoot, path));
-      }
-    }
-    deletionStagingResidues.sort(compareBytes);
+    const deletionStagingResidues = uniqueSortedPaths([
+      ...(Array.isArray(error?.deletionStagingResidues)
+        ? error.deletionStagingResidues
+        : []),
+      ...(await existingStagingResidues(repositoryRoot, stagingContainers)),
+    ]);
     const transactionError = new Error("Original removal transaction failed", {
       cause: error,
     });
+    transactionError.concurrentRecreatedPaths = concurrentRecreatedPaths;
     transactionError.deletionStagingResidues = deletionStagingResidues;
     throw transactionError;
   }
+}
+
+async function recreatedOriginalPaths(repositoryRoot, removed) {
+  const paths = [];
+  for (const { entry } of removed) {
+    if (
+      (await pathMetadata(join(repositoryRoot, entry.relativePath))).type !==
+      "missing"
+    ) {
+      paths.push(entry.relativePath);
+    }
+  }
+  return uniqueSortedPaths(paths);
+}
+
+async function existingStagingResidues(repositoryRoot, stagingContainers) {
+  const paths = [];
+  for (const path of stagingContainers) {
+    if ((await pathMetadata(path)).type !== "missing") {
+      paths.push(relative(repositoryRoot, path));
+    }
+  }
+  return uniqueSortedPaths(paths);
+}
+
+function uniqueSortedPaths(paths) {
+  return [...new Set(paths)].sort(compareBytes);
 }
 
 async function removeStagedPath(path, removedEntry, dependencies) {

@@ -387,6 +387,89 @@ describe("verified workspace quarantine transaction", () => {
     }
   });
 
+  it("rejects a source copy recreated after staging without overwriting it", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      expect(() =>
+        invokeSupport("quarantineWorkspace", [approvedOptions(fixture, 2)], {
+          availableBytes: 4_096_000_000,
+          recreateAfterStaging: {
+            relativePath: "src/identical 2.ts",
+            contents: "newer-recreated-source\n",
+          },
+        }),
+      ).toThrow();
+
+      const runDirectory = onlyRunDirectory(fixture.quarantineRoot);
+      const manifest = readManifest(runDirectory);
+      expect(manifest.state).toBe("incomplete");
+      expect(manifest.concurrentRecreatedPaths).toEqual(["src/identical 2.ts"]);
+      expect(manifest.deletionStagingResidues).toEqual([]);
+      expect(
+        readFileSync(join(fixture.root, "src/identical 2.ts"), "utf8"),
+      ).toBe("newer-recreated-source\n");
+      expect(
+        readFileSync(join(fixture.root, "src/divergent 3.ts"), "utf8"),
+      ).toBe("divergent-private-body\n");
+      expect(
+        readFileSync(join(fixture.root, "node_modules/package.json"), "utf8"),
+      ).toBe("old\n");
+      expect(readFileSync(join(fixture.root, ".next/build.txt"), "utf8")).toBe(
+        "old-build\n",
+      );
+      expect(findDeletionStagingPaths(fixture.root)).toEqual([]);
+      expect(JSON.stringify(manifest)).not.toContain("newer-recreated-source");
+      expectManifestChecksum(runDirectory);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects a generated root recreated after staging without overwriting it", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      expect(() =>
+        invokeSupport("quarantineWorkspace", [approvedOptions(fixture, 2)], {
+          availableBytes: 4_096_000_000,
+          recreateAfterStaging: {
+            relativePath: "node_modules",
+            childPath: "concurrent-package.json",
+            contents: "newer-generated-tree\n",
+          },
+        }),
+      ).toThrow();
+
+      const runDirectory = onlyRunDirectory(fixture.quarantineRoot);
+      const manifest = readManifest(runDirectory);
+      expect(manifest.state).toBe("incomplete");
+      expect(manifest.concurrentRecreatedPaths).toEqual(["node_modules"]);
+      expect(manifest.deletionStagingResidues).toEqual([]);
+      expect(
+        readFileSync(
+          join(fixture.root, "node_modules/concurrent-package.json"),
+          "utf8",
+        ),
+      ).toBe("newer-generated-tree\n");
+      expect(existsSync(join(fixture.root, "node_modules/package.json"))).toBe(
+        false,
+      );
+      expect(
+        readFileSync(join(fixture.root, "src/identical 2.ts"), "utf8"),
+      ).toBe("same\n");
+      expect(
+        readFileSync(join(fixture.root, "src/divergent 3.ts"), "utf8"),
+      ).toBe("divergent-private-body\n");
+      expect(readFileSync(join(fixture.root, ".next/build.txt"), "utf8")).toBe(
+        "old-build\n",
+      );
+      expect(findDeletionStagingPaths(fixture.root)).toEqual([]);
+      expect(JSON.stringify(manifest)).not.toContain("newer-generated-tree");
+      expectManifestChecksum(runDirectory);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it("restores every removed original when a later removal fails", () => {
     const fixture = createPopulatedRepository();
     try {
@@ -437,6 +520,7 @@ describe("verified workspace quarantine transaction", () => {
       const runDirectory = onlyRunDirectory(fixture.quarantineRoot);
       const manifest = readManifest(runDirectory);
       expect(manifest.state).toBe("incomplete");
+      expect(manifest.concurrentRecreatedPaths).toEqual(["node_modules"]);
       expect(manifest.deletionStagingResidues).toHaveLength(1);
       const residuePath = join(
         fixture.root,
@@ -710,6 +794,7 @@ type QuarantineResult = Readonly<{
 }>;
 
 type QuarantineManifest = Readonly<{
+  concurrentRecreatedPaths?: ReadonlyArray<string>;
   deletionStagingResidues?: ReadonlyArray<string>;
   state: string;
   validationAt: string | null;
@@ -734,12 +819,17 @@ function invokeSupport<T>(
     mutateBeforeRemoval?: Readonly<{ path: string; contents: string }>;
     mutateBeforeRecheck?: Readonly<{ path: string; contents: string }>;
     onlyFailIfMissing?: string;
+    recreateAfterStaging?: Readonly<{
+      childPath?: string;
+      contents: string;
+      relativePath: string;
+    }>;
   }> = {},
 ): T {
   const source = `
 import * as support from ${JSON.stringify(supportModule)};
 import { lstat, mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
@@ -807,6 +897,17 @@ try {
           path !== stagingPath
         ) return;
         await writeFile(join(path, "concurrent-residue.txt"), "staging-residue\\n");
+      },
+    }),
+    ...(request.seams.recreateAfterStaging === undefined ? {} : {
+      afterOriginalStaged: async ({ relativePath, repositoryRoot }) => {
+        if (relativePath !== request.seams.recreateAfterStaging.relativePath) return;
+        const originalPath = join(repositoryRoot, relativePath);
+        const destination = request.seams.recreateAfterStaging.childPath === undefined
+          ? originalPath
+          : join(originalPath, request.seams.recreateAfterStaging.childPath);
+        await mkdir(dirname(destination), { recursive: true });
+        await writeFile(destination, request.seams.recreateAfterStaging.contents);
       },
     }),
   };
