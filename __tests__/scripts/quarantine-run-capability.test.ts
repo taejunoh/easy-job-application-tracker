@@ -430,6 +430,7 @@ async function run() {
       const bound = getRunFsContext(capability);
       const repeated = getRunFsContext(capability);
       const asserted = getRunFsContext(capability, fsApi);
+      const explicitUndefined = await capture(() => getRunFsContext(capability, undefined));
       const distinct = Object.fromEntries(requiredFsMethods.map((method) => [method, () => {}]));
       const distinctLookup = await capture(() => getRunFsContext(capability, distinct));
       for (const method of requiredFsMethods) {
@@ -451,6 +452,7 @@ async function run() {
         frozen: Object.isFrozen(bound),
         keys: Object.keys(bound),
         sameLookup: bound === repeated && bound === asserted,
+        explicitUndefined,
         distinctLookup,
         derived,
         probes,
@@ -482,6 +484,30 @@ async function run() {
     const fsApi = completeNodeAdapter();
     delete fsApi[request.method];
     return withQuarantineRunCapability(options({ fsApi }), async () => "called");
+  }
+  if (request.operation === "invalid-adapter-source") {
+    let fsApi;
+    if (request.shape === "function") fsApi = function Adapter() {};
+    if (request.shape === "array") fsApi = [];
+    if (request.shape === "class") fsApi = new (class Adapter {})();
+    if (request.shape === "custom-prototype") fsApi = Object.create({ adapter: true });
+    let getterReads = 0;
+    for (const method of requiredFsMethods) {
+      Object.defineProperty(fsApi, method, {
+        enumerable: true,
+        get() {
+          getterReads += 1;
+          return () => {};
+        },
+      });
+    }
+    return {
+      outcome: await capture(() => withQuarantineRunCapability(
+        options({ fsApi }),
+        async () => "called",
+      )),
+      getterReads,
+    };
   }
   if (request.operation === "public-exports") {
     return Object.keys(capabilityModule).sort();
@@ -756,6 +782,10 @@ describe("callback-scoped quarantine run capability", () => {
         frozen: true,
         keys: REQUIRED_FS_METHODS,
         sameLookup: true,
+        explicitUndefined: {
+          threw: true,
+          error: { message: expect.stringMatching(/filesystem|source|context/i) },
+        },
         distinctLookup: {
           threw: true,
           error: { message: expect.stringMatching(/filesystem|source|context/i) },
@@ -787,6 +817,15 @@ describe("callback-scoped quarantine run capability", () => {
       error: { message: expect.stringMatching(new RegExp(method, "i")) },
     });
   });
+
+  it.each(["function", "array", "class", "custom-prototype"])(
+    "rejects a complete %s adapter before reading any method getter",
+    (shape) => {
+      const value = workerValue(invoke(fixture, { operation: "invalid-adapter-source", shape }));
+      expectCapturedError(value.outcome, /plain object|filesystem adapter/i);
+      expect(value.getterReads).toBe(0);
+    },
+  );
 
   it("keeps the run capability public surface at exactly three exports", () => {
     expect(workerValue(invoke(fixture, { operation: "public-exports" }))).toEqual([

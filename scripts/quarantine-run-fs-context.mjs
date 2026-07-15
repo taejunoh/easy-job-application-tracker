@@ -59,8 +59,18 @@ function assertObject(value, label) {
   }
 }
 
+function assertPlainObject(value, label) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be a plain object`);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`${label} must be a plain object`);
+  }
+}
+
 function normalizeSource(source) {
-  assertObject(source, "filesystem adapter");
+  assertPlainObject(source, "filesystem adapter");
   const adapter = Object.create(null);
   for (const methodName of REQUIRED_METHODS) {
     const implementation = source[methodName];
@@ -87,12 +97,13 @@ export function bindRunFsContext(capability, source = DEFAULT_SOURCE) {
 }
 
 export function getRunFsContext(capability, source) {
+  const sourceOmitted = arguments.length === 1;
   assertObject(capability, "quarantine run capability");
   const context = contexts.get(capability);
   if (context === undefined || !context.active) {
     throw new TypeError("quarantine run filesystem context is inactive");
   }
-  if (source !== undefined && source !== context.source) {
+  if (!sourceOmitted && source !== context.source) {
     throw new TypeError("filesystem adapter must be the capability source object");
   }
   return context.adapter;
