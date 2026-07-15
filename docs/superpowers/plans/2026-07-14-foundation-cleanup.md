@@ -112,7 +112,8 @@ git commit -m "feat: enforce quarantine path policy"
 
 - [ ] **Step 5: Write streaming inventory and RSS tests**
 
-Import `hashFileStream`, `writeInventoryJsonl`, and `parseInventorySummary`.
+Import `hashFileStream`, `writeInventoryJsonl`, `parseInventoryRecord`, and
+`parseInventorySummary`.
 Require the summary parser to accept exactly `{ sha256, entries, bytes }` and
 reject unknown or missing keys, malformed hashes, and negative or unsafe
 integers. Build a synthetic generated tree containing exactly 40,000 small
@@ -132,10 +133,14 @@ inject payload `readFile` to throw, proving regular-file bodies are consumed via
 `createReadStream`. Require bytewise path order, mode/type/size/hash/link-target
 coverage, no symlink traversal, mode `0600`, and a manifest-sized summary of
 only `{ sha256, entries, bytes }`.
-Directory inventories exclude the root itself. A regular-file root must emit
-one canonical record at path `"."` with its mode, size, and SHA-256, while a
-symlink root remains rejected; this keeps source-copy inventories stable after
-moving to an ID-derived destination basename.
+Directory inventories exclude the root itself and emit only exact
+`{ scope: "relative", path, ...typeMetadata }` descendants. Relative paths are
+NFC POSIX paths and reject empty, absolute, backslash, NUL, duplicate-separator,
+`.`-component, and `..`-component forms. A regular-file root emits exactly
+`{ scope: "root", type: "file", mode, size, sha256 }` with no `path`, while a
+symlink root remains rejected. Consumers must branch on `scope` before resolving
+a relative path. Equal file bytes and mode therefore produce identical JSONL
+and summary bytes regardless of the root basename.
 
 - [ ] **Step 6: Verify inventory RED, implement streaming inventory, and verify GREEN**
 
@@ -149,6 +154,7 @@ Implement:
 ```js
 export async function hashFileStream(absolutePath, options = {}) {}
 export async function writeInventoryJsonl({ root, outputPath, fsApi }) {}
+export function parseInventoryRecord(value) {}
 export function parseInventorySummary(value) {}
 export async function compareInventorySummary(expected, observed) {}
 export async function fsyncTree(root, fsApi) {}
@@ -178,10 +184,16 @@ import {
 } from "../../scripts/quarantine-journal.mjs";
 ```
 
-Test the complete state graph and a table of interruption points after file
-create, frame append, frame fsync, payload rename, payload fsync, source-parent
-fsync, destination-parent fsync, verification, and `MOVED` append. A torn final
-frame must replay to the preceding record; a malformed middle frame, changed
+Test the complete state graph and supplementary interruption simulations:
+exception injection after journal file creation, frame append, and fsync, plus
+step-limited filesystem moves after payload rename, payload fsync, parent fsync,
+verification, and `MOVED` append. Those harnesses demonstrate replay invariants
+but are not process-crash proof.
+Additionally terminate real child processes with `SIGKILL` immediately after
+lock `wx` creation and immediately after lock-metadata `fsync`; normal append
+must reject both stale locks, while explicit attested reclaim appends the next
+event with an intact sequence and hash chain. A torn final frame must replay to
+the preceding record; a malformed middle frame, changed
 payload, unknown key, sequence gap, hash mismatch, or illegal transition must
 fail closed. Assert the journal is mode `0600` and every successful append calls
 both file `sync()` and parent-directory sync before resolving.
@@ -241,10 +253,24 @@ type JournalFrame = {
 
 Hash the canonical envelope without `recordHash`, append one complete frame,
 `sync()` the handle, and fsync its directory. Replay ignores only an incomplete
-final length/body pair and reports the last valid byte offset. Appends use an
-exclusive fail-closed lock and the same open handle to revalidate, truncate only
-that recognized torn tail, sync the truncation and parent, and then append; they
-must never truncate malformed complete frames or race concurrent appenders.
+final length/body pair and reports the last valid byte offset. Appends create a
+mode-`0600` lock with `wx`, keep its handle open, and write one length-framed
+canonical `{ version: 1, ownerToken, pid, checksum }` record. They `fsync` the
+lock and parent directory before touching the journal, then use the same journal
+handle to revalidate, truncate only a recognized torn tail, sync the truncation
+and parent, and append. `EEXIST` always fails; normal append never uses TTL or
+PID-liveness reclamation and never races concurrent appenders.
+
+Export `reclaimJournalLock` as the only stale-lock recovery primitive. It
+requires `writersStopped === true`, rejects symlink, non-regular, oversized, and
+malformed complete locks without changing them, and accepts only a valid
+checksummed lock or a recognizable creation-torn frame (including zero bytes).
+It atomically renames the stale lock to a unique tombstone, `fsync`s the parent,
+creates and durably publishes a new `wx` lock, and runs a recovery callback with
+an append function under that held lock. Only after the recovery journal append
+is durable may it remove the new lock and tombstone and `fsync` the parent.
+Current-PID/different-token locks model PID reuse: ordinary append still fails,
+while explicitly attested recovery is permitted.
 Replay validates every complete frame, event-specific
 payload, and lifecycle edge. Implement an exact payload-parser table keyed by
 event and invoke it during both append and replay; accepting an arbitrary plain

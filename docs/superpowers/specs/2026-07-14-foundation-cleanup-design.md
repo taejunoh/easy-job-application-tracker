@@ -177,10 +177,14 @@ construct runtime entry plans and journal references, but those objects refer
 back to the manifest entry ID and summary; they do not replace or duplicate the
 authoritative enriched manifest entry.
 
-Directory inventories exclude the directory root and record only descendants.
-A regular-file inventory root emits exactly one record whose path is `"."`, so
-the inventory remains stable when the quarantined destination basename is the
-validated entry ID. A symlink inventory root is always rejected.
+Directory inventories exclude the directory root and record only exact
+`{ scope: "relative", path, ...typeMetadata }` descendants. Relative paths are
+NFC POSIX paths; empty, absolute, backslash, NUL, duplicate-separator, `.`, and
+`..` components are rejected. A regular-file inventory root emits exactly one
+`{ scope: "root", type: "file", mode, size, sha256 }` record with no `path`, so
+equal bytes and mode produce identical JSONL and summary bytes under different
+basenames. A symlink inventory root is always rejected. Inventory consumers
+branch on `scope` before resolving a relative path.
 
 Unified diffs and verified Git-history matches for all four divergent files are
 stored in `divergent-diffs/`. No divergent content is automatically merged into
@@ -203,11 +207,29 @@ append-only sequence of length-framed canonical JSON records. Every record has a
 monotonic sequence, previous-record hash, payload, and record hash. Each append
 is flushed and `fsync`ed before the corresponding destructive transition; new
 files and rename operations also `fsync` their containing directories. A torn
-final frame is ignored during replay. Before a later append, the appender holds
-an exclusive fail-closed journal lock, replays through the same open handle,
-truncates only a recognized torn final frame to the last valid offset, and
-`fsync`s the file and parent directory before appending. Lock removal is also
-directory-`fsync`ed. Any malformed non-final frame, sequence
+final frame is ignored during replay. Before touching the journal, the appender
+creates a mode-`0600` lock with `wx`, keeps its handle open, writes the exact
+length-framed canonical metadata
+`{ version: 1, ownerToken, pid, checksum }`, and `fsync`s both lock and parent
+directory. `EEXIST` always fails; normal append never reclaims by TTL or PID
+liveness. While holding the lock, append replays through the same journal
+handle, truncates only a recognized torn final frame to the last valid offset,
+and `fsync`s the file and parent directory before appending. Lock removal is
+also directory-`fsync`ed.
+
+Stale-lock recovery is a separate `reclaimJournalLock` operation that requires
+`writersStopped === true`. It rejects and preserves symlink, non-regular,
+oversized, and malformed complete locks. Only valid checksummed metadata or a
+recognizable creation-torn frame, including a zero-byte file left after `wx`,
+is reclaimable. Recovery atomically renames the old lock to a unique tombstone,
+`fsync`s the parent, durably creates a new `wx` lock, and invokes recovery with
+an append function under that held lock. It removes the tombstone and new lock,
+then `fsync`s the parent, only after the recovery journal operation is durable.
+A current PID with a different owner token is treated as possible PID reuse:
+ordinary append still fails and only explicit attested recovery may proceed.
+Tests use actual child-process `SIGKILL` after `wx` and after metadata `fsync`;
+exception injection remains supplementary replay evidence, not crash proof.
+Any malformed non-final frame, sequence
 gap, hash-chain break, unknown field, or illegal state transition is fatal.
 The envelope schema and event payload schema are separate closed boundaries.
 Every event in the transition table has an exact payload parser on both append

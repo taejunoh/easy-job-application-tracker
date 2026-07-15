@@ -62,6 +62,8 @@ try {
     result = await inventory.compareInventorySummary(request.expected, request.observed);
   } else if (request.operation === "parse-summary") {
     result = inventory.parseInventorySummary(request.value);
+  } else if (request.operation === "parse-record") {
+    result = inventory.parseInventoryRecord(request.value);
   }
   if (global.gc) global.gc();
   peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
@@ -124,7 +126,7 @@ describe("streaming quarantine inventory", () => {
     expect(second).toBe(first);
     const records = second.trimEnd().split("\n").map((line) => JSON.parse(line));
     expect(records).toHaveLength(40_003);
-    expect(records[0]).toMatchObject({ path: "files", type: "directory" });
+    expect(records[0]).toMatchObject({ scope: "relative", path: "files", type: "directory" });
     const paths = records.map((record) => record.path);
     const sortedPaths = [...paths].sort((left, right) =>
       Buffer.compare(Buffer.from(left), Buffer.from(right)),
@@ -139,6 +141,7 @@ describe("streaming quarantine inventory", () => {
       .map((line) => JSON.parse(line));
     const file = records.find((record) => record.path.endsWith("file-00000.txt"));
     expect(file).toEqual({
+      scope: "relative",
       path: "files/nested/file-00000.txt",
       type: "file",
       mode: 0o640,
@@ -147,6 +150,7 @@ describe("streaming quarantine inventory", () => {
     });
     const link = records.find((record) => record.path.endsWith("leaf-link"));
     expect(link).toEqual({
+      scope: "relative",
       path: "files/nested/leaf-link",
       type: "symlink",
       mode: lstatSync(join(leafDirectory, "leaf-link")).mode & 0o7777,
@@ -209,25 +213,90 @@ describe("streaming quarantine inventory", () => {
     }
   });
 
-  it("streams a regular-file root as one canonical dot-path entry", () => {
-    const source = join(fixture, "single-source 2.ts");
-    const outputPath = join(fixture, "single-source.jsonl");
-    writeFileSync(source, "source-body");
-    chmodSync(source, 0o640);
+  it("streams equal regular-file roots identically without encoding their basenames", () => {
+    const firstSource = join(fixture, "single-source 1.ts");
+    const secondSource = join(fixture, "renamed-source 2.ts");
+    const firstRootOutput = join(fixture, "single-source-first.jsonl");
+    const secondRootOutput = join(fixture, "single-source-second.jsonl");
+    writeFileSync(firstSource, "source-body");
+    writeFileSync(secondSource, "source-body");
+    chmodSync(firstSource, 0o640);
+    chmodSync(secondSource, 0o640);
 
-    const result = runWorker({ operation: "one-pass", root: source, outputPath }).result;
-    expect(result).toEqual({
+    const first = runWorker({
+      operation: "one-pass",
+      root: firstSource,
+      outputPath: firstRootOutput,
+    }).result;
+    const second = runWorker({
+      operation: "one-pass",
+      root: secondSource,
+      outputPath: secondRootOutput,
+    }).result;
+    expect(second).toEqual(first);
+    expect(first).toEqual({
       sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       entries: 1,
       bytes: 11,
     });
-    expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual({
-      path: ".",
+    expect(readFileSync(secondRootOutput)).toEqual(readFileSync(firstRootOutput));
+    expect(JSON.parse(readFileSync(firstRootOutput, "utf8"))).toEqual({
+      scope: "root",
       type: "file",
       mode: 0o640,
       size: 11,
       sha256: "503419c10318bf558f3f23a748378b6954027b3b8af93ff609da5313ab624b6b",
     });
+  });
+
+  it("parses only the exact root-file and safe relative-record union", () => {
+    const rootFile = {
+      scope: "root",
+      type: "file",
+      mode: 0o640,
+      size: 11,
+      sha256: "a".repeat(64),
+    };
+    const relativeFile = { ...rootFile, scope: "relative", path: "src/file.ts" };
+    const relativeDirectory = {
+      scope: "relative",
+      path: "src",
+      type: "directory",
+      mode: 0o755,
+      size: 0,
+    };
+    const relativeSymlink = {
+      scope: "relative",
+      path: "src/link",
+      type: "symlink",
+      mode: 0o777,
+      size: 9,
+      linkTarget: "../target",
+    };
+
+    for (const value of [rootFile, relativeFile, relativeDirectory, relativeSymlink]) {
+      expect(runWorker({ operation: "parse-record", value }).result).toEqual(value);
+    }
+
+    for (const value of [
+      { ...rootFile, path: "file.ts" },
+      { ...rootFile, type: "directory" },
+      { ...rootFile, attackerPath: "../victim" },
+      { ...relativeFile, path: undefined },
+      { ...relativeFile, path: "" },
+      { ...relativeFile, path: "." },
+      { ...relativeFile, path: ".." },
+      { ...relativeFile, path: "../victim" },
+      { ...relativeFile, path: "/tmp/victim" },
+      { ...relativeFile, path: "src/../victim" },
+      { ...relativeFile, path: "src/./victim" },
+      { ...relativeFile, path: "src\\victim" },
+      { ...relativeFile, path: "src//victim" },
+      { ...relativeFile, path: "src/\0victim" },
+      { ...relativeFile, path: "src/cafe\u0301.ts" },
+    ]) {
+      expect(() => runWorker({ operation: "parse-record", value })).toThrow(/inventory record/u);
+    }
   });
 
   it("rejects a symlink inventory root without following it", () => {

@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
@@ -13,6 +13,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,6 +36,7 @@ let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
 const durabilityEvents = [];
+let directorySyncCount = 0;
 const needsWrappedFs = request.trackDurability || request.failAt;
 const wrappedFs = needsWrappedFs ? {
   ...fsPromises,
@@ -43,20 +45,22 @@ const wrappedFs = needsWrappedFs ? {
     return new Proxy(handle, {
       get(target, property) {
         if (property === "sync") return async () => {
-          durabilityEvents.push(path === dirname(request.journalPath) ? "directory-sync" : "file-sync");
+          const isDirectory = path === dirname(request.journalPath);
+          durabilityEvents.push(isDirectory ? "directory-sync" : "file-sync");
+          if (isDirectory) directorySyncCount += 1;
           const result = await target.sync();
           if (request.failAt === "frame-fsync" && path === request.journalPath) {
             throw new Error("injected crash after frame fsync");
           }
-          if (request.failAt === "parent-fsync" && path === dirname(request.journalPath)) {
+          if (request.failAt === "parent-fsync" && isDirectory && directorySyncCount === 2) {
             throw new Error("injected crash after parent fsync");
           }
           return result;
         };
-        if (property === "write" && request.failAt === "file-create") {
+        if (property === "write" && request.failAt === "file-create" && path === request.journalPath) {
           return async () => { throw new Error("injected crash after file create"); };
         }
-        if (property === "write" && request.failAt === "partial-frame") {
+        if (property === "write" && request.failAt === "partial-frame" && path === request.journalPath) {
           return async (buffer) => {
             const partial = buffer.subarray(0, Math.max(1, Math.floor(buffer.length / 2)));
             await target.write(partial);
@@ -111,6 +115,15 @@ try {
     result = settled.map((item) => item.status);
   } else if (request.operation === "replay") {
     result = await journal.replayJournal(request.journalPath);
+  } else if (request.operation === "reclaim") {
+    result = await journal.reclaimJournalLock({
+      journalPath: request.journalPath,
+      writersStopped: request.writersStopped,
+      recovery: async ({ append }) => append({
+        event: request.record.event,
+        payload: request.record.payload,
+      }),
+    });
   } else if (request.operation === "transition") {
     result = journal.validateTransition(request.state, request.event);
   }
@@ -152,6 +165,64 @@ function appendMany(journalPath: string, records = happyRecords, trackDurability
 
 function replay(journalPath: string) {
   return invokeJournal({ operation: "replay", journalPath }).result;
+}
+
+function killAppendAtLockBoundary(
+  journalPath: string,
+  record: (typeof happyRecords)[number],
+  crashAt: "after-wx" | "after-lock-fsync",
+) {
+  const source = `
+import * as journal from ${JSON.stringify(journalModuleUrl)};
+import * as fsPromises from "node:fs/promises";
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const request = JSON.parse(input);
+const fsApi = {
+  ...fsPromises,
+  open: async (path, flags, mode) => {
+    const handle = await fsPromises.open(path, flags, mode);
+    if (path === request.journalPath + ".lock" && request.crashAt === "after-wx") {
+      process.kill(process.pid, "SIGKILL");
+    }
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === "sync" && path === request.journalPath + ".lock") {
+          return async () => {
+            const result = await target.sync();
+            if (request.crashAt === "after-lock-fsync") {
+              process.kill(process.pid, "SIGKILL");
+            }
+            return result;
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  },
+};
+await journal.appendJournalRecord({
+  journalPath: request.journalPath,
+  event: request.record.event,
+  payload: request.record.payload,
+  fsApi,
+});
+`;
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    encoding: "utf8",
+    input: JSON.stringify({ journalPath, record, crashAt }),
+  });
+}
+
+function encodeJournalLock(ownerToken: string, pid: number, checksumOverride?: string) {
+  const identity = { version: 1, ownerToken, pid };
+  const checksum =
+    checksumOverride ?? createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  const body = Buffer.from(JSON.stringify({ ...identity, checksum }));
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(body.length);
+  return Buffer.concat([length, body]);
 }
 
 function syncPath(path: string) {
@@ -268,6 +339,8 @@ describe("durable quarantine journal", () => {
     expect(appended.durabilityEvents).toEqual([
       "file-sync",
       "directory-sync",
+      "file-sync",
+      "directory-sync",
       "directory-sync",
     ]);
 
@@ -316,7 +389,15 @@ describe("durable quarantine journal", () => {
   });
 
   it.each([
-    ["file create", "file-create", [], happyRecords[0], 0, false, ["directory-sync"]],
+    [
+      "file create",
+      "file-create",
+      [],
+      happyRecords[0],
+      0,
+      false,
+      ["file-sync", "directory-sync", "directory-sync"],
+    ],
     [
       "partial frame append",
       "partial-frame",
@@ -324,7 +405,7 @@ describe("durable quarantine journal", () => {
       happyRecords[1],
       1,
       true,
-      ["directory-sync"],
+      ["file-sync", "directory-sync", "directory-sync"],
     ],
     [
       "frame fsync",
@@ -333,7 +414,7 @@ describe("durable quarantine journal", () => {
       happyRecords[1],
       2,
       false,
-      ["file-sync", "directory-sync"],
+      ["file-sync", "directory-sync", "file-sync", "directory-sync"],
     ],
     [
       "parent fsync",
@@ -342,7 +423,13 @@ describe("durable quarantine journal", () => {
       happyRecords[1],
       2,
       false,
-      ["file-sync", "directory-sync", "directory-sync"],
+      [
+        "file-sync",
+        "directory-sync",
+        "file-sync",
+        "directory-sync",
+        "directory-sync",
+      ],
     ],
   ])(
     "replays the durable invariant after interruption at %s",
@@ -407,7 +494,7 @@ describe("durable quarantine journal", () => {
         "MOVED append",
       ],
     ],
-  ])("proves the transaction-like boundary after %s", (boundary, expectedSteps) => {
+  ])("simulates the transaction-like boundary after %s", (boundary, expectedSteps) => {
     const result = runMoveBoundary(fixture, boundary as string);
     expect(result.completedSteps).toEqual(expectedSteps);
     expect(result.sourceExists).toBe(false);
@@ -459,6 +546,168 @@ describe("durable quarantine journal", () => {
       1, 2,
     ]);
   });
+
+  it.each(["after-wx", "after-lock-fsync"] as const)(
+    "recovers explicitly after an actual SIGKILL %s boundary",
+    (crashAt) => {
+      const path = join(fixture, `sigkill-${crashAt}`, "journal.log");
+      appendMany(path, happyRecords.slice(0, 1));
+
+      const killed = killAppendAtLockBoundary(path, happyRecords[1], crashAt);
+      expect(killed.signal).toBe("SIGKILL");
+      const lockPath = `${path}.lock`;
+      expect(existsSync(lockPath)).toBe(true);
+      const staleLock = readFileSync(lockPath);
+      if (crashAt === "after-wx") {
+        expect(staleLock).toHaveLength(0);
+      } else {
+        expect(lstatSync(lockPath).mode & 0o777).toBe(0o600);
+        expect(staleLock.readUInt32BE(0)).toBe(staleLock.length - 4);
+        const metadata = JSON.parse(staleLock.subarray(4).toString("utf8"));
+        expect(Object.keys(metadata)).toEqual(["version", "ownerToken", "pid", "checksum"]);
+        expect(metadata.checksum).toBe(
+          createHash("sha256")
+            .update(
+              JSON.stringify({
+                version: metadata.version,
+                ownerToken: metadata.ownerToken,
+                pid: metadata.pid,
+              }),
+            )
+            .digest("hex"),
+        );
+      }
+      expect(() => appendMany(path, [happyRecords[1]])).toThrow(/lock/u);
+
+      const recovered = invokeJournal({
+        operation: "reclaim",
+        journalPath: path,
+        writersStopped: true,
+        record: happyRecords[1],
+      }).result;
+      const replayed = replay(path);
+      expect(recovered).toMatchObject({ sequence: 2, event: "MOVING" });
+      expect(replayed.records).toHaveLength(2);
+      expect(replayed.records[1].previousHash).toBe(replayed.records[0].recordHash);
+      expect(replayed.state).toBe("MOVING");
+      expect(existsSync(`${path}.lock`)).toBe(false);
+    },
+  );
+
+  it("requires stopped-writer attestation but permits PID reuse with a different owner token", () => {
+    const path = join(fixture, "pid-reuse", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    const lockPath = `${path}.lock`;
+    writeFileSync(
+      lockPath,
+      encodeJournalLock("11111111-1111-4111-8111-111111111111", process.pid),
+      { mode: 0o600 },
+    );
+
+    expect(() => appendMany(path, [happyRecords[1]])).toThrow(/lock/u);
+    expect(() =>
+      invokeJournal({
+        operation: "reclaim",
+        journalPath: path,
+        writersStopped: false,
+        record: happyRecords[1],
+      }),
+    ).toThrow(/writers.*stopped|attest/u);
+    expect(readFileSync(lockPath)).toEqual(
+      encodeJournalLock("11111111-1111-4111-8111-111111111111", process.pid),
+    );
+
+    invokeJournal({
+      operation: "reclaim",
+      journalPath: path,
+      writersStopped: true,
+      record: happyRecords[1],
+    });
+    expect(replay(path)).toMatchObject({ state: "MOVING" });
+  });
+
+  it.each([
+    [
+      "schema",
+      (() => {
+        const body = Buffer.from(JSON.stringify({ version: 1, attackerPath: "../victim" }));
+        const length = Buffer.alloc(4);
+        length.writeUInt32BE(body.length);
+        return Buffer.concat([length, body]);
+      })(),
+    ],
+    [
+      "checksum",
+      encodeJournalLock(
+        "44444444-4444-4444-8444-444444444444",
+        process.pid,
+        "f".repeat(64),
+      ),
+    ],
+  ])("rejects and preserves a malformed complete stale lock %s", (label, malformed) => {
+    const path = join(fixture, `malformed-lock-${label}`, "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    const lockPath = `${path}.lock`;
+    writeFileSync(lockPath, malformed, { mode: 0o600 });
+
+    expect(() =>
+      invokeJournal({
+        operation: "reclaim",
+        journalPath: path,
+        writersStopped: true,
+        record: happyRecords[1],
+      }),
+    ).toThrow(/lock/u);
+    expect(readFileSync(lockPath)).toEqual(malformed);
+  });
+
+  it("accepts a recognizable torn lock frame only through attested recovery", () => {
+    const path = join(fixture, "torn-lock", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    const lockPath = `${path}.lock`;
+    const torn = encodeJournalLock("22222222-2222-4222-8222-222222222222", process.pid).subarray(
+      0,
+      11,
+    );
+    writeFileSync(lockPath, torn, { mode: 0o600 });
+
+    expect(() => appendMany(path, [happyRecords[1]])).toThrow(/lock/u);
+    invokeJournal({
+      operation: "reclaim",
+      journalPath: path,
+      writersStopped: true,
+      record: happyRecords[1],
+    });
+    expect(replay(path)).toMatchObject({ state: "MOVING" });
+  });
+
+  it.each(["symlink", "directory", "oversize"])(
+    "rejects and preserves a %s stale-lock inode",
+    (kind) => {
+      const path = join(fixture, `invalid-lock-${kind}`, "journal.log");
+      appendMany(path, happyRecords.slice(0, 1));
+      const lockPath = `${path}.lock`;
+      if (kind === "symlink") {
+        const target = `${lockPath}.target`;
+        writeFileSync(target, encodeJournalLock("33333333-3333-4333-8333-333333333333", 1));
+        symlinkSync(target, lockPath);
+      } else if (kind === "directory") {
+        mkdirSync(lockPath);
+      } else {
+        writeFileSync(lockPath, Buffer.alloc(4 * 1024 + 5), { mode: 0o600 });
+      }
+
+      expect(() =>
+        invokeJournal({
+          operation: "reclaim",
+          journalPath: path,
+          writersStopped: true,
+          record: happyRecords[1],
+        }),
+      ).toThrow(/lock/u);
+      expect(lstatSync(lockPath)[kind === "symlink" ? "isSymbolicLink" : kind === "directory" ? "isDirectory" : "isFile"]()).toBe(true);
+    },
+  );
 
   it("ignores only a torn final length or body", () => {
     const path = join(fixture, "torn", "journal.log");

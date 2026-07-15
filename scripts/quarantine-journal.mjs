@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -7,7 +7,11 @@ import { parseInventorySummary } from "./quarantine-inventory.mjs";
 const ZERO_HASH = "0".repeat(64);
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+const MAX_LOCK_BODY_BYTES = 4 * 1024;
 const ENVELOPE_KEYS = ["sequence", "previousHash", "event", "payload", "recordHash"];
+const LOCK_KEYS = ["version", "ownerToken", "pid", "checksum"];
+const OWNER_TOKEN_PATTERN =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 const ENTRY_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 
@@ -345,7 +349,7 @@ async function writeComplete(handle, buffer) {
   let offset = 0;
   while (offset < buffer.length) {
     const { bytesWritten } = await handle.write(buffer.subarray(offset));
-    if (bytesWritten <= 0) throw new Error("journal append made no progress");
+    if (bytesWritten <= 0) throw new Error("durable write made no progress");
     offset += bytesWritten;
   }
 }
@@ -373,6 +377,162 @@ async function fsyncDirectory(path, fsApi) {
   }
 }
 
+function lockChecksum(version, ownerToken, pid) {
+  return createHash("sha256")
+    .update(JSON.stringify({ version, ownerToken, pid }))
+    .digest("hex");
+}
+
+function encodeLockFrame() {
+  const version = 1;
+  const ownerToken = randomUUID();
+  const pid = process.pid;
+  const checksum = lockChecksum(version, ownerToken, pid);
+  const metadata = { version, ownerToken, pid, checksum };
+  const body = Buffer.from(JSON.stringify(metadata));
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(body.length);
+  return { metadata, frame: Buffer.concat([length, body]) };
+}
+
+function malformedLock(message, cause) {
+  return new Error(`malformed journal lock: ${message}`, cause === undefined ? undefined : { cause });
+}
+
+function parseLockFrame(input) {
+  if (input.length === 0) return { torn: true, metadata: null };
+  if (input.length < 4) return { torn: true, metadata: null };
+
+  const bodyLength = input.readUInt32BE(0);
+  if (bodyLength > MAX_LOCK_BODY_BYTES) throw malformedLock("frame is too large");
+  const frameLength = 4 + bodyLength;
+  if (input.length < frameLength) return { torn: true, metadata: null };
+  if (input.length !== frameLength) throw malformedLock("frame has trailing bytes");
+
+  const rawBody = input.subarray(4);
+  let value;
+  try {
+    value = JSON.parse(rawBody.toString("utf8"));
+  } catch (error) {
+    throw malformedLock("frame is not JSON", error);
+  }
+  if (!isPlainObject(value)) throw malformedLock("metadata must be an object");
+  const keys = Object.keys(value);
+  if (keys.length !== LOCK_KEYS.length || keys.some((key, index) => key !== LOCK_KEYS[index])) {
+    throw malformedLock("metadata schema is invalid");
+  }
+  if (value.version !== 1) throw malformedLock("version is invalid");
+  if (typeof value.ownerToken !== "string" || !OWNER_TOKEN_PATTERN.test(value.ownerToken)) {
+    throw malformedLock("owner token is invalid");
+  }
+  if (!Number.isSafeInteger(value.pid) || value.pid <= 0) {
+    throw malformedLock("PID is invalid");
+  }
+  if (typeof value.checksum !== "string" || !HASH_PATTERN.test(value.checksum)) {
+    throw malformedLock("checksum is invalid");
+  }
+  const expectedChecksum = lockChecksum(value.version, value.ownerToken, value.pid);
+  if (value.checksum !== expectedChecksum) throw malformedLock("checksum mismatch");
+  const metadata = {
+    version: value.version,
+    ownerToken: value.ownerToken,
+    pid: value.pid,
+    checksum: value.checksum,
+  };
+  if (!rawBody.equals(Buffer.from(JSON.stringify(metadata)))) {
+    throw malformedLock("metadata is not canonical");
+  }
+  return { torn: false, metadata };
+}
+
+async function createJournalLock(lockPath, fsApi) {
+  let handle;
+  try {
+    handle = await fsApi.open(lockPath, "wx", 0o600);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw new Error("journal append lock already exists", { cause: error });
+    }
+    throw error;
+  }
+
+  try {
+    await handle.chmod(0o600);
+    const encoded = encodeLockFrame();
+    await writeComplete(handle, encoded.frame);
+    await handle.sync();
+    await fsyncDirectory(dirname(lockPath), fsApi);
+    return { handle, metadata: encoded.metadata };
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function appendUnderHeldLock({ journalPath, event, payload, fsApi }) {
+  if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
+  const handle = await fsApi.open(journalPath, "a+", 0o600);
+  let record;
+  try {
+    await handle.chmod(0o600);
+    const replayed = replayJournalBuffer(await readCompleteFile(handle));
+    validateTransition(replayed.state, event);
+    const canonicalPayload = canonicalize(parseEventPayload(event, payload));
+    const sequence = replayed.records.length + 1;
+    const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
+    const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
+    record = {
+      sequence,
+      previousHash,
+      event,
+      payload: canonicalPayload,
+      recordHash,
+    };
+    const body = Buffer.from(JSON.stringify(record));
+    if (body.length > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(body.length);
+
+    if (replayed.truncatedTail) {
+      await handle.truncate(replayed.validEndOffset);
+      await handle.sync();
+      await fsyncDirectory(dirname(journalPath), fsApi);
+    }
+    await writeComplete(handle, Buffer.concat([length, body]));
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fsyncDirectory(dirname(journalPath), fsApi);
+  return record;
+}
+
+async function readStaleLock(lockPath, fsApi) {
+  const before = await fsApi.lstat(lockPath);
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error("journal lock must be a non-symlink regular file");
+  }
+  if (before.size > 4 + MAX_LOCK_BODY_BYTES) {
+    throw new Error("journal lock is too large");
+  }
+
+  const handle = await fsApi.open(lockPath, "r");
+  try {
+    const opened = await handle.stat();
+    if (
+      !opened.isFile() ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size
+    ) {
+      throw new Error("journal lock changed while being inspected");
+    }
+    return parseLockFrame(await readCompleteFile(handle));
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function appendJournalRecord({
   journalPath,
   event,
@@ -385,59 +545,73 @@ export async function appendJournalRecord({
   if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
   await fsApi.mkdir(dirname(journalPath), { recursive: true, mode: 0o700 });
   const lockPath = `${journalPath}.lock`;
-  let lockAcquired = false;
+  let lock;
   try {
-    let lockHandle;
-    try {
-      lockHandle = await fsApi.open(lockPath, "wx", 0o600);
-      lockAcquired = true;
-      await lockHandle.chmod(0o600);
-    } catch (error) {
-      if (error?.code === "EEXIST") {
-        throw new Error("journal append lock already exists", { cause: error });
-      }
-      throw error;
-    } finally {
-      await lockHandle?.close();
-    }
-
-    const handle = await fsApi.open(journalPath, "a+", 0o600);
-    let record;
-    try {
-      await handle.chmod(0o600);
-      const replayed = replayJournalBuffer(await readCompleteFile(handle));
-      validateTransition(replayed.state, event);
-      const canonicalPayload = canonicalize(parseEventPayload(event, payload));
-      const sequence = replayed.records.length + 1;
-      const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
-      const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
-      record = {
-        sequence,
-        previousHash,
-        event,
-        payload: canonicalPayload,
-        recordHash,
-      };
-      const body = Buffer.from(JSON.stringify(record));
-      if (body.length > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
-      const length = Buffer.alloc(4);
-      length.writeUInt32BE(body.length);
-
-      if (replayed.truncatedTail) {
-        await handle.truncate(replayed.validEndOffset);
-        await handle.sync();
-        await fsyncDirectory(dirname(journalPath), fsApi);
-      }
-      await writeComplete(handle, Buffer.concat([length, body]));
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await fsyncDirectory(dirname(journalPath), fsApi);
-    return record;
+    lock = await createJournalLock(lockPath, fsApi);
+    return await appendUnderHeldLock({ journalPath, event, payload, fsApi });
   } finally {
-    if (lockAcquired) {
+    if (lock !== undefined) {
+      await lock.handle.close();
       await fsApi.rm(lockPath, { force: true });
+      await fsyncDirectory(dirname(journalPath), fsApi);
+    }
+  }
+}
+
+export async function reclaimJournalLock({
+  journalPath,
+  writersStopped,
+  recovery,
+  fsApi = fsPromises,
+}) {
+  if (typeof journalPath !== "string" || journalPath.length === 0) {
+    throw new TypeError("journal path is required");
+  }
+  if (writersStopped !== true) {
+    throw new Error("journal lock recovery requires writers-stopped attestation");
+  }
+  if (typeof recovery !== "function") {
+    throw new TypeError("journal lock recovery callback is required");
+  }
+
+  const lockPath = `${journalPath}.lock`;
+  const staleLock = await readStaleLock(lockPath, fsApi);
+  const tombstonePath = `${lockPath}.reclaim-${randomUUID()}`;
+  await fsApi.rename(lockPath, tombstonePath);
+  await fsyncDirectory(dirname(journalPath), fsApi);
+
+  let recoveryLock;
+  let recoverySucceeded = false;
+  try {
+    recoveryLock = await createJournalLock(lockPath, fsApi);
+    let appendInProgress = false;
+    let durableAppends = 0;
+    const append = async ({ event, payload }) => {
+      if (appendInProgress) throw new Error("journal recovery append is already in progress");
+      appendInProgress = true;
+      try {
+        const record = await appendUnderHeldLock({ journalPath, event, payload, fsApi });
+        durableAppends += 1;
+        return record;
+      } finally {
+        appendInProgress = false;
+      }
+    };
+    const result = await recovery({
+      append,
+      staleLock: staleLock.metadata,
+      staleLockTorn: staleLock.torn,
+    });
+    if (durableAppends === 0) {
+      throw new Error("journal lock recovery requires a durable journal append");
+    }
+    recoverySucceeded = true;
+    return result;
+  } finally {
+    await recoveryLock?.handle.close();
+    if (recoverySucceeded) {
+      await fsApi.rm(lockPath);
+      await fsApi.rm(tombstonePath);
       await fsyncDirectory(dirname(journalPath), fsApi);
     }
   }

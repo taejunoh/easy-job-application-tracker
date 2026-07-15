@@ -25,10 +25,128 @@ function modeOf(stat) {
   return stat.mode & 0o7777;
 }
 
-async function inventoryRecord(absolutePath, relativePath, stat, fsApi) {
+function isPlainObject(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function assertExactRecordKeys(value, expectedKeys) {
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    throw new TypeError("inventory record has an invalid schema");
+  }
+}
+
+function parseRecordMode(value) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0o7777) {
+    throw new TypeError("inventory record mode is invalid");
+  }
+  return value;
+}
+
+function parseRecordSize(value) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError("inventory record size is invalid");
+  }
+  return value;
+}
+
+function parseRecordHash(value) {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/u.test(value)) {
+    throw new TypeError("inventory record hash is invalid");
+  }
+  return value;
+}
+
+function parseRelativeInventoryPath(value) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value !== value.normalize("NFC") ||
+    value.startsWith("/") ||
+    value.includes("\\") ||
+    value.includes("\0") ||
+    value.includes("//")
+  ) {
+    throw new TypeError("inventory record relative path is invalid");
+  }
+  const components = value.split("/");
+  if (components.some((component) => component === "" || component === "." || component === "..")) {
+    throw new TypeError("inventory record relative path is invalid");
+  }
+  return value;
+}
+
+export function parseInventoryRecord(value) {
+  if (!isPlainObject(value)) throw new TypeError("inventory record must be an object");
+
+  if (value.scope === "root") {
+    assertExactRecordKeys(value, ["scope", "type", "mode", "size", "sha256"]);
+    if (value.type !== "file") throw new TypeError("inventory record root must be a file");
+    return Object.freeze({
+      scope: "root",
+      type: "file",
+      mode: parseRecordMode(value.mode),
+      size: parseRecordSize(value.size),
+      sha256: parseRecordHash(value.sha256),
+    });
+  }
+
+  if (value.scope !== "relative") {
+    throw new TypeError("inventory record scope is invalid");
+  }
+  const path = parseRelativeInventoryPath(value.path);
+  if (value.type === "file") {
+    assertExactRecordKeys(value, ["scope", "path", "type", "mode", "size", "sha256"]);
+    return Object.freeze({
+      scope: "relative",
+      path,
+      type: "file",
+      mode: parseRecordMode(value.mode),
+      size: parseRecordSize(value.size),
+      sha256: parseRecordHash(value.sha256),
+    });
+  }
+  if (value.type === "directory") {
+    assertExactRecordKeys(value, ["scope", "path", "type", "mode", "size"]);
+    if (value.size !== 0) throw new TypeError("inventory record directory size is invalid");
+    return Object.freeze({
+      scope: "relative",
+      path,
+      type: "directory",
+      mode: parseRecordMode(value.mode),
+      size: 0,
+    });
+  }
+  if (value.type === "symlink") {
+    assertExactRecordKeys(value, ["scope", "path", "type", "mode", "size", "linkTarget"]);
+    if (typeof value.linkTarget !== "string") {
+      throw new TypeError("inventory record symlink target is invalid");
+    }
+    return Object.freeze({
+      scope: "relative",
+      path,
+      type: "symlink",
+      mode: parseRecordMode(value.mode),
+      size: parseRecordSize(value.size),
+      linkTarget: value.linkTarget,
+    });
+  }
+  throw new TypeError("inventory record type is invalid");
+}
+
+async function inventoryRecord(absolutePath, relativePath, stat, fsApi, scope = "relative") {
   if (stat.isDirectory()) {
     return {
-      record: { path: relativePath, type: "directory", mode: modeOf(stat), size: 0 },
+      record: parseInventoryRecord({
+        scope,
+        path: relativePath,
+        type: "directory",
+        mode: modeOf(stat),
+        size: 0,
+      }),
       bytes: 0,
     };
   }
@@ -38,13 +156,24 @@ async function inventoryRecord(absolutePath, relativePath, stat, fsApi) {
       throw new Error(`file changed while being inventoried: ${relativePath}`);
     }
     return {
-      record: {
-        path: relativePath,
-        type: "file",
-        mode: modeOf(stat),
-        size: stat.size,
-        sha256: hashed.sha256,
-      },
+      record: parseInventoryRecord(
+        scope === "root"
+          ? {
+              scope: "root",
+              type: "file",
+              mode: modeOf(stat),
+              size: stat.size,
+              sha256: hashed.sha256,
+            }
+          : {
+              scope: "relative",
+              path: relativePath,
+              type: "file",
+              mode: modeOf(stat),
+              size: stat.size,
+              sha256: hashed.sha256,
+            },
+      ),
       bytes: stat.size,
     };
   }
@@ -52,13 +181,14 @@ async function inventoryRecord(absolutePath, relativePath, stat, fsApi) {
     const linkTarget = await fsApi.readlink(absolutePath);
     const size = Buffer.byteLength(linkTarget);
     return {
-      record: {
+      record: parseInventoryRecord({
+        scope,
         path: relativePath,
         type: "symlink",
         mode: modeOf(stat),
         size,
         linkTarget,
-      },
+      }),
       bytes: size,
     };
   }
@@ -84,7 +214,11 @@ async function* walkTree(root, fsApi) {
 }
 
 function compareRecords(left, right) {
-  return Buffer.compare(Buffer.from(left.path), Buffer.from(right.path));
+  return Buffer.compare(recordSortKey(left), recordSortKey(right));
+}
+
+function recordSortKey(record) {
+  return record.scope === "root" ? Buffer.alloc(0) : Buffer.from(record.path);
 }
 
 async function writeChunk(records, path, fsApi) {
@@ -136,7 +270,7 @@ async function* mergeSortedFiles(paths) {
       if (!next.done) {
         source.current = {
           line: next.value,
-          path: Buffer.from(JSON.parse(next.value).path),
+          path: recordSortKey(JSON.parse(next.value)),
         };
       }
     }
@@ -160,7 +294,7 @@ async function* mergeSortedFiles(paths) {
       const next = await selected.iterator.next();
       selected.current = next.done
         ? null
-        : { line: next.value, path: Buffer.from(JSON.parse(next.value).path) };
+        : { line: next.value, path: recordSortKey(JSON.parse(next.value)) };
     }
   } finally {
     for (const source of sources) source.reader.close();
@@ -215,7 +349,7 @@ export async function writeInventoryJsonl({ root, outputPath, fsApi = fsPromises
 
   try {
     const inventoryItems = rootStat.isFile()
-      ? [{ absolutePath: root, relativePath: ".", stat: rootStat }]
+      ? [{ absolutePath: root, relativePath: null, stat: rootStat, scope: "root" }]
       : walkTree(root, fsApi);
     for await (const item of inventoryItems) {
       const inventoried = await inventoryRecord(
@@ -223,6 +357,7 @@ export async function writeInventoryJsonl({ root, outputPath, fsApi = fsPromises
         item.relativePath,
         item.stat,
         fsApi,
+        item.scope,
       );
       bufferedRecords.push(inventoried.record);
       entries += 1;
