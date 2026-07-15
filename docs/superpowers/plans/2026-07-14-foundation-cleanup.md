@@ -772,6 +772,13 @@ Minor 0; every finding returns to that slice's RED/GREEN cycle.
 - Extend `fsyncTree` with the exact rollback-entry shape from the design.
 - Add the exact restore-rollback events and `settleDurableTip` result from the
   design; all unknown keys and illegal transitions remain fatal.
+- Permit `RECOVERY_REQUIRED { entryIds: [] }` only for an apply or restore with
+  no durable relevant entry intent; add the exact first-intent rollback/abort
+  transitions from the design. Every post-intent recovery array remains
+  non-empty and equals the sorted unresolved IDs.
+- Change `RESTORE_PREPARED` from `{}` to the design's exact
+  `{ restoreId, activeGenerated }` payload, with fixed generated IDs and each
+  durable pre-restore inventory summary or explicit null absence.
 
 - [ ] **Step 0.1: Write the primitive RED tests**
 
@@ -787,12 +794,22 @@ return {
   settleDurableTip: {
     sequence: replayed.records.at(-1).sequence,
     recordHash: replayed.records.at(-1).recordHash,
+    event: replayed.records.at(-1).event,
+    state: replayed.state,
   },
 };
 ```
 
-Changing either field, adding any key, changing the tip between replays, or
-supplying a torn tail must preserve journal, lock, and tombstones byte-for-byte.
+Test all seven allowed event/state pairs from the design. Changing any field,
+adding a key, using a pair outside the allowlist, changing the tip between
+replays, supplying a torn tail, omitting `writersStopped`, or removing/replacing
+the owned stale lock/tombstone must preserve every artifact byte-for-byte.
+Also test PREPARED/MOVING and RESTORE_PREPARED/RESTORING crashes before the
+first entry intent: empty recovery IDs may resume, roll back, or abort without
+inventing an entry event. The same empty array after one durable intent is fatal.
+Require `RESTORE_PREPARED` to reject swapped IDs, sparse/custom arrays, unknown
+keys, a non-null summary without its matching durable restore-active inventory,
+and any digest/count/byte mismatch.
 
 - [ ] **Step 0.2: Verify RED**
 
@@ -811,7 +828,9 @@ Keep the existing capability and bound-adapter lookups. `rollback-entry`
 validates a restore ID plus a fixed generated ID before derivation. The selected
 restore parent must already be a mode-`0700` non-symlink directory. The journal
 accepts zero durable appends only after the callback's exact `settleDurableTip`
-matches the unchanged replayed tip under the fresh held lock.
+matches one allowed unchanged replayed tip under the fresh held lock and all
+owned stale evidence remains proven. Implement direct no-intent recovery paths
+without weakening the non-empty unresolved-ID contract after the first intent.
 
 ```bash
 npm test -- --runInBand \
@@ -847,6 +866,9 @@ export async function quarantineWorkspace({
 
 Both are closed plain-object APIs. Optional fields may be omitted but no unknown
 string or symbol key is accepted. `createdAt` is a canonical UTC ISO string.
+`inspectWorkspace` accepts no writer attestation or fault hook and returns
+exactly the `INSPECTED` result from the design. `quarantineWorkspace` accepts
+only `ApplyPhase` hook values and returns exactly its `QUARANTINED` result.
 
 - [ ] **Step 1.1: Write discovery and bootstrap RED tests**
 
@@ -989,16 +1011,31 @@ Assert this matrix without overwrites:
 
 Also reject duplicate/out-of-order semantic entry events even when their
 individual journal frames are structurally valid. A new apply or restore must
-refuse every nonterminal run.
+refuse every nonterminal run. Kill at PREPARED and MOVING before the first
+`MOVE_INTENT`; require `RECOVERY_REQUIRED { entryIds: [] }` to resume or enter
+`ROLLING_BACK` and reach `ROLLED_BACK` without an entry rollback event.
 
 - [ ] **Step 3.2: Implement semantic replay and reverse rollback**
 
-Replay before filesystem action. Infer an indeterminate candidate from the
-durable ledger plus the matrix, append it only when absent, or settle its exact
-durable tip when no legal successor is ready. Roll back entries in reverse
-durable-intent order. `QUARANTINED` resume is idempotent;
+Replay before filesystem action. Reconcile an indeterminate append from the
+durable ledger plus the matrix and append the next required event only when the
+state transition proves it absent. Use `settleDurableTip` only for an owned
+stale artifact and one exact stable-tip allowlist pair; make no claim about an
+unrecorded candidate. Roll back entries in reverse durable-intent order.
+`QUARANTINED` resume is idempotent;
 `recoverQuarantine(... action: "rollback")` rejects `QUARANTINED` and directs
 the operator to restore.
+
+Assert the exact closed recovery results:
+
+```text
+{ transactionId, status: "QUARANTINED"|"VALIDATED", action: "resume",
+  reconciledEntries }
+| { transactionId, status: "ROLLED_BACK", action: "rollback",
+    reconciledEntries }
+| { transactionId, status: "INCOMPLETE_CONFLICT",
+    action: "resume"|"rollback", conflictEntryIds }
+```
 
 - [ ] **Step 3.3: Verify, commit, and review Slice 3**
 
@@ -1038,7 +1075,8 @@ JSONL stream. Reject a path-bearing pointer, another transaction, changed HEAD,
 missing generated root, inventory drift, or stale foreign lock without mutation.
 
 Kill after VALIDATED append and before pointer publication, then rerun. Recovery
-must settle the exact durable tip, return `already-present` to manifest
+must settle the exact allowlisted `(VALIDATED, VALIDATED)` durable tip with
+owned stale evidence, return `already-present` to manifest
 activation, and publish only the canonical root-level pointer.
 
 - [ ] **Step 4.2: Implement validated generation and activation**
@@ -1057,6 +1095,11 @@ activation, and publish only the canonical root-level pointer.
   deletionRequiresConfirmation: true,
 }
 ```
+
+Accept only the design's `ValidationPhase` fault-hook union. Regeneration is
+expected between apply and this function; stop all writers and establish a new
+truthful attestation immediately before `markQuarantineValidated` rather than
+carrying the apply attestation across regeneration.
 
 - [ ] **Step 4.3: Verify, commit, and review Slice 4**
 
@@ -1105,15 +1148,40 @@ state immediately before `RESTORE_PREPARED`. Concurrent active recreation,
 payload mutation, missing evidence, and both-side mutation must never be
 overwritten or deleted. A completed `RESTORED` run cannot be silently undone.
 
+For every generated entry, parameterize the design's complete `A/R/P` matrix
+using canonical original summary `O`, regenerated summary/presence `G`, absence,
+duplicate canonical content, and mismatching content. Assert the prescribed
+resume and rollback action for each valid row. Missing `O` or a required `G` is
+fatal evidence loss with no mutation; duplicate, unexpected, or mismatching
+locations are all preserved and become `INCOMPLETE_CONFLICT`. Kill in
+RESTORE_PREPARED and RESTORING before the first `RESTORE_INTENT`; an empty
+recovery ID array must resume or directly abort to the exact prior state without
+an entry rollback event.
+
 - [ ] **Step 5.2: Implement restore and reverse replay**
 
 Create the restore parent as a mode-`0700` capability-validated directory, use
 only rollback-entry paths, and preserve regenerated rollback content after a
 successful restore. On conflict append sorted unique IDs to
-`INCOMPLETE_CONFLICT` and keep every observed location. Return:
+`INCOMPLETE_CONFLICT` and keep every observed location. Resume processes durable
+`RESTORE_INTENT` records forward; rollback processes them in reverse durable
+intent order and reverses a generated entry as active original to payload, then
+rollback regenerated to active. `restoreQuarantine` accepts only `RestorePhase`
+and returns:
 
 ```js
 { transactionId, restoreId, status: "RESTORED", restoredEntries }
+```
+
+`recoverRestore` accepts only `RestoreRecoveryPhase` and returns exactly:
+
+```text
+{ transactionId, restoreId, status: "RESTORED", action: "resume",
+  reconciledEntries }
+| { transactionId, restoreId, status: "QUARANTINED"|"VALIDATED",
+    action: "rollback", reconciledEntries, restoreAborted: true }
+| { transactionId, restoreId, status: "INCOMPLETE_CONFLICT",
+    action: "resume"|"rollback", conflictEntryIds }
 ```
 
 - [ ] **Step 5.3: Verify, commit, and review Slice 5**
@@ -1150,19 +1218,49 @@ same-device rename supersedes those behaviors.
 
 - [ ] **Step 6.2: Write exact facade and spawned-CLI RED tests**
 
-The facade re-exports the current public functions from the seven focused
-modules plus exactly these orchestration functions:
+The seven public modules are the capability, path-policy, journal, manifest,
+inventory, transaction, and restore modules named in the design. Assert that
+the facade's bytewise-sorted `Object.keys()` equals exactly these 33 unique
+names:
 
 ```text
+GENERATED_ROOTS
+IndeterminateJournalAppendError
+activateManifestGeneration
+appendJournalRecord
+assertPathUnderRoot
+assertSameDevice
+buildValidatedManifest
+canonicalPathForNumberedCopy
+cleanupTerminalJournalArtifacts
+compareInventorySummary
+derivePayloadPath
+deriveRunPath
+fsyncTree
+hashFileStream
 inspectWorkspace
-quarantineWorkspace
-recoverQuarantine
 markQuarantineValidated
-restoreQuarantine
+parseInventoryRecord
+parseInventorySummary
+parseManifestEntry
+quarantineWorkspace
+readCurrentManifestPointer
+readManifestGeneration
+reclaimJournalLock
+recoverQuarantine
 recoverRestore
+replayJournal
+restoreQuarantine
+revalidateRunCapability
+validateTransition
+withJournalLock
+withQuarantineRunCapability
+writeInventoryJsonl
+writeManifestGeneration
 ```
 
-It never exports `quarantine-run-fs-context.mjs`. Test exact CLI commands:
+It never exports the filesystem-context registry, workspace runtime, fault
+helpers, or fixtures. Test exact CLI commands:
 
 ```text
 cleanup:quarantine inspect --repo-root <abs> --quarantine-root <abs> --expected-branch <name> --expected-head <sha> --expected-count <n>
@@ -1172,14 +1270,26 @@ cleanup:quarantine mark-validated --repo-root <abs> --quarantine-root <abs> --tr
 cleanup:quarantine restore --repo-root <abs> --quarantine-root <abs> --transaction-id <id> --writers-stopped
 ```
 
-Apply generates a transaction ID and flushes
-`{"state":"STARTING","transactionId":"..."}` before layout mutation so a
-killed process remains recoverable. `recover` dispatches to apply or restore
-recovery from the validated journal ledger. Reject duplicate/unknown flags,
-unknown commands, relative roots, malformed values, and missing attestation.
-stdout contains only state, counts, transaction ID, validation time, and
-deletion deadline; stderr contains no stack, file body, diff, credential, URL,
-or production response.
+Apply generates a transaction ID and flushes the design's exact
+`{ ok: true, command: "apply", status: "STARTING", transactionId }` JSONL record
+before layout mutation so a killed process remains recoverable. Assert every
+per-command success record and each exact recovery result variant from the
+design. `recover` dispatches to apply or restore recovery from the validated
+journal ledger. Reject duplicate/unknown flags, unknown commands, relative
+roots, and malformed values. Reject missing attestation for apply, recovery,
+mark-validation, and restore; `inspect` accepts no attestation flag and remains
+advisory.
+
+API conflict variants are durable results, but the CLI must convert them to the
+closed `ERR_CONFLICT` stderr record and exit 3; it must not label a conflict
+`ok: true` or print the conflict IDs.
+
+For every error class assert exactly
+`{ ok: false, command: string|null, code, message }` on stderr, empty stdout
+unless apply already flushed STARTING, and the design's exit code mapping:
+usage/preflight 2, recovery/conflict/integrity/EXDEV 3, indeterminate append 4,
+and sanitized internal failure 1. No record may contain a stack, file body,
+diff, credential, URL, authorization value, or production response.
 
 - [ ] **Step 6.3: Implement facade, CLI, package script, and verify**
 
@@ -1246,8 +1356,10 @@ or rebase the original checkout.
 - [ ] **Step C: Perform the original operation in this exact ten-step order**
 
 1. Stop development servers, builds, package installs, editors, and every
-   repository/quarantine writer; truthfully retain `--writers-stopped` for the
-   whole operation.
+   repository/quarantine writer before apply. `inspect` is advisory and needs
+   no attestation. Each later apply recovery, restore recovery, restore, or
+   mark-validation command requires writers to be stopped again and a fresh
+   truthful `--writers-stopped`; the attestation does not span regeneration.
 2. From the feature worktree, create or verify the external quarantine root as
    a mode-`0700` non-symlink directory. Do not change the original checkout.
 3. Run read-only `inspect` against the original checkout and require exact
@@ -1256,17 +1368,19 @@ or rebase the original checkout.
 4. Run `apply` with the same approved inputs, capture the flushed transaction
    ID, replay the journal, and require `QUARANTINED`, two matching destination
    inventories, absent sources, and private modes. On failure, never start a new
-   apply; use explicit recovery with that ID.
+   apply; stop all writers and use explicit recovery with that ID.
 5. Run in the original checkout:
    `npm ci`, `npm ls --depth=0`, `npm run check:audit`,
    `npm run lint -- --max-warnings=0`, `npm run typecheck`,
    `npm test -- --runInBand --no-cache`, `npm run check:extension`, and
    `npm run build`.
-6. Require no numbered source, `node_modules`, or `.next` entry and no
-   unexpected Git status. A failure leaves quarantine intact and stops before
-   validation; choose explicit recovery or restore only after reviewing the
-   exact journal state.
-7. Run `mark-validated` with the captured transaction ID and attestation.
+6. Require regenerated `node_modules` and `.next` roots to exist, require no
+   numbered-copy basename anywhere inside either root, require no numbered
+   source copy, and require no unexpected Git status. A failure leaves
+   quarantine intact and stops before validation; choose explicit recovery or
+   restore only after reviewing the exact journal state.
+7. Stop all writers again, then run `mark-validated` with the captured
+   transaction ID and a fresh attestation.
    Require a replayable `VALIDATED` state and canonical root pointer.
 8. Require `deleteAfter` exactly 96 hours after `validatedAt`,
    `deletionRequiresConfirmation: true`, and retained payload/diffs. Create only
