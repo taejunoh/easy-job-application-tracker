@@ -80,7 +80,14 @@ function invoke(fixture: Fixture, request: Record<string, unknown>): WorkerResul
   const source = `
 import * as capabilityModule from ${JSON.stringify(moduleUrl)};
 import * as fsPromises from "node:fs/promises";
-import { chmodSync, mkdirSync, renameSync, symlinkSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  renameSync,
+  symlinkSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 let input = "";
@@ -107,6 +114,26 @@ async function capture(callback) {
   } catch (error) {
     return { threw: true, error: errorDetails(error) };
   }
+}
+
+function changingProxy(sequences) {
+  const counts = Object.fromEntries(Object.keys(sequences).map((key) => [key, 0]));
+  const target = Object.freeze(
+    Object.fromEntries(Object.entries(sequences).map(([key, values]) => [key, values[0]])),
+  );
+  return {
+    counts,
+    proxy: new Proxy(target, {
+      get(current, property, receiver) {
+        if (typeof property !== "string" || !Object.hasOwn(sequences, property)) {
+          return Reflect.get(current, property, receiver);
+        }
+        const index = counts[property]++;
+        const values = sequences[property];
+        return values[Math.min(index, values.length - 1)];
+      },
+    }),
+  };
 }
 
 function options(overrides = {}) {
@@ -178,6 +205,8 @@ async function run() {
   if (request.operation === "device-mismatch") {
     const fsApi = {
       ...fsPromises,
+      lstatSync,
+      realpathSync,
       lstat: async (path) => {
         const stat = await fsPromises.lstat(path);
         if (path !== request.fixture.quarantineRoot) return stat;
@@ -190,6 +219,159 @@ async function run() {
       },
     };
     return withQuarantineRunCapability(options({ fsApi }), async () => "called");
+  }
+  if (request.operation === "snapshot-options") {
+    const counts = {
+      repoRoot: 0,
+      quarantineRoot: 0,
+      transactionId: 0,
+      writersStopped: 0,
+      fsApi: 0,
+    };
+    const firstValues = {
+      repoRoot: request.fixture.repoRoot,
+      quarantineRoot: request.fixture.quarantineRoot,
+      transactionId: request.safeTransactionId,
+      writersStopped: true,
+      fsApi: { ...fsPromises, lstatSync, realpathSync },
+    };
+    const secondValues = {
+      repoRoot: "/escaped/repository",
+      quarantineRoot: "/escaped/quarantine",
+      transactionId: ".",
+      writersStopped: false,
+      fsApi: {},
+    };
+    const hostileOptions = Object.create(null);
+    for (const key of Object.keys(counts)) {
+      Object.defineProperty(hostileOptions, key, {
+        enumerable: true,
+        get() {
+          counts[key] += 1;
+          return counts[key] === 1 ? firstValues[key] : secondValues[key];
+        },
+      });
+    }
+    Object.freeze(hostileOptions);
+    const outcome = await capture(() => withQuarantineRunCapability(
+      hostileOptions,
+      async (capability) => deriveRunPath(capability, { purpose: "journal" }),
+    ));
+    return { counts, frozen: Object.isFrozen(hostileOptions), outcome };
+  }
+  if (request.operation === "snapshot-requests") {
+    return withQuarantineRunCapability(options(), async (capability) => {
+      const sha = changingProxy({
+        purpose: ["manifest-generation"],
+        id: [request.safeDigest, "../../../escaped"],
+      });
+      const purpose = changingProxy({
+        purpose: ["manifest-generation", "journal"],
+        id: [request.safeDigest],
+      });
+      const phase = changingProxy({
+        purpose: ["inventory"],
+        id: ["copy-0001"],
+        phase: ["pre", "../../../escaped"],
+      });
+      const boundary = changingProxy({
+        purpose: ["journal"],
+        boundary: ["before-mutation", "invalid"],
+      });
+      return {
+        sha: {
+          counts: sha.counts,
+          frozen: Object.isFrozen(sha.proxy),
+          outcome: await capture(() => deriveRunPath(capability, sha.proxy)),
+        },
+        purpose: {
+          counts: purpose.counts,
+          frozen: Object.isFrozen(purpose.proxy),
+          outcome: await capture(() => deriveRunPath(capability, purpose.proxy)),
+        },
+        phase: {
+          counts: phase.counts,
+          frozen: Object.isFrozen(phase.proxy),
+          outcome: await capture(() => deriveRunPath(capability, phase.proxy)),
+        },
+        boundary: {
+          counts: boundary.counts,
+          frozen: Object.isFrozen(boundary.proxy),
+          outcome: await capture(() => revalidateRunCapability(capability, boundary.proxy)),
+        },
+      };
+    });
+  }
+  if (request.operation === "virtual-adapter") {
+    const virtual = {
+      repoRoot: "/virtual/repository",
+      quarantineRoot: "/virtual/quarantine",
+      runRoot: "/virtual/quarantine/transaction-1",
+      manifests: "/virtual/quarantine/transaction-1/manifests",
+    };
+    const inodeByPath = new Map([
+      [virtual.repoRoot, 1],
+      [virtual.quarantineRoot, 2],
+      [virtual.runRoot, 3],
+      [virtual.manifests, 4],
+    ]);
+    const calls = { lstat: [], realpath: [], mkdir: [], lstatSync: [], realpathSync: [] };
+    const statFor = (path) => {
+      if (!inodeByPath.has(path)) {
+        const error = new Error("virtual ENOENT: " + path);
+        error.code = "ENOENT";
+        throw error;
+      }
+      return {
+        dev: 9,
+        ino: inodeByPath.get(path),
+        mode: 0o40700,
+        isDirectory: () => true,
+        isSymbolicLink: () => false,
+      };
+    };
+    const fsApi = {
+      async lstat(path) {
+        calls.lstat.push(path);
+        return statFor(path);
+      },
+      async realpath(path) {
+        calls.realpath.push(path);
+        statFor(path);
+        return path;
+      },
+      async mkdir(path) {
+        calls.mkdir.push(path);
+      },
+      lstatSync(path) {
+        calls.lstatSync.push(path);
+        return statFor(path);
+      },
+      realpathSync(path) {
+        calls.realpathSync.push(path);
+        statFor(path);
+        return path;
+      },
+    };
+    const path = await withQuarantineRunCapability({
+      repoRoot: virtual.repoRoot,
+      quarantineRoot: virtual.quarantineRoot,
+      transactionId: "transaction-1",
+      writersStopped: true,
+      fsApi,
+    }, async (capability) => {
+      const derived = deriveRunPath(capability, {
+        purpose: "manifest-generation",
+        id: request.safeDigest,
+      });
+      await revalidateRunCapability(capability, {
+        purpose: "manifest-generation",
+        id: request.safeDigest,
+        boundary: "before-mutation",
+      });
+      return derived;
+    });
+    return { calls, path, virtual };
   }
   if (request.operation === "replace-root") {
     return withQuarantineRunCapability(options(), async (capability) => {
@@ -348,6 +530,110 @@ describe("callback-scoped quarantine run capability", () => {
     );
     expectCapturedError(injected, /field|request/u);
     expect(expected).not.toContain(callerPath);
+  });
+
+  it("snapshots every capability option exactly once before validation", () => {
+    const value = workerValue(
+      invoke(fixture, {
+        operation: "snapshot-options",
+        safeTransactionId: TRANSACTION_ID,
+      }),
+    );
+    expect(value).toMatchObject({
+      counts: {
+        repoRoot: 1,
+        quarantineRoot: 1,
+        transactionId: 1,
+        writersStopped: 1,
+        fsApi: 1,
+      },
+      frozen: true,
+      outcome: {
+        threw: false,
+        value: join(fixture.runRoot, "journal.log"),
+      },
+    });
+  });
+
+  it("snapshots hostile request proxies once and derives only approved paths", () => {
+    const value = workerValue(
+      invoke(fixture, {
+        operation: "snapshot-requests",
+        safeDigest: DIGEST,
+      }),
+    );
+    expect(value).toMatchObject({
+      sha: {
+        counts: { purpose: 1, id: 1 },
+        frozen: true,
+        outcome: {
+          threw: false,
+          value: join(fixture.runRoot, "manifests", `${DIGEST}.json`),
+        },
+      },
+      purpose: {
+        counts: { purpose: 1, id: 1 },
+        frozen: true,
+        outcome: {
+          threw: false,
+          value: join(fixture.runRoot, "manifests", `${DIGEST}.json`),
+        },
+      },
+      phase: {
+        counts: { purpose: 1, id: 1, phase: 1 },
+        frozen: true,
+        outcome: {
+          threw: false,
+          value: join(fixture.runRoot, "inventories", "pre", "copy-0001.jsonl"),
+        },
+      },
+      boundary: {
+        counts: { purpose: 1, boundary: 1 },
+        frozen: true,
+        outcome: { threw: false },
+      },
+    });
+  });
+
+  it("uses one virtual filesystem adapter for open, derive, and revalidation", () => {
+    const value = workerValue(
+      invoke(fixture, {
+        operation: "virtual-adapter",
+        safeDigest: DIGEST,
+      }),
+    );
+    expect(value).toMatchObject({
+      path: `/virtual/quarantine/transaction-1/manifests/${DIGEST}.json`,
+      calls: {
+        lstat: [
+          "/virtual/repository",
+          "/virtual/quarantine",
+          "/virtual/quarantine/transaction-1",
+          "/virtual/quarantine",
+          "/virtual/quarantine/transaction-1",
+          "/virtual/quarantine/transaction-1/manifests",
+        ],
+        realpath: [
+          "/virtual/repository",
+          "/virtual/quarantine",
+          "/virtual/quarantine/transaction-1",
+          "/virtual/quarantine",
+          "/virtual/quarantine/transaction-1",
+          "/virtual/quarantine/transaction-1/manifests",
+        ],
+        mkdir: [],
+        lstatSync: [
+          "/virtual/quarantine",
+          "/virtual/quarantine/transaction-1",
+          "/virtual/quarantine/transaction-1/manifests",
+        ],
+        realpathSync: [
+          "/virtual/quarantine",
+          "/virtual/quarantine/transaction-1",
+          "/virtual/quarantine/transaction-1/manifests",
+        ],
+      },
+    });
   });
 
   it.each([false, null, 1, "true"])(

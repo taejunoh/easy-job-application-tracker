@@ -1,6 +1,16 @@
-import { lstatSync, realpathSync } from "node:fs";
-import { lstat, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  lstatSync as nodeLstatSync,
+  realpathSync as nodeRealpathSync,
+} from "node:fs";
+import { lstat, mkdir, realpath } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
+/**
+ * Cooperative quarantine writer boundary. Downstream writers must use the same
+ * supplied filesystem adapter and revalidate immediately before mutation and
+ * after durability sync. These boundary checks detect replacement but cannot
+ * eliminate a hostile TOCTOU race between a check and a filesystem operation.
+ */
 
 const activeCapabilities = new WeakSet();
 const capabilityState = new WeakMap();
@@ -18,6 +28,14 @@ const INVENTORY_PHASES = new Set([
   "restore-active",
 ]);
 const BOUNDARIES = new Set(["before-mutation", "after-sync"]);
+const FS_METHODS = ["lstat", "realpath", "mkdir", "lstatSync", "realpathSync"];
+const DEFAULT_FS_ADAPTER = Object.freeze({
+  lstat,
+  realpath,
+  mkdir,
+  lstatSync: nodeLstatSync,
+  realpathSync: nodeRealpathSync,
+});
 
 function assertPlainObject(value, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -29,17 +47,35 @@ function assertPlainObject(value, label) {
   }
 }
 
-function assertExactKeys(value, allowed, required, label) {
-  for (const key of Object.keys(value)) {
-    if (!allowed.includes(key)) {
+function snapshotPublicRecord(value, allowed, required, label) {
+  assertPlainObject(value, label);
+  const keys = Reflect.ownKeys(value);
+  for (const key of keys) {
+    if (typeof key !== "string" || !allowed.includes(key)) {
       throw new TypeError(`${label} has an unknown field: ${key}`);
     }
   }
   for (const key of required) {
-    if (!Object.hasOwn(value, key)) {
+    if (!keys.includes(key)) {
       throw new TypeError(`${label} is missing field: ${key}`);
     }
   }
+  const snapshot = Object.create(null);
+  for (const key of keys) snapshot[key] = value[key];
+  return Object.freeze(snapshot);
+}
+
+function normalizeFsAdapter(value) {
+  assertPlainObject(value, "filesystem adapter");
+  const normalized = Object.create(null);
+  for (const methodName of FS_METHODS) {
+    const method = value[methodName];
+    if (typeof method !== "function") {
+      throw new TypeError(`filesystem adapter must provide ${methodName}`);
+    }
+    normalized[methodName] = (...args) => Reflect.apply(method, value, args);
+  }
+  return Object.freeze(normalized);
 }
 
 function assertAbsolutePath(value, label) {
@@ -165,54 +201,75 @@ const PURPOSES = Object.freeze({
   }),
 });
 
-function validateRequest(request) {
-  assertPlainObject(request, "run path request");
-  assertExactKeys(request, ["purpose", "id", "phase"], ["purpose"], "run path request");
-  if (typeof request.purpose !== "string" || !Object.hasOwn(PURPOSES, request.purpose)) {
+function validateRequest(request, includeBoundary = false) {
+  const label = includeBoundary
+    ? "run capability revalidation request"
+    : "run path request";
+  const normalized = snapshotPublicRecord(
+    request,
+    includeBoundary
+      ? ["purpose", "id", "phase", "boundary"]
+      : ["purpose", "id", "phase"],
+    includeBoundary ? ["purpose", "boundary"] : ["purpose"],
+    label,
+  );
+  if (
+    typeof normalized.purpose !== "string" ||
+    !Object.hasOwn(PURPOSES, normalized.purpose)
+  ) {
     throw new TypeError("run path request purpose is invalid");
   }
+  if (
+    includeBoundary &&
+    (typeof normalized.boundary !== "string" || !BOUNDARIES.has(normalized.boundary))
+  ) {
+    throw new TypeError("revalidation boundary is invalid");
+  }
 
-  switch (request.purpose) {
+  switch (normalized.purpose) {
     case "journal":
     case "journal-lock":
     case "current-pointer":
-      assertNoIdOrPhase(request);
+      assertNoIdOrPhase(normalized);
       break;
     case "journal-tombstone":
     case "manifest-temporary":
     case "current-temporary":
     case "inventory-work":
-      assertIdOnly(request, (id) => assertIdentifier(id, UUID_V4, "opaque"));
+      assertIdOnly(normalized, (id) => assertIdentifier(id, UUID_V4, "opaque"));
       break;
     case "manifest-generation":
-      assertIdOnly(request, (id) => assertIdentifier(id, SHA256, "manifest generation"));
+      assertIdOnly(normalized, (id) => assertIdentifier(id, SHA256, "manifest generation"));
       break;
     case "payload":
     case "conflict":
-      assertIdOnly(request, assertEntryId);
+      assertIdOnly(normalized, assertEntryId);
       break;
     case "rollback":
-      assertIdOnly(request, (id) => assertIdentifier(id, RESTORE_ID, "restore"));
+      assertIdOnly(normalized, (id) => assertIdentifier(id, RESTORE_ID, "restore"));
       break;
     case "divergent-diff":
-      assertIdOnly(request, (id) => assertIdentifier(id, COPY_ID, "source copy"));
+      assertIdOnly(normalized, (id) => assertIdentifier(id, COPY_ID, "source copy"));
       break;
     case "inventory":
-      if (!Object.hasOwn(request, "id") || !Object.hasOwn(request, "phase")) {
+      if (!Object.hasOwn(normalized, "id") || !Object.hasOwn(normalized, "phase")) {
         throw new TypeError("request has an invalid purpose/ID/phase combination");
       }
-      if (typeof request.phase !== "string" || !INVENTORY_PHASES.has(request.phase)) {
+      if (
+        typeof normalized.phase !== "string" ||
+        !INVENTORY_PHASES.has(normalized.phase)
+      ) {
         throw new TypeError("inventory phase is invalid");
       }
-      if (request.phase === "restore-active") {
-        assertIdentifier(request.id, RESTORE_ID, "restore");
+      if (normalized.phase === "restore-active") {
+        assertIdentifier(normalized.id, RESTORE_ID, "restore");
       } else {
-        assertEntryId(request.id);
+        assertEntryId(normalized.id);
       }
       break;
   }
 
-  return request;
+  return normalized;
 }
 
 function isWithinOrEqual(root, candidate) {
@@ -239,13 +296,13 @@ function sameIdentity(stat, recorded) {
   return stat.dev === recorded.dev && stat.ino === recorded.ino;
 }
 
-function assertRecordedDirectorySync(path, recorded, label) {
-  const stat = lstatSync(path);
+function assertRecordedDirectorySync(path, recorded, label, fsApi) {
+  const stat = fsApi.lstatSync(path);
   assertDirectoryStat(stat, label, true);
   if (!sameIdentity(stat, recorded)) {
     throw new Error(`${label} identity changed`);
   }
-  if (realpathSync(path) !== recorded.realPath) {
+  if (fsApi.realpathSync(path) !== recorded.realPath) {
     throw new Error(`${label} real path changed`);
   }
 }
@@ -267,9 +324,9 @@ function expectedParentRoot(state, derived) {
 
 function assertSelectedParentSync(state, derived) {
   const root = expectedParentRoot(state, derived);
-  const stat = lstatSync(derived.parent);
+  const stat = state.fsApi.lstatSync(derived.parent);
   assertDirectoryStat(stat, "selected path parent", true);
-  const resolvedParent = realpathSync(derived.parent);
+  const resolvedParent = state.fsApi.realpathSync(derived.parent);
   if (
     stat.dev !== root.dev ||
     resolvedParent !== resolve(derived.parent) ||
@@ -305,43 +362,54 @@ function requireActiveCapability(capability) {
 }
 
 function deriveForState(state, request) {
-  return PURPOSES[request.purpose]({
+  const derived = PURPOSES[request.purpose]({
     quarantineRoot: state.quarantine.realPath,
     runRoot: state.run.realPath,
     id: request.id,
     phase: request.phase,
   });
+  const approvedRoot = expectedParentRoot(state, derived).realPath;
+  const lexicalPath = resolve(derived.path);
+  const lexicalParent = dirname(lexicalPath);
+  if (
+    lexicalPath !== derived.path ||
+    lexicalParent !== derived.parent ||
+    !isWithinOrEqual(approvedRoot, derived.parent) ||
+    !isWithinOrEqual(approvedRoot, lexicalPath)
+  ) {
+    throw new Error("derived path escaped its approved parent or root");
+  }
+  return derived;
 }
 
 export async function withQuarantineRunCapability(options, callback) {
-  assertPlainObject(options, "run capability options");
-  assertExactKeys(
+  const normalizedOptions = snapshotPublicRecord(
     options,
     ["repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi"],
     ["repoRoot", "quarantineRoot", "transactionId", "writersStopped"],
     "run capability options",
   );
-  if (options.writersStopped !== true) {
+  if (normalizedOptions.writersStopped !== true) {
     throw new TypeError("writers-stopped attestation must be true");
   }
   if (typeof callback !== "function") {
     throw new TypeError("run capability callback must be a function");
   }
-  assertAbsolutePath(options.repoRoot, "repository root");
-  assertAbsolutePath(options.quarantineRoot, "quarantine root");
-  assertTransactionId(options.transactionId);
+  assertAbsolutePath(normalizedOptions.repoRoot, "repository root");
+  assertAbsolutePath(normalizedOptions.quarantineRoot, "quarantine root");
+  assertTransactionId(normalizedOptions.transactionId);
 
-  const fsApi = options.fsApi ?? { lstat, realpath };
-  if (typeof fsApi?.lstat !== "function" || typeof fsApi?.realpath !== "function") {
-    throw new TypeError("fsApi must provide lstat and realpath functions");
-  }
-
-  const repoStat = await fsApi.lstat(options.repoRoot);
-  const quarantineStat = await fsApi.lstat(options.quarantineRoot);
+  const fsApi = normalizeFsAdapter(
+    normalizedOptions.fsApi === undefined
+      ? DEFAULT_FS_ADAPTER
+      : normalizedOptions.fsApi,
+  );
+  const repoStat = await fsApi.lstat(normalizedOptions.repoRoot);
+  const quarantineStat = await fsApi.lstat(normalizedOptions.quarantineRoot);
   assertDirectoryStat(repoStat, "repository root", false);
   assertDirectoryStat(quarantineStat, "quarantine root", true);
-  const repoRealPath = await fsApi.realpath(options.repoRoot);
-  const quarantineRealPath = await fsApi.realpath(options.quarantineRoot);
+  const repoRealPath = await fsApi.realpath(normalizedOptions.repoRoot);
+  const quarantineRealPath = await fsApi.realpath(normalizedOptions.quarantineRoot);
   if (
     isWithinOrEqual(repoRealPath, quarantineRealPath) ||
     isWithinOrEqual(quarantineRealPath, repoRealPath)
@@ -352,7 +420,7 @@ export async function withQuarantineRunCapability(options, callback) {
     throw new Error("repository and quarantine root are on different devices");
   }
 
-  const runPath = join(quarantineRealPath, options.transactionId);
+  const runPath = join(quarantineRealPath, normalizedOptions.transactionId);
   const runStat = await fsApi.lstat(runPath);
   assertDirectoryStat(runStat, "quarantine run root", true);
   const runRealPath = await fsApi.realpath(runPath);
@@ -401,28 +469,21 @@ export function deriveRunPath(capability, request) {
     state.quarantine.path,
     state.quarantine,
     "quarantine root",
+    state.fsApi,
   );
-  assertRecordedDirectorySync(state.run.path, state.run, "quarantine run root");
+  assertRecordedDirectorySync(
+    state.run.path,
+    state.run,
+    "quarantine run root",
+    state.fsApi,
+  );
   assertSelectedParentSync(state, derived);
   return derived.path;
 }
 
 export async function revalidateRunCapability(capability, request) {
   const state = requireActiveCapability(capability);
-  assertPlainObject(request, "run capability revalidation request");
-  assertExactKeys(
-    request,
-    ["purpose", "id", "phase", "boundary"],
-    ["purpose", "boundary"],
-    "run capability revalidation request",
-  );
-  if (typeof request.boundary !== "string" || !BOUNDARIES.has(request.boundary)) {
-    throw new TypeError("revalidation boundary is invalid");
-  }
-  const pathRequest = { purpose: request.purpose };
-  if (Object.hasOwn(request, "id")) pathRequest.id = request.id;
-  if (Object.hasOwn(request, "phase")) pathRequest.phase = request.phase;
-  const validatedRequest = validateRequest(pathRequest);
+  const validatedRequest = validateRequest(request, true);
   const derived = deriveForState(state, validatedRequest);
   await assertRecordedDirectory(
     state.quarantine.path,
