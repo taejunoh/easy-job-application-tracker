@@ -146,8 +146,9 @@ preserves all evidence needed for explicit recovery.
 This is a cooperative safety boundary under the truthful writer-quiescence
 attestation. The design detects identity changes at defined seams; it does not
 claim atomic protection from a hostile process replacing a pathname between a
-check and a Node filesystem call. Apply, restore, recovery, terminal cleanup,
-and manifest activation therefore all require `writersStopped === true`.
+check and a Node filesystem call. Apply, mark-validation and manifest
+activation, restore, recovery, and terminal cleanup therefore all require
+`writersStopped === true`.
 
 ### Immutable manifest generations
 
@@ -415,21 +416,18 @@ allowed `(event, state)` pairs are:
 ```text
 (QUARANTINED, QUARANTINED)
 (VALIDATED, VALIDATED)
-(ROLLED_BACK, ROLLED_BACK)
-(RESTORED, RESTORED)
-(INCOMPLETE_CONFLICT, INCOMPLETE_CONFLICT)
 (RESTORE_ABORTED_TO_QUARANTINED, QUARANTINED)
 (RESTORE_ABORTED_TO_VALIDATED, VALIDATED)
 ```
 
-`ROLLED_BACK`, `RESTORED`, and `INCOMPLETE_CONFLICT` normally use the existing
-terminal cleanup-only path; listing them here fixes the complete stable-tip
-allowlist rather than broadening nonterminal cleanup. Unknown fields, a pair
-outside the allowlist, changed sequence/hash/event/state, a torn or changed tip,
-missing or foreign stale-lock/tombstone ownership evidence, or a zero-append
-callback without this exact result preserves every artifact and fails. This
-protocol makes no claim about an unrecorded candidate's identity and is never
-authorization to clean an arbitrary nonterminal journal.
+`ROLLED_BACK`, `RESTORED`, and `INCOMPLETE_CONFLICT` are deliberately absent:
+they use only the existing terminal cleanup-only path and have no settlement
+variant. Unknown fields, a pair outside the four-pair allowlist, changed
+sequence/hash/event/state, a torn or changed tip, missing or foreign stale-lock/
+tombstone ownership evidence, or a zero-append callback without this exact
+result preserves every artifact and fails. This protocol makes no claim about
+an unrecorded candidate's identity and is never authorization to clean an
+arbitrary nonterminal journal.
 
 Terminal stale artifacts use a separate cleanup-only API; recovery append is
 not reused. The API accepts only a fully replayed journal whose last durable
@@ -490,6 +488,12 @@ inventory; null proves that the corresponding active root was absent during
 the attested restore preflight. Unknown fields, another order/ID, an absent
 inventory for a non-null summary, or an inventory mismatch fails before
 `RESTORE_PREPARED` is appended.
+
+Restore preparation publishes and `fsync`s both fixed generated
+`restore-active` inventories first, using an explicit durable absence result
+for an absent root. It captures those two immutable summaries in the fixed
+order above and only then appends `RESTORE_PREPARED` referencing them. No
+inventory may be created or replaced after that event to satisfy its payload.
 
 The durable lifecycle is:
 
@@ -768,6 +772,7 @@ ApplyRecoveryPhase = ApplyPhase |
   "after-event:ROLLED_BACK" | "after-event:INCOMPLETE_CONFLICT" |
   `after-event:ROLLBACK_INTENT:${entryId}` |
   `after-rollback-rename:${entryId}` |
+  `after-rollback-payload-sync:${entryId}` |
   `after-rollback-destination-parent-sync:${entryId}` |
   `after-rollback-source-parent-sync:${entryId}` |
   `after-event:ROLLED_BACK_ENTRY:${entryId}`
@@ -789,6 +794,7 @@ RestorePhase =
   `after-rollback-destination-parent-sync:${generatedEntryId}` |
   `after-rollback-source-parent-sync:${generatedEntryId}` |
   `after-payload-to-active-rename:${entryId}` |
+  `after-restored-payload-sync:${entryId}` |
   `after-restore-destination-parent-sync:${entryId}` |
   `after-restore-source-parent-sync:${entryId}` |
   `after-event:RESTORED_ENTRY:${entryId}`
@@ -801,9 +807,11 @@ RestoreRecoveryPhase = RestorePhase |
   "after-event:INCOMPLETE_CONFLICT" |
   `after-event:RESTORE_ROLLBACK_INTENT:${entryId}` |
   `after-original-active-to-payload-rename:${entryId}` |
+  `after-original-payload-sync:${entryId}` |
   `after-original-payload-parent-sync:${entryId}` |
   `after-original-active-parent-sync:${entryId}` |
   `after-regenerated-rollback-to-active-rename:${generatedEntryId}` |
+  `after-regenerated-active-tree-sync:${generatedEntryId}` |
   `after-regenerated-active-parent-sync:${generatedEntryId}` |
   `after-regenerated-rollback-parent-sync:${generatedEntryId}` |
   `after-event:RESTORE_ROLLED_BACK_ENTRY:${entryId}`
@@ -815,6 +823,15 @@ respectively `ApplyPhase`, `ApplyRecoveryPhase`, `ValidationPhase`,
 `RestorePhase`, and `RestoreRecoveryPhase`. `inspectWorkspace` accepts no
 `faultHook`. A hook receives no path, summary body, file content, credential, or
 unvalidated string.
+
+The recovery hooks expose each durability seam in operation order. Apply
+rollback uses rename, moved-payload sync, destination-parent sync, then
+source-parent sync. Normal restore uses payload-to-active/source rename,
+restored-payload sync, destination-parent sync, then source-parent sync. Restore
+rollback uses original `A -> P` rename, payload sync, payload-parent sync, then
+active-parent sync; regenerated `R -> A` uses rename, active-tree sync,
+active-parent sync, then rollback-parent sync. The destination and source parent
+phases are distinct and may not be collapsed into one hook.
 
 `createdAt` and `validatedAt` are canonical UTC ISO strings. Mutating and
 recovery functions require `writersStopped === true`. `faultHook` receives only
@@ -929,10 +946,12 @@ ends at `ROLLED_BACK` or `INCOMPLETE_CONFLICT`.
 The restore ID is deterministically derived from the transaction ID as a
 version-4-shaped UUID, so every retry selects the same validated rollback
 paths without persisting a free-form destination. For a generated entry,
-restore inventories the active regenerated tree, records one
-`RESTORE_INTENT`, moves that tree to its `rollback-entry`, then moves the
-quarantined original payload to the active path. Both moves use payload/tree
-sync, destination-parent sync, and source-parent sync.
+restore publishes and `fsync`s both generated `restore-active` inventories,
+captures their summaries in one durable `RESTORE_PREPARED`, enters
+`RESTORING`, records one `RESTORE_INTENT`, moves that tree to its
+`rollback-entry`, then moves the quarantined original payload to the active
+path. Both moves use payload/tree sync, destination-parent sync, and
+source-parent sync in that order.
 
 Generated restore recovery treats active (`A`), rollback-entry (`R`), and
 quarantined payload (`P`) as three independent locations. `O` is the canonical
@@ -950,15 +969,23 @@ matrix is:
 | `O` | `-` | `-` | record complete when the active tree was originally absent | move `A` to `P`; abort restore |
 
 The last two rows are legal only when the persisted restore-active presence bit
-was false. If `O` exists nowhere, or a previously present `G` required for
-rollback exists nowhere, recovery stops as fatal evidence loss without further
-mutation. If `O` or `G` appears in more than its one expected location, all
-three locations are present, an unexpected location is present, or any present
-summary differs from the row's `O`/`G`, recovery preserves every location and
-records `INCOMPLETE_CONFLICT`; it never chooses one copy by timestamp or name.
-This includes concurrent recreation after the active-to-rollback rename and a
-mutated payload or rollback tree. Source-copy restore uses the corresponding
-two-location rules from apply recovery.
+was false. `O` and `G` are persisted roles, not labels inferred by counting
+matching summary bytes. When `O == G`, the durable ledger phase, persisted
+restore-active presence bit, authorized path, and observed inode/location assign
+the role; all five rows above remain legal even when the two summaries are
+byte-equal. Two authorized locations in one listed row are not a duplicate
+conflict merely because their content digests match.
+
+If `O` exists nowhere, or a previously present `G` required for rollback exists
+nowhere, recovery stops as fatal evidence loss without further mutation.
+`INCOMPLETE_CONFLICT` is reserved for a physical location pattern unauthorized
+by the exact three-location table for the durable ledger phase, a distinct
+concurrent inode at an unauthorized path, or a present summary that matches
+neither persisted role. Recovery preserves every location and never chooses one
+copy by timestamp or name. This includes concurrent recreation after the
+active-to-rollback rename and a mutated payload or rollback tree. Source-copy
+restore has no rollback entry; its exact location table is the `A`/`P`
+projection of the durable restore phases above with `R` required absent.
 
 Restore resume processes durable `RESTORE_INTENT` records in forward order.
 Restore rollback processes them in reverse durable `RESTORE_INTENT` order; for
@@ -970,10 +997,21 @@ silently undone.
 Validation writes independent `validation-pass-1` and `validation-pass-2`
 inventories for both regenerated roots, rejects every numbered basename and
 unexpected workspace residue, and requires matching summaries before
-activation. `deleteAfter` is exactly 96 hours after `validatedAt`,
-`deletionRequiresConfirmation` remains true, and neither Task 2 nor any
-scheduled action deletes quarantine content. Permanent deletion remains a
-separate explicit operator decision after four full days and final review.
+activation. On a first transition from `QUARANTINED`, the canonical supplied
+`validatedAt` constructs the immutable `VALIDATED` generation and
+`deleteAfter` is exactly 96 hours later. On retry when replay is already
+`VALIDATED`, the journal tip's `manifestSha256` is authoritative: the function
+ignores the newly supplied `validatedAt` for manifest construction, reads that
+immutable generation by digest, and verifies its digest, state, transaction,
+repository/root/HEAD, entry set, `retentionDays: 4`,
+`deletionRequiresConfirmation: true`, `deletionStatus: "retained"`, and
+`deleteAfter == stored validatedAt + 96 hours`. It returns or activates the
+stored generation's `validatedAt`, `deleteAfter`, and digest. A different valid
+input timestamp alone neither creates a new digest nor causes failure. A
+missing, mismatched, or corrupt journal-named generation is fatal and preserves
+all evidence. Neither Task 2 nor any scheduled action deletes quarantine
+content. Permanent deletion remains a separate explicit operator decision after
+four full days and final review.
 
 ## Backup documentation hardening
 
@@ -1031,14 +1069,16 @@ deletion removes them as well.
 - Source rollback atomically moves quarantined files to their exact validated
   original relative paths and modes in reverse journal order. It never merges
   them into canonical files and never overwrites a concurrently recreated path.
-- Generated restore first appends `RESTORE_PREPARED`, inventories the active
-  regenerated `.next` and `node_modules` trees separately, and atomically moves
-  each tree into its derived child under
+- Generated restore first publishes and `fsync`s the active regenerated
+  `.next` and `node_modules` inventories separately, captures both summaries or
+  explicit absences, then appends `RESTORE_PREPARED` referencing them. It
+  atomically moves each tree into its derived child under
   `rollback/regenerated-before-restore/<restore-id>/`. It fsyncs and records
   each move before atomically moving the corresponding quarantined original
   tree into the active path. It never unlinks an active tree to make room.
-- Restore uses the same replay matrix and explicit recovery commands as apply.
-  A crash can therefore resume or reverse each atomic move without guessing.
+- Restore uses the exact `A/R/P` three-location table and explicit restore
+  recovery commands above. A crash can therefore resume or reverse each atomic
+  move without guessing.
 - A successful restore consumes the quarantined payload but retains the
   manifest generations, inventories, current pointer, and journal as its audit
   record. Regenerated rollback content remains quarantined until explicit
@@ -1056,8 +1096,8 @@ deletion removes them as well.
 - Treat manifests, inventories, journal frames, current pointers, and restore
   arguments as untrusted. Validate closed schemas and derive payload paths from
   validated IDs; a hash or checksum is corruption evidence, not authorization.
-- Require writer quiescence and same-device identity on apply, recovery, and
-  restore. `EXDEV` is fatal and never triggers a copy fallback.
+- Require writer quiescence and same-device identity on apply, mark-validation,
+  recovery, and restore. `EXDEV` is fatal and never triggers a copy fallback.
 - Stream payload hashes and JSONL inventories with bounded memory. Never call
   `readFile` on payload bodies or serialize a complete generated tree into one
   JSON value.
@@ -1163,21 +1203,26 @@ the assertions:
    without a new event only through the closed `settleDurableTip` result while
    the owned stale lock/tombstone evidence remains proven. A changed
    sequence/hash/event/state, unknown key, non-allowlisted pair, changed tip,
-   missing or foreign owned evidence, or torn tail preserves all artifacts.
-10. **Restore and reverse restore:** inventory both active generated roots,
-    interrupt after every intent, active-tree move, original-tree move, and
-    durability sync, then prove resume reaches `RESTORED` and rollback returns
+   missing or foreign owned evidence, or torn tail preserves all artifacts. The
+   three terminal outcomes use cleanup-only and reject settlement variants.
+10. **Restore and reverse restore:** publish and sync both active generated
+    inventory results before `RESTORE_PREPARED`, then interrupt after every
+    intent, active-tree move, original-tree move, and durability sync. Prove
+    resume reaches `RESTORED` and rollback returns
     to the exact prior `QUARANTINED` or `VALIDATED` state. Concurrent or mutated
     evidence remains in place and yields `INCOMPLETE_CONFLICT`; a completed
     `RESTORED` transaction is not silently undone. Exercise every practical
-    matching/missing/mismatching `A/R/P` row, reverse durable intent order, and
-    the empty-ID no-intent abort path.
+    matching/missing/mismatching `A/R/P` row including `O == G`, classify roles
+    by ledger phase and authorized location, reverse durable intent order, and
+    exercise the empty-ID no-intent abort path.
 11. **Validation and retention:** two independent inventories for each
     regenerated root match and contain no numbered basename before the
     `VALIDATED` generation and canonical pointer become current. Recovery from
     every validation publication boundary yields one complete current
     generation, `deleteAfter` exactly 96 hours after `validatedAt`, retained
-    content, and no automatic deletion path.
+    content, and no automatic deletion path. An already-`VALIDATED` retry uses
+    the journal-named immutable generation and returns its stored timestamps;
+    a different supplied timestamp never creates a second digest.
 
 ## Success criteria
 

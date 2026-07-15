@@ -800,10 +800,12 @@ return {
 };
 ```
 
-Test all seven allowed event/state pairs from the design. Changing any field,
+Test all four allowed event/state pairs from the design. Changing any field,
 adding a key, using a pair outside the allowlist, changing the tip between
 replays, supplying a torn tail, omitting `writersStopped`, or removing/replacing
 the owned stale lock/tombstone must preserve every artifact byte-for-byte.
+For terminal `ROLLED_BACK`, `RESTORED`, and `INCOMPLETE_CONFLICT` tips, test only
+the existing cleanup-only API and explicitly reject every settlement variant.
 Also test PREPARED/MOVING and RESTORE_PREPARED/RESTORING crashes before the
 first entry intent: empty recovery IDs may resume, roll back, or abort without
 inventing an entry event. The same empty array after one durable intent is fatal.
@@ -996,6 +998,12 @@ Spawn a child and kill it through `faultHook` after manifest publication, each
 durable journal event, rename, payload sync, destination-parent sync,
 source-parent sync, first inventory publication, second inventory publication,
 and before lock cleanup. Run `resume` and `rollback` from fresh fixtures.
+For rollback specifically, kill after source-to-payload rename, after the moved
+payload sync, after destination-parent sync, and after source-parent sync as
+four distinct seams using `after-rollback-rename:${entryId}`,
+`after-rollback-payload-sync:${entryId}`,
+`after-rollback-destination-parent-sync:${entryId}`, and
+`after-rollback-source-parent-sync:${entryId}`.
 
 Assert this matrix without overwrites:
 
@@ -1074,6 +1082,13 @@ both regenerated roots, matching summaries, and no numbered basename in either
 JSONL stream. Reject a path-bearing pointer, another transaction, changed HEAD,
 missing generated root, inventory drift, or stale foreign lock without mutation.
 
+When replay is already `VALIDATED`, supply a different canonical `validatedAt`
+and require the journal tip's digest to select the existing immutable generation.
+Verify and return its stored `validatedAt` and `deleteAfter`; do not construct a
+second digest. Missing, digest-mismatched, schema-invalid, wrong-state,
+wrong-transaction/repository/HEAD/entries, or invalid four-day retention fields
+in that journal-named generation are fatal and preserve all evidence.
+
 Kill after VALIDATED append and before pointer publication, then rerun. Recovery
 must settle the exact allowlisted `(VALIDATED, VALIDATED)` durable tip with
 owned stale evidence, return `already-present` to manifest
@@ -1081,9 +1096,12 @@ activation, and publish only the canonical root-level pointer.
 
 - [ ] **Step 4.2: Implement validated generation and activation**
 
-`validatedAt` is canonical UTC. Build the closed `VALIDATED` generation with
-`deleteAfter = validatedAt + 96 hours`, `deletionStatus: "retained"`, and
-`deletionRequiresConfirmation: true`. Return only:
+On a `QUARANTINED` replay, `validatedAt` is canonical UTC. Build the closed
+`VALIDATED` generation with `deleteAfter = validatedAt + 96 hours`,
+`deletionStatus: "retained"`, and `deletionRequiresConfirmation: true`. On an
+already-`VALIDATED` replay, ignore the supplied timestamp for construction,
+read and fully validate the journal-named immutable generation, activate it if
+needed, and return its stored timestamp, deadline, and digest. Return only:
 
 ```js
 {
@@ -1136,24 +1154,45 @@ export async function recoverRestore({
 - [ ] **Step 5.1: Write restore and actual-SIGKILL RED matrices**
 
 Derive one deterministic version-4-shaped restore ID from the transaction ID.
-For each generated entry, inventory the active regenerated tree, append one
-`RESTORE_INTENT`, rename active to its fixed rollback-entry, sync the tree and
-both parents, rename original payload to active, sync both parents, then append
-`RESTORED_ENTRY`. Source copies use one payload-to-source move.
+Publish and `fsync` both fixed generated `restore-active` inventories first,
+capture their two summaries or durable absences, and only then append
+`RESTORE_PREPARED` referencing them and enter `RESTORING`. For each generated
+entry, append one `RESTORE_INTENT`, rename active to its fixed rollback-entry,
+sync the tree and both parents, rename original payload to active, sync the
+restored payload and both parents, then append `RESTORED_ENTRY`. Source copies
+use one payload-to-source move.
 
 Kill after every append, active rename, tree/payload sync, parent sync, and
-original rename. `resume` must reach `RESTORED`. `rollback` before `RESTORED`
-must reverse processed entries and append the abort event matching the durable
-state immediately before `RESTORE_PREPARED`. Concurrent active recreation,
-payload mutation, missing evidence, and both-side mutation must never be
-overwritten or deleted. A completed `RESTORED` run cannot be silently undone.
+original rename. Include separate hooks after original `A -> P` rename, payload
+sync, payload-parent sync, and active-parent sync, plus after regenerated
+`R -> A` rename, active-tree sync, active-parent sync, and rollback-parent sync.
+Use exactly `after-original-active-to-payload-rename:${entryId}`,
+`after-original-payload-sync:${entryId}`,
+`after-original-payload-parent-sync:${entryId}`,
+`after-original-active-parent-sync:${entryId}`,
+`after-regenerated-rollback-to-active-rename:${generatedEntryId}`,
+`after-regenerated-active-tree-sync:${generatedEntryId}`,
+`after-regenerated-active-parent-sync:${generatedEntryId}`, and
+`after-regenerated-rollback-parent-sync:${generatedEntryId}`. Normal restore's
+payload move uses `after-payload-to-active-rename:${entryId}` followed by
+`after-restored-payload-sync:${entryId}` and its two distinct parent-sync hooks.
+`resume` must reach `RESTORED`. `rollback` before `RESTORED` must process durable
+`RESTORE_INTENT` records in reverse order, reverse processed entries, and append
+the abort event matching the durable state immediately before
+`RESTORE_PREPARED`. Concurrent active recreation, payload mutation, missing
+evidence, and both-side mutation must never be overwritten or deleted. A
+completed `RESTORED` run cannot be silently undone.
 
 For every generated entry, parameterize the design's complete `A/R/P` matrix
 using canonical original summary `O`, regenerated summary/presence `G`, absence,
-duplicate canonical content, and mismatching content. Assert the prescribed
-resume and rollback action for each valid row. Missing `O` or a required `G` is
-fatal evidence loss with no mutation; duplicate, unexpected, or mismatching
-locations are all preserved and become `INCOMPLETE_CONFLICT`. Kill in
+byte-equal `O == G`, distinct concurrent inodes, and mismatching content. Assert
+the prescribed resume and rollback action for each valid row, including every
+allowed row when `O == G`; role comes from the durable phase and authorized
+physical location,
+not matching-summary multiplicity. Missing `O` or a required `G` is fatal
+evidence loss with no mutation. Only a physical path/inode pattern unauthorized
+by that exact three-location row, or content matching neither persisted role,
+is preserved as `INCOMPLETE_CONFLICT`. Kill in
 RESTORE_PREPARED and RESTORING before the first `RESTORE_INTENT`; an empty
 recovery ID array must resume or directly abort to the exact prior state without
 an entry rollback event.
