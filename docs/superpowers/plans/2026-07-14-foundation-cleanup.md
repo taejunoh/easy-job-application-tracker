@@ -112,10 +112,13 @@ git commit -m "feat: enforce quarantine path policy"
 
 - [ ] **Step 5: Write streaming inventory and RSS tests**
 
-Import `hashFileStream` and `writeInventoryJsonl`. Build a synthetic generated
-tree containing exactly 40,000 small files, two nested directories, and one leaf
-symlink; the inventory excludes its root and therefore contains 40,003 entries.
-Require deterministic JSONL and summary equality across two independent passes:
+Import `hashFileStream`, `writeInventoryJsonl`, and `parseInventorySummary`.
+Require the summary parser to accept exactly `{ sha256, entries, bytes }` and
+reject unknown or missing keys, malformed hashes, and negative or unsafe
+integers. Build a synthetic generated tree containing exactly 40,000 small
+files, two nested directories, and one leaf symlink; the inventory excludes its
+root and therefore contains 40,003 entries. Require deterministic JSONL and
+summary equality across two independent passes:
 
 ```ts
 expect(second.summary).toEqual(first.summary);
@@ -142,6 +145,7 @@ Implement:
 ```js
 export async function hashFileStream(absolutePath, options = {}) {}
 export async function writeInventoryJsonl({ root, outputPath, fsApi }) {}
+export function parseInventorySummary(value) {}
 export async function compareInventorySummary(expected, observed) {}
 export async function fsyncTree(root, fsApi) {}
 ```
@@ -178,6 +182,37 @@ payload, unknown key, sequence gap, hash mismatch, or illegal transition must
 fail closed. Assert the journal is mode `0600` and every successful append calls
 both file `sync()` and parent-directory sync before resolving.
 
+Journal envelopes and event payloads are independent closed schemas. Add a
+table-driven payload-validator test for every event already present in the
+transition graph. At minimum require these exact shapes:
+
+```ts
+type InventorySummary = {
+  sha256: string;
+  entries: number;
+  bytes: number;
+};
+
+type RequiredJournalPayloads = {
+  PREPARED: { transactionId: string; manifestSha256: string };
+  MOVING: Record<string, never>;
+  MOVE_INTENT: { id: string; expected: InventorySummary };
+  MOVED: { id: string; observed: InventorySummary };
+  VERIFYING: Record<string, never>;
+  QUARANTINED: { manifestSha256: string };
+};
+```
+
+Lifecycle-only events outside this minimum accept exactly `{}` unless their
+Task 2 transition contract defines a narrower entry-ID, inventory-summary, or
+sorted conflict-ID payload. Tests must prove that an empty-payload event rejects
+one unknown key; `PREPARED` rejects a missing or extra field, invalid transaction
+ID, and invalid checksum; `MOVE_INTENT` and `MOVED` reject unknown fields, invalid
+entry IDs, invalid nested summary keys, hashes, counts, and byte sizes. Replay
+must reject a canonical, correctly re-hashed frame whose event payload violates
+its event schema. Assert that every event in the transition map has a payload
+parser, so adding a transition without a schema fails the suite.
+
 - [ ] **Step 9: Verify journal RED, implement durable replay, and verify GREEN**
 
 ```bash
@@ -199,7 +234,12 @@ type JournalFrame = {
 
 Hash the canonical envelope without `recordHash`, append one complete frame,
 `sync()` the handle, and fsync its directory. Replay ignores only an incomplete
-final length/body pair and validates every complete frame and lifecycle edge.
+final length/body pair and validates every complete frame, event-specific
+payload, and lifecycle edge. Implement an exact payload-parser table keyed by
+event and invoke it during both append and replay; accepting an arbitrary plain
+object after canonicalization is forbidden. Task 2 may add fields only by first
+adding the corresponding RED exact-schema tests and updating the documented
+event contract.
 Run the same Jest command and require PASS.
 
 - [ ] **Step 10: Implement the small manifest publisher with RED/GREEN tests**
@@ -207,6 +247,65 @@ Run the same Jest command and require PASS.
 Add manifest tests to `quarantine-journal.test.ts` that reject unknown fields and
 path-bearing current pointers, verify atomic temporary-file replacement, verify
 file/directory fsync ordering, and require:
+
+```ts
+type InventorySummary = {
+  sha256: string;
+  entries: number;
+  bytes: number;
+};
+
+type ManifestEntry =
+  | {
+      id: string;
+      kind: "source-copy";
+      relativePath: string;
+      canonicalRelativePath: string;
+      mode: number;
+      size: number;
+      sha256: string;
+      canonicalSize: number;
+      canonicalSha256: string;
+      classification: "identical" | "divergent";
+      historyMatch: string | null;
+      preMoveInventory: InventorySummary;
+    }
+  | {
+      id: "generated-next";
+      kind: "generated-root";
+      relativePath: ".next";
+      mode: number;
+      preMoveInventory: InventorySummary;
+    }
+  | {
+      id: "generated-node-modules";
+      kind: "generated-root";
+      relativePath: "node_modules";
+      mode: number;
+      preMoveInventory: InventorySummary;
+    };
+```
+
+The manifest parser owns this enriched exact-key union. Keep the path-policy
+parser focused on the locator fields and export a reusable closed
+`parseInventorySummary` from `quarantine-inventory.mjs`; do not duplicate hash,
+count, or byte validation in transaction code. Inventory files are derived as
+`inventories/pre/<validated-entry-id>.jsonl`, so reject any `inventoryPath`,
+`payloadPath`, destination, rollback path, or other free-form path field.
+
+Add positive source-copy and generated-root fixtures plus failures for every
+missing/unknown field, malformed hash, unsafe mode, negative or unsafe integer,
+invalid classification/hash relationship, invalid history match, source
+summary not equal to one entry/source byte size, duplicate ID, duplicate
+relative path, unsorted entries, nondeterministic `copy-NNNN` IDs, a missing or
+duplicate generated root, and generated IDs/paths that are not exactly
+`generated-next`/`.next` and `generated-node-modules`/`node_modules`. Require
+the complete manifest entry array to use bytewise relative-path order and to
+contain both generated roots exactly once. The transaction's invocation-supplied
+expected copy count is checked in Task 2 and is not stored as a free-form
+manifest override.
+
+Also require validation metadata behavior:
 
 ```ts
 expect(marked).toMatchObject({
@@ -218,14 +317,19 @@ expect(marked).toMatchObject({
 
 Run the suite to see missing exports, then create
 `scripts/quarantine-manifest.mjs` exporting `readManifest`, `publishManifest`,
-and `markQuarantineValidated`. The current pointer contains only a validated
-transaction ID, never a path. Rerun and require PASS.
+and `markQuarantineValidated`. Compose the locator parser and exported inventory
+summary parser into the enriched manifest-entry parser, enforce cross-entry and
+cross-field invariants before publication and after reading, and keep all
+normalized objects canonical. The current pointer contains only a validated
+transaction ID, never a path. A Task 2 runtime summary/reference may point to
+the validated manifest entry ID and its `preMoveInventory`, but cannot replace
+or weaken the manifest schema. Rerun and require PASS.
 
 - [ ] **Step 11: Commit journal and manifest primitives**
 
 ```bash
 git diff --check
-git add scripts/quarantine-journal.mjs scripts/quarantine-manifest.mjs __tests__/scripts/quarantine-journal.test.ts
+git add scripts/quarantine-inventory.mjs scripts/quarantine-journal.mjs scripts/quarantine-manifest.mjs __tests__/scripts/quarantine-inventory.test.ts __tests__/scripts/quarantine-journal.test.ts
 git commit -m "feat: add durable quarantine journal"
 ```
 

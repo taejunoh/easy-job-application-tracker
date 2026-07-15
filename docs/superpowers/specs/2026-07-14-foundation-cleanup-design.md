@@ -106,6 +106,77 @@ The small manifest records:
   directory entries;
 - retention deadline and deletion status.
 
+The manifest entry schema is fixed before transaction orchestration is added.
+`quarantine-path-policy.mjs` validates only the filesystem locator
+`{ id, kind, relativePath, canonicalRelativePath? }`.
+`quarantine-inventory.mjs` validates the reusable closed summary
+`{ sha256, entries, bytes }`. `quarantine-manifest.mjs` composes those two
+boundaries into this exact discriminated union:
+
+```ts
+type InventorySummary = {
+  sha256: string;
+  entries: number;
+  bytes: number;
+};
+
+type SourceCopyManifestEntry = {
+  id: string;
+  kind: "source-copy";
+  relativePath: string;
+  canonicalRelativePath: string;
+  mode: number;
+  size: number;
+  sha256: string;
+  canonicalSize: number;
+  canonicalSha256: string;
+  classification: "identical" | "divergent";
+  historyMatch: string | null;
+  preMoveInventory: InventorySummary;
+};
+
+type GeneratedRootManifestEntry =
+  | {
+      id: "generated-next";
+      kind: "generated-root";
+      relativePath: ".next";
+      mode: number;
+      preMoveInventory: InventorySummary;
+    }
+  | {
+      id: "generated-node-modules";
+      kind: "generated-root";
+      relativePath: "node_modules";
+      mode: number;
+      preMoveInventory: InventorySummary;
+    };
+
+type ManifestEntry =
+  | SourceCopyManifestEntry
+  | GeneratedRootManifestEntry;
+```
+
+Every object above has an exact key set. Hashes are lowercase 64-character
+SHA-256 values; `historyMatch` is null or an accepted 40/64-character Git
+object ID; modes are safe integers from `0` through `0o7777`; sizes, entry
+counts, and byte counts are non-negative safe integers. A source-copy summary
+has exactly one entry and its byte count equals `size`. `identical` requires
+equal source/canonical sizes and hashes, while `divergent` requires unequal
+hashes. Entry IDs and relative paths are unique. Source copies are assigned
+`copy-0001`, `copy-0002`, and so on in bytewise relative-path order; generated
+entries use exactly `generated-next` and `generated-node-modules`. The complete
+manifest entry array is bytewise sorted by relative path and contains each
+generated root exactly once. The expected numbered-copy count remains an
+invocation precondition enforced by transaction orchestration.
+
+Inventory JSONL paths are always derived as
+`inventories/pre/<validated-entry-id>.jsonl`. Neither a manifest entry nor a
+journal payload may store an inventory path, payload destination, rollback
+destination, or other free-form filesystem target. The transaction layer may
+construct runtime entry plans and journal references, but those objects refer
+back to the manifest entry ID and summary; they do not replace or duplicate the
+authoritative enriched manifest entry.
+
 Unified diffs and verified Git-history matches for all four divergent files are
 stored in `divergent-diffs/`. No divergent content is automatically merged into
 canonical files.
@@ -129,6 +200,17 @@ is flushed and `fsync`ed before the corresponding destructive transition; new
 files and rename operations also `fsync` their containing directories. A torn
 final frame is ignored during replay. Any malformed non-final frame, sequence
 gap, hash-chain break, unknown field, or illegal state transition is fatal.
+The envelope schema and event payload schema are separate closed boundaries.
+Every event in the transition table has an exact payload parser on both append
+and replay. Lifecycle-only events accept exactly `{}`; `PREPARED` accepts only
+the validated transaction ID and manifest SHA-256; `MOVE_INTENT` accepts only
+the entry ID and expected `InventorySummary`; `MOVED` accepts only the entry ID
+and observed `InventorySummary`. Entry-oriented rollback and restore events
+accept only their validated entry ID plus any inventory summary explicitly
+required by their documented transition. Conflict/recovery events accept only
+sorted unique validated entry-ID arrays. Task 2 may extend an event payload only
+after adding a failing exact-schema test and updating this contract; arbitrary
+plain canonical JSON is never an accepted journal payload.
 
 The durable lifecycle is:
 
