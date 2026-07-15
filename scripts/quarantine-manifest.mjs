@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { basename, dirname, isAbsolute } from "node:path";
 
@@ -262,7 +262,9 @@ export function buildValidatedManifest(value) {
   const manifest = snapshotRecord(value, MANIFEST_KEYS, MANIFEST_KEYS, "manifest");
   if (manifest.schemaVersion !== 1) throw new TypeError("manifest schema version is invalid");
   const transactionId = assertTransactionId(manifest.transactionId);
-  if (manifest.state !== "VALIDATED") throw new TypeError("manifest state must be VALIDATED");
+  if (manifest.state !== "PREPARED" && manifest.state !== "VALIDATED") {
+    throw new TypeError("manifest state must be PREPARED or VALIDATED");
+  }
   if (
     typeof manifest.repositoryRoot !== "string" ||
     !isAbsolute(manifest.repositoryRoot) ||
@@ -275,27 +277,41 @@ export function buildValidatedManifest(value) {
     throw new TypeError("manifest HEAD is invalid");
   }
   const createdAt = assertIsoDate(manifest.createdAt, "createdAt");
-  const validatedAt = assertIsoDate(manifest.validatedAt, "validatedAt");
   if (manifest.retentionDays !== RETENTION_DAYS) {
-    throw new TypeError("validated manifest retentionDays is invalid");
+    throw new TypeError("manifest retentionDays is invalid");
   }
   if (manifest.deletionRequiresConfirmation !== true) {
     throw new TypeError("manifest deletion must require confirmation");
   }
-  const deleteAfter = assertIsoDate(manifest.deleteAfter, "deleteAfter");
-  const expectedDeleteAfter = new Date(
-    Date.parse(validatedAt) + RETENTION_DAYS * 24 * 60 * 60 * 1000,
-  ).toISOString();
-  if (deleteAfter !== expectedDeleteAfter) {
-    throw new TypeError("validated manifest deleteAfter is invalid");
-  }
-  if (manifest.deletionStatus !== "retained" && manifest.deletionStatus !== "deleted") {
-    throw new TypeError("manifest deletion status is invalid");
+  let validatedAt;
+  let deleteAfter;
+  if (manifest.state === "PREPARED") {
+    if (
+      manifest.validatedAt !== null ||
+      manifest.deleteAfter !== null ||
+      manifest.deletionStatus !== "retained"
+    ) {
+      throw new TypeError("PREPARED manifest validation metadata is invalid");
+    }
+    validatedAt = null;
+    deleteAfter = null;
+  } else {
+    validatedAt = assertIsoDate(manifest.validatedAt, "validatedAt");
+    deleteAfter = assertIsoDate(manifest.deleteAfter, "deleteAfter");
+    const expectedDeleteAfter = new Date(
+      Date.parse(validatedAt) + RETENTION_DAYS * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    if (deleteAfter !== expectedDeleteAfter) {
+      throw new TypeError("VALIDATED manifest deleteAfter is invalid");
+    }
+    if (manifest.deletionStatus !== "retained" && manifest.deletionStatus !== "deleted") {
+      throw new TypeError("VALIDATED manifest deletion status is invalid");
+    }
   }
   return Object.freeze({
     schemaVersion: 1,
     transactionId,
-    state: "VALIDATED",
+    state: manifest.state,
     repositoryRoot: manifest.repositoryRoot,
     head: manifest.head,
     createdAt,
@@ -402,7 +418,12 @@ async function fsyncDirectory(path, fsApi) {
   return withHandle(handle, (opened) => opened.sync(), "directory sync and close both failed");
 }
 
-async function readBoundedFile(path, fsApi, maxBytes, label) {
+async function fsyncFile(path, fsApi) {
+  const handle = await fsApi.open(path, "r");
+  return withHandle(handle, (opened) => opened.sync(), "file sync and close both failed");
+}
+
+async function readBoundedSnapshot(path, fsApi, maxBytes, label) {
   const before = await fsApi.lstat(path);
   assertRegularFile(before, label);
   if (before.size > maxBytes) throw new Error(`${label} is too large`);
@@ -434,8 +455,12 @@ async function readBoundedFile(path, fsApi, maxBytes, label) {
     ) {
       throw new Error(`${label} identity, size, or mode changed while being read`);
     }
-    return bytes;
+    return { bytes, identity: after };
   }, `${label} read and close both failed`);
+}
+
+async function readBoundedFile(path, fsApi, maxBytes, label) {
+  return (await readBoundedSnapshot(path, fsApi, maxBytes, label)).bytes;
 }
 
 async function removeOwnedTemporary({
@@ -466,12 +491,27 @@ async function removeOwnedTemporary({
   });
 }
 
+async function assertOwnedPrivateTemporary(path, identity, fsApi, label) {
+  const current = await fsApi.lstat(path);
+  assertRegularFile(current, label);
+  if (!sameIdentity(current, identity)) {
+    throw new Error(`${label} ownership changed`);
+  }
+}
+
 function canonicalBytes(value) {
   return Buffer.from(`${JSON.stringify(value)}\n`);
 }
 
 function digestBytes(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function temporaryIdForDigest(digest) {
+  return (
+    `${digest.slice(0, 8)}-${digest.slice(8, 12)}-` +
+    `4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`
+  );
 }
 
 function assertGenerationTransaction(generationPath, transactionId) {
@@ -498,6 +538,26 @@ function parsePointer(value) {
   });
 }
 
+function parseEnsureValidatedResult(value, expectedDigest) {
+  const result = snapshotRecord(
+    value,
+    ["status", "manifestSha256"],
+    ["status", "manifestSha256"],
+    "ensure-validated result",
+  );
+  if (result.status !== "appended" && result.status !== "already-present") {
+    throw new TypeError("ensure-validated result status is invalid");
+  }
+  const manifestSha256 = assertSha256(
+    result.manifestSha256,
+    "ensure-validated manifest SHA-256",
+  );
+  if (manifestSha256 !== expectedDigest) {
+    throw new Error("ensure-validated result conflicts with the requested manifest digest");
+  }
+  return Object.freeze({ status: result.status, manifestSha256 });
+}
+
 export async function writeManifestGeneration(options) {
   const input = snapshotRecord(
     options,
@@ -511,7 +571,7 @@ export async function writeManifestGeneration(options) {
   const bytes = canonicalBytes(manifest);
   if (bytes.length > MAX_GENERATION_BYTES) throw new Error("manifest generation is too large");
   const manifestSha256 = digestBytes(bytes);
-  const temporaryId = randomUUID();
+  const temporaryId = temporaryIdForDigest(manifestSha256);
   const temporaryPath = deriveRunPath(input.capability, {
     purpose: "manifest-temporary",
     id: temporaryId,
@@ -529,30 +589,60 @@ export async function writeManifestGeneration(options) {
       id: temporaryId,
       boundary: "before-mutation",
     });
-    const handle = await fsApi.open(temporaryPath, "wx", 0o600);
-    await withHandle(handle, async (opened) => {
-      temporaryIdentity = await opened.stat();
-      assertOwnedRegularFile(temporaryIdentity, "manifest temporary file");
-      const pathIdentity = await fsApi.lstat(temporaryPath);
-      assertOwnedRegularFile(pathIdentity, "manifest temporary file");
-      if (!sameIdentity(temporaryIdentity, pathIdentity)) {
-        throw new Error("manifest temporary file ownership changed after open");
+    let handle;
+    try {
+      handle = await fsApi.open(temporaryPath, "wx", 0o600);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const stale = await readBoundedSnapshot(
+        temporaryPath,
+        fsApi,
+        bytes.length,
+        "stale manifest temporary file",
+      );
+      if (!stale.bytes.equals(bytes)) {
+        throw new Error("stale manifest temporary file conflicts with expected canonical bytes");
       }
-      await opened.chmod(0o600);
-      const privateIdentity = await opened.stat();
-      assertRegularFile(privateIdentity, "manifest temporary file");
-      if (!sameIdentity(temporaryIdentity, privateIdentity)) {
-        throw new Error("manifest temporary file ownership changed during chmod");
-      }
-      await writeComplete(opened, bytes);
-      await opened.sync();
-    }, "manifest temporary write and close both failed");
+      temporaryIdentity = stale.identity;
+      await assertOwnedPrivateTemporary(
+        temporaryPath,
+        temporaryIdentity,
+        fsApi,
+        "stale manifest temporary file",
+      );
+      await fsyncFile(temporaryPath, fsApi);
+    }
+    if (handle !== undefined) {
+      await withHandle(handle, async (opened) => {
+        temporaryIdentity = await opened.stat();
+        assertOwnedRegularFile(temporaryIdentity, "manifest temporary file");
+        const pathIdentity = await fsApi.lstat(temporaryPath);
+        assertOwnedRegularFile(pathIdentity, "manifest temporary file");
+        if (!sameIdentity(temporaryIdentity, pathIdentity)) {
+          throw new Error("manifest temporary file ownership changed after open");
+        }
+        await opened.chmod(0o600);
+        const privateIdentity = await opened.stat();
+        assertRegularFile(privateIdentity, "manifest temporary file");
+        if (!sameIdentity(temporaryIdentity, privateIdentity)) {
+          throw new Error("manifest temporary file ownership changed during chmod");
+        }
+        await writeComplete(opened, bytes);
+        await opened.sync();
+      }, "manifest temporary write and close both failed");
+    }
     await invokeFaultHook(faultHook, "after-generation-temporary-sync");
     await revalidateRunCapability(input.capability, {
       purpose: "manifest-temporary",
       id: temporaryId,
       boundary: "after-sync",
     });
+    await assertOwnedPrivateTemporary(
+      temporaryPath,
+      temporaryIdentity,
+      fsApi,
+      "manifest temporary file",
+    );
     await revalidateRunCapability(input.capability, {
       purpose: "manifest-generation",
       id: manifestSha256,
@@ -632,6 +722,9 @@ export async function activateManifestGeneration(options) {
   if (generation.transactionId !== transactionId) {
     throw new Error("manifest generation transaction ID mismatch");
   }
+  if (generation.state !== "VALIDATED") {
+    throw new Error("only a VALIDATED manifest generation can be activated");
+  }
   const generationPath = deriveRunPath(input.capability, {
     purpose: "manifest-generation",
     id: manifestSha256,
@@ -642,11 +735,13 @@ export async function activateManifestGeneration(options) {
     id: manifestSha256,
     boundary: "after-sync",
   });
-  await input.appendValidated(Object.freeze({ manifestSha256 }));
+  const ensureResult = await input.appendValidated(Object.freeze({ manifestSha256 }));
+  parseEnsureValidatedResult(ensureResult, manifestSha256);
+  await invokeFaultHook(faultHook, "after-ensure-validated");
 
   const pointer = Object.freeze({ schemaVersion: 1, transactionId, manifestSha256 });
   const pointerBytes = canonicalBytes(pointer);
-  const temporaryId = randomUUID();
+  const temporaryId = temporaryIdForDigest(manifestSha256);
   const temporaryPath = deriveRunPath(input.capability, {
     purpose: "current-temporary",
     id: temporaryId,
@@ -661,30 +756,60 @@ export async function activateManifestGeneration(options) {
       id: temporaryId,
       boundary: "before-mutation",
     });
-    const handle = await fsApi.open(temporaryPath, "wx", 0o600);
-    await withHandle(handle, async (opened) => {
-      temporaryIdentity = await opened.stat();
-      assertOwnedRegularFile(temporaryIdentity, "current pointer temporary file");
-      const pathIdentity = await fsApi.lstat(temporaryPath);
-      assertOwnedRegularFile(pathIdentity, "current pointer temporary file");
-      if (!sameIdentity(temporaryIdentity, pathIdentity)) {
-        throw new Error("current pointer temporary file ownership changed after open");
+    let handle;
+    try {
+      handle = await fsApi.open(temporaryPath, "wx", 0o600);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const stale = await readBoundedSnapshot(
+        temporaryPath,
+        fsApi,
+        pointerBytes.length,
+        "stale current pointer temporary file",
+      );
+      if (!stale.bytes.equals(pointerBytes)) {
+        throw new Error("stale current pointer temporary conflicts with expected canonical bytes");
       }
-      await opened.chmod(0o600);
-      const privateIdentity = await opened.stat();
-      assertRegularFile(privateIdentity, "current pointer temporary file");
-      if (!sameIdentity(temporaryIdentity, privateIdentity)) {
-        throw new Error("current pointer temporary file ownership changed during chmod");
-      }
-      await writeComplete(opened, pointerBytes);
-      await opened.sync();
-    }, "current pointer temporary write and close both failed");
+      temporaryIdentity = stale.identity;
+      await assertOwnedPrivateTemporary(
+        temporaryPath,
+        temporaryIdentity,
+        fsApi,
+        "stale current pointer temporary file",
+      );
+      await fsyncFile(temporaryPath, fsApi);
+    }
+    if (handle !== undefined) {
+      await withHandle(handle, async (opened) => {
+        temporaryIdentity = await opened.stat();
+        assertOwnedRegularFile(temporaryIdentity, "current pointer temporary file");
+        const pathIdentity = await fsApi.lstat(temporaryPath);
+        assertOwnedRegularFile(pathIdentity, "current pointer temporary file");
+        if (!sameIdentity(temporaryIdentity, pathIdentity)) {
+          throw new Error("current pointer temporary file ownership changed after open");
+        }
+        await opened.chmod(0o600);
+        const privateIdentity = await opened.stat();
+        assertRegularFile(privateIdentity, "current pointer temporary file");
+        if (!sameIdentity(temporaryIdentity, privateIdentity)) {
+          throw new Error("current pointer temporary file ownership changed during chmod");
+        }
+        await writeComplete(opened, pointerBytes);
+        await opened.sync();
+      }, "current pointer temporary write and close both failed");
+    }
     await invokeFaultHook(faultHook, "after-pointer-temporary-sync");
     await revalidateRunCapability(input.capability, {
       purpose: "current-temporary",
       id: temporaryId,
       boundary: "after-sync",
     });
+    await assertOwnedPrivateTemporary(
+      temporaryPath,
+      temporaryIdentity,
+      fsApi,
+      "current pointer temporary file",
+    );
     await revalidateRunCapability(input.capability, {
       purpose: "current-pointer",
       boundary: "before-mutation",
@@ -734,9 +859,12 @@ export async function readCurrentManifestPointer(options) {
     "current pointer read options",
   );
   const fsApi = normalizeFsApi(input.fsApi);
-  const maxBytes = assertMaxBytes(
-    input.maxBytes === undefined ? 4096 : input.maxBytes,
-    "current pointer maximum bytes",
+  const maxBytes = Math.min(
+    assertMaxBytes(
+      input.maxBytes === undefined ? 4096 : input.maxBytes,
+      "current pointer maximum bytes",
+    ),
+    4096,
   );
   const path = deriveRunPath(input.capability, { purpose: "current-pointer" });
   const bytes = await readBoundedFile(path, fsApi, maxBytes, "current pointer");
@@ -759,9 +887,12 @@ export async function readManifestGeneration(options) {
   );
   const manifestSha256 = assertSha256(input.manifestSha256, "manifest generation SHA-256");
   const fsApi = normalizeFsApi(input.fsApi);
-  const maxBytes = assertMaxBytes(
-    input.maxBytes === undefined ? MAX_GENERATION_BYTES : input.maxBytes,
-    "manifest generation maximum bytes",
+  const maxBytes = Math.min(
+    assertMaxBytes(
+      input.maxBytes === undefined ? MAX_GENERATION_BYTES : input.maxBytes,
+      "manifest generation maximum bytes",
+    ),
+    MAX_GENERATION_BYTES,
   );
   const path = deriveRunPath(input.capability, {
     purpose: "manifest-generation",

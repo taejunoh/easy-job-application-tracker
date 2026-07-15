@@ -76,6 +76,14 @@ const validManifest = {
     },
   ],
 };
+const preparedManifest = {
+  ...validManifest,
+  state: "PREPARED",
+  validatedAt: null,
+  retentionDays: 4,
+  deleteAfter: null,
+  deletionStatus: "retained",
+};
 
 type Outcome =
   | { ok: true; value: unknown }
@@ -108,6 +116,11 @@ const capture = async (callback) => {
     };
   }
 };
+const appendedResult = (payload) => ({ status: "appended", manifestSha256: payload.manifestSha256 });
+const temporaryIdForDigest = (digest) =>
+  digest.slice(0, 8) + "-" +
+  digest.slice(8, 12) + "-4" + digest.slice(13, 16) +
+  "-8" + digest.slice(17, 20) + "-" + digest.slice(20, 32);
 const root = request.root;
 const repoRoot = join(root, "repo");
 const quarantineRoot = join(root, "quarantine");
@@ -126,9 +139,22 @@ const adapterState = {
   failTemporaryUnlink: false,
   temporaryTarget: null,
   chmodBoundary: null,
+  staleSwapPath: null,
+  staleSwapLstats: 0,
 };
 const fsApi = {
   ...baseFsApi,
+  async lstat(path) {
+    if (path === adapterState.staleSwapPath) {
+      adapterState.staleSwapLstats += 1;
+      if (adapterState.staleSwapLstats === 2) {
+        await baseFsApi.rename(path, path + ".owned");
+        await baseFsApi.writeFile(path, "foreign", { mode: 0o600 });
+        await baseFsApi.chmod(path, 0o600);
+      }
+    }
+    return baseFsApi.lstat(path);
+  },
   async open(path, flags, mode) {
     if (request.operation === "activation-order" && path.includes("/.current.")) {
       adapterEvents.push("pointer-temp-open");
@@ -177,6 +203,30 @@ const withCapability = (callback, adapter = fsApi) => withQuarantineRunCapabilit
   writersStopped: true,
   fsApi: adapter,
 }, callback);
+const validationMarker = join(root, "validated-marker.json");
+const ensureValidatedDurably = async (payload) => {
+  try {
+    const existing = JSON.parse(await fsPromises.readFile(validationMarker, "utf8"));
+    return { status: "already-present", manifestSha256: existing.manifestSha256 };
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const handle = await fsPromises.open(validationMarker, "wx", 0o600);
+  try {
+    await handle.chmod(0o600);
+    await handle.writeFile(JSON.stringify(payload) + "\\n");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  const rootHandle = await fsPromises.open(root, "r");
+  try {
+    await rootHandle.sync();
+  } finally {
+    await rootHandle.close();
+  }
+  return appendedResult(payload);
+};
 
 const result = await (async () => {
   if (request.operation === "builder") {
@@ -220,6 +270,7 @@ const result = await (async () => {
             id: written.manifestSha256,
           }));
           order.push({ event: "generation-present", bytes: bytes.length });
+          return appendedResult(payload);
         },
         fsApi,
       });
@@ -237,6 +288,52 @@ const result = await (async () => {
         order,
         names: (await fsPromises.readdir(manifestsRoot)).sort(),
         rootNames: (await fsPromises.readdir(quarantineRoot)).sort(),
+      };
+    }
+    if (request.operation === "generation-only") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const written = await manifestApi.writeManifestGeneration({
+        capability,
+        manifest: built,
+        fsApi,
+      });
+      const generation = await manifestApi.readManifestGeneration({
+        capability,
+        manifestSha256: written.manifestSha256,
+        fsApi,
+      });
+      return {
+        written,
+        generation,
+        preparedJournalRecord: {
+          event: "PREPARED",
+          payload: { transactionId: built.transactionId, manifestSha256: written.manifestSha256 },
+        },
+      };
+    }
+    if (request.operation === "activate-prepared") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const written = await manifestApi.writeManifestGeneration({
+        capability,
+        manifest: built,
+        fsApi,
+      });
+      let ensureCalls = 0;
+      const outcome = await capture(() => manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: written.manifestSha256,
+        appendValidated: async (payload) => {
+          ensureCalls += 1;
+          return appendedResult(payload);
+        },
+        fsApi,
+      }));
+      return {
+        outcome,
+        ensureCalls,
+        currentExists: await fsPromises.access(join(quarantineRoot, "current"))
+          .then(() => true, () => false),
       };
     }
     if (request.operation === "read-pointer-bytes") {
@@ -308,7 +405,7 @@ const result = await (async () => {
         capability,
         transactionId,
         manifestSha256: written.manifestSha256,
-        appendValidated: async () => {},
+        appendValidated: async (payload) => appendedResult(payload),
         fsApi,
       });
       const generationPath = deriveRunPath(capability, {
@@ -354,7 +451,7 @@ const result = await (async () => {
             capability,
             transactionId,
             manifestSha256: written.manifestSha256,
-            appendValidated: async () => {},
+            appendValidated: async (payload) => appendedResult(payload),
             fsApi,
           });
         } finally {
@@ -375,6 +472,92 @@ const result = await (async () => {
           ...manifestNames.filter((name) => name.startsWith(".")),
           ...rootNames.filter((name) => name.startsWith(".current.")),
         ],
+      };
+    }
+    if (request.operation === "sigkill-crash") {
+      const oldBuilt = manifestApi.buildValidatedManifest(request.oldValue);
+      const oldWritten = await manifestApi.writeManifestGeneration({
+        capability, manifest: oldBuilt, fsApi,
+      });
+      await manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: oldWritten.manifestSha256,
+        appendValidated: async (payload) => appendedResult(payload),
+        fsApi,
+      });
+      const nextBuilt = manifestApi.buildValidatedManifest(request.newValue);
+      const killAtBoundary = async (phase) => {
+        if (phase === request.phase) process.kill(process.pid, "SIGKILL");
+      };
+      if (request.phase.startsWith("after-generation")) {
+        await manifestApi.writeManifestGeneration({
+          capability,
+          manifest: nextBuilt,
+          fsApi,
+          faultHook: killAtBoundary,
+        });
+      } else {
+        const nextWritten = await manifestApi.writeManifestGeneration({
+          capability, manifest: nextBuilt, fsApi,
+        });
+        await manifestApi.activateManifestGeneration({
+          capability,
+          transactionId,
+          manifestSha256: nextWritten.manifestSha256,
+          appendValidated: ensureValidatedDurably,
+          fsApi,
+          faultHook: killAtBoundary,
+        });
+      }
+      throw new Error("SIGKILL boundary was not reached");
+    }
+    if (request.operation === "sigkill-inspect-retry") {
+      const oldBuilt = manifestApi.buildValidatedManifest(request.oldValue);
+      const nextBuilt = manifestApi.buildValidatedManifest(request.newValue);
+      const oldBytes = Buffer.from(JSON.stringify(oldBuilt) + "\\n");
+      const nextBytes = Buffer.from(JSON.stringify(nextBuilt) + "\\n");
+      const oldDigest = createHash("sha256").update(oldBytes).digest("hex");
+      const nextDigest = createHash("sha256").update(nextBytes).digest("hex");
+      const beforePointer = await manifestApi.readCurrentManifestPointer({ capability, fsApi });
+      const beforeSelected = await manifestApi.readManifestGeneration({
+        capability,
+        manifestSha256: beforePointer.manifestSha256,
+        fsApi,
+      });
+      const oldReadable = await manifestApi.readManifestGeneration({
+        capability,
+        manifestSha256: oldDigest,
+        fsApi,
+      });
+      const nextWritten = await manifestApi.writeManifestGeneration({
+        capability, manifest: nextBuilt, fsApi,
+      });
+      const retryEnsure = await manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: nextWritten.manifestSha256,
+        appendValidated: async (payload) => {
+          const result = await ensureValidatedDurably(payload);
+          adapterEvents.push(result.status);
+          return result;
+        },
+        fsApi,
+      });
+      const afterPointer = await manifestApi.readCurrentManifestPointer({ capability, fsApi });
+      return {
+        beforePointer,
+        beforeSelectedState: beforeSelected.state,
+        oldReadableState: oldReadable.state,
+        oldDigest,
+        nextDigest,
+        retryEnsure,
+        retryEnsureStatus: adapterEvents.at(-1),
+        afterPointer,
+        manifestTemps: (await fsPromises.readdir(manifestsRoot))
+          .filter((name) => name.startsWith(".")),
+        pointerTemps: (await fsPromises.readdir(quarantineRoot))
+          .filter((name) => name.startsWith(".current.")),
       };
     }
     if (request.operation === "temporary-chmod-failure") {
@@ -398,7 +581,7 @@ const result = await (async () => {
               capability,
               transactionId,
               manifestSha256: written.manifestSha256,
-              appendValidated: async () => {},
+              appendValidated: async (payload) => appendedResult(payload),
               fsApi,
             }));
       } finally {
@@ -429,7 +612,7 @@ const result = await (async () => {
         capability,
         transactionId,
         manifestSha256: oldWritten.manifestSha256,
-        appendValidated: async () => {},
+        appendValidated: async (payload) => appendedResult(payload),
         fsApi,
       });
       const nextManifest = manifestApi.buildValidatedManifest(request.newValue);
@@ -452,7 +635,7 @@ const result = await (async () => {
           capability,
           transactionId,
           manifestSha256: nextWritten.manifestSha256,
-          appendValidated: async () => {},
+          appendValidated: async (payload) => appendedResult(payload),
           fsApi,
           faultHook: crash,
         }));
@@ -482,10 +665,177 @@ const result = await (async () => {
         capability,
         transactionId,
         manifestSha256: written.manifestSha256,
-        appendValidated: async (payload) => adapterEvents.push(["append", payload]),
+        appendValidated: async (payload) => {
+          adapterEvents.push(["append", payload]);
+          return appendedResult(payload);
+        },
         fsApi,
       });
       return adapterEvents;
+    }
+    if (request.operation === "activation-retry") {
+      const oldBuilt = manifestApi.buildValidatedManifest(request.oldValue);
+      const oldWritten = await manifestApi.writeManifestGeneration({
+        capability, manifest: oldBuilt, fsApi,
+      });
+      await manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: oldWritten.manifestSha256,
+        appendValidated: async (payload) => appendedResult(payload),
+        fsApi,
+      });
+      const nextBuilt = manifestApi.buildValidatedManifest(request.newValue);
+      const nextWritten = await manifestApi.writeManifestGeneration({
+        capability, manifest: nextBuilt, fsApi,
+      });
+      let ensuredDigest = null;
+      let appended = 0;
+      let calls = 0;
+      const ensureValidated = async (payload) => {
+        calls += 1;
+        if (ensuredDigest === null) {
+          ensuredDigest = payload.manifestSha256;
+          appended += 1;
+          return appendedResult(payload);
+        }
+        return { status: "already-present", manifestSha256: ensuredDigest };
+      };
+      const first = await capture(() => manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: nextWritten.manifestSha256,
+        appendValidated: ensureValidated,
+        fsApi,
+        faultHook: async (phase) => {
+          if (phase === request.phase) throw new Error("crash:" + phase);
+        },
+      }));
+      const second = await capture(() => manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: nextWritten.manifestSha256,
+        appendValidated: ensureValidated,
+        fsApi,
+      }));
+      const pointer = await manifestApi.readCurrentManifestPointer({ capability, fsApi });
+      return {
+        first,
+        second,
+        pointer,
+        expectedDigest: nextWritten.manifestSha256,
+        calls,
+        appended,
+      };
+    }
+    if (request.operation === "activation-invalid-result") {
+      const oldBuilt = manifestApi.buildValidatedManifest(request.oldValue);
+      const oldWritten = await manifestApi.writeManifestGeneration({
+        capability, manifest: oldBuilt, fsApi,
+      });
+      await manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: oldWritten.manifestSha256,
+        appendValidated: async (payload) => appendedResult(payload),
+        fsApi,
+      });
+      const nextBuilt = manifestApi.buildValidatedManifest(request.newValue);
+      const nextWritten = await manifestApi.writeManifestGeneration({
+        capability, manifest: nextBuilt, fsApi,
+      });
+      const callbackResult = {
+        ...request.result,
+        manifestSha256: request.result.manifestSha256 === "expected"
+          ? nextWritten.manifestSha256
+          : request.result.manifestSha256,
+      };
+      const outcome = await capture(() => manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: nextWritten.manifestSha256,
+        appendValidated: async () => callbackResult,
+        fsApi,
+      }));
+      const pointer = await manifestApi.readCurrentManifestPointer({ capability, fsApi });
+      return {
+        outcome,
+        pointer,
+        oldDigest: oldWritten.manifestSha256,
+        nextDigest: nextWritten.manifestSha256,
+      };
+    }
+    if (request.operation === "stale-temporary") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const manifestBytes = Buffer.from(JSON.stringify(built) + "\\n");
+      const digest = createHash("sha256").update(manifestBytes).digest("hex");
+      let temporaryPath;
+      let expectedBytes;
+      if (request.target === "generation") {
+        temporaryPath = deriveRunPath(capability, {
+          purpose: "manifest-temporary",
+          id: temporaryIdForDigest(digest),
+        });
+        expectedBytes = manifestBytes;
+      } else {
+        await manifestApi.writeManifestGeneration({ capability, manifest: built, fsApi });
+        temporaryPath = deriveRunPath(capability, {
+          purpose: "current-temporary",
+          id: temporaryIdForDigest(digest),
+        });
+        expectedBytes = Buffer.from(JSON.stringify({
+          schemaVersion: 1,
+          transactionId,
+          manifestSha256: digest,
+        }) + "\\n");
+      }
+      const sentinel = join(root, "stale-sentinel");
+      if (request.case === "symlink") {
+        await fsPromises.writeFile(sentinel, "sentinel", { mode: 0o600 });
+        await fsPromises.symlink(sentinel, temporaryPath);
+      } else {
+        const staleBytes = request.case === "mismatch" ? Buffer.from("foreign") : expectedBytes;
+        await fsPromises.writeFile(temporaryPath, staleBytes, { mode: 0o600 });
+        await fsPromises.chmod(temporaryPath, request.case === "public-mode" ? 0o644 : 0o600);
+      }
+      const before = request.case === "symlink"
+        ? null
+        : await fsPromises.readFile(temporaryPath);
+      if (request.case === "swap") adapterState.staleSwapPath = temporaryPath;
+      const outcome = await capture(() => request.target === "generation"
+        ? manifestApi.writeManifestGeneration({ capability, manifest: built, fsApi })
+        : manifestApi.activateManifestGeneration({
+            capability,
+            transactionId,
+            manifestSha256: digest,
+            appendValidated: async (payload) => appendedResult(payload),
+            fsApi,
+          }));
+      adapterState.staleSwapPath = null;
+      let afterKind = "missing";
+      let unchanged = null;
+      try {
+        const after = await fsPromises.lstat(temporaryPath);
+        afterKind = after.isSymbolicLink() ? "symlink" : "file";
+        if (before !== null && after.isFile()) {
+          unchanged = (await fsPromises.readFile(temporaryPath)).equals(before);
+        }
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      return {
+        outcome,
+        afterKind,
+        unchanged,
+        afterBytes: afterKind === "file"
+          ? await fsPromises.readFile(temporaryPath, "utf8")
+          : null,
+        ownedPresent: await fsPromises.access(temporaryPath + ".owned")
+          .then(() => true, () => false),
+        sentinel: request.case === "symlink"
+          ? await fsPromises.readFile(sentinel, "utf8")
+          : null,
+      };
     }
     if (request.operation === "cleanup-aggregate") {
       const oldBuilt = manifestApi.buildValidatedManifest(request.oldValue);
@@ -496,7 +846,7 @@ const result = await (async () => {
         capability,
         transactionId,
         manifestSha256: oldWritten.manifestSha256,
-        appendValidated: async () => {},
+        appendValidated: async (payload) => appendedResult(payload),
         fsApi,
       });
       const pointerBefore = await fsPromises.readFile(join(quarantineRoot, "current"));
@@ -594,13 +944,17 @@ const result = await (async () => {
 process.stdout.write(JSON.stringify(result));
 `;
 
+function spawnWorkerAtRoot(root: string, request: Record<string, unknown>) {
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", workerSource], {
+    encoding: "utf8",
+    input: JSON.stringify({ ...request, root }),
+  });
+}
+
 function invoke(request: Record<string, unknown>) {
   const root = mkdtempSync(join(tmpdir(), "quarantine-manifest-"));
   try {
-    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", workerSource], {
-      encoding: "utf8",
-      input: JSON.stringify({ ...request, root }),
-    });
+    const result = spawnWorkerAtRoot(root, request);
     if (result.status !== 0) {
       throw new Error(`manifest worker failed (${result.status}): ${result.stderr}`);
     }
@@ -631,6 +985,41 @@ describe("immutable quarantine manifest generations", () => {
     const outcome = invoke({ operation: "builder", value: input }) as Outcome;
     expect(outcome).toEqual({ ok: true, value: validManifest });
     expect(input).toEqual(before);
+  });
+
+  it("builds and round-trips an exact PREPARED generation for the initial journal payload", () => {
+    const built = invoke({ operation: "builder", value: preparedManifest });
+    expect(built).toEqual({ ok: true, value: preparedManifest });
+    const result = invoke({ operation: "generation-only", value: preparedManifest });
+    expect(result.generation).toEqual(preparedManifest);
+    expect(result.preparedJournalRecord).toEqual({
+      event: "PREPARED",
+      payload: {
+        transactionId: "tx-0001",
+        manifestSha256: result.written.manifestSha256,
+      },
+    });
+  });
+
+  it("does not activate a PREPARED generation", () => {
+    const result = invoke({ operation: "activate-prepared", value: preparedManifest });
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/VALIDATED|state/i) },
+    });
+    expect(result.ensureCalls).toBe(0);
+    expect(result.currentExists).toBe(false);
+  });
+
+  it.each([
+    ["PREPARED validatedAt", { ...preparedManifest, validatedAt: validManifest.validatedAt }],
+    ["PREPARED deleteAfter", { ...preparedManifest, deleteAfter: validManifest.deleteAfter }],
+    ["PREPARED deleted status", { ...preparedManifest, deletionStatus: "deleted" }],
+    ["PREPARED null retention", { ...preparedManifest, retentionDays: null }],
+    ["VALIDATED null validatedAt", { ...validManifest, validatedAt: null }],
+    ["VALIDATED null deleteAfter", { ...validManifest, deleteAfter: null }],
+  ])("rejects the cross-state combination %s", (_label, value) => {
+    expect(invoke({ operation: "builder", value })).toMatchObject({ ok: false });
   });
 
   it("snapshots public manifest and entry getters exactly once", () => {
@@ -765,6 +1154,21 @@ describe("immutable quarantine manifest generations", () => {
     })).toMatchObject({ ok: false, error: { message: expect.stringMatching(/digest/i) } });
   });
 
+  it("never lets caller maxBytes raise the hard pointer or generation ceilings", () => {
+    expect(invoke({
+      operation: "read-pointer-bytes",
+      bytes: bytes(Buffer.alloc(4097, 0x20)),
+      maxBytes: 1024 * 1024,
+    })).toMatchObject({ ok: false, error: { message: expect.stringMatching(/large|maximum|4096/i) } });
+    const oversized = Buffer.alloc(4 * 1024 * 1024 + 1, 0x20);
+    expect(invoke({
+      operation: "read-generation-bytes",
+      digest: createHash("sha256").update(oversized).digest("hex"),
+      bytes: bytes(oversized),
+      maxBytes: 8 * 1024 * 1024,
+    })).toMatchObject({ ok: false, error: { message: expect.stringMatching(/large|maximum/i) } });
+  });
+
   it("never overwrites an existing digest name containing different bytes", () => {
     expect(invoke({ operation: "existing-conflict", value: validManifest })).toEqual({
       outcome: { ok: false, error: expect.objectContaining({ message: expect.any(String) }) },
@@ -887,6 +1291,94 @@ describe("immutable quarantine manifest generations", () => {
     },
   );
 
+  it.each(["generation", "pointer"])(
+    "rejects a post-read inode swap of an exact stale %s temporary",
+    (target) => {
+      const result = invoke({
+        operation: "stale-temporary",
+        target,
+        case: "swap",
+        value: validManifest,
+      });
+      expect(result.outcome).toMatchObject({ ok: false });
+      expect(result.afterKind).toBe("file");
+      expect(result.afterBytes).toBe("foreign");
+      expect(result.ownedPresent).toBe(true);
+    },
+  );
+
+  it.each([
+    "after-ensure-validated",
+    "after-pointer-temporary-sync",
+    "after-pointer-rename",
+    "after-quarantine-root-sync",
+  ])("retries activation after %s without duplicating VALIDATED", (phase) => {
+    const result = invoke({
+      operation: "activation-retry",
+      phase,
+      oldValue: validManifest,
+      newValue: changedManifest(),
+    });
+    expect(result.first).toMatchObject({ ok: false, error: { message: `crash:${phase}` } });
+    expect(result.second).toMatchObject({ ok: true });
+    expect(result.pointer.manifestSha256).toBe(result.expectedDigest);
+    expect(result.calls).toBe(2);
+    expect(result.appended).toBe(1);
+  });
+
+  it.each([
+    ["conflicting digest", { status: "already-present", manifestSha256: hash("f") }],
+    ["final conflict status", { status: "final-conflict", manifestSha256: "expected" }],
+    ["unknown result field", { status: "appended", manifestSha256: "expected", path: "../x" }],
+  ])("rejects ensure-validated result with %s before pointer mutation", (_label, resultValue) => {
+    const result = invoke({
+      operation: "activation-invalid-result",
+      oldValue: validManifest,
+      newValue: changedManifest(),
+      result: resultValue,
+    });
+    expect(result.outcome).toMatchObject({ ok: false, error: { message: expect.any(String) } });
+    expect(result.pointer.manifestSha256).toBe(result.oldDigest);
+    expect(result.pointer.manifestSha256).not.toBe(result.nextDigest);
+  });
+
+  it.each(["generation", "pointer"])(
+    "reuses an exact deterministic stale %s temporary",
+    (target) => {
+      const result = invoke({
+        operation: "stale-temporary",
+        target,
+        case: "exact",
+        value: validManifest,
+      });
+      expect(result.outcome).toMatchObject({ ok: true });
+      expect(result.afterKind).toBe("missing");
+    },
+  );
+
+  it.each([
+    ["generation", "mismatch"],
+    ["generation", "public-mode"],
+    ["generation", "symlink"],
+    ["pointer", "mismatch"],
+    ["pointer", "public-mode"],
+    ["pointer", "symlink"],
+  ])(
+    "preserves and rejects a %s %s deterministic stale temporary",
+    (target, staleCase) => {
+      const result = invoke({
+        operation: "stale-temporary",
+        target,
+        case: staleCase,
+        value: validManifest,
+      });
+      expect(result.outcome).toMatchObject({ ok: false });
+      expect(result.afterKind).toBe(staleCase === "symlink" ? "symlink" : "file");
+      if (staleCase === "symlink") expect(result.sentinel).toBe("sentinel");
+      else expect(result.unchanged).toBe(true);
+    },
+  );
+
   it("rejects a manifest transaction ID that differs from the live capability", () => {
     expect(invoke({
       operation: "mismatched-transaction",
@@ -912,6 +1404,54 @@ describe("immutable quarantine manifest generations", () => {
     expect([result.oldDigest, result.nextDigest]).toContain(result.pointer.manifestSha256);
     expect(result.selectedTransactionId).toBe("tx-0001");
     expect(result.oldReadable).toBe("tx-0001");
+  });
+
+  it.each([
+    "after-generation-temporary-sync",
+    "after-generation-publish",
+    "after-generation-directory-sync",
+    "after-ensure-validated",
+    "after-pointer-temporary-sync",
+    "after-pointer-rename",
+    "after-quarantine-root-sync",
+  ])("reconciles an actual SIGKILL at %s in a fresh capability", (phase) => {
+    const root = mkdtempSync(join(tmpdir(), "quarantine-manifest-sigkill-"));
+    try {
+      const request = {
+        phase,
+        oldValue: validManifest,
+        newValue: changedManifest(),
+      };
+      const crashed = spawnWorkerAtRoot(root, { operation: "sigkill-crash", ...request });
+      expect(crashed.status).toBeNull();
+      expect(crashed.signal).toBe("SIGKILL");
+
+      const recovered = spawnWorkerAtRoot(root, {
+        operation: "sigkill-inspect-retry",
+        ...request,
+      });
+      expect(recovered.status).toBe(0);
+      expect(recovered.stderr).toBe("");
+      const result = JSON.parse(recovered.stdout);
+      expect([result.oldDigest, result.nextDigest]).toContain(
+        result.beforePointer.manifestSha256,
+      );
+      expect(result.beforeSelectedState).toBe("VALIDATED");
+      expect(result.oldReadableState).toBe("VALIDATED");
+      expect(result.retryEnsure).toEqual({
+        schemaVersion: 1,
+        transactionId: "tx-0001",
+        manifestSha256: result.nextDigest,
+      });
+      expect(result.retryEnsureStatus).toBe(
+        phase.startsWith("after-generation") ? "appended" : "already-present",
+      );
+      expect(result.afterPointer.manifestSha256).toBe(result.nextDigest);
+      expect(result.manifestTemps).toEqual([]);
+      expect(result.pointerTemps).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("appends VALIDATED exactly once before opening the pointer temporary", () => {
