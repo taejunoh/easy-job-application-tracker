@@ -480,6 +480,47 @@ async function run() {
       after: await capture(() => getRunFsContext(leaked)),
     };
   }
+  if (request.operation === "adapter-lifecycle") {
+    const { getRunFsContext } = await import(${JSON.stringify(contextModuleUrl)});
+    const base = completeNodeAdapter();
+    const sourceCalls = Object.fromEntries(requiredFsMethods.map((method) => [method, 0]));
+    let completeInFlight;
+    const inFlightGate = new Promise((resolve) => { completeInFlight = resolve; });
+    const fsApi = Object.fromEntries(requiredFsMethods.map((method) => [
+      method,
+      (...args) => {
+        sourceCalls[method] += 1;
+        if (method === "readdir" && args[0] === "__in_flight__") return inFlightGate;
+        if (args[0] === "__after__") return "source-called-after-settlement";
+        return Reflect.apply(base[method], base, args);
+      },
+    ]));
+    let adapter;
+    let inFlight;
+    const settlement = await capture(() => withQuarantineRunCapability(
+      options({ fsApi }),
+      async (capability) => {
+        adapter = getRunFsContext(capability);
+        inFlight = adapter.readdir("__in_flight__");
+        if (request.settlement === "reject") throw new Error("lifecycle callback rejected");
+        return "lifecycle callback resolved";
+      },
+    ));
+    const countsBeforeRevokedCalls = { ...sourceCalls };
+    const revokedCalls = {};
+    for (const method of requiredFsMethods) {
+      revokedCalls[method] = await capture(() => adapter[method]("__after__"));
+    }
+    const countsAfterRevokedCalls = { ...sourceCalls };
+    completeInFlight("in-flight-completed");
+    return {
+      settlement,
+      inFlight: await inFlight,
+      revokedCalls,
+      countsBeforeRevokedCalls,
+      countsAfterRevokedCalls,
+    };
+  }
   if (request.operation === "missing-adapter-method") {
     const fsApi = completeNodeAdapter();
     delete fsApi[request.method];
@@ -809,6 +850,29 @@ describe("callback-scoped quarantine run capability", () => {
     expectCapturedError(value.settlement, /binding callback rejected/i);
     expectCapturedError(value.after, /inactive|context|capability/i);
   });
+
+  it.each(["resolve", "reject"])(
+    "revokes captured filesystem adapter methods after callback %s while allowing active calls to finish",
+    (settlement) => {
+      const value = workerValue(invoke(fixture, { operation: "adapter-lifecycle", settlement }));
+      if (settlement === "resolve") {
+        expect(value.settlement).toEqual({
+          threw: false,
+          value: "lifecycle callback resolved",
+        });
+      } else {
+        expectCapturedError(value.settlement, /lifecycle callback rejected/i);
+      }
+      expect(value.inFlight).toBe("in-flight-completed");
+      for (const method of REQUIRED_FS_METHODS) {
+        expectCapturedError(
+          (value.revokedCalls as Record<string, unknown>)[method],
+          /inactive|settled|revoked|context/i,
+        );
+      }
+      expect(value.countsAfterRevokedCalls).toEqual(value.countsBeforeRevokedCalls);
+    },
+  );
 
   it.each(REQUIRED_FS_METHODS)("requires the complete filesystem adapter method: %s", (method) => {
     const result = invoke(fixture, { operation: "missing-adapter-method", method });
