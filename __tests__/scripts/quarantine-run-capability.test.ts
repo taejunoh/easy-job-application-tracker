@@ -415,6 +415,18 @@ describe("callback-scoped quarantine run capability", () => {
     expectCapturedError(value, /ID|identifier|request/u);
   });
 
+  it.each([
+    { purpose: "payload", id: "copy-0000" },
+    { purpose: "conflict", id: "copy-0000" },
+    { purpose: "divergent-diff", id: "copy-0000" },
+    { purpose: "inventory", phase: "pre", id: "copy-0000" },
+    { purpose: "inventory", phase: "moved-pass-1", id: "copy-0000" },
+    { purpose: "inventory", phase: "moved-pass-2", id: "copy-0000" },
+  ])("rejects the reserved zero copy ID: %o", (pathRequest) => {
+    const value = workerValue(invoke(fixture, { operation: "derive-error", pathRequest }));
+    expectCapturedError(value, /ID|identifier|request/u);
+  });
+
   it.each(["../escape", ".", "..", "-leading", "trailing-", "Cafe\u0301"])(
     "rejects unsafe transaction ID: %s",
     (transactionId) => {
