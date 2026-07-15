@@ -1,8 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { dirname } from "node:path";
 
 import { parseInventorySummary } from "./quarantine-inventory.mjs";
+import {
+  deriveRunPath,
+  revalidateRunCapability,
+} from "./quarantine-run-capability.mjs";
 
 const ZERO_HASH = "0".repeat(64);
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
@@ -379,19 +383,6 @@ function replayJournalBuffer(input) {
   return { records, state, validEndOffset: offset, truncatedTail };
 }
 
-export async function replayJournal(journalPath, fsApi = fsPromises) {
-  let input;
-  try {
-    input = await fsApi.readFile(journalPath);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return { records: [], state: null, validEndOffset: 0, truncatedTail: false };
-    }
-    throw error;
-  }
-  return replayJournalBuffer(input);
-}
-
 async function writeComplete(handle, buffer) {
   let offset = 0;
   while (offset < buffer.length) {
@@ -401,8 +392,10 @@ async function writeComplete(handle, buffer) {
   }
 }
 
-async function readCompleteFile(handle) {
+async function readCompleteFile(handle, maxBytes = MAX_FRAME_BYTES) {
   const before = await handle.stat();
+  if (!before.isFile()) throw new Error("journal must be a regular file");
+  if (before.size > maxBytes) throw new Error("journal is too large");
   const input = Buffer.alloc(before.size);
   let offset = 0;
   while (offset < input.length) {
@@ -577,7 +570,88 @@ function parseLockFrame(input) {
   return { torn: false, metadata };
 }
 
-async function createJournalLock(lockPath, fsApi) {
+const heldLockState = new WeakMap();
+const TERMINAL_CLEANUP_STATES = new Set([
+  "ROLLED_BACK",
+  "RESTORED",
+  "INCOMPLETE_CONFLICT",
+]);
+const TOMBSTONE_PREFIX = "journal.lock.tombstone.";
+
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function indeterminate(candidate, cause) {
+  if (cause instanceof IndeterminateJournalAppendError) return cause;
+  return new IndeterminateJournalAppendError({
+    cause,
+    expectedSequence: candidate.sequence,
+    expectedRecordHash: candidate.recordHash,
+  });
+}
+
+async function invokeFaultHook(faultHook, phase) {
+  if (faultHook === undefined) return;
+  if (typeof faultHook !== "function") throw new TypeError("journal fault hook must be a function");
+  await faultHook(phase);
+}
+
+async function readJournalSnapshot({ capability, fsApi, maxBytes = MAX_FRAME_BYTES }) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new TypeError("journal maximum bytes must be a non-negative safe integer");
+  }
+  const journalPath = deriveRunPath(capability, { purpose: "journal" });
+  let before;
+  try {
+    before = await fsApi.lstat(journalPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return {
+        bytes: Buffer.alloc(0),
+        identity: null,
+        journalPath,
+        replayed: { records: [], state: null, validEndOffset: 0, truncatedTail: false },
+      };
+    }
+    throw error;
+  }
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error("journal must be a non-symlink regular file");
+  }
+  if (before.size > maxBytes) throw new Error("journal is too large");
+  const handle = await fsApi.open(journalPath, "r");
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameIdentity(before, opened) || opened.size !== before.size) {
+      throw new Error("journal changed while being inspected");
+    }
+    const bytes = await readCompleteFile(handle, maxBytes);
+    return {
+      bytes,
+      identity: { dev: opened.dev, ino: opened.ino },
+      journalPath,
+      replayed: replayJournalBuffer(bytes),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function replayJournal({
+  capability,
+  fsApi = fsPromises,
+  maxBytes = MAX_FRAME_BYTES,
+}) {
+  return (await readJournalSnapshot({ capability, fsApi, maxBytes })).replayed;
+}
+
+async function createJournalLock({ capability, fsApi }) {
+  const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+  await revalidateRunCapability(capability, {
+    purpose: "journal-lock",
+    boundary: "before-mutation",
+  });
   let handle;
   try {
     handle = await fsApi.open(lockPath, "wx", 0o600);
@@ -587,261 +661,229 @@ async function createJournalLock(lockPath, fsApi) {
     }
     throw error;
   }
-
   try {
     await handle.chmod(0o600);
     const encoded = encodeLockFrame();
     await writeComplete(handle, encoded.frame);
     await handle.sync();
     await fsyncDirectory(dirname(lockPath), fsApi);
-    return { handle, metadata: encoded.metadata };
+    await revalidateRunCapability(capability, {
+      purpose: "journal-lock",
+      boundary: "after-sync",
+    });
+    const stat = await handle.stat();
+    return {
+      handle,
+      identity: { dev: stat.dev, ino: stat.ino },
+      lockPath,
+      metadata: encoded.metadata,
+    };
   } catch (error) {
     await handle.close().catch(() => {});
     throw error;
   }
 }
 
-async function appendUnderHeldLock({ journalPath, event, payload, fsApi, assertLockOwned }) {
-  if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
-  let record;
-  let mutationStarted = false;
+async function assertPathIdentity(path, identity, fsApi, label) {
+  let current;
   try {
-    await assertLockOwned?.();
-    const handle = await fsApi.open(journalPath, "a+", 0o600);
-    try {
-      await handle.chmod(0o600);
-      const replayed = replayJournalBuffer(await readCompleteFile(handle));
-      validateTransition(replayed.state, event);
-      const canonicalPayload = canonicalize(parseEventPayload(event, payload));
-      const sequence = replayed.records.length + 1;
-      const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
-      const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
-      record = {
-        sequence,
-        previousHash,
-        event,
-        payload: canonicalPayload,
-        recordHash,
-      };
-      const body = Buffer.from(JSON.stringify(record));
-      if (body.length > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
-      const length = Buffer.alloc(4);
-      length.writeUInt32BE(body.length);
-
-      if (replayed.truncatedTail) {
-        await assertLockOwned?.();
-        mutationStarted = true;
-        await handle.truncate(replayed.validEndOffset);
-        await handle.sync();
-        await fsyncDirectory(dirname(journalPath), fsApi);
-      }
-      await assertLockOwned?.();
-      mutationStarted = true;
-      await writeComplete(handle, Buffer.concat([length, body]));
-      await handle.sync();
-      await assertLockOwned?.();
-    } finally {
-      await handle.close();
-    }
-    await fsyncDirectory(dirname(journalPath), fsApi);
-    await assertLockOwned?.();
-    return record;
+    current = await fsApi.lstat(path);
   } catch (error) {
-    if (mutationStarted && record !== undefined) {
-      if (error instanceof IndeterminateJournalAppendError) throw error;
-      throw new IndeterminateJournalAppendError({
-        cause: error,
-        expectedSequence: record.sequence,
-        expectedRecordHash: record.recordHash,
-      });
+    throw new Error(`${label} ownership cannot be verified`, { cause: error });
+  }
+  if (
+    current.isSymbolicLink() ||
+    !current.isFile() ||
+    current.dev !== identity.dev ||
+    current.ino !== identity.ino
+  ) {
+    throw new Error(`${label} ownership mismatch`);
+  }
+}
+
+async function assertHeldLockOwned(state) {
+  if (!state.active) throw new Error("journal held-lock capability is inactive");
+  const held = await state.handle.stat();
+  if (!held.isFile() || held.dev !== state.identity.dev || held.ino !== state.identity.ino) {
+    throw new Error("journal held lock identity changed");
+  }
+  await assertPathIdentity(state.lockPath, state.identity, state.fsApi, "journal held lock");
+  if (!state.active) throw new Error("journal held-lock capability is inactive");
+}
+
+async function closeHeldLock(state, primaryError) {
+  state.active = false;
+  let closeError;
+  try {
+    await state.handle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (primaryError !== undefined) {
+    throw closeError === undefined ? primaryError : attachCleanupError(primaryError, closeError);
+  }
+  if (closeError !== undefined) {
+    throw state.lastCandidate === null
+      ? closeError
+      : indeterminate(state.lastCandidate, closeError);
+  }
+}
+
+async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callback) {
+  if (typeof callback !== "function") throw new TypeError("journal lock callback is required");
+  const created = await createJournalLock({ capability, fsApi });
+  const heldLock = Object.freeze(Object.create(null));
+  const state = {
+    ...created,
+    active: true,
+    appendInProgress: false,
+    capability,
+    durableAppends: 0,
+    fsApi,
+    lastCandidate: null,
+  };
+  heldLockState.set(heldLock, state);
+  let result;
+  let primaryError;
+  let callbackCompleted = false;
+  try {
+    result = await callback(heldLock);
+    callbackCompleted = true;
+    if (state.appendInProgress) throw new Error("journal lock callback returned during an append");
+    await assertHeldLockOwned(state);
+  } catch (error) {
+    primaryError =
+      callbackCompleted && state.lastCandidate !== null
+        ? indeterminate(state.lastCandidate, error)
+        : error;
+  }
+  let settledError;
+  try {
+    await closeHeldLock(state, primaryError);
+  } catch (error) {
+    settledError = error;
+  } finally {
+    heldLockState.delete(heldLock);
+  }
+  if (
+    removeOnSuccess &&
+    !(settledError instanceof IndeterminateJournalAppendError)
+  ) {
+    try {
+      await assertPathIdentity(state.lockPath, state.identity, fsApi, "journal held lock");
+      await fsApi.rm(state.lockPath);
+      await fsyncDirectory(dirname(state.lockPath), fsApi);
+    } catch (error) {
+      if (settledError !== undefined) throw attachCleanupError(settledError, error);
+      throw state.lastCandidate === null ? error : indeterminate(state.lastCandidate, error);
     }
+  }
+  if (settledError !== undefined) throw settledError;
+  return { created, result, state };
+}
+
+export async function withJournalLock({ capability, fsApi = fsPromises }, callback) {
+  return (await runWithJournalLock({ capability, fsApi, removeOnSuccess: true }, callback)).result;
+}
+
+async function openJournalForAppend({ capability, fsApi }) {
+  const journalPath = deriveRunPath(capability, { purpose: "journal" });
+  let before = null;
+  try {
+    before = await fsApi.lstat(journalPath);
+    if (before.isSymbolicLink() || !before.isFile()) {
+      throw new Error("journal must be a non-symlink regular file");
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const handle = await fsApi.open(journalPath, "a+", 0o600);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || (before !== null && !sameIdentity(before, opened))) {
+      throw new Error("journal changed while being opened");
+    }
+    return { handle, journalPath };
+  } catch (error) {
+    await handle.close().catch(() => {});
     throw error;
   }
 }
 
-async function readStaleLock(lockPath, fsApi) {
-  const before = await fsApi.lstat(lockPath);
-  if (before.isSymbolicLink() || !before.isFile()) {
-    throw new Error("journal lock must be a non-symlink regular file");
-  }
-  if (before.size > 4 + MAX_LOCK_BODY_BYTES) {
-    throw new Error("journal lock is too large");
-  }
-
-  const handle = await fsApi.open(lockPath, "r");
-  try {
-    const opened = await handle.stat();
-    if (
-      !opened.isFile() ||
-      opened.dev !== before.dev ||
-      opened.ino !== before.ino ||
-      opened.size !== before.size
-    ) {
-      throw new Error("journal lock changed while being inspected");
-    }
-    return parseLockFrame(await readCompleteFile(handle));
-  } finally {
-    await handle.close();
-  }
-}
-
-async function validatedTombstoneResidues(lockPath, fsApi) {
-  const parentPath = dirname(lockPath);
-  const prefix = `${basename(lockPath)}.reclaim-`;
-  const entries = await fsApi.readdir(parentPath, { withFileTypes: true });
-  const residues = [];
-  for (const entry of entries) {
-    if (!entry.name.startsWith(prefix)) continue;
-    const ownerToken = entry.name.slice(prefix.length);
-    if (!TOMBSTONE_TOKEN_PATTERN.test(ownerToken)) {
-      throw new Error(`malformed journal lock tombstone name: ${entry.name}`);
-    }
-    const residuePath = join(parentPath, entry.name);
-    try {
-      await readStaleLock(residuePath, fsApi);
-    } catch (error) {
-      throw new Error(`invalid journal lock tombstone: ${entry.name}`, { cause: error });
-    }
-    residues.push(residuePath);
-  }
-  return residues.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
-}
-
-async function removeValidatedLockResidues(paths, fsApi) {
-  for (const path of paths) await readStaleLock(path, fsApi);
-  for (const path of paths) await fsApi.rm(path);
-  if (paths.length > 0) await fsyncDirectory(dirname(paths[0]), fsApi);
-}
-
-async function assertHeldLockOwnership(lockPath, lockHandle, fsApi) {
-  let held;
-  let current;
-  try {
-    [held, current] = await Promise.all([lockHandle.stat(), fsApi.lstat(lockPath)]);
-  } catch (error) {
-    throw new Error("journal recovery lock ownership cannot be verified", { cause: error });
-  }
-  if (
-    !held.isFile() ||
-    current.isSymbolicLink() ||
-    !current.isFile() ||
-    held.dev !== current.dev ||
-    held.ino !== current.ino
-  ) {
-    throw new Error("journal recovery lock ownership mismatch");
-  }
-}
-
-export async function appendJournalRecord({
-  journalPath,
-  event,
-  payload,
-  fsApi = fsPromises,
-}) {
-  if (typeof journalPath !== "string" || journalPath.length === 0) {
-    throw new TypeError("journal path is required");
-  }
+async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi, faultHook }) {
   if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
-  await fsApi.mkdir(dirname(journalPath), { recursive: true, mode: 0o700 });
-  const lockPath = `${journalPath}.lock`;
-  let lock;
-  try {
-    lock = await createJournalLock(lockPath, fsApi);
-    return await appendUnderHeldLock({ journalPath, event, payload, fsApi });
-  } finally {
-    if (lock !== undefined) {
-      await lock.handle.close();
-      await fsApi.rm(lockPath, { force: true });
-      await fsyncDirectory(dirname(journalPath), fsApi);
-    }
+  const state = heldLockState.get(heldLock);
+  if (state === undefined || !state.active) {
+    throw new TypeError("journal held-lock capability is forged or inactive");
   }
-}
-
-export async function reclaimJournalLock({
-  journalPath,
-  writersStopped,
-  recovery,
-  fsApi = fsPromises,
-}) {
-  if (typeof journalPath !== "string" || journalPath.length === 0) {
-    throw new TypeError("journal path is required");
+  if (state.capability !== capability || state.fsApi !== fsApi) {
+    throw new TypeError("journal held-lock capability does not match the append boundary");
   }
-  if (writersStopped !== true) {
-    throw new Error("journal lock recovery requires writers-stopped attestation");
-  }
-  if (typeof recovery !== "function") {
-    throw new TypeError("journal lock recovery callback is required");
-  }
-
-  const lockPath = `${journalPath}.lock`;
-  const priorTombstones = await validatedTombstoneResidues(lockPath, fsApi);
-  const staleLock = await readStaleLock(lockPath, fsApi);
-  const tombstonePath = `${lockPath}.reclaim-${randomUUID()}`;
-  await fsApi.rename(lockPath, tombstonePath);
-  await fsyncDirectory(dirname(journalPath), fsApi);
-
-  let recoveryLock;
-  let recoverySucceeded = false;
+  if (state.appendInProgress) throw new Error("journal append is already in progress");
+  state.appendInProgress = true;
+  let candidate;
+  let mutationStarted = false;
+  let journal;
   let result;
   let primaryError;
   try {
-    recoveryLock = await createJournalLock(lockPath, fsApi);
-    const capability = { active: true };
-    let appendInProgress = false;
-    let durableAppends = 0;
-    const assertCapabilityOwnsLock = async () => {
-      if (!capability.active) {
-        throw new Error("journal recovery append capability is inactive");
-      }
-      await assertHeldLockOwnership(lockPath, recoveryLock.handle, fsApi);
-      if (!capability.active) {
-        throw new Error("journal recovery append capability is inactive");
-      }
-    };
-    const append = async ({ event, payload }) => {
-      if (!capability.active) {
-        throw new Error("journal recovery append capability is inactive");
-      }
-      if (appendInProgress) throw new Error("journal recovery append is already in progress");
-      appendInProgress = true;
-      try {
-        const record = await appendUnderHeldLock({
-          journalPath,
-          event,
-          payload,
-          fsApi,
-          assertLockOwned: assertCapabilityOwnsLock,
-        });
-        durableAppends += 1;
-        return record;
-      } finally {
-        appendInProgress = false;
-      }
-    };
-    try {
-      result = await recovery({
-        append,
-        staleLock: staleLock.metadata,
-        staleLockTorn: staleLock.torn,
-      });
-    } finally {
-      capability.active = false;
+    await assertHeldLockOwned(state);
+    journal = await openJournalForAppend({ capability, fsApi });
+    await journal.handle.chmod(0o600);
+    const replayed = replayJournalBuffer(await readCompleteFile(journal.handle));
+    validateTransition(replayed.state, event);
+    const canonicalPayload = canonicalize(parseEventPayload(event, payload));
+    const sequence = replayed.records.length + 1;
+    const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
+    const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
+    candidate = { sequence, previousHash, event, payload: canonicalPayload, recordHash };
+    const body = Buffer.from(JSON.stringify(candidate));
+    if (body.length > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
+    if (replayed.validEndOffset + 4 + body.length > MAX_FRAME_BYTES) {
+      throw new Error("journal is too large");
     }
-    if (appendInProgress) {
-      throw new Error("journal recovery callback returned during an append");
-    }
-    if (durableAppends === 0) {
-      throw new Error("journal lock recovery requires a durable journal append");
-    }
-    await assertHeldLockOwnership(lockPath, recoveryLock.handle, fsApi);
-    recoverySucceeded = true;
-  } catch (error) {
-    primaryError = error;
-  }
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(body.length);
 
+    await invokeFaultHook(faultHook, "before-mutation");
+    await assertHeldLockOwned(state);
+    await revalidateRunCapability(capability, {
+      purpose: "journal",
+      boundary: "before-mutation",
+    });
+    if (replayed.truncatedTail) {
+      mutationStarted = true;
+      state.lastCandidate = candidate;
+      await journal.handle.truncate(replayed.validEndOffset);
+      await journal.handle.sync();
+      await fsyncDirectory(dirname(journal.journalPath), fsApi);
+      await assertHeldLockOwned(state);
+    }
+    mutationStarted = true;
+    state.lastCandidate = candidate;
+    await writeComplete(journal.handle, Buffer.concat([length, body]));
+    await journal.handle.sync();
+    await invokeFaultHook(faultHook, "after-journal-sync");
+    await assertHeldLockOwned(state);
+    await revalidateRunCapability(capability, {
+      purpose: "journal",
+      boundary: "after-sync",
+    });
+    await fsyncDirectory(dirname(journal.journalPath), fsApi);
+    await invokeFaultHook(faultHook, "before-lock-cleanup");
+    await assertHeldLockOwned(state);
+    state.durableAppends += 1;
+    result = candidate;
+  } catch (error) {
+    primaryError =
+      mutationStarted && candidate !== undefined
+        ? indeterminate(candidate, error)
+        : error;
+  }
+  state.appendInProgress = false;
   let closeError;
   try {
-    await recoveryLock?.handle.close();
+    await journal?.handle.close();
   } catch (error) {
     closeError = error;
   }
@@ -850,12 +892,207 @@ export async function reclaimJournalLock({
       ? primaryError
       : attachCleanupError(primaryError, closeError);
   }
-  if (closeError !== undefined) throw closeError;
-  if (recoverySucceeded) {
-    await removeValidatedLockResidues(
-      [lockPath, tombstonePath, ...priorTombstones],
-      fsApi,
-    );
+  if (closeError !== undefined) {
+    throw mutationStarted && candidate !== undefined
+      ? indeterminate(candidate, closeError)
+      : closeError;
   }
   return result;
+}
+
+export async function appendJournalRecord({
+  capability,
+  heldLock,
+  event,
+  payload,
+  fsApi = fsPromises,
+  faultHook,
+}) {
+  return appendUnderHeldLock({ capability, heldLock, event, payload, fsApi, faultHook });
+}
+
+async function readStaleLock(path, fsApi) {
+  const before = await fsApi.lstat(path);
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error("journal lock must be a non-symlink regular file");
+  }
+  if (before.size > 4 + MAX_LOCK_BODY_BYTES) throw new Error("journal lock is too large");
+  const handle = await fsApi.open(path, "r");
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameIdentity(opened, before) || opened.size !== before.size) {
+      throw new Error("journal lock changed while being inspected");
+    }
+    return {
+      ...parseLockFrame(await readCompleteFile(handle, 4 + MAX_LOCK_BODY_BYTES)),
+      identity: { dev: opened.dev, ino: opened.ino },
+      path,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readOptionalStaleLock(path, fsApi) {
+  try {
+    return await readStaleLock(path, fsApi);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function validatedTombstones(capability, fsApi) {
+  const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+  const entries = await fsApi.readdir(dirname(lockPath), { withFileTypes: true });
+  const artifacts = [];
+  for (const entry of entries) {
+    if (!entry.name.startsWith(TOMBSTONE_PREFIX)) continue;
+    const id = entry.name.slice(TOMBSTONE_PREFIX.length);
+    if (!TOMBSTONE_TOKEN_PATTERN.test(id)) {
+      throw new Error(`malformed journal lock tombstone name: ${entry.name}`);
+    }
+    const path = deriveRunPath(capability, { purpose: "journal-tombstone", id });
+    try {
+      artifacts.push(await readStaleLock(path, fsApi));
+    } catch (error) {
+      throw new Error(`invalid journal lock tombstone: ${entry.name}`, { cause: error });
+    }
+  }
+  return artifacts.sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)));
+}
+
+async function removeOwnedArtifacts(artifacts, fsApi) {
+  for (const artifact of artifacts) {
+    await assertPathIdentity(artifact.path, artifact.identity, fsApi, "journal lock artifact");
+  }
+  for (const artifact of artifacts) await fsApi.rm(artifact.path);
+  if (artifacts.length > 0) await fsyncDirectory(dirname(artifacts[0].path), fsApi);
+}
+
+export async function reclaimJournalLock(
+  { capability, writersStopped, fsApi = fsPromises },
+  callback,
+) {
+  if (writersStopped !== true) {
+    throw new Error("journal lock recovery requires writers-stopped attestation");
+  }
+  if (typeof callback !== "function") {
+    throw new TypeError("journal lock recovery callback is required");
+  }
+  const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+  const priorTombstones = await validatedTombstones(capability, fsApi);
+  const staleLock = await readStaleLock(lockPath, fsApi);
+  const tombstoneId = randomUUID();
+  const tombstonePath = deriveRunPath(capability, {
+    purpose: "journal-tombstone",
+    id: tombstoneId,
+  });
+  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
+  await revalidateRunCapability(capability, {
+    purpose: "journal-lock",
+    boundary: "before-mutation",
+  });
+  await fsApi.rename(lockPath, tombstonePath);
+  await fsyncDirectory(dirname(lockPath), fsApi);
+  await revalidateRunCapability(capability, {
+    purpose: "journal-tombstone",
+    id: tombstoneId,
+    boundary: "after-sync",
+  });
+  const moved = { ...staleLock, path: tombstonePath };
+  const run = await runWithJournalLock(
+    { capability, fsApi, removeOnSuccess: false },
+    (heldLock) => callback(heldLock, Object.freeze({
+      staleLock: staleLock.metadata,
+      staleLockTorn: staleLock.torn,
+    })),
+  );
+  if (run.state.durableAppends === 0) {
+    throw new Error("journal lock recovery requires a durable journal append");
+  }
+  try {
+    await removeOwnedArtifacts(
+      [{ path: run.created.lockPath, identity: run.created.identity }, moved, ...priorTombstones],
+      fsApi,
+    );
+  } catch (error) {
+    throw run.state.lastCandidate === null ? error : indeterminate(run.state.lastCandidate, error);
+  }
+  return run.result;
+}
+
+function sameTerminalSnapshot(before, after) {
+  const beforeTip = before.replayed.records.at(-1);
+  const afterTip = after.replayed.records.at(-1);
+  return (
+    before.bytes.equals(after.bytes) &&
+    before.replayed.state === after.replayed.state &&
+    before.replayed.records.length === after.replayed.records.length &&
+    beforeTip?.sequence === afterTip?.sequence &&
+    beforeTip?.recordHash === afterTip?.recordHash
+  );
+}
+
+export async function cleanupTerminalJournalArtifacts({
+  capability,
+  writersStopped,
+  fsApi = fsPromises,
+}) {
+  if (writersStopped !== true) {
+    throw new Error("terminal journal cleanup requires writers-stopped attestation");
+  }
+  const before = await readJournalSnapshot({ capability, fsApi });
+  if (before.replayed.truncatedTail) {
+    throw new Error("terminal journal cleanup rejects a torn journal tail");
+  }
+  if (!TERMINAL_CLEANUP_STATES.has(before.replayed.state)) {
+    throw new Error("terminal journal cleanup requires a cleanup-only terminal state");
+  }
+  const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+  const priorTombstones = await validatedTombstones(capability, fsApi);
+  const staleLock = await readOptionalStaleLock(lockPath, fsApi);
+  if (staleLock === null && priorTombstones.length === 0) return before.replayed;
+
+  let moved = null;
+  if (staleLock !== null) {
+    const tombstoneId = randomUUID();
+    const tombstonePath = deriveRunPath(capability, {
+      purpose: "journal-tombstone",
+      id: tombstoneId,
+    });
+    await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
+    await revalidateRunCapability(capability, {
+      purpose: "journal-lock",
+      boundary: "before-mutation",
+    });
+    await fsApi.rename(lockPath, tombstonePath);
+    await fsyncDirectory(dirname(lockPath), fsApi);
+    await revalidateRunCapability(capability, {
+      purpose: "journal-tombstone",
+      id: tombstoneId,
+      boundary: "after-sync",
+    });
+    moved = { ...staleLock, path: tombstonePath };
+  }
+
+  const run = await runWithJournalLock(
+    { capability, fsApi, removeOnSuccess: false },
+    async () => {
+      const after = await readJournalSnapshot({ capability, fsApi });
+      if (after.replayed.truncatedTail || !sameTerminalSnapshot(before, after)) {
+        throw new Error("terminal journal tip changed during cleanup");
+      }
+      return after.replayed;
+    },
+  );
+  await removeOwnedArtifacts(
+    [
+      { path: run.created.lockPath, identity: run.created.identity },
+      ...(moved === null ? [] : [moved]),
+      ...priorTombstones,
+    ],
+    fsApi,
+  );
+  return run.result;
 }
