@@ -282,14 +282,57 @@ function parseEntryPayload(event, payload) {
   return Object.freeze({ id: parseEntryId(payload.id) });
 }
 
+function snapshotDenseArray(value, label, expectedLength) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new TypeError(`${label} must be an exact Array`);
+  }
+  const keys = Reflect.ownKeys(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined ||
+    !Object.hasOwn(lengthDescriptor, "value") ||
+    lengthDescriptor.enumerable ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0 ||
+    (expectedLength !== undefined && lengthDescriptor.value !== expectedLength)
+  ) {
+    throw new TypeError(`${label} length descriptor is invalid`);
+  }
+  const length = lengthDescriptor.value;
+  const expectedKeys = [
+    ...Array.from({ length }, (_, index) => String(index)),
+    "length",
+  ];
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new TypeError(`${label} must be dense and have no custom keys`);
+  }
+  const snapshot = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      descriptor === undefined ||
+      !Object.hasOwn(descriptor, "value") ||
+      !descriptor.enumerable
+    ) {
+      throw new TypeError(`${label} entries must be own enumerable data properties`);
+    }
+    snapshot.push(descriptor.value);
+  }
+  return Object.freeze(snapshot);
+}
+
 function parseSortedEntryIds(event, payload, key, { allowEmpty = false } = {}) {
   assertPayloadKeys(payload, [key], event);
-  if (!Array.isArray(payload[key]) || (!allowEmpty && payload[key].length === 0)) {
+  const input = snapshotDenseArray(payload[key], `${event} payload ${key}`);
+  if (!allowEmpty && input.length === 0) {
     throw new TypeError(
       `${event} payload ${key} must be ${allowEmpty ? "an array" : "a non-empty array"}`,
     );
   }
-  const values = payload[key].map((value) => parseEntryId(value));
+  const values = input.map((value) => parseEntryId(value));
   for (let index = 1; index < values.length; index += 1) {
     if (Buffer.compare(Buffer.from(values[index - 1]), Buffer.from(values[index])) >= 0) {
       throw new TypeError(`${event} payload ${key} must be bytewise sorted and unique`);
@@ -306,16 +349,12 @@ function parseRestoreId(value) {
 }
 
 function parseActiveGenerated(value) {
-  if (
-    !Array.isArray(value) ||
-    value.length !== GENERATED_IDS.length ||
-    Reflect.ownKeys(value).length !== GENERATED_IDS.length + 1 ||
-    Reflect.ownKeys(value).some((key, index) =>
-      key !== (index < GENERATED_IDS.length ? String(index) : "length"))
-  ) {
-    throw new TypeError("RESTORE_PREPARED activeGenerated must be a dense fixed array");
-  }
-  return Object.freeze(value.map((entry, index) => {
+  const input = snapshotDenseArray(
+    value,
+    "RESTORE_PREPARED activeGenerated",
+    GENERATED_IDS.length,
+  );
+  return Object.freeze(input.map((entry, index) => {
     assertPayloadKeys(entry, ["id", "inventory"], "RESTORE_PREPARED activeGenerated record");
     if (entry.id !== GENERATED_IDS[index]) {
       throw new TypeError("RESTORE_PREPARED activeGenerated IDs are invalid or out of order");
@@ -531,6 +570,24 @@ function validateJournalSemantics(records) {
       } else if (record.event === "RESTORE_ROLLING_BACK") {
         restoreRollbackIndex = restoreIntents.length - 1;
         restoreRollbackPending = null;
+      }
+    }
+
+    if (record.event === "VERIFYING") {
+      if (
+        applyIntents.length === 0 ||
+        applyCompleted.size !== applyIntents.length ||
+        firstUnresolved(applyIntents, applyCompleted) !== undefined
+      ) {
+        throw new Error("VERIFYING requires every durable MOVE_INTENT to be completed");
+      }
+    } else if (record.event === "RESTORED") {
+      if (
+        restoreIntents.length === 0 ||
+        restoreCompleted.size !== restoreIntents.length ||
+        firstUnresolved(restoreIntents, restoreCompleted) !== undefined
+      ) {
+        throw new Error("RESTORED requires every durable RESTORE_INTENT to be completed");
       }
     }
 

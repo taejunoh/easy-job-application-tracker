@@ -42,6 +42,10 @@ const records = {
     event: "MOVE_INTENT",
     payload: { id: "copy-0001", expected: validSummary },
   },
+  moved: {
+    event: "MOVED",
+    payload: { id: "copy-0001", observed: validSummary },
+  },
   recoveryRequired: {
     event: "RECOVERY_REQUIRED",
     payload: { entryIds: [] },
@@ -87,10 +91,14 @@ const terminalRecords = {
   RESTORED: [
     records.prepared,
     records.moving,
+    records.moveIntent,
+    records.moved,
     records.verifying,
     records.quarantined,
     records.restorePrepared,
     records.restoring,
+    { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+    { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
     records.restored,
   ],
   INCOMPLETE_CONFLICT: [
@@ -774,6 +782,56 @@ const result = await withQuarantineRunCapability({
     await fsPromises.writeFile(victim, "victim");
     await fsPromises.symlink(victim, journalPath);
     return capture(() => journal.replayJournal({ capability }));
+  }
+  if (request.operation === "adversarial-id-array") {
+    await appendAll(capability, request.prefix);
+    const journalPath = deriveRunPath(capability, { purpose: "journal" });
+    const before = await fsPromises.readFile(journalPath);
+    let getterReads = 0;
+    let values;
+    if (request.shape === "sparse") {
+      values = new Array(1);
+    } else if (request.shape === "custom-key") {
+      values = ["copy-0001"];
+      values.extra = true;
+    } else if (request.shape === "symbol") {
+      values = ["copy-0001"];
+      values[Symbol("extra")] = true;
+    } else if (request.shape === "accessor") {
+      values = [];
+      Object.defineProperty(values, "0", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          getterReads += 1;
+          return "copy-0001";
+        },
+      });
+      values.length = 1;
+    } else if (request.shape === "subclass") {
+      class IdArray extends Array {}
+      values = new IdArray("copy-0001");
+    } else if (request.shape === "custom-prototype") {
+      values = ["copy-0001"];
+      Object.setPrototypeOf(values, Object.create(Array.prototype));
+    } else if (request.shape === "inherited") {
+      values = new Array(1);
+      const prototype = Object.create(Array.prototype);
+      prototype[0] = "copy-0001";
+      Object.setPrototypeOf(values, prototype);
+    } else {
+      throw new Error("unknown adversarial array shape");
+    }
+    const key = request.event === "RECOVERY_REQUIRED" ? "entryIds" : "conflictEntryIds";
+    const outcome = await capture(() => appendAll(capability, [{
+      event: request.event,
+      payload: { [key]: values },
+    }]));
+    return {
+      outcome,
+      getterReads,
+      bytesUnchanged: before.equals(await fsPromises.readFile(journalPath)),
+    };
   }
   if (request.operation === "journal-regression") {
     await appendAll(capability, request.prefix);
@@ -1517,6 +1575,14 @@ await withQuarantineRunCapability({
 
 describe("capability-bound durable quarantine journal", () => {
   const fixture = mkdtempSync(join(tmpdir(), "quarantine-journal-capability-"));
+  const quarantinedPrefix = [
+    records.prepared,
+    records.moving,
+    records.moveIntent,
+    records.moved,
+    records.verifying,
+    records.quarantined,
+  ];
 
   afterAll(() => rmSync(fixture, { recursive: true, force: true }));
 
@@ -1692,7 +1758,7 @@ describe("capability-bound durable quarantine journal", () => {
   );
 
   it.each([
-    ["VALIDATED", [...terminalRecords.RESTORED.slice(0, 4), records.validated]],
+    ["VALIDATED", [...terminalRecords.RESTORED.slice(0, 6), records.validated]],
     ["nonterminal", [records.prepared, records.moving]],
     ["torn", terminalRecords.ROLLED_BACK],
     ["malformed-journal", terminalRecords.ROLLED_BACK],
@@ -1860,10 +1926,88 @@ describe("capability-bound durable quarantine journal", () => {
   });
 
   it.each([
-    ["QUARANTINED", [records.prepared, records.moving, records.verifying], records.quarantined],
+    "sparse",
+    "custom-key",
+    "symbol",
+    "accessor",
+    "subclass",
+    "custom-prototype",
+    "inherited",
+  ])("rejects adversarial RECOVERY_REQUIRED %s arrays before append", (shape) => {
+    const result = invoke(join(fixture, `recovery-array-${shape}`), {
+      operation: "adversarial-id-array",
+      shape,
+      event: "RECOVERY_REQUIRED",
+      prefix: [records.prepared, records.moving, records.moveIntent],
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
+    if (shape === "accessor") expect(result.getterReads).toBe(0);
+  });
+
+  it.each([
+    "sparse",
+    "custom-key",
+    "symbol",
+    "accessor",
+    "subclass",
+    "custom-prototype",
+    "inherited",
+  ])("rejects adversarial INCOMPLETE_CONFLICT %s arrays before append", (shape) => {
+    const result = invoke(join(fixture, `conflict-array-${shape}`), {
+      operation: "adversarial-id-array",
+      shape,
+      event: "INCOMPLETE_CONFLICT",
+      prefix: [records.prepared, records.moving],
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
+    if (shape === "accessor") expect(result.getterReads).toBe(0);
+  });
+
+  it.each([
+    ["RECOVERY_REQUIRED", [records.prepared, records.moving], {
+      entryIds: { 0: "copy-0001", length: 1 },
+    }],
+    ["RECOVERY_REQUIRED", [records.prepared, records.moving], {
+      entryIds: [null],
+    }],
+    ["INCOMPLETE_CONFLICT", [records.prepared, records.moving], {
+      conflictEntryIds: { 0: "copy-0001", length: 1 },
+    }],
+    ["INCOMPLETE_CONFLICT", [records.prepared, records.moving], {
+      conflictEntryIds: [null],
+    }],
+  ])("rejects a crafted replay frame with invalid %s dense-array shape", (event, prefix, payload) => {
+    const result = invoke(join(fixture, `replay-array-${event}-${JSON.stringify(payload)}`), {
+      operation: "tamper",
+      case: "rehashed-invalid-payload",
+      prefix,
+      event,
+      payload,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toMatch(/array|entry ID|payload/u);
+  });
+
+  it.each([
+    ["QUARANTINED", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      records.moved,
+      records.verifying,
+    ], records.quarantined],
     [
       "VALIDATED",
-      [records.prepared, records.moving, records.verifying, records.quarantined],
+      [
+        records.prepared,
+        records.moving,
+        records.moveIntent,
+        records.moved,
+        records.verifying,
+        records.quarantined,
+      ],
       records.validated,
     ],
   ])("accepts the exact %s payload contract", (_event, prefix, record) => {
@@ -1877,19 +2021,25 @@ describe("capability-bound durable quarantine journal", () => {
   });
 
   it.each([
-    ["QUARANTINED unknown", [records.prepared, records.moving, records.verifying], {
+    ["QUARANTINED unknown", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      records.moved,
+      records.verifying,
+    ], {
       event: "QUARANTINED",
       payload: { manifestSha256 },
     }],
-    ["VALIDATED missing", [records.prepared, records.moving, records.verifying, records.quarantined], {
+    ["VALIDATED missing", quarantinedPrefix, {
       event: "VALIDATED",
       payload: {},
     }],
-    ["VALIDATED unknown", [records.prepared, records.moving, records.verifying, records.quarantined], {
+    ["VALIDATED unknown", quarantinedPrefix, {
       event: "VALIDATED",
       payload: { manifestSha256, attackerPath: "../victim" },
     }],
-    ["VALIDATED uppercase hash", [records.prepared, records.moving, records.verifying, records.quarantined], {
+    ["VALIDATED uppercase hash", quarantinedPrefix, {
       event: "VALIDATED",
       payload: { manifestSha256: "A".repeat(64) },
     }],
@@ -1903,13 +2053,6 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.outcome.ok).toBe(false);
     expect(result.bytesUnchanged).toBe(true);
   });
-
-  const quarantinedPrefix = [
-    records.prepared,
-    records.moving,
-    records.verifying,
-    records.quarantined,
-  ];
 
   it.each([
     ["missing restoreId", { activeGenerated: activeGenerated() }],
@@ -2094,26 +2237,17 @@ describe("capability-bound durable quarantine journal", () => {
       records.rollingBack,
     ], { event: "ROLLED_BACK_ENTRY", payload: { id: "generic-slug" } }],
     ["RESTORE_INTENT", [
-      records.prepared,
-      records.moving,
-      records.verifying,
-      records.quarantined,
+      ...quarantinedPrefix,
       records.restorePrepared,
       records.restoring,
     ], { event: "RESTORE_INTENT", payload: { id: "generic-slug" } }],
     ["RESTORED_ENTRY", [
-      records.prepared,
-      records.moving,
-      records.verifying,
-      records.quarantined,
+      ...quarantinedPrefix,
       records.restorePrepared,
       records.restoring,
     ], { event: "RESTORED_ENTRY", payload: { id: "generic-slug" } }],
     ["RESTORE_ROLLBACK_INTENT", [
-      records.prepared,
-      records.moving,
-      records.verifying,
-      records.quarantined,
+      ...quarantinedPrefix,
       records.restorePrepared,
       records.restoring,
       { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
@@ -2121,10 +2255,7 @@ describe("capability-bound durable quarantine journal", () => {
       records.restoreRollingBack,
     ], { event: "RESTORE_ROLLBACK_INTENT", payload: { id: "generic-slug" } }],
     ["RESTORE_ROLLED_BACK_ENTRY", [
-      records.prepared,
-      records.moving,
-      records.verifying,
-      records.quarantined,
+      ...quarantinedPrefix,
       records.restorePrepared,
       records.restoring,
       { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
@@ -2155,7 +2286,7 @@ describe("capability-bound durable quarantine journal", () => {
     const result = invoke(join(fixture, "rehashed-invalid-validated"), {
       operation: "tamper",
       case: "rehashed-invalid-payload",
-      prefix: [records.prepared, records.moving, records.verifying, records.quarantined],
+      prefix: quarantinedPrefix,
       event: "VALIDATED",
       payload: {},
     });
@@ -2377,6 +2508,100 @@ describe("capability-bound durable quarantine journal", () => {
       edges: transitionEdges.map(([previous, next]) => [previous, next]),
     });
     expect(result).toEqual(transitionEdges.map(([, , expected]) => expected));
+  });
+
+  it.each([
+    ["VERIFYING", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      records.moved,
+      { event: "MOVE_INTENT", payload: { id: "copy-0002", expected: validSummary } },
+      { event: "MOVED", payload: { id: "copy-0002", observed: validSummary } },
+      records.verifying,
+    ]],
+    ["RESTORED", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
+      { event: "RESTORE_INTENT", payload: { id: "generated-node-modules" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-node-modules" } },
+      records.restored,
+    ]],
+  ])("accepts %s only after all multi-entry intents complete", (_event, lifecycle) => {
+    const result = invoke(join(fixture, `completion-positive-${_event}`), {
+      operation: "append-valid-lifecycle",
+      records: lifecycle,
+    });
+    expect(result.records).toHaveLength(lifecycle.length);
+  });
+
+  const incompleteTerminalCases = [
+    ["VERIFYING none", [records.prepared, records.moving], records.verifying],
+    ["VERIFYING partial", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+    ], records.verifying],
+    ["VERIFYING mixed", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      records.moved,
+      { event: "MOVE_INTENT", payload: { id: "copy-0002", expected: validSummary } },
+    ], records.verifying],
+    ["RESTORED none", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+    ], records.restored],
+    ["RESTORED partial", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+    ], records.restored],
+    ["RESTORED mixed", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
+      { event: "RESTORE_INTENT", payload: { id: "generated-node-modules" } },
+    ], records.restored],
+  ] as const;
+
+  it.each(incompleteTerminalCases)("rejects incomplete completion append: %s", (
+    label,
+    prefix,
+    record,
+  ) => {
+    const result = invoke(join(fixture, `completion-append-${label.replaceAll(" ", "-")}`), {
+      operation: "journal-regression",
+      case: "semantic-completion",
+      prefix,
+      record,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
+  });
+
+  it.each(incompleteTerminalCases)("rejects incomplete completion replay: %s", (
+    label,
+    prefix,
+    record,
+  ) => {
+    const result = invoke(join(fixture, `completion-replay-${label.replaceAll(" ", "-")}`), {
+      operation: "tamper",
+      case: "rehashed-invalid-payload",
+      prefix,
+      event: record.event,
+      payload: record.payload,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toMatch(/intent|complete|pending/u);
   });
 
   it.each([
@@ -2695,10 +2920,7 @@ describe("capability-bound durable quarantine journal", () => {
       records.rolledBack,
     ]],
     ["restore", [
-      records.prepared,
-      records.moving,
-      records.verifying,
-      records.quarantined,
+      ...quarantinedPrefix,
       records.restorePrepared,
       records.restoring,
       { event: "RESTORE_INTENT", payload: { id: "copy-0001" } },
@@ -2706,10 +2928,7 @@ describe("capability-bound durable quarantine journal", () => {
       records.restored,
     ]],
     ["restore rollback", [
-      records.prepared,
-      records.moving,
-      records.verifying,
-      records.quarantined,
+      ...quarantinedPrefix,
       records.restorePrepared,
       records.restoring,
       { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
