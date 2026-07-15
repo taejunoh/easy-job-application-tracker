@@ -16,6 +16,25 @@ import { pathToFileURL } from "node:url";
 const moduleUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-run-capability.mjs"),
 ).href;
+const contextModuleUrl = pathToFileURL(
+  join(__dirname, "../../scripts/quarantine-run-fs-context.mjs"),
+).href;
+const REQUIRED_FS_METHODS = [
+  "lstat",
+  "realpath",
+  "mkdir",
+  "open",
+  "readdir",
+  "rm",
+  "rename",
+  "unlink",
+  "link",
+  "opendir",
+  "readlink",
+  "createReadStream",
+  "lstatSync",
+  "realpathSync",
+] as const;
 const TRANSACTION_ID = "cleanup.2026-07-15_A";
 const UUID = "123e4567-e89b-42d3-a456-426614174000";
 const RESTORE_ID = `restore-${UUID}`;
@@ -82,6 +101,7 @@ import * as capabilityModule from ${JSON.stringify(moduleUrl)};
 import * as fsPromises from "node:fs/promises";
 import {
   chmodSync,
+  createReadStream,
   lstatSync,
   mkdirSync,
   realpathSync,
@@ -94,6 +114,17 @@ let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
 const runDirectories = ${JSON.stringify(runDirectories)};
+const requiredFsMethods = ${JSON.stringify(REQUIRED_FS_METHODS)};
+
+function completeNodeAdapter(overrides = {}) {
+  return {
+    ...fsPromises,
+    createReadStream,
+    lstatSync,
+    realpathSync,
+    ...overrides,
+  };
+}
 
 function privateDirectory(path) {
   mkdirSync(path, { recursive: true, mode: 0o700 });
@@ -203,10 +234,7 @@ async function run() {
     };
   }
   if (request.operation === "device-mismatch") {
-    const fsApi = {
-      ...fsPromises,
-      lstatSync,
-      realpathSync,
+    const fsApi = completeNodeAdapter({
       lstat: async (path) => {
         const stat = await fsPromises.lstat(path);
         if (path !== request.fixture.quarantineRoot) return stat;
@@ -217,7 +245,7 @@ async function run() {
           },
         });
       },
-    };
+    });
     return withQuarantineRunCapability(options({ fsApi }), async () => "called");
   }
   if (request.operation === "snapshot-options") {
@@ -233,7 +261,7 @@ async function run() {
       quarantineRoot: request.fixture.quarantineRoot,
       transactionId: request.safeTransactionId,
       writersStopped: true,
-      fsApi: { ...fsPromises, lstatSync, realpathSync },
+      fsApi: completeNodeAdapter(),
     };
     const secondValues = {
       repoRoot: "/escaped/repository",
@@ -331,6 +359,7 @@ async function run() {
       };
     };
     const fsApi = {
+      ...completeNodeAdapter(),
       async lstat(path) {
         calls.lstat.push(path);
         return statFor(path);
@@ -372,6 +401,90 @@ async function run() {
       return derived;
     });
     return { calls, path, virtual };
+  }
+  if (request.operation === "binding-contract") {
+    const { getRunFsContext } = await import(${JSON.stringify(contextModuleUrl)});
+    const base = completeNodeAdapter();
+    const getterCounts = Object.fromEntries(requiredFsMethods.map((method) => [method, 0]));
+    const receiverCounts = Object.fromEntries(requiredFsMethods.map((method) => [method, 0]));
+    const fsApi = Object.create(null);
+    for (const method of requiredFsMethods) {
+      Object.defineProperty(fsApi, method, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          getterCounts[method] += 1;
+          const implementation = base[method];
+          return function (...args) {
+            if (this !== fsApi) throw new Error("filesystem receiver changed: " + method);
+            receiverCounts[method] += 1;
+            if (args[0] === "__probe__") return method;
+            return Reflect.apply(implementation, base, args);
+          };
+        },
+      });
+    }
+    let leaked;
+    const inside = await withQuarantineRunCapability(options({ fsApi }), async (capability) => {
+      leaked = capability;
+      const bound = getRunFsContext(capability);
+      const repeated = getRunFsContext(capability);
+      const asserted = getRunFsContext(capability, fsApi);
+      const distinct = Object.fromEntries(requiredFsMethods.map((method) => [method, () => {}]));
+      const distinctLookup = await capture(() => getRunFsContext(capability, distinct));
+      for (const method of requiredFsMethods) {
+        Object.defineProperty(fsApi, method, {
+          configurable: true,
+          enumerable: true,
+          value() { throw new Error("mutated filesystem method used: " + method); },
+        });
+      }
+      const derived = deriveRunPath(capability, { purpose: "journal" });
+      await revalidateRunCapability(capability, {
+        purpose: "journal",
+        boundary: "before-mutation",
+      });
+      const probes = Object.fromEntries(
+        requiredFsMethods.map((method) => [method, bound[method]("__probe__")]),
+      );
+      return {
+        frozen: Object.isFrozen(bound),
+        keys: Object.keys(bound),
+        sameLookup: bound === repeated && bound === asserted,
+        distinctLookup,
+        derived,
+        probes,
+      };
+    });
+    return {
+      inside,
+      getterCounts,
+      receiverCounts,
+      after: await capture(() => getRunFsContext(leaked)),
+    };
+  }
+  if (request.operation === "binding-reject") {
+    const { getRunFsContext } = await import(${JSON.stringify(contextModuleUrl)});
+    let leaked;
+    const settlement = await capture(() => withQuarantineRunCapability(
+      options({ fsApi: completeNodeAdapter() }),
+      async (capability) => {
+        leaked = capability;
+        throw new Error("binding callback rejected");
+      },
+    ));
+    return {
+      settlement,
+      after: await capture(() => getRunFsContext(leaked)),
+    };
+  }
+  if (request.operation === "missing-adapter-method") {
+    const fsApi = completeNodeAdapter();
+    delete fsApi[request.method];
+    return withQuarantineRunCapability(options({ fsApi }), async () => "called");
+  }
+  if (request.operation === "public-exports") {
+    return Object.keys(capabilityModule).sort();
   }
   if (request.operation === "replace-root") {
     return withQuarantineRunCapability(options(), async (capability) => {
@@ -634,6 +747,53 @@ describe("callback-scoped quarantine run capability", () => {
         ],
       },
     });
+  });
+
+  it("captures and freezes one complete filesystem context for preflight and capability use", () => {
+    const value = workerValue(invoke(fixture, { operation: "binding-contract" }));
+    expect(value).toMatchObject({
+      inside: {
+        frozen: true,
+        keys: REQUIRED_FS_METHODS,
+        sameLookup: true,
+        distinctLookup: {
+          threw: true,
+          error: { message: expect.stringMatching(/filesystem|source|context/i) },
+        },
+        derived: join(fixture.runRoot, "journal.log"),
+        probes: Object.fromEntries(REQUIRED_FS_METHODS.map((method) => [method, method])),
+      },
+      getterCounts: Object.fromEntries(REQUIRED_FS_METHODS.map((method) => [method, 1])),
+      after: {
+        threw: true,
+        error: { message: expect.stringMatching(/inactive|context|capability/i) },
+      },
+    });
+    for (const method of REQUIRED_FS_METHODS) {
+      expect((value.receiverCounts as Record<string, number>)[method]).toBeGreaterThan(0);
+    }
+  });
+
+  it("removes the filesystem binding before a rejected callback settles", () => {
+    const value = workerValue(invoke(fixture, { operation: "binding-reject" }));
+    expectCapturedError(value.settlement, /binding callback rejected/i);
+    expectCapturedError(value.after, /inactive|context|capability/i);
+  });
+
+  it.each(REQUIRED_FS_METHODS)("requires the complete filesystem adapter method: %s", (method) => {
+    const result = invoke(fixture, { operation: "missing-adapter-method", method });
+    expect(result).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(new RegExp(method, "i")) },
+    });
+  });
+
+  it("keeps the run capability public surface at exactly three exports", () => {
+    expect(workerValue(invoke(fixture, { operation: "public-exports" }))).toEqual([
+      "deriveRunPath",
+      "revalidateRunCapability",
+      "withQuarantineRunCapability",
+    ]);
   });
 
   it.each([false, null, 1, "true"])(

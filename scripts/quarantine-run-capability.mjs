@@ -1,9 +1,10 @@
-import {
-  lstatSync as nodeLstatSync,
-  realpathSync as nodeRealpathSync,
-} from "node:fs";
-import { lstat, mkdir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
+import {
+  bindRunFsContext,
+  getRunFsContext,
+  invalidateRunFsContext,
+} from "./quarantine-run-fs-context.mjs";
 
 /**
  * Cooperative quarantine writer boundary. Downstream writers must use the same
@@ -28,15 +29,6 @@ const INVENTORY_PHASES = new Set([
   "restore-active",
 ]);
 const BOUNDARIES = new Set(["before-mutation", "after-sync"]);
-const FS_METHODS = ["lstat", "realpath", "mkdir", "lstatSync", "realpathSync"];
-const DEFAULT_FS_ADAPTER = Object.freeze({
-  lstat,
-  realpath,
-  mkdir,
-  lstatSync: nodeLstatSync,
-  realpathSync: nodeRealpathSync,
-});
-
 function assertPlainObject(value, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError(`${label} must be a plain object`);
@@ -63,19 +55,6 @@ function snapshotPublicRecord(value, allowed, required, label) {
   const snapshot = Object.create(null);
   for (const key of keys) snapshot[key] = value[key];
   return Object.freeze(snapshot);
-}
-
-function normalizeFsAdapter(value) {
-  assertPlainObject(value, "filesystem adapter");
-  const normalized = Object.create(null);
-  for (const methodName of FS_METHODS) {
-    const method = value[methodName];
-    if (typeof method !== "function") {
-      throw new TypeError(`filesystem adapter must provide ${methodName}`);
-    }
-    normalized[methodName] = (...args) => Reflect.apply(method, value, args);
-  }
-  return Object.freeze(normalized);
 }
 
 function assertAbsolutePath(value, label) {
@@ -322,11 +301,11 @@ function expectedParentRoot(state, derived) {
   return derived.parentRoot === "quarantine" ? state.quarantine : state.run;
 }
 
-function assertSelectedParentSync(state, derived) {
+function assertSelectedParentSync(state, derived, fsApi) {
   const root = expectedParentRoot(state, derived);
-  const stat = state.fsApi.lstatSync(derived.parent);
+  const stat = fsApi.lstatSync(derived.parent);
   assertDirectoryStat(stat, "selected path parent", true);
-  const resolvedParent = state.fsApi.realpathSync(derived.parent);
+  const resolvedParent = fsApi.realpathSync(derived.parent);
   if (
     stat.dev !== root.dev ||
     resolvedParent !== resolve(derived.parent) ||
@@ -336,11 +315,11 @@ function assertSelectedParentSync(state, derived) {
   }
 }
 
-async function assertSelectedParent(state, derived) {
+async function assertSelectedParent(state, derived, fsApi) {
   const root = expectedParentRoot(state, derived);
-  const stat = await state.fsApi.lstat(derived.parent);
+  const stat = await fsApi.lstat(derived.parent);
   assertDirectoryStat(stat, "selected path parent", true);
-  const resolvedParent = await state.fsApi.realpath(derived.parent);
+  const resolvedParent = await fsApi.realpath(derived.parent);
   if (
     stat.dev !== root.dev ||
     resolvedParent !== resolve(derived.parent) ||
@@ -399,103 +378,103 @@ export async function withQuarantineRunCapability(options, callback) {
   assertAbsolutePath(normalizedOptions.quarantineRoot, "quarantine root");
   assertTransactionId(normalizedOptions.transactionId);
 
-  const fsApi = normalizeFsAdapter(
-    normalizedOptions.fsApi === undefined
-      ? DEFAULT_FS_ADAPTER
-      : normalizedOptions.fsApi,
-  );
-  const repoStat = await fsApi.lstat(normalizedOptions.repoRoot);
-  const quarantineStat = await fsApi.lstat(normalizedOptions.quarantineRoot);
-  assertDirectoryStat(repoStat, "repository root", false);
-  assertDirectoryStat(quarantineStat, "quarantine root", true);
-  const repoRealPath = await fsApi.realpath(normalizedOptions.repoRoot);
-  const quarantineRealPath = await fsApi.realpath(normalizedOptions.quarantineRoot);
-  if (
-    isWithinOrEqual(repoRealPath, quarantineRealPath) ||
-    isWithinOrEqual(quarantineRealPath, repoRealPath)
-  ) {
-    throw new TypeError("quarantine root must be outside the repository");
-  }
-  if (repoStat.dev !== quarantineStat.dev) {
-    throw new Error("repository and quarantine root are on different devices");
-  }
-
-  const runPath = join(quarantineRealPath, normalizedOptions.transactionId);
-  const runStat = await fsApi.lstat(runPath);
-  assertDirectoryStat(runStat, "quarantine run root", true);
-  const runRealPath = await fsApi.realpath(runPath);
-  if (
-    runRealPath !== resolve(runPath) ||
-    !isWithinOrEqual(quarantineRealPath, runRealPath) ||
-    quarantineStat.dev !== runStat.dev
-  ) {
-    throw new Error("quarantine run root identity or containment is invalid");
-  }
-
   const capability = Object.freeze(Object.create(null));
-  const state = Object.freeze({
-    fsApi,
-    quarantine: Object.freeze({
-      path: quarantineRealPath,
-      realPath: quarantineRealPath,
-      dev: quarantineStat.dev,
-      ino: quarantineStat.ino,
-      mode: quarantineStat.mode,
-    }),
-    run: Object.freeze({
-      path: runPath,
-      realPath: runRealPath,
-      dev: runStat.dev,
-      ino: runStat.ino,
-      mode: runStat.mode,
-    }),
-  });
-  capabilityState.set(capability, state);
-  activeCapabilities.add(capability);
-
+  const fsApi = bindRunFsContext(capability, normalizedOptions.fsApi);
   try {
-    return await callback(capability);
+    const repoStat = await fsApi.lstat(normalizedOptions.repoRoot);
+    const quarantineStat = await fsApi.lstat(normalizedOptions.quarantineRoot);
+    assertDirectoryStat(repoStat, "repository root", false);
+    assertDirectoryStat(quarantineStat, "quarantine root", true);
+    const repoRealPath = await fsApi.realpath(normalizedOptions.repoRoot);
+    const quarantineRealPath = await fsApi.realpath(normalizedOptions.quarantineRoot);
+    if (
+      isWithinOrEqual(repoRealPath, quarantineRealPath) ||
+      isWithinOrEqual(quarantineRealPath, repoRealPath)
+    ) {
+      throw new TypeError("quarantine root must be outside the repository");
+    }
+    if (repoStat.dev !== quarantineStat.dev) {
+      throw new Error("repository and quarantine root are on different devices");
+    }
+
+    const runPath = join(quarantineRealPath, normalizedOptions.transactionId);
+    const runStat = await fsApi.lstat(runPath);
+    assertDirectoryStat(runStat, "quarantine run root", true);
+    const runRealPath = await fsApi.realpath(runPath);
+    if (
+      runRealPath !== resolve(runPath) ||
+      !isWithinOrEqual(quarantineRealPath, runRealPath) ||
+      quarantineStat.dev !== runStat.dev
+    ) {
+      throw new Error("quarantine run root identity or containment is invalid");
+    }
+
+    const state = Object.freeze({
+      quarantine: Object.freeze({
+        path: quarantineRealPath,
+        realPath: quarantineRealPath,
+        dev: quarantineStat.dev,
+        ino: quarantineStat.ino,
+        mode: quarantineStat.mode,
+      }),
+      run: Object.freeze({
+        path: runPath,
+        realPath: runRealPath,
+        dev: runStat.dev,
+        ino: runStat.ino,
+        mode: runStat.mode,
+      }),
+    });
+    capabilityState.set(capability, state);
+    activeCapabilities.add(capability);
+    try {
+      return await callback(capability);
+    } finally {
+      activeCapabilities.delete(capability);
+      capabilityState.delete(capability);
+    }
   } finally {
-    activeCapabilities.delete(capability);
-    capabilityState.delete(capability);
+    invalidateRunFsContext(capability);
   }
 }
 
 export function deriveRunPath(capability, request) {
   const state = requireActiveCapability(capability);
+  const fsApi = getRunFsContext(capability);
   const validatedRequest = validateRequest(request);
   const derived = deriveForState(state, validatedRequest);
   assertRecordedDirectorySync(
     state.quarantine.path,
     state.quarantine,
     "quarantine root",
-    state.fsApi,
+    fsApi,
   );
   assertRecordedDirectorySync(
     state.run.path,
     state.run,
     "quarantine run root",
-    state.fsApi,
+    fsApi,
   );
-  assertSelectedParentSync(state, derived);
+  assertSelectedParentSync(state, derived, fsApi);
   return derived.path;
 }
 
 export async function revalidateRunCapability(capability, request) {
   const state = requireActiveCapability(capability);
+  const fsApi = getRunFsContext(capability);
   const validatedRequest = validateRequest(request, true);
   const derived = deriveForState(state, validatedRequest);
   await assertRecordedDirectory(
     state.quarantine.path,
     state.quarantine,
     "quarantine root",
-    state.fsApi,
+    fsApi,
   );
   await assertRecordedDirectory(
     state.run.path,
     state.run,
     "quarantine run root",
-    state.fsApi,
+    fsApi,
   );
-  await assertSelectedParent(state, derived);
+  await assertSelectedParent(state, derived, fsApi);
 }
