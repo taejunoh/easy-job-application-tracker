@@ -59,10 +59,13 @@ const runDirectories = [
   "inventories/moved-pass-1",
   "inventories/moved-pass-2",
   "inventories/restore-active",
+  "inventories/validation-pass-1",
+  "inventories/validation-pass-2",
   "inventories/work",
   "payload/source-copies",
   "payload/generated",
   "rollback/regenerated-before-restore",
+  `rollback/regenerated-before-restore/${RESTORE_ID}`,
   "conflicts",
   "divergent-diffs",
 ];
@@ -671,12 +674,19 @@ describe("callback-scoped quarantine run capability", () => {
       { purpose: "current-pointer" },
       { purpose: "current-temporary", id: UUID },
       { purpose: "inventory", phase: "pre", id: "copy-0001" },
-      { purpose: "inventory", phase: "restore-active", id: RESTORE_ID },
+      { purpose: "inventory", phase: "restore-active", id: "generated-next" },
+      { purpose: "inventory", phase: "restore-active", id: "generated-node-modules" },
+      { purpose: "inventory", phase: "validation-pass-1", id: "generated-next" },
+      { purpose: "inventory", phase: "validation-pass-1", id: "generated-node-modules" },
+      { purpose: "inventory", phase: "validation-pass-2", id: "generated-next" },
+      { purpose: "inventory", phase: "validation-pass-2", id: "generated-node-modules" },
       { purpose: "inventory-work", id: UUID },
       { purpose: "payload", id: "copy-0001" },
       { purpose: "payload", id: "generated-next" },
       { purpose: "payload", id: "generated-node-modules" },
       { purpose: "rollback", id: RESTORE_ID },
+      { purpose: "rollback-entry", id: RESTORE_ID, phase: "generated-next" },
+      { purpose: "rollback-entry", id: RESTORE_ID, phase: "generated-node-modules" },
       { purpose: "conflict", id: "generated-node-modules" },
       { purpose: "divergent-diff", id: "copy-0042" },
     ];
@@ -689,12 +699,25 @@ describe("callback-scoped quarantine run capability", () => {
       join(fixture.quarantineRoot, "current"),
       join(fixture.quarantineRoot, `.current.${UUID}.tmp`),
       join(fixture.runRoot, "inventories", "pre", "copy-0001.jsonl"),
-      join(fixture.runRoot, "inventories", "restore-active", `${RESTORE_ID}.jsonl`),
+      join(fixture.runRoot, "inventories", "restore-active", "generated-next.jsonl"),
+      join(fixture.runRoot, "inventories", "restore-active", "generated-node-modules.jsonl"),
+      join(fixture.runRoot, "inventories", "validation-pass-1", "generated-next.jsonl"),
+      join(fixture.runRoot, "inventories", "validation-pass-1", "generated-node-modules.jsonl"),
+      join(fixture.runRoot, "inventories", "validation-pass-2", "generated-next.jsonl"),
+      join(fixture.runRoot, "inventories", "validation-pass-2", "generated-node-modules.jsonl"),
       join(fixture.runRoot, "inventories", "work", `${UUID}.bin`),
       join(fixture.runRoot, "payload", "source-copies", "copy-0001"),
       join(fixture.runRoot, "payload", "generated", ".next"),
       join(fixture.runRoot, "payload", "generated", "node_modules"),
       join(fixture.runRoot, "rollback", "regenerated-before-restore", RESTORE_ID),
+      join(fixture.runRoot, "rollback", "regenerated-before-restore", RESTORE_ID, ".next"),
+      join(
+        fixture.runRoot,
+        "rollback",
+        "regenerated-before-restore",
+        RESTORE_ID,
+        "node_modules",
+      ),
       join(fixture.runRoot, "conflicts", "generated-node-modules"),
       join(fixture.runRoot, "divergent-diffs", "copy-0042.patch"),
     ];
@@ -940,9 +963,18 @@ describe("callback-scoped quarantine run capability", () => {
     { purpose: "inventory", phase: "pre" },
     { purpose: "inventory", id: "copy-0001", phase: "later" },
     { purpose: "inventory-work", id: UUID, phase: "pre" },
+    { purpose: "rollback-entry" },
+    { purpose: "rollback-entry", id: RESTORE_ID },
+    { purpose: "rollback-entry", phase: "generated-next" },
+    {
+      purpose: "rollback-entry",
+      id: RESTORE_ID,
+      phase: "generated-next",
+      entryId: "generated-next",
+    },
   ])("rejects invalid purpose/id/phase combinations: %o", (pathRequest) => {
     const value = workerValue(invoke(fixture, { operation: "derive-error", pathRequest }));
-    expectCapturedError(value, /purpose|request|phase/u);
+    expectCapturedError(value, /purpose|request|phase|field/u);
   });
 
   it.each([
@@ -955,10 +987,24 @@ describe("callback-scoped quarantine run capability", () => {
     { purpose: "payload", id: "copy-001" },
     { purpose: "payload", id: "generated-dist" },
     { purpose: "rollback", id: UUID },
+    { purpose: "rollback-entry", id: UUID, phase: "generated-next" },
+    { purpose: "rollback-entry", id: null, phase: "generated-next" },
+    { purpose: "rollback-entry", id: RESTORE_ID, phase: null },
+    { purpose: "rollback-entry", id: RESTORE_ID.toUpperCase(), phase: "generated-next" },
+    {
+      purpose: "rollback-entry",
+      id: "restore-123e4567-e89b-12d3-a456-426614174000",
+      phase: "generated-next",
+    },
+    { purpose: "rollback-entry", id: RESTORE_ID, phase: "copy-0001" },
+    { purpose: "rollback-entry", id: RESTORE_ID, phase: "generated-dist" },
     { purpose: "conflict", id: RESTORE_ID },
     { purpose: "divergent-diff", id: "generated-next" },
     { purpose: "inventory", phase: "pre", id: RESTORE_ID },
     { purpose: "inventory", phase: "restore-active", id: "copy-0001" },
+    { purpose: "inventory", phase: "restore-active", id: RESTORE_ID },
+    { purpose: "inventory", phase: "validation-pass-1", id: "copy-0001" },
+    { purpose: "inventory", phase: "validation-pass-2", id: RESTORE_ID },
   ])("enforces purpose-specific ID grammar: %o", (pathRequest) => {
     const value = workerValue(invoke(fixture, { operation: "derive-error", pathRequest }));
     expectCapturedError(value, /ID|identifier|request/u);
@@ -1044,6 +1090,11 @@ describe("callback-scoped quarantine run capability", () => {
     ["journal", { purpose: "journal" }, ""],
     ["inventory", { purpose: "inventory", phase: "pre", id: "copy-0001" }, "inventories/pre"],
     ["manifest", { purpose: "manifest-generation", id: DIGEST }, "manifests"],
+    [
+      "rollback entry",
+      { purpose: "rollback-entry", id: RESTORE_ID, phase: "generated-next" },
+      `rollback/regenerated-before-restore/${RESTORE_ID}`,
+    ],
   ] as const)(
     "rejects symlink replacement of derived %s parent without touching its target",
     (_label, pathRequest, parentRelativePath) => {
@@ -1064,13 +1115,14 @@ describe("callback-scoped quarantine run capability", () => {
     },
   );
 
-  it("rejects non-0700 selected parent at derivation and both boundaries", () => {
-    const value = workerValue(
-      invoke(fixture, {
-        operation: "parent-mode",
-        pathRequest: { purpose: "manifest-generation", id: DIGEST },
-      }),
-    );
+  it.each([
+    ["manifest", { purpose: "manifest-generation", id: DIGEST }],
+    [
+      "rollback entry",
+      { purpose: "rollback-entry", id: RESTORE_ID, phase: "generated-next" },
+    ],
+  ])("rejects non-0700 selected %s parent at derivation and both boundaries", (_label, pathRequest) => {
+    const value = workerValue(invoke(fixture, { operation: "parent-mode", pathRequest }));
     expectCapturedError(value.derive, /0700|mode/u);
     expectCapturedError(value.before, /0700|mode/u);
     expectCapturedError(value.after, /0700|mode/u);

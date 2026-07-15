@@ -22,15 +22,20 @@ const inventoryUrl = pathToFileURL(
 const capabilityUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-run-capability.mjs"),
 ).href;
+const RESTORE_ID = "restore-123e4567-e89b-42d3-a456-426614174000";
 
 const RUN_DIRECTORIES = [
   "inventories/pre",
   "inventories/moved-pass-1",
   "inventories/moved-pass-2",
   "inventories/restore-active",
+  "inventories/validation-pass-1",
+  "inventories/validation-pass-2",
   "inventories/work",
   "payload/source-copies",
   "payload/generated",
+  "rollback/regenerated-before-restore",
+  `rollback/regenerated-before-restore/${RESTORE_ID}`,
 ];
 
 type WorkerResult = {
@@ -208,25 +213,77 @@ try {
       },
     };
     result = await withCapability(async (capability) => {
-      const root = deriveRunPath(capability, { purpose: "payload", id: "generated-next" });
+      const entryId = request.entryId ?? "generated-next";
+      const purpose = request.purpose ?? "payload";
+      const pathRequest = purpose === "rollback-entry"
+        ? { purpose, id: request.restoreId, phase: entryId }
+        : { purpose, id: entryId };
+      const root = purpose === "rollback-entry" && request.root !== undefined
+        ? request.root
+        : deriveRunPath(capability, pathRequest);
       const metrics = {};
       await inventory.fsyncTree({
         capability,
         root,
-        entryId: "generated-next",
-        purpose: "payload",
+        entryId,
+        purpose,
+        ...(purpose === "rollback-entry" ? { restoreId: request.restoreId } : {}),
         fsApi,
         metrics,
       });
       return { events, metrics };
     }, fsApi);
+  } else if (request.operation === "rollback-invalid") {
+    const sourceA = instrumentedAdapter();
+    const sourceB = instrumentedAdapter();
+    result = await withCapability(async (capability) => {
+      const validRoot = deriveRunPath(capability, {
+        purpose: "rollback-entry",
+        id: request.restoreId,
+        phase: "generated-next",
+      });
+      const options = {
+        capability,
+        root: request.case === "foreign-root" ? request.root : validRoot,
+        purpose: "rollback-entry",
+        restoreId: request.restoreId,
+        entryId: "generated-next",
+        metrics: {},
+      };
+      if (request.case === "unknown") options.unknown = true;
+      if (request.case === "symbol") options[Symbol("unknown")] = true;
+      if (request.case === "missing-restore") delete options.restoreId;
+      if (request.case === "missing-entry") delete options.entryId;
+      if (request.case === "bad-entry") options.entryId = "copy-0001";
+      if (request.case === "payload-restore") options.purpose = "payload";
+      if (request.case === "undefined-adapter") options.fsApi = undefined;
+      if (request.case === "distinct-adapter") options.fsApi = sourceB.adapter;
+      const before = { ...sourceA.counts };
+      let outcome;
+      try {
+        outcome = { ok: true, value: await inventory.fsyncTree(options) };
+      } catch (error) {
+        outcome = { ok: false, error: { message: error?.message ?? String(error) } };
+      }
+      const after = { ...sourceA.counts };
+      return {
+        outcome,
+        delta: Object.fromEntries(
+          Object.keys(after).map((method) => [method, after[method] - before[method]]),
+        ),
+        distinctCalls: { ...sourceB.counts },
+      };
+    }, sourceA.adapter);
   } else if (request.operation === "bound-adapter-contract") {
     const sourceA = instrumentedAdapter();
     const sourceB = instrumentedAdapter();
     result = await withCapability(async (capability) => {
+      const fsyncPurpose = request.purpose ?? "payload";
       const root = request.writer === "write"
         ? request.root
-        : deriveRunPath(capability, { purpose: "payload", id: "generated-next" });
+        : deriveRunPath(capability, fsyncPurpose === "rollback-entry"
+            ? { purpose: fsyncPurpose, id: request.restoreId, phase: "generated-next" }
+            : { purpose: fsyncPurpose, id: "generated-next" });
       const before = { ...sourceA.counts };
       if (request.mutateSource) {
         for (const method of capabilityFsMethods) {
@@ -245,7 +302,8 @@ try {
             capability,
             root,
             entryId: "generated-next",
-            purpose: "payload",
+            purpose: fsyncPurpose,
+            ...(fsyncPurpose === "rollback-entry" ? { restoreId: request.restoreId } : {}),
             metrics: {},
           };
       if (request.adapterMode === "same") options.fsApi = sourceA.adapter;
@@ -281,7 +339,11 @@ try {
     }, sourceA.adapter);
   } else if (request.operation === "deep-fsync") {
     const depth = request.depth;
-    const root = join(realpathSync(request.quarantineRoot), request.transactionId, "payload/generated/.next");
+    const root = request.root ?? join(
+      realpathSync(request.quarantineRoot),
+      request.transactionId,
+      "payload/generated/.next",
+    );
     const fakeDirectoryStat = (level) => ({
       dev: 1, ino: level + 100, mode: 0o40700, size: 0,
       isDirectory: () => true,
@@ -320,7 +382,13 @@ try {
     result = await withCapability(async (capability) => {
       const metrics = {};
       await inventory.fsyncTree({
-        capability, root, entryId: "generated-next", purpose: "payload", fsApi: hybrid, metrics,
+        capability,
+        root,
+        entryId: "generated-next",
+        purpose: request.purpose ?? "payload",
+        ...(request.purpose === "rollback-entry" ? { restoreId: request.restoreId } : {}),
+        fsApi: hybrid,
+        metrics,
       });
       return { metrics, openDirectories };
     }, hybrid);
@@ -861,6 +929,36 @@ describe("bounded quarantine inventory", () => {
     });
   });
 
+  it("publishes distinct generated inventories for restore and validation phases", () => {
+    const nextTransaction = "inventory-restore-validation-phases";
+    createRun(quarantineRoot, nextTransaction);
+    const source = join(repoRoot, "restore-validation-source");
+    privateDirectory(source);
+    writeFileSync(join(source, "file"), "phase");
+    const cases = [
+      ["restore-active", "generated-next"],
+      ["restore-active", "generated-node-modules"],
+      ["validation-pass-1", "generated-next"],
+      ["validation-pass-2", "generated-node-modules"],
+    ] as const;
+    const outputs = cases.map(([phase, entryId]) => {
+      const result = runWorker({
+        operation: "one-pass",
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        root: source,
+        phase,
+        entryId,
+      }).result as { output: string; summary: { entries: number } };
+      expect(result.summary.entries).toBe(1);
+      return result.output;
+    });
+    expect(new Set(outputs).size).toBe(cases.length);
+    expect(outputs).toEqual(cases.map(([phase, entryId]) =>
+      join(realpathSync(quarantineRoot), nextTransaction, "inventories", phase, `${entryId}.jsonl`)));
+  });
+
   it("accepts only the exact RootFileRecord and safe RelativeRecord union", () => {
     const rootFile = { scope: "root", type: "file", mode: 0o640, size: 1, sha256: "a".repeat(64) };
     const relative = { ...rootFile, scope: "relative", path: "src/file.ts" };
@@ -1163,6 +1261,46 @@ describe("bounded quarantine inventory", () => {
     },
   );
 
+  it.each([
+    ["omit", true],
+    ["same", false],
+  ])(
+    "rollback fsync accepts the %s capability adapter form",
+    (adapterMode, mutateSource) => {
+      const nextTransaction = `inventory-rollback-bound-${adapterMode}`;
+      const nextRun = createRun(quarantineRoot, nextTransaction);
+      const rollbackRoot = join(
+        nextRun,
+        "rollback/regenerated-before-restore",
+        RESTORE_ID,
+        ".next",
+      );
+      privateDirectory(rollbackRoot);
+      writeFileSync(join(rollbackRoot, "file"), "bound");
+      const result = runWorker({
+        operation: "bound-adapter-contract",
+        adapterMode,
+        mutateSource,
+        writer: "fsync",
+        purpose: "rollback-entry",
+        restoreId: RESTORE_ID,
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+      }).result as {
+        outcome: { ok: boolean };
+        before: Record<string, number>;
+        after: Record<string, number>;
+        workNames: string[];
+      };
+      expect(result.outcome.ok).toBe(true);
+      for (const method of ["lstat", "opendir", "open", "unlink", "createReadStream"]) {
+        expect(result.after[method]).toBeGreaterThan(result.before[method]);
+      }
+      expect(result.workNames).toEqual([]);
+    },
+  );
+
   it.each(["write", "fsync"])(
     "%s accepts only the exact capability source when fsApi is present",
     (writer) => {
@@ -1284,6 +1422,138 @@ describe("bounded quarantine inventory", () => {
     expect(result.events.some(([, path]) => path === join(canonicalNested, "link"))).toBe(false);
     expect(result.events.some(([, path]) => path === external)).toBe(false);
     expect(result.metrics.maxOpenDirectoryHandles).toBeLessThanOrEqual(1);
+  });
+
+  it("fsyncs a capability-derived rollback entry in bounded postorder", () => {
+    const nextTransaction = "inventory-rollback-fsync";
+    const nextRun = createRun(quarantineRoot, nextTransaction);
+    const rollbackRoot = join(
+      nextRun,
+      "rollback/regenerated-before-restore",
+      RESTORE_ID,
+      ".next",
+    );
+    const nested = join(rollbackRoot, "nested");
+    privateDirectory(nested);
+    writeFileSync(join(nested, "file"), "rollback");
+    const result = runWorker({
+      operation: "fsync",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      purpose: "rollback-entry",
+      restoreId: RESTORE_ID,
+      entryId: "generated-next",
+      root: realpathSync(rollbackRoot),
+    }).result as { events: [string, string][]; metrics: Record<string, number> };
+    const synced = result.events
+      .filter(([event, path]) => event === "sync" && path.startsWith(realpathSync(rollbackRoot)))
+      .map(([, path]) => path);
+    expect(synced).toEqual([
+      join(realpathSync(nested), "file"),
+      realpathSync(nested),
+      realpathSync(rollbackRoot),
+    ]);
+    expect(result.metrics.maxOpenDirectoryHandles).toBeLessThanOrEqual(1);
+    expect(result.metrics.maxTraversalAndHashHandles).toBeLessThanOrEqual(2);
+  });
+
+  it("handles a virtual 10,000-deep rollback tree within the fixed bounds", () => {
+    const nextTransaction = "inventory-rollback-deep";
+    const nextRun = createRun(quarantineRoot, nextTransaction);
+    const rollbackRoot = join(
+      realpathSync(nextRun),
+      "rollback/regenerated-before-restore",
+      RESTORE_ID,
+      ".next",
+    );
+    const result = runWorker({
+      operation: "deep-fsync",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      depth: 10_000,
+      purpose: "rollback-entry",
+      restoreId: RESTORE_ID,
+      root: rollbackRoot,
+    }).result as { metrics: Record<string, number>; openDirectories: number };
+    expect(result.openDirectories).toBe(0);
+    expect(result.metrics.maxOpenDirectoryHandles).toBeLessThanOrEqual(1);
+    expect(result.metrics.maxTraversalAndHashHandles).toBeLessThanOrEqual(2);
+    expect(result.metrics.maxPostorderFrames).toBeLessThanOrEqual(1024);
+    expect(result.metrics.maxPostorderBytes).toBeLessThanOrEqual(8 * 1024 * 1024);
+    expect(result.metrics.postorderSpills).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("rejects closed rollback fsync options before traversal or mutation", () => {
+    const nextTransaction = "inventory-rollback-invalid";
+    createRun(quarantineRoot, nextTransaction);
+    const foreignRoot = join(fixture, "foreign-rollback-root");
+    privateDirectory(foreignRoot);
+    writeFileSync(join(foreignRoot, "sentinel"), "keep");
+    for (const invalidCase of [
+      "foreign-root",
+      "unknown",
+      "symbol",
+      "missing-restore",
+      "missing-entry",
+      "bad-entry",
+      "payload-restore",
+      "undefined-adapter",
+      "distinct-adapter",
+    ]) {
+      const result = runWorker({
+        operation: "rollback-invalid",
+        case: invalidCase,
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        restoreId: RESTORE_ID,
+        root: foreignRoot,
+      }).result as {
+        outcome: { ok: boolean; error: { message: string } };
+        delta: Record<string, number>;
+        distinctCalls: Record<string, number>;
+      };
+      expect(result.outcome).toMatchObject({
+        ok: false,
+        error: { message: expect.any(String) },
+      });
+      expect(result.delta.open).toBe(0);
+      expect(result.delta.opendir).toBe(0);
+      expect(result.delta.createReadStream).toBe(0);
+      expect(Object.values(result.distinctCalls).every((count) => count === 0)).toBe(true);
+      if (invalidCase !== "foreign-root") {
+        expect(Object.values(result.delta).every((count) => count === 0)).toBe(true);
+      }
+    }
+    expect(readFileSync(join(foreignRoot, "sentinel"), "utf8")).toBe("keep");
+  });
+
+  it("rejects a rollback-entry symlink root without touching its target", () => {
+    const nextTransaction = "inventory-rollback-symlink";
+    const nextRun = createRun(quarantineRoot, nextTransaction);
+    const external = join(fixture, "rollback-symlink-target");
+    privateDirectory(external);
+    writeFileSync(join(external, "sentinel"), "keep");
+    const rollbackRoot = join(
+      nextRun,
+      "rollback/regenerated-before-restore",
+      RESTORE_ID,
+      ".next",
+    );
+    symlinkSync(external, rollbackRoot);
+    expect(() => runWorker({
+      operation: "fsync",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      purpose: "rollback-entry",
+      restoreId: RESTORE_ID,
+      entryId: "generated-next",
+      root: join(realpathSync(nextRun), "rollback/regenerated-before-restore", RESTORE_ID, ".next"),
+    })).toThrow(/symlink|root/i);
+    expect(readFileSync(join(external, "sentinel"), "utf8")).toBe("keep");
   });
 
   it("handles a virtual 10,000-deep tree without recursion or leaked directory handles", () => {

@@ -27,6 +27,13 @@ const INVENTORY_PHASES = new Set([
   "moved-pass-1",
   "moved-pass-2",
   "restore-active",
+  "validation-pass-1",
+  "validation-pass-2",
+]);
+const GENERATED_INVENTORY_PHASES = new Set([
+  "restore-active",
+  "validation-pass-1",
+  "validation-pass-2",
 ]);
 const BOUNDARIES = new Set(["before-mutation", "after-sync"]);
 function assertPlainObject(value, label) {
@@ -84,6 +91,12 @@ function assertIdentifier(value, pattern, label) {
 function assertEntryId(value) {
   if (typeof value !== "string" || (!COPY_ID.test(value) && !GENERATED_IDS.has(value))) {
     throw new TypeError("manifest entry ID is invalid");
+  }
+}
+
+function assertGeneratedEntryId(value) {
+  if (typeof value !== "string" || !GENERATED_IDS.has(value)) {
+    throw new TypeError("generated manifest entry ID is invalid");
   }
 }
 
@@ -168,6 +181,14 @@ const PURPOSES = Object.freeze({
     parent: join(runRoot, "rollback", "regenerated-before-restore"),
     parentRoot: "run",
   }),
+  "rollback-entry": ({ runRoot, id, phase }) => {
+    const parent = join(runRoot, "rollback", "regenerated-before-restore", id);
+    return {
+      path: join(parent, phase === "generated-next" ? ".next" : "node_modules"),
+      parent,
+      parentRoot: "run",
+    };
+  },
   conflict: ({ runRoot, id }) => ({
     path: join(runRoot, "conflicts", id),
     parent: join(runRoot, "conflicts"),
@@ -227,6 +248,13 @@ function validateRequest(request, includeBoundary = false) {
     case "rollback":
       assertIdOnly(normalized, (id) => assertIdentifier(id, RESTORE_ID, "restore"));
       break;
+    case "rollback-entry":
+      if (!Object.hasOwn(normalized, "id") || !Object.hasOwn(normalized, "phase")) {
+        throw new TypeError("request has an invalid purpose/ID/phase combination");
+      }
+      assertIdentifier(normalized.id, RESTORE_ID, "restore");
+      assertGeneratedEntryId(normalized.phase);
+      break;
     case "divergent-diff":
       assertIdOnly(normalized, (id) => assertIdentifier(id, COPY_ID, "source copy"));
       break;
@@ -240,8 +268,8 @@ function validateRequest(request, includeBoundary = false) {
       ) {
         throw new TypeError("inventory phase is invalid");
       }
-      if (normalized.phase === "restore-active") {
-        assertIdentifier(normalized.id, RESTORE_ID, "restore");
+      if (GENERATED_INVENTORY_PHASES.has(normalized.phase)) {
+        assertGeneratedEntryId(normalized.id);
       } else {
         assertEntryId(normalized.id);
       }

@@ -1266,7 +1266,16 @@ function comparePostorderTasks(left, right) {
 export async function fsyncTree(options) {
   const input = snapshotRecord(
     options,
-    ["capability", "root", "entryId", "purpose", "fsApi", "limits", "metrics"],
+    [
+      "capability",
+      "root",
+      "entryId",
+      "purpose",
+      "restoreId",
+      "fsApi",
+      "limits",
+      "metrics",
+    ],
     ["capability", "root", "entryId", "purpose"],
     "fsync tree options",
   );
@@ -1274,13 +1283,25 @@ export async function fsyncTree(options) {
     ? getRunFsContext(input.capability, input.fsApi)
     : getRunFsContext(input.capability);
   const root = assertAbsolutePath(input.root, "fsync tree root");
-  if (input.purpose !== "payload") {
-    throw new TypeError("fsync tree purpose must be payload");
+  let pathRequest;
+  if (input.purpose === "payload") {
+    if (Object.hasOwn(input, "restoreId")) {
+      throw new TypeError("payload fsync tree options must not include restoreId");
+    }
+    pathRequest = { purpose: "payload", id: input.entryId };
+  } else if (input.purpose === "rollback-entry") {
+    if (!Object.hasOwn(input, "restoreId")) {
+      throw new TypeError("rollback fsync tree options must include restoreId");
+    }
+    pathRequest = {
+      purpose: "rollback-entry",
+      id: input.restoreId,
+      phase: input.entryId,
+    };
+  } else {
+    throw new TypeError("fsync tree purpose must be payload or rollback-entry");
   }
-  const expectedRoot = deriveRunPath(input.capability, {
-    purpose: "payload",
-    id: input.entryId,
-  });
+  const expectedRoot = deriveRunPath(input.capability, pathRequest);
   if (root !== expectedRoot) {
     throw new Error(`fsync tree root does not match capability path: ${root} !== ${expectedRoot}`);
   }
@@ -1332,8 +1353,7 @@ export async function fsyncTree(options) {
   };
 
   await revalidateRunCapability(input.capability, {
-    purpose: "payload",
-    id: input.entryId,
+    ...pathRequest,
     boundary: "before-mutation",
   });
   try {
@@ -1386,8 +1406,7 @@ export async function fsyncTree(options) {
     }
     metrics.mergePasses += 1;
     await revalidateRunCapability(input.capability, {
-      purpose: "payload",
-      id: input.entryId,
+      ...pathRequest,
       boundary: "after-sync",
     });
   } catch (error) {
