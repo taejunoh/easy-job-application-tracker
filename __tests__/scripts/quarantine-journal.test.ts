@@ -34,8 +34,8 @@ const records = {
     payload: { conflictEntryIds: ["copy-0001"] },
   },
   verifying: { event: "VERIFYING", payload: {} },
-  quarantined: { event: "QUARANTINED", payload: { manifestSha256 } },
-  validated: { event: "VALIDATED", payload: {} },
+  quarantined: { event: "QUARANTINED", payload: {} },
+  validated: { event: "VALIDATED", payload: { manifestSha256 } },
   restorePrepared: { event: "RESTORE_PREPARED", payload: {} },
   restoring: { event: "RESTORING", payload: {} },
   restored: { event: "RESTORED", payload: {} },
@@ -229,6 +229,28 @@ const result = await withQuarantineRunCapability({
       await fsPromises.writeFile(join(runRoot, "journal.lock.tombstone.bad"), lockBytes(), {
         mode: 0o600,
       });
+    }
+    if (request.case === "oversized-lock") {
+      const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+      await fsPromises.writeFile(lockPath, Buffer.alloc(5000), { mode: 0o600 });
+    }
+    if (request.case === "malformed-lock") {
+      const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+      await fsPromises.writeFile(lockPath, "bad", { mode: 0o600 });
+    }
+    if (request.case === "symlink-lock" || request.case === "nonregular-lock") {
+      const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+      await fsPromises.rm(lockPath);
+      if (request.case === "symlink-lock") {
+        const victim = join(request.root, "lock-victim");
+        await fsPromises.writeFile(victim, "victim", { mode: 0o600 });
+        await fsPromises.symlink(victim, lockPath);
+      } else {
+        await fsPromises.mkdir(lockPath);
+      }
+    }
+    if (request.case === "oversized-tombstone") {
+      await fsPromises.writeFile(tombstonePath, Buffer.alloc(5000), { mode: 0o600 });
     }
     if (request.case === "lock-replacement") {
       let lockStats = 0;
@@ -499,6 +521,126 @@ const result = await withQuarantineRunCapability({
       }),
     ));
   }
+  if (request.operation === "close-only") {
+    if (request.mode === "recovery") {
+      await appendAll(capability, [request.prefix]);
+      await seedArtifacts(capability);
+    }
+    const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+    const failureFs = {
+      ...fsPromises,
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (String(path) !== lockPath || !String(flags).includes("x")) return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === "close") return async () => {
+              await target.close();
+              throw new Error("injected close-only failure");
+            };
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+    const append = (heldLock) => journal.appendJournalRecord({
+      capability,
+      heldLock,
+      event: request.record.event,
+      payload: request.record.payload,
+      fsApi: failureFs,
+    });
+    const outcome = request.mode === "recovery"
+      ? await capture(() => journal.reclaimJournalLock(
+        { capability, writersStopped: true, fsApi: failureFs },
+        append,
+      ))
+      : await capture(() => journal.withJournalLock(
+        { capability, fsApi: failureFs },
+        append,
+      ));
+    return { outcome, replayed: await journal.replayJournal({ capability }) };
+  }
+  if (request.operation === "pre-mutation") {
+    const journalPath = deriveRunPath(capability, { purpose: "journal" });
+    let created = false;
+    const failureFs = request.case === "after-create"
+      ? {
+        ...fsPromises,
+        open: async (path, flags, mode) => {
+          const handle = await fsPromises.open(path, flags, mode);
+          if (String(path) === journalPath && String(flags).includes("x")) {
+            created = true;
+            await handle.close();
+            throw new Error("injected failure after journal create");
+          }
+          return handle;
+        },
+      }
+      : fsPromises;
+    const outcome = await capture(() => journal.withJournalLock(
+      { capability, fsApi: failureFs },
+      (heldLock) => journal.appendJournalRecord({
+        capability,
+        heldLock,
+        event: request.record.event,
+        payload: request.record.payload,
+        fsApi: failureFs,
+        faultHook: request.case === "precheck"
+          ? async (phase) => {
+            if (phase === "before-mutation") throw new Error("injected precheck failure");
+          }
+          : undefined,
+      }),
+    ));
+    return {
+      outcome,
+      created,
+      journalExists: await fsPromises.lstat(journalPath).then(() => true, () => false),
+    };
+  }
+  if (request.operation === "tamper") {
+    await appendAll(capability, request.prefix);
+    const journalPath = deriveRunPath(capability, { purpose: "journal" });
+    if (request.case === "rehashed-invalid-payload") {
+      const replayed = await journal.replayJournal({ capability });
+      const sequence = replayed.records.length + 1;
+      const previousHash = replayed.records.at(-1).recordHash;
+      const event = request.event;
+      const payload = request.payload;
+      const recordHash = createHash("sha256")
+        .update(JSON.stringify({ sequence, previousHash, event, payload }))
+        .digest("hex");
+      const body = Buffer.from(JSON.stringify({
+        sequence,
+        previousHash,
+        event,
+        payload,
+        recordHash,
+      }));
+      const length = Buffer.alloc(4);
+      length.writeUInt32BE(body.length);
+      await fsPromises.appendFile(journalPath, Buffer.concat([length, body]));
+    } else {
+      const input = await fsPromises.readFile(journalPath);
+      const bodyLength = input.readUInt32BE(0);
+      const record = JSON.parse(input.subarray(4, 4 + bodyLength).toString("utf8"));
+      if (request.case === "sequence") record.sequence = 9;
+      if (request.case === "previousHash") record.previousHash = "f".repeat(64);
+      if (request.case === "recordHash") record.recordHash = "f".repeat(64);
+      if (request.case === "unknown-envelope") record.attackerPath = "../victim";
+      const body = Buffer.from(JSON.stringify(record));
+      const length = Buffer.alloc(4);
+      length.writeUInt32BE(body.length);
+      await fsPromises.writeFile(journalPath, Buffer.concat([
+        length,
+        body,
+        input.subarray(4 + bodyLength),
+      ]));
+    }
+    return capture(() => journal.replayJournal({ capability }));
+  }
   if (request.operation === "api-contract") {
     return {
       exports: Object.keys(journal).sort(),
@@ -601,8 +743,18 @@ const crashFs = {
     if (value.endsWith("/journal.log") && boundary === "partial-frame") {
       return new Proxy(handle, {
         get(target, property) {
-          if (property === "write") return async (buffer) => {
-            await target.write(buffer.subarray(0, Math.max(1, Math.floor(buffer.length / 2))));
+          if (property === "write") return async (
+            buffer,
+            offset = 0,
+            length = buffer.length - offset,
+            position = null,
+          ) => {
+            await target.write(
+              buffer,
+              offset,
+              Math.max(1, Math.floor(length / 2)),
+              position,
+            );
             process.kill(process.pid, "SIGKILL");
           };
           const member = Reflect.get(target, property, target);
@@ -669,6 +821,11 @@ describe("capability-bound durable quarantine journal", () => {
     ["symlink-artifact", terminalRecords.ROLLED_BACK],
     ["nonregular-artifact", terminalRecords.ROLLED_BACK],
     ["malformed-name", terminalRecords.ROLLED_BACK],
+    ["malformed-lock", terminalRecords.ROLLED_BACK],
+    ["oversized-lock", terminalRecords.ROLLED_BACK],
+    ["symlink-lock", terminalRecords.ROLLED_BACK],
+    ["nonregular-lock", terminalRecords.ROLLED_BACK],
+    ["oversized-tombstone", terminalRecords.ROLLED_BACK],
     ["lock-replacement", terminalRecords.ROLLED_BACK],
   ])("fails cleanup closed with every artifact unchanged for %s", (caseName, values) => {
     const result = invoke(join(fixture, `reject-${caseName}`), {
@@ -816,6 +973,180 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.outcome.ok).toBe(false);
     expect(result.bytesUnchanged).toBe(true);
   });
+
+  it.each([
+    ["QUARANTINED", [records.prepared, records.moving, records.verifying], records.quarantined],
+    [
+      "VALIDATED",
+      [records.prepared, records.moving, records.verifying, records.quarantined],
+      records.validated,
+    ],
+  ])("accepts the exact %s payload contract", (_event, prefix, record) => {
+    const result = invoke(join(fixture, `payload-valid-${_event}`), {
+      operation: "journal-regression",
+      case: "valid-payload",
+      prefix,
+      record,
+    });
+    expect(result.outcome.ok).toBe(true);
+  });
+
+  it.each([
+    ["QUARANTINED unknown", [records.prepared, records.moving, records.verifying], {
+      event: "QUARANTINED",
+      payload: { manifestSha256 },
+    }],
+    ["VALIDATED missing", [records.prepared, records.moving, records.verifying, records.quarantined], {
+      event: "VALIDATED",
+      payload: {},
+    }],
+    ["VALIDATED unknown", [records.prepared, records.moving, records.verifying, records.quarantined], {
+      event: "VALIDATED",
+      payload: { manifestSha256, attackerPath: "../victim" },
+    }],
+    ["VALIDATED uppercase hash", [records.prepared, records.moving, records.verifying, records.quarantined], {
+      event: "VALIDATED",
+      payload: { manifestSha256: "A".repeat(64) },
+    }],
+  ])("rejects %s payload", (label, prefix, record) => {
+    const result = invoke(join(fixture, `payload-invalid-${label.replaceAll(" ", "-")}`), {
+      operation: "journal-regression",
+      case: "invalid-payload",
+      prefix,
+      record,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
+  });
+
+  it.each([
+    ["MOVE_INTENT", [records.prepared, records.moving], {
+      event: "MOVE_INTENT",
+      payload: { id: "generic-slug", expected: validSummary },
+    }],
+    ["MOVED", [records.prepared, records.moving], {
+      event: "MOVED",
+      payload: { id: "generic-slug", observed: validSummary },
+    }],
+    ["ROLLBACK_INTENT", [
+      records.prepared,
+      records.moving,
+      records.recoveryRequired,
+      records.rollingBack,
+    ], { event: "ROLLBACK_INTENT", payload: { id: "generic-slug" } }],
+    ["ROLLED_BACK_ENTRY", [
+      records.prepared,
+      records.moving,
+      records.recoveryRequired,
+      records.rollingBack,
+    ], { event: "ROLLED_BACK_ENTRY", payload: { id: "generic-slug" } }],
+    ["RESTORE_INTENT", [
+      records.prepared,
+      records.moving,
+      records.verifying,
+      records.quarantined,
+      records.restorePrepared,
+      records.restoring,
+    ], { event: "RESTORE_INTENT", payload: { id: "generic-slug" } }],
+    ["RESTORED_ENTRY", [
+      records.prepared,
+      records.moving,
+      records.verifying,
+      records.quarantined,
+      records.restorePrepared,
+      records.restoring,
+    ], { event: "RESTORED_ENTRY", payload: { id: "generic-slug" } }],
+    ["RECOVERY_REQUIRED", [records.prepared, records.moving], {
+      event: "RECOVERY_REQUIRED",
+      payload: { entryIds: ["generic-slug"] },
+    }],
+    ["INCOMPLETE_CONFLICT", [records.prepared, records.moving], {
+      event: "INCOMPLETE_CONFLICT",
+      payload: { conflictEntryIds: ["generic-slug"] },
+    }],
+  ])("rejects a generic slug in %s", (event, prefix, record) => {
+    const result = invoke(join(fixture, `entry-id-${event}`), {
+      operation: "journal-regression",
+      case: "invalid-entry",
+      prefix,
+      record,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
+  });
+
+  it("rejects a correctly rehashed frame whose VALIDATED payload is invalid", () => {
+    const result = invoke(join(fixture, "rehashed-invalid-validated"), {
+      operation: "tamper",
+      case: "rehashed-invalid-payload",
+      prefix: [records.prepared, records.moving, records.verifying, records.quarantined],
+      event: "VALIDATED",
+      payload: {},
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toMatch(/VALIDATED|payload|missing/u);
+  });
+
+  it.each([
+    ["sequence", /sequence/u],
+    ["previousHash", /previous hash/u],
+    ["recordHash", /hash/u],
+    ["unknown-envelope", /unknown field/u],
+  ])("rejects replay tampering: %s", (caseName, expected) => {
+    const result = invoke(join(fixture, `tamper-${caseName}`), {
+      operation: "tamper",
+      case: caseName,
+      prefix: [records.prepared],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toMatch(expected);
+  });
+
+  it("fails before creating an absent journal when the pre-mutation check fails", () => {
+    const result = invoke(join(fixture, "pre-mutation-absent"), {
+      operation: "pre-mutation",
+      case: "precheck",
+      record: records.prepared,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.outcome.error.name).not.toBe("IndeterminateJournalAppendError");
+    expect(result.journalExists).toBe(false);
+  });
+
+  it("reports candidate evidence when absent-journal creation fails after the mutation boundary", () => {
+    const result = invoke(join(fixture, "post-create-absent"), {
+      operation: "pre-mutation",
+      case: "after-create",
+      record: records.prepared,
+    });
+    expect(result.created).toBe(true);
+    expect(result.journalExists).toBe(true);
+    expect(result.outcome.error).toMatchObject({
+      name: "IndeterminateJournalAppendError",
+      expectedSequence: 1,
+      expectedRecordHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+  });
+
+  it.each(["ordinary", "recovery"])(
+    "surfaces a successful %s append held-lock close-only failure directly",
+    (mode) => {
+      const result = invoke(join(fixture, `close-only-${mode}`), {
+        operation: "close-only",
+        mode,
+        prefix: records.prepared,
+        record: mode === "ordinary" ? records.prepared : records.moving,
+      });
+      expect(result.outcome.ok).toBe(false);
+      expect(result.outcome.error).toMatchObject({
+        name: "Error",
+        code: null,
+        message: "injected close-only failure",
+        expectedSequence: null,
+        expectedRecordHash: null,
+      });
+    },
+  );
 
   it("ignores a torn final tail, then truncates and appends at the next sequence", () => {
     const result = invoke(join(fixture, "torn-repair"), {

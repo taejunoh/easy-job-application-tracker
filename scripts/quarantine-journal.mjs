@@ -32,7 +32,7 @@ const LOCK_BODY_FIXED_BYTES =
   LOCK_BODY_SUFFIX.length;
 const MIN_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + 1;
 const MAX_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + String(Number.MAX_SAFE_INTEGER).length;
-const ENTRY_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
+const ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 
 export class IndeterminateJournalAppendError extends Error {
@@ -244,11 +244,11 @@ const EVENT_PAYLOAD_PARSERS = Object.freeze({
     });
   },
   VERIFYING: (payload) => parseEmptyPayload("VERIFYING", payload),
-  QUARANTINED(payload) {
-    assertPayloadKeys(payload, ["manifestSha256"], "QUARANTINED");
+  QUARANTINED: (payload) => parseEmptyPayload("QUARANTINED", payload),
+  VALIDATED(payload) {
+    assertPayloadKeys(payload, ["manifestSha256"], "VALIDATED");
     return Object.freeze({ manifestSha256: parseManifestSha256(payload.manifestSha256) });
   },
-  VALIDATED: (payload) => parseEmptyPayload("VALIDATED", payload),
   RECOVERY_REQUIRED: (payload) =>
     parseSortedEntryIds("RECOVERY_REQUIRED", payload, "entryIds"),
   ROLLING_BACK: (payload) => parseEmptyPayload("ROLLING_BACK", payload),
@@ -722,11 +722,7 @@ async function closeHeldLock(state, primaryError) {
   if (primaryError !== undefined) {
     throw closeError === undefined ? primaryError : attachCleanupError(primaryError, closeError);
   }
-  if (closeError !== undefined) {
-    throw state.lastCandidate === null
-      ? closeError
-      : indeterminate(state.lastCandidate, closeError);
-  }
+  if (closeError !== undefined) throw closeError;
 }
 
 async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callback) {
@@ -786,24 +782,44 @@ export async function withJournalLock({ capability, fsApi = fsPromises }, callba
   return (await runWithJournalLock({ capability, fsApi, removeOnSuccess: true }, callback)).result;
 }
 
-async function openJournalForAppend({ capability, fsApi }) {
-  const journalPath = deriveRunPath(capability, { purpose: "journal" });
-  let before = null;
-  try {
-    before = await fsApi.lstat(journalPath);
-    if (before.isSymbolicLink() || !before.isFile()) {
-      throw new Error("journal must be a non-symlink regular file");
-    }
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+async function writeCompleteAt(handle, buffer, position) {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesWritten } = await handle.write(
+      buffer,
+      offset,
+      buffer.length - offset,
+      position + offset,
+    );
+    if (bytesWritten <= 0) throw new Error("durable write made no progress");
+    offset += bytesWritten;
   }
-  const handle = await fsApi.open(journalPath, "a+", 0o600);
+}
+
+async function openJournalForMutation(snapshot, fsApi) {
+  const flags = snapshot.identity === null ? "wx+" : "r+";
+  if (snapshot.identity !== null) {
+    await assertPathIdentity(
+      snapshot.journalPath,
+      snapshot.identity,
+      fsApi,
+      "journal",
+    );
+  }
+  const handle = await fsApi.open(snapshot.journalPath, flags, 0o600);
   try {
     const opened = await handle.stat();
-    if (!opened.isFile() || (before !== null && !sameIdentity(before, opened))) {
-      throw new Error("journal changed while being opened");
+    if (
+      !opened.isFile() ||
+      (snapshot.identity !== null && !sameIdentity(snapshot.identity, opened))
+    ) {
+      throw new Error("journal changed while being opened for mutation");
     }
-    return { handle, journalPath };
+    const observed = await readCompleteFile(handle);
+    if (!observed.equals(snapshot.bytes)) {
+      throw new Error("journal changed before mutation");
+    }
+    return handle;
   } catch (error) {
     await handle.close().catch(() => {});
     throw error;
@@ -828,9 +844,8 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
   let primaryError;
   try {
     await assertHeldLockOwned(state);
-    journal = await openJournalForAppend({ capability, fsApi });
-    await journal.handle.chmod(0o600);
-    const replayed = replayJournalBuffer(await readCompleteFile(journal.handle));
+    const snapshot = await readJournalSnapshot({ capability, fsApi });
+    const replayed = snapshot.replayed;
     validateTransition(replayed.state, event);
     const canonicalPayload = canonicalize(parseEventPayload(event, payload));
     const sequence = replayed.records.length + 1;
@@ -851,17 +866,23 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
       purpose: "journal",
       boundary: "before-mutation",
     });
+    mutationStarted = true;
+    state.lastCandidate = candidate;
+    const handle = await openJournalForMutation(snapshot, fsApi);
+    journal = { handle, journalPath: snapshot.journalPath };
+    await invokeFaultHook(faultHook, "after-journal-open");
+    await journal.handle.chmod(0o600);
     if (replayed.truncatedTail) {
-      mutationStarted = true;
-      state.lastCandidate = candidate;
       await journal.handle.truncate(replayed.validEndOffset);
       await journal.handle.sync();
       await fsyncDirectory(dirname(journal.journalPath), fsApi);
       await assertHeldLockOwned(state);
     }
-    mutationStarted = true;
-    state.lastCandidate = candidate;
-    await writeComplete(journal.handle, Buffer.concat([length, body]));
+    await writeCompleteAt(
+      journal.handle,
+      Buffer.concat([length, body]),
+      replayed.validEndOffset,
+    );
     await journal.handle.sync();
     await invokeFaultHook(faultHook, "after-journal-sync");
     await assertHeldLockOwned(state);
