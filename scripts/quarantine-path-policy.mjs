@@ -3,7 +3,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const GENERATED_ROOTS = Object.freeze(["node_modules", ".next"]);
 
