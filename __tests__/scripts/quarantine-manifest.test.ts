@@ -142,6 +142,7 @@ const adapterState = {
   staleSwapPath: null,
   staleSwapLstats: 0,
   durableSwap: null,
+  readSwap: null,
 };
 const fsApi = {
   ...baseFsApi,
@@ -184,6 +185,37 @@ const fsApi = {
               { mode: 0o600 },
             );
             await baseFsApi.chmod(adapterState.durableSwap.path, 0o600);
+          };
+          const member = Reflect.get(target, property, target);
+          return typeof member === "function" ? member.bind(target) : member;
+        },
+      });
+    }
+    if (
+      flags === "r" &&
+      adapterState.readSwap !== null &&
+      path === adapterState.readSwap.path &&
+      !adapterState.readSwap.complete
+    ) {
+      return new Proxy(handle, {
+        get(target, property) {
+          if (property === "read") return async (...args) => {
+            const result = await target.read(...args);
+            if (result.bytesRead === 0 || adapterState.readSwap.complete) return result;
+            adapterState.readSwap.complete = true;
+            if (adapterState.readSwap.replacement === "mode") {
+              await baseFsApi.chmod(path, 0o644);
+              return result;
+            }
+            const original = await baseFsApi.readFile(path);
+            await baseFsApi.rename(path, path + ".owned");
+            await baseFsApi.writeFile(
+              path,
+              adapterState.readSwap.replacement === "foreign" ? "foreign" : original,
+              { mode: 0o600 },
+            );
+            await baseFsApi.chmod(path, 0o600);
+            return result;
           };
           const member = Reflect.get(target, property, target);
           return typeof member === "function" ? member.bind(target) : member;
@@ -1019,6 +1051,68 @@ const result = await (async () => {
       }
       return { distinct, explicitUndefined, omitted, distinctIo };
     }
+    if (request.operation === "post-read-path-swap") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const manifestBytes = Buffer.from(JSON.stringify(built) + "\\n");
+      const digest = createHash("sha256").update(manifestBytes).digest("hex");
+      let written;
+      let path;
+      if (request.target === "publication") {
+        path = deriveRunPath(capability, {
+          purpose: "manifest-generation",
+          id: digest,
+        });
+      } else {
+        written = await manifestApi.writeManifestGeneration({
+          capability,
+          manifest: built,
+          fsApi,
+        });
+        if (request.target === "current") {
+          await manifestApi.activateManifestGeneration({
+            capability,
+            transactionId,
+            manifestSha256: written.manifestSha256,
+            appendValidated: async (payload) => appendedResult(payload),
+            fsApi,
+          });
+          path = deriveRunPath(capability, { purpose: "current-pointer" });
+        } else {
+          path = deriveRunPath(capability, {
+            purpose: "manifest-generation",
+            id: written.manifestSha256,
+          });
+        }
+      }
+      adapterState.readSwap = {
+        path,
+        replacement: request.case,
+        complete: false,
+      };
+      const outcome = await capture(() => {
+        if (request.target === "publication") {
+          return manifestApi.writeManifestGeneration({ capability, manifest: built, fsApi });
+        }
+        if (request.target === "current") {
+          return manifestApi.readCurrentManifestPointer({ capability, fsApi });
+        }
+        return manifestApi.readManifestGeneration({
+          capability,
+          manifestSha256: written.manifestSha256,
+          fsApi,
+        });
+      });
+      return {
+        outcome,
+        swapComplete: adapterState.readSwap.complete,
+        liveBytes: await fsPromises.readFile(path, "utf8"),
+        liveMode: (await fsPromises.lstat(path)).mode & 0o7777,
+        ownedPresent: await fsPromises.access(path + ".owned")
+          .then(() => true, () => false),
+        temporaryNames: (await fsPromises.readdir(manifestsRoot))
+          .filter((name) => name.startsWith(".")).sort(),
+      };
+    }
     if (request.operation === "generation-post-sync-swap") {
       const built = manifestApi.buildValidatedManifest(request.value);
       const manifestBytes = Buffer.from(JSON.stringify(built) + "\\n");
@@ -1339,6 +1433,63 @@ describe("immutable quarantine manifest generations", () => {
     expect(result.appendCalls).toBe(1);
     expect(result.currentBytes).toBe("foreign");
     expect(result.ownedPresent).toBe(true);
+  });
+
+  it.each([
+    ["current", "foreign"],
+    ["generation", "same"],
+  ])(
+    "rejects and preserves a %s pathname replacement after its old handle is read",
+    (target, replacement) => {
+      const result = invoke({
+        operation: "post-read-path-swap",
+        target,
+        case: replacement,
+        value: validManifest,
+      });
+      expect(result.swapComplete).toBe(true);
+      expect(result.outcome).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/identity|path|changed/i) },
+      });
+      expect(result.ownedPresent).toBe(true);
+      expect(result.liveBytes).toBe(
+        target === "current" ? "foreign" : `${JSON.stringify(validManifest)}\n`,
+      );
+    },
+  );
+
+  it("rejects a pathname mode change after reading the old generation bytes", () => {
+    const result = invoke({
+      operation: "post-read-path-swap",
+      target: "generation",
+      case: "mode",
+      value: validManifest,
+    });
+    expect(result.swapComplete).toBe(true);
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/mode|changed|private/i) },
+    });
+    expect(result.liveMode).toBe(0o644);
+    expect(result.ownedPresent).toBe(false);
+  });
+
+  it("preserves publication evidence when the generation pathname changes after read", () => {
+    const result = invoke({
+      operation: "post-read-path-swap",
+      target: "publication",
+      case: "same",
+      value: validManifest,
+    });
+    expect(result.swapComplete).toBe(true);
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/identity|path|changed/i) },
+    });
+    expect(result.ownedPresent).toBe(true);
+    expect(result.liveBytes).toBe(`${JSON.stringify(validManifest)}\n`);
+    expect(result.temporaryNames).toHaveLength(1);
   });
 
   it.each([

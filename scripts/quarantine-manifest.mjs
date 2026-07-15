@@ -446,6 +446,16 @@ async function readBoundedSnapshot(path, fsApi, maxBytes, label) {
     ) {
       throw new Error(`${label} identity, size, or mode changed while being read`);
     }
+    const finalPath = await fsApi.lstat(path);
+    assertRegularFile(finalPath, label);
+    if (
+      !sameIdentity(before, finalPath) ||
+      !sameIdentity(after, finalPath) ||
+      finalPath.size !== first.size ||
+      finalPath.mode !== first.mode
+    ) {
+      throw new Error(`${label} pathname identity, size, or mode changed after being read`);
+    }
     return { bytes, identity: after };
   }, `${label} read and close both failed`);
 }
