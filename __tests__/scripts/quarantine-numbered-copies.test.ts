@@ -1,17 +1,25 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  readdirSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
-import {
-  canonicalPathForNumberedCopy,
-  inspectWorkspace,
-} from "../../scripts/quarantine-numbered-copies-support.mjs";
+const supportModule = pathToFileURL(
+  join(__dirname, "../../scripts/quarantine-numbered-copies-support.mjs"),
+).href;
 
 type TemporaryRepository = Readonly<{
   head: string;
@@ -28,13 +36,15 @@ describe("numbered-copy workspace inventory", () => {
       "scripts/verify-invalid-startup.mjs",
     ],
   ])("maps the final numbered filename in %s", (input, expected) => {
-    expect(canonicalPathForNumberedCopy(input)).toBe(expected);
+    expect(invokeSupport("canonicalPathForNumberedCopy", [input])).toBe(
+      expected,
+    );
   });
 
   it.each(["src/lib/version2.ts", "src/lib 2/server-env.ts"])(
     "rejects a non-copy path %s",
     (input) => {
-      expect(canonicalPathForNumberedCopy(input)).toBeNull();
+      expect(invokeSupport("canonicalPathForNumberedCopy", [input])).toBeNull();
     },
   );
 
@@ -51,18 +61,19 @@ describe("numbered-copy workspace inventory", () => {
         "divergent-private-body\n",
       );
 
-      const inspection = await inspectWorkspace(
-        {
-          repositoryRoot: fixture.root,
-          quarantineRoot: fixture.quarantineRoot,
-          expectedBranch: "main",
-          expectedHead: git(fixture.root, ["rev-parse", "HEAD"]),
-          expectedCount: 2,
-          now: new Date("2026-07-14T12:00:00.000Z"),
-        },
-        {
-          statfs: async () => ({ bavail: 1_000_000, bsize: 4_096 }),
-        },
+      const inspection = invokeSupport<WorkspaceInspection>(
+        "inspectWorkspace",
+        [
+          {
+            repositoryRoot: fixture.root,
+            quarantineRoot: fixture.quarantineRoot,
+            expectedBranch: "main",
+            expectedHead: git(fixture.root, ["rev-parse", "HEAD"]),
+            expectedCount: 2,
+            now: new Date("2026-07-14T12:00:00.000Z"),
+          },
+        ],
+        { availableBytes: 4_096_000_000 },
       );
 
       expect(inspection.copies).toHaveLength(2);
@@ -79,6 +90,320 @@ describe("numbered-copy workspace inventory", () => {
       expect(JSON.stringify(inspection)).not.toContain(
         "divergent-private-body",
       );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects every unapproved workspace or storage precondition", () => {
+    const cases: Array<{
+      name: string;
+      prepare(fixture: TemporaryRepository): Record<string, unknown>;
+      seams?: Readonly<{ availableBytes?: number }>;
+    }> = [
+      {
+        name: "branch",
+        prepare: () => ({ expectedBranch: "other" }),
+      },
+      {
+        name: "head",
+        prepare: () => ({ expectedHead: "0".repeat(40) }),
+      },
+      {
+        name: "count",
+        prepare: () => ({ expectedCount: 2 }),
+      },
+      {
+        name: "tracked",
+        prepare: (fixture) => {
+          writeFixture(fixture.root, "canonical.ts", "changed\n");
+          return {};
+        },
+      },
+      {
+        name: "staged",
+        prepare: (fixture) => {
+          writeFixture(fixture.root, "canonical.ts", "staged\n");
+          git(fixture.root, ["add", "canonical.ts"]);
+          return {};
+        },
+      },
+      {
+        name: "internal quarantine",
+        prepare: (fixture) => {
+          const internal = join(fixture.root, "internal-quarantine");
+          mkdirSync(internal);
+          return { quarantineRoot: internal };
+        },
+      },
+      {
+        name: "space",
+        prepare: () => ({}),
+        seams: { availableBytes: 0 },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const fixture = createRepository();
+      try {
+        writeFixture(fixture.root, "canonical.ts", "canonical\n");
+        commitAll(fixture.root, "add canonical");
+        writeFixture(fixture.root, "canonical 2.ts", "copy\n");
+        const overrides = testCase.prepare(fixture);
+        expect(() =>
+          invokeSupport(
+            "inspectWorkspace",
+            [{ ...approvedOptions(fixture, 1), ...overrides }],
+            testCase.seams ?? { availableBytes: 4_096_000_000 },
+          ),
+        ).toThrow();
+      } finally {
+        fixture.cleanup();
+      }
+    }
+  });
+});
+
+describe("verified workspace quarantine transaction", () => {
+  it("copies, verifies, and removes source copies and complete generated trees", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      const result = invokeSupport<QuarantineResult>(
+        "quarantineWorkspace",
+        [approvedOptions(fixture, 2)],
+        { availableBytes: 4_096_000_000 },
+      );
+      const manifest = readManifest(result.runDirectory);
+
+      expect(manifest.state).toBe("quarantined");
+      expect(statSync(result.runDirectory).mode & 0o777).toBe(0o700);
+      expect(
+        statSync(join(result.runDirectory, "manifest.json")).mode & 0o777,
+      ).toBe(0o600);
+      expect(
+        statSync(join(result.runDirectory, "manifest.sha256")).mode & 0o777,
+      ).toBe(0o600);
+      expectManifestChecksum(result.runDirectory);
+
+      for (const relativePath of [
+        "src/identical 2.ts",
+        "src/divergent 3.ts",
+        "node_modules",
+        ".next",
+      ]) {
+        expect(existsSync(join(fixture.root, relativePath))).toBe(false);
+      }
+      expect(
+        readFileSync(
+          join(result.runDirectory, "source-copies/src/identical 2.ts"),
+          "utf8",
+        ),
+      ).toBe("same\n");
+      expect(
+        statSync(join(result.runDirectory, "source-copies/src/identical 2.ts"))
+          .mode & 0o777,
+      ).toBe(0o640);
+      expect(
+        readlinkSync(
+          join(result.runDirectory, "generated/node_modules/.bin/tool"),
+        ),
+      ).toBe("../tool.js");
+      expect(manifest.generatedTrees.map((tree) => tree.path)).toEqual([
+        ".next",
+        "node_modules",
+      ]);
+
+      const divergent = manifest.copies.find(
+        (copy) => copy.classification === "divergent",
+      );
+      expect(divergent?.diffPath).toEqual(expect.any(String));
+      const diffPath = join(result.runDirectory, divergent!.diffPath!);
+      expect(statSync(diffPath).mode & 0o777).toBe(0o600);
+      expect(readFileSync(diffPath, "utf8")).toContain(
+        "divergent-private-body",
+      );
+      expect(JSON.stringify(manifest)).not.toContain("divergent-private-body");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("marks an incomplete manifest and leaves every original when archive verification fails", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      expect(() =>
+        invokeSupport("quarantineWorkspace", [approvedOptions(fixture, 2)], {
+          availableBytes: 4_096_000_000,
+          corruptAfterCopy: "source-copies/src/identical 2.ts",
+        }),
+      ).toThrow();
+
+      const runDirectory = onlyRunDirectory(fixture.quarantineRoot);
+      expect(readManifest(runDirectory).state).toBe("incomplete");
+      expectManifestChecksum(runDirectory);
+      for (const relativePath of [
+        "src/identical 2.ts",
+        "src/divergent 3.ts",
+        "node_modules/package.json",
+        ".next/build.txt",
+      ]) {
+        expect(existsSync(join(fixture.root, relativePath))).toBe(true);
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("requires clean regenerated trees before validation and sets the four-day deadline", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      const quarantined = invokeSupport<QuarantineResult>(
+        "quarantineWorkspace",
+        [approvedOptions(fixture, 2)],
+        { availableBytes: 4_096_000_000 },
+      );
+      expect(() =>
+        invokeSupport("markQuarantineValidated", [
+          {
+            repositoryRoot: fixture.root,
+            runDirectory: quarantined.runDirectory,
+            now: "2026-07-15T08:30:00.000Z",
+          },
+        ]),
+      ).toThrow();
+
+      writeFixture(fixture.root, "node_modules/package.json", "{}\n");
+      writeFixture(fixture.root, ".next/build.txt", "fresh\n");
+      const validated = invokeSupport<QuarantineManifest>(
+        "markQuarantineValidated",
+        [
+          {
+            repositoryRoot: fixture.root,
+            runDirectory: quarantined.runDirectory,
+            now: "2026-07-15T08:30:00.000Z",
+          },
+        ],
+      );
+
+      expect(validated.state).toBe("validated");
+      expect(validated.validationAt).toBe("2026-07-15T08:30:00.000Z");
+      expect(validated.retentionDays).toBe(4);
+      expect(validated.deleteAfter).toBe("2026-07-19T08:30:00.000Z");
+      expect(validated.deletionRequiresConfirmation).toBe(true);
+      expectManifestChecksum(quarantined.runDirectory);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("archives regenerated trees before restoring original paths and modes", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      const quarantined = invokeSupport<QuarantineResult>(
+        "quarantineWorkspace",
+        [approvedOptions(fixture, 2)],
+        { availableBytes: 4_096_000_000 },
+      );
+      writeFixture(fixture.root, "node_modules/new-package.json", "fresh\n");
+      writeFixture(fixture.root, ".next/new-build.txt", "fresh\n");
+
+      const restored = invokeSupport<QuarantineManifest>("restoreQuarantine", [
+        {
+          repositoryRoot: fixture.root,
+          runDirectory: quarantined.runDirectory,
+          now: "2026-07-16T09:00:00.000Z",
+        },
+      ]);
+
+      expect(restored.state).toBe("restored");
+      expect(
+        readFileSync(join(fixture.root, "src/identical 2.ts"), "utf8"),
+      ).toBe("same\n");
+      expect(
+        statSync(join(fixture.root, "src/identical 2.ts")).mode & 0o777,
+      ).toBe(0o640);
+      expect(
+        readFileSync(join(fixture.root, "node_modules/package.json"), "utf8"),
+      ).toBe("old\n");
+      expect(
+        readFileSync(
+          join(
+            quarantined.runDirectory,
+            "rollback/regenerated-before-restore/20260716T090000000Z/node_modules/new-package.json",
+          ),
+          "utf8",
+        ),
+      ).toBe("fresh\n");
+      expectManifestChecksum(quarantined.runDirectory);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("refuses a corrupted manifest checksum without changing active or archived files", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      const quarantined = invokeSupport<QuarantineResult>(
+        "quarantineWorkspace",
+        [approvedOptions(fixture, 2)],
+        { availableBytes: 4_096_000_000 },
+      );
+      writeFixture(fixture.root, "node_modules/new-package.json", "fresh\n");
+      writeFileSync(join(quarantined.runDirectory, "manifest.json"), "{}\n");
+
+      expect(() =>
+        invokeSupport("restoreQuarantine", [
+          {
+            repositoryRoot: fixture.root,
+            runDirectory: quarantined.runDirectory,
+            now: "2026-07-16T09:00:00.000Z",
+          },
+        ]),
+      ).toThrow();
+      expect(
+        existsSync(join(fixture.root, "node_modules/new-package.json")),
+      ).toBe(true);
+      expect(
+        existsSync(
+          join(quarantined.runDirectory, "source-copies/src/identical 2.ts"),
+        ),
+      ).toBe(true);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("refuses restore conflicts before moving regenerated trees", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      const quarantined = invokeSupport<QuarantineResult>(
+        "quarantineWorkspace",
+        [approvedOptions(fixture, 2)],
+        { availableBytes: 4_096_000_000 },
+      );
+      writeFixture(fixture.root, "node_modules/new-package.json", "fresh\n");
+      writeFixture(fixture.root, "src/identical 2.ts", "conflict\n");
+
+      expect(() =>
+        invokeSupport("restoreQuarantine", [
+          {
+            repositoryRoot: fixture.root,
+            runDirectory: quarantined.runDirectory,
+            now: "2026-07-16T09:00:00.000Z",
+          },
+        ]),
+      ).toThrow();
+      expect(
+        readFileSync(join(fixture.root, "src/identical 2.ts"), "utf8"),
+      ).toBe("conflict\n");
+      expect(
+        existsSync(join(fixture.root, "node_modules/new-package.json")),
+      ).toBe(true);
+      expect(
+        existsSync(
+          join(quarantined.runDirectory, "source-copies/src/identical 2.ts"),
+        ),
+      ).toBe(true);
     } finally {
       fixture.cleanup();
     }
@@ -105,6 +430,138 @@ function createRepository(): TemporaryRepository {
       rmSync(quarantineRoot, { recursive: true, force: true });
     },
   };
+}
+
+type WorkspaceInspection = Readonly<{
+  copies: ReadonlyArray<{
+    originalPath: string;
+    canonicalPath: string;
+    classification: "identical" | "divergent";
+  }>;
+}>;
+
+type QuarantineResult = Readonly<{
+  runDirectory: string;
+}>;
+
+type QuarantineManifest = Readonly<{
+  state: string;
+  validationAt: string | null;
+  retentionDays?: number;
+  deleteAfter: string | null;
+  deletionRequiresConfirmation: boolean;
+  generatedTrees: ReadonlyArray<{ path: string }>;
+  copies: ReadonlyArray<{
+    classification: "identical" | "divergent";
+    diffPath?: string | null;
+  }>;
+}>;
+
+function invokeSupport<T>(
+  operation: string,
+  args: readonly unknown[],
+  seams: Readonly<{
+    availableBytes?: number;
+    corruptAfterCopy?: string;
+  }> = {},
+): T {
+  const source = `
+import * as support from ${JSON.stringify(supportModule)};
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const request = JSON.parse(input);
+try {
+  const dependencies = {
+    ...(request.seams.availableBytes === undefined ? {} : {
+      statfs: async () => ({ bavail: request.seams.availableBytes, bsize: 1 }),
+    }),
+    ...(request.seams.corruptAfterCopy === undefined ? {} : {
+      afterArchiveCopied: async ({ runDirectory }) => {
+        await writeFile(
+          join(runDirectory, request.seams.corruptAfterCopy),
+          "corrupted-after-copy",
+        );
+      },
+    }),
+  };
+  const value = await support[request.operation](...request.args, dependencies);
+  process.stdout.write(JSON.stringify({ ok: true, value }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({
+    ok: false,
+    error: error instanceof Error ? error.message : "Unknown support failure",
+  }));
+}
+`;
+  const runnerRoot = mkdtempSync(
+    join(tmpdir(), "jobtracker-quarantine-runner-"),
+  );
+  const runnerPath = join(runnerRoot, "invoke-support.mjs");
+  writeFileSync(runnerPath, source);
+  try {
+    const output = execFileSync(process.execPath, [runnerPath], {
+      encoding: "utf8",
+      input: JSON.stringify({ operation, args, seams }),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const response = JSON.parse(output) as
+      { ok: true; value: T } | { ok: false; error: string };
+    if (!response.ok) throw new Error(response.error);
+    return response.value;
+  } finally {
+    rmSync(runnerRoot, { recursive: true, force: true });
+  }
+}
+
+function approvedOptions(fixture: TemporaryRepository, expectedCount: number) {
+  return {
+    repositoryRoot: fixture.root,
+    quarantineRoot: fixture.quarantineRoot,
+    expectedBranch: "main",
+    expectedHead: git(fixture.root, ["rev-parse", "HEAD"]),
+    expectedCount,
+    now: "2026-07-14T12:00:00.000Z",
+  };
+}
+
+function createPopulatedRepository(): TemporaryRepository {
+  const fixture = createRepository();
+  writeFixture(fixture.root, "src/identical.ts", "same\n");
+  writeFixture(fixture.root, "src/divergent.ts", "canonical\n");
+  commitAll(fixture.root, "add canonical sources");
+  writeFixture(fixture.root, "src/identical 2.ts", "same\n");
+  chmodSync(join(fixture.root, "src/identical 2.ts"), 0o640);
+  writeFixture(fixture.root, "src/divergent 3.ts", "divergent-private-body\n");
+  writeFixture(fixture.root, "node_modules/package.json", "old\n");
+  writeFixture(fixture.root, "node_modules/tool.js", "tool\n");
+  mkdirSync(join(fixture.root, "node_modules/.bin"), { recursive: true });
+  symlinkSync("../tool.js", join(fixture.root, "node_modules/.bin/tool"));
+  writeFixture(fixture.root, ".next/build.txt", "old-build\n");
+  return fixture;
+}
+
+function onlyRunDirectory(quarantineRoot: string): string {
+  const entries = readdirSync(quarantineRoot);
+  expect(entries).toHaveLength(1);
+  return join(quarantineRoot, entries[0]);
+}
+
+function readManifest(runDirectory: string): QuarantineManifest {
+  return JSON.parse(
+    readFileSync(join(runDirectory, "manifest.json"), "utf8"),
+  ) as QuarantineManifest;
+}
+
+function expectManifestChecksum(runDirectory: string) {
+  const contents = readFileSync(join(runDirectory, "manifest.json"));
+  const expected = createHash("sha256").update(contents).digest("hex");
+  const checksum = readFileSync(
+    join(runDirectory, "manifest.sha256"),
+    "utf8",
+  ).trim();
+  expect(checksum).toBe(`${expected}  manifest.json`);
 }
 
 function writeFixture(root: string, relativePath: string, contents: string) {
