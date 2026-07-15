@@ -388,6 +388,20 @@ prior well-formed tombstone residues, then `fsync`s the parent. Malformed names,
 malformed frames, symlinks, and non-regular tombstones are preserved and fatal
 before recovery mutation.
 
+Task 2 closes one orchestration-only recovery seam without weakening this
+ownership boundary. If the interrupted candidate is already the current durable
+journal tip and no legal successor is ready yet, the recovery callback may
+return exactly
+`{ settleDurableTip: { sequence, recordHash } }` without appending. Recovery
+accepts that result only when the sequence and lowercase record hash equal the
+same non-torn tip observed under the fresh held lock. It then removes the
+validated stale lock and tombstones through the normal pre/post capability
+boundaries. Unknown fields, a changed or torn tip, a missing candidate, or a
+zero-append callback without this exact confirmation preserves every artifact
+and fails. This settlement exists for boundaries such as a durable
+`QUARANTINED` or `VALIDATED` append whose next operation is not yet authorized;
+it is not a general nonterminal cleanup API.
+
 Terminal stale artifacts use a separate cleanup-only API; recovery append is
 not reused. The API accepts only a fully replayed journal whose last durable
 state is exactly `ROLLED_BACK`, `RESTORED`, or `INCOMPLETE_CONFLICT`, requires
@@ -434,7 +448,25 @@ PREPARED -> MOVING -> VERIFYING -> QUARANTINED -> VALIDATED
                  \-> RECOVERY_REQUIRED -> ROLLING_BACK -> ROLLED_BACK
                  \-> INCOMPLETE_CONFLICT
 QUARANTINED|VALIDATED -> RESTORE_PREPARED -> RESTORING -> RESTORED
+                                             \-> RECOVERY_REQUIRED
+RECOVERY_REQUIRED -> RESTORING
+                  \-> RESTORE_ROLLING_BACK
+RESTORE_ROLLING_BACK -> RESTORE_ABORTED_TO_QUARANTINED -> QUARANTINED
+                     \-> RESTORE_ABORTED_TO_VALIDATED -> VALIDATED
+                     \-> INCOMPLETE_CONFLICT
 ```
+
+`RESTORE_ROLLING_BACK`, `RESTORE_ABORTED_TO_QUARANTINED`, and
+`RESTORE_ABORTED_TO_VALIDATED` accept exactly `{}`.
+`RESTORE_ROLLBACK_INTENT` and `RESTORE_ROLLED_BACK_ENTRY` accept exactly
+`{ id: <validated-entry-id> }` and keep the state at
+`RESTORE_ROLLING_BACK`. The transaction layer derives the correct abort event
+from the durable state immediately preceding `RESTORE_PREPARED`; it rejects an
+abort event that does not return to that state. The existing
+`RESTORE_PREPARED`, `RESTORING`, `RESTORE_INTENT`, and `RESTORED_ENTRY` payload
+schemas remain unchanged. One `RESTORE_INTENT` covers the generated entry's
+active-tree archival move followed by its original-payload restore move, whose
+filesystem locations make either partial state unambiguous during replay.
 
 `INCOMPLETE_CONFLICT` is terminal until an operator resolves the preserved
 source and destination evidence. A new `apply` or `restore` is refused whenever
@@ -503,9 +535,12 @@ For each source copy and each complete generated root, the tool:
 After all moves, two independent streaming destination-inventory passes must
 match the pre-move summaries. All original sources must remain absent and no
 unexpected numbered-path residue may exist. Only then does the transaction
-append `QUARANTINED`, durably write the final immutable manifest generation,
-append `VALIDATED` with that exact generation digest, and atomically activate
-the canonical root-level `current` pointer.
+append `QUARANTINED`. The initial `PREPARED` generation already contains the
+authoritative entries and pre-move summaries, so Task 2 does not publish a
+byte-identical intermediate generation. After clean regeneration, validation
+builds and durably publishes the `VALIDATED` generation, appends `VALIDATED`
+with that exact digest, and atomically activates the canonical root-level
+`current` pointer.
 Selective cleanup within `node_modules` or `.next` is forbidden.
 
 Crash replay reconciles every durable move intent against filesystem reality:
@@ -538,6 +573,121 @@ After quarantine:
 If regeneration or validation fails, keep the quarantine and restore the prior
 generated trees only when needed to return the workspace to its starting state.
 Do not discard evidence to make a validation command pass.
+
+### Recoverable orchestration closure
+
+Task 2 preserves the Task 1F current-pointer, immutable-generation, inventory,
+journal, and capability-bound filesystem contracts. It adds only the derived
+locations and state transitions required to compose those primitives into a
+recoverable transaction.
+
+The `restore-active` inventory phase accepts exactly
+`generated-next` or `generated-node-modules` as its ID and writes respectively
+to:
+
+```text
+inventories/restore-active/generated-next.jsonl
+inventories/restore-active/generated-node-modules.jsonl
+```
+
+The two validation phases accept the same two generated IDs and write to:
+
+```text
+inventories/validation-pass-1/<generated-entry-id>.jsonl
+inventories/validation-pass-2/<generated-entry-id>.jsonl
+```
+
+Source-copy IDs and restore IDs are rejected for all three phases. The original
+`pre`, `moved-pass-1`, and `moved-pass-2` phase contracts remain unchanged.
+
+A new `rollback-entry` run-path purpose accepts exactly a validated restore ID
+as `id` and one of the two generated entry IDs as `phase`. It derives only:
+
+```text
+rollback/regenerated-before-restore/<restore-id>/.next
+rollback/regenerated-before-restore/<restore-id>/node_modules
+```
+
+Its selected parent is the mode-`0700`, non-symlink
+`rollback/regenerated-before-restore/<restore-id>` directory. `fsyncTree`
+accepts this target only through the exact option shape
+`{ capability, root, purpose: "rollback-entry", restoreId, entryId, fsApi?,
+limits?, metrics? }`; the derived path must equal `root`. Its existing payload
+shape and bounds remain unchanged.
+
+Every public orchestration option is a closed plain object snapshotted before
+its first await. The transaction module exports exactly `inspectWorkspace`,
+`quarantineWorkspace`, `recoverQuarantine`, and
+`markQuarantineValidated`. The restore module exports exactly
+`restoreQuarantine` and `recoverRestore`. Their option contracts are:
+
+```text
+inspectWorkspace({ repoRoot, quarantineRoot, expectedBranch, expectedHead,
+                   expectedCount, fsApi? })
+quarantineWorkspace({ repoRoot, quarantineRoot, expectedBranch, expectedHead,
+                      expectedCount, transactionId, createdAt, writersStopped,
+                      fsApi?, faultHook? })
+recoverQuarantine({ repoRoot, quarantineRoot, transactionId,
+                    action: "resume"|"rollback", writersStopped,
+                    fsApi?, faultHook? })
+markQuarantineValidated({ repoRoot, quarantineRoot, transactionId,
+                          validatedAt, writersStopped, fsApi?, faultHook? })
+restoreQuarantine({ repoRoot, quarantineRoot, transactionId, writersStopped,
+                    fsApi?, faultHook? })
+recoverRestore({ repoRoot, quarantineRoot, transactionId,
+                 action: "resume"|"rollback", writersStopped,
+                 fsApi?, faultHook? })
+```
+
+`createdAt` and `validatedAt` are canonical UTC ISO strings. Mutating and
+recovery functions require `writersStopped === true`. `faultHook` receives only
+a closed phase name and exists for subprocess crash proof; it receives no path
+or file content. No API accepts a run directory, payload destination, rollback
+destination, manifest path, inventory path, or current-pointer path.
+
+The transaction captures the caller filesystem source once, uses that frozen
+source for the idempotent fixed-layout bootstrap, passes the same source object
+to `withQuarantineRunCapability`, and obtains the live normalized adapter from
+the private run filesystem context inside the callback. The private registry is
+never re-exported. After capability creation, transaction and restore rename,
+sync, inventory, manifest, and journal operations use only that bound adapter.
+
+Inspection is advisory and read-only. Apply repeats branch, HEAD, clean-index,
+same-device, root-identity, and two NUL-safe byte-identical discovery passes
+after the truthful writer attestation. The existing mode-`0700` quarantine root
+must already exist outside the repository. Bootstrap creates only the validated
+transaction directory and its fixed mode-`0700` children, syncing every created
+parent. It never removes a partial layout; retry with the same transaction ID
+adopts only the expected private directories and otherwise preserves evidence
+and fails.
+
+Apply records `MOVE_INTENT`, revalidates the source and absent destination,
+renames, syncs the moved tree, destination parent, and source parent in that
+order, verifies `moved-pass-1`, and records `MOVED`. A second independent pass
+and source-absence check precede `QUARANTINED`. `EXDEV` is fatal and never
+selects a copy fallback. Explicit recovery uses the source/payload matrix above;
+rollback is reverse journal order, never overwrites a recreated source, and
+ends at `ROLLED_BACK` or `INCOMPLETE_CONFLICT`.
+
+The restore ID is deterministically derived from the transaction ID as a
+version-4-shaped UUID, so every retry selects the same validated rollback
+paths without persisting a free-form destination. For a generated entry,
+restore inventories the active regenerated tree, records one
+`RESTORE_INTENT`, moves that tree to its `rollback-entry`, then moves the
+quarantined original payload to the active path. Both moves use payload/tree
+sync, destination-parent sync, and source-parent sync. Restore rollback reverses
+completed entry moves in journal order and returns to the exact pre-restore
+`QUARANTINED` or `VALIDATED` state; a mismatch or concurrent recreation
+preserves all locations and ends at `INCOMPLETE_CONFLICT`. A completed
+`RESTORED` transaction is not silently undone.
+
+Validation writes independent `validation-pass-1` and `validation-pass-2`
+inventories for both regenerated roots, rejects every numbered basename and
+unexpected workspace residue, and requires matching summaries before
+activation. `deleteAfter` is exactly 96 hours after `validatedAt`,
+`deletionRequiresConfirmation` remains true, and neither Task 2 nor any
+scheduled action deletes quarantine content. Permanent deletion remains a
+separate explicit operator decision after four full days and final review.
 
 ## Backup documentation hardening
 
@@ -596,10 +746,11 @@ deletion removes them as well.
   original relative paths and modes in reverse journal order. It never merges
   them into canonical files and never overwrites a concurrently recreated path.
 - Generated restore first appends `RESTORE_PREPARED`, inventories the active
-  regenerated tree, and atomically moves that tree into the derived
-  `rollback/regenerated-before-restore/<restore-id>/` path. It fsyncs and records
-  that move before atomically moving the quarantined original tree into the
-  active path. It never unlinks the active tree to make room.
+  regenerated `.next` and `node_modules` trees separately, and atomically moves
+  each tree into its derived child under
+  `rollback/regenerated-before-restore/<restore-id>/`. It fsyncs and records
+  each move before atomically moving the corresponding quarantined original
+  tree into the active path. It never unlinks an active tree to make room.
 - Restore uses the same replay matrix and explicit recovery commands as apply.
   A crash can therefore resume or reverse each atomic move without guessing.
 - A successful restore consumes the quarantined payload but retains the
@@ -652,6 +803,12 @@ that permits:
   and indeterminate-error rules used by recovery;
 - terminal stale-lock cleanup that appends an event, changes journal bytes,
   accepts a torn tail, or mutates artifacts before the second same-tip replay;
+- a single restore-active inventory keyed only by restore ID, a shared rollback
+  destination for both generated roots, or restore recovery that cannot return
+  to the exact pre-restore `QUARANTINED` or `VALIDATED` state;
+- treating `settleDurableTip` as authorization to clean an arbitrary
+  nonterminal journal rather than exact confirmation of the unchanged durable
+  candidate under explicit attested recovery;
   or
 - recursive directory traversal, one open directory per depth, unbounded
   in-memory sorting, more than 32 merge readers, or following a symlink during
@@ -709,6 +866,27 @@ the assertions:
    preserve evidence; and manifest generation/current publication returns only
    after the post-sync target retains its recorded identity and exact mode
    `0600`.
+8. **Atomic apply and replay:** use actual child `SIGKILL` after every journal,
+   rename, payload-sync, parent-sync, and inventory-publication boundary. Resume
+   or reverse rollback must reach `QUARANTINED`, `ROLLED_BACK`, or
+   `INCOMPLETE_CONFLICT` with no lost or overwritten path. `EXDEV` never invokes
+   copy or unlink.
+9. **Durable-tip settlement:** a stale candidate already present as the exact
+   non-torn tip may be settled without a new event only through the closed
+   `settleDurableTip` result. A changed sequence/hash, unknown key, changed tip,
+   missing candidate, or torn tail preserves all journal artifacts.
+10. **Restore and reverse restore:** inventory both active generated roots,
+    interrupt after every intent, active-tree move, original-tree move, and
+    durability sync, then prove resume reaches `RESTORED` and rollback returns
+    to the exact prior `QUARANTINED` or `VALIDATED` state. Concurrent or mutated
+    evidence remains in place and yields `INCOMPLETE_CONFLICT`; a completed
+    `RESTORED` transaction is not silently undone.
+11. **Validation and retention:** two independent inventories for each
+    regenerated root match and contain no numbered basename before the
+    `VALIDATED` generation and canonical pointer become current. Recovery from
+    every validation publication boundary yields one complete current
+    generation, `deleteAfter` exactly 96 hours after `validatedAt`, retained
+    content, and no automatic deletion path.
 
 ## Success criteria
 
