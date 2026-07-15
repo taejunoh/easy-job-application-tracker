@@ -534,22 +534,29 @@ async function removeOriginalsTransactionally(
     await requireOriginalMatch(repositoryRoot, entry);
   }
 
-  const attempted = [];
+  const removed = [];
   try {
     for (const entry of entries) {
-      attempted.push(entry);
       await dependencies.beforeOriginalRemoval?.({
         relativePath: entry.relativePath,
         repositoryRoot,
       });
       await requireOriginalMatch(repositoryRoot, entry);
-      await removePath(join(repositoryRoot, entry.relativePath));
+      const originalPath = join(repositoryRoot, entry.relativePath);
+      try {
+        await removePath(originalPath);
+        removed.push(entry);
+      } catch (error) {
+        if ((await pathMetadata(originalPath)).type === "missing") {
+          removed.push(entry);
+        }
+        throw error;
+      }
     }
   } catch (error) {
-    for (const entry of attempted.reverse()) {
-      if (await originalMatches(repositoryRoot, entry)) continue;
+    for (const entry of removed.reverse()) {
       const originalPath = join(repositoryRoot, entry.relativePath);
-      await removePath(originalPath);
+      if ((await pathMetadata(originalPath)).type !== "missing") continue;
       if (entry.type === "file") {
         await copyRegularFile(
           join(runDirectory, entry.quarantinePath),
@@ -562,15 +569,6 @@ async function removeOriginalsTransactionally(
       await requireOriginalMatch(repositoryRoot, entry);
     }
     throw error;
-  }
-}
-
-async function originalMatches(repositoryRoot, entry) {
-  try {
-    await requireOriginalMatch(repositoryRoot, entry);
-    return true;
-  } catch {
-    return false;
   }
 }
 

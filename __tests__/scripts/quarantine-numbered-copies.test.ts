@@ -352,6 +352,40 @@ describe("verified workspace quarantine transaction", () => {
     }
   });
 
+  it("restores an earlier removal without overwriting a later concurrent mutation", () => {
+    const fixture = createPopulatedRepository();
+    try {
+      expect(() =>
+        invokeSupport("quarantineWorkspace", [approvedOptions(fixture, 2)], {
+          availableBytes: 4_096_000_000,
+          mutateBeforeRecheck: {
+            path: "src/identical 2.ts",
+            contents: "concurrent-newer-bytes\n",
+          },
+        }),
+      ).toThrow();
+
+      const runDirectory = onlyRunDirectory(fixture.quarantineRoot);
+      expect(readManifest(runDirectory).state).toBe("incomplete");
+      expect(
+        readFileSync(join(fixture.root, "src/divergent 3.ts"), "utf8"),
+      ).toBe("divergent-private-body\n");
+      expect(
+        readFileSync(join(fixture.root, "src/identical 2.ts"), "utf8"),
+      ).toBe("concurrent-newer-bytes\n");
+      expect(
+        statSync(join(fixture.root, "src/identical 2.ts")).mode & 0o777,
+      ).toBe(0o640);
+      expect(existsSync(join(fixture.root, "node_modules/package.json"))).toBe(
+        true,
+      );
+      expect(existsSync(join(fixture.root, ".next/build.txt"))).toBe(true);
+      expectManifestChecksum(runDirectory);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it("restores every removed original when a later removal fails", () => {
     const fixture = createPopulatedRepository();
     try {
@@ -633,6 +667,7 @@ function invokeSupport<T>(
     corruptAfterCopy?: string;
     failBeforeRemoval?: string;
     mutateBeforeRemoval?: Readonly<{ path: string; contents: string }>;
+    mutateBeforeRecheck?: Readonly<{ path: string; contents: string }>;
     onlyFailIfMissing?: string;
   }> = {},
 ): T {
@@ -676,6 +711,15 @@ try {
           }
         }
         throw new Error("Injected original-removal failure");
+      },
+    }),
+    ...(request.seams.mutateBeforeRecheck === undefined ? {} : {
+      beforeOriginalRemoval: async ({ relativePath, repositoryRoot }) => {
+        if (relativePath !== request.seams.mutateBeforeRecheck.path) return;
+        await writeFile(
+          join(repositoryRoot, request.seams.mutateBeforeRecheck.path),
+          request.seams.mutateBeforeRecheck.contents,
+        );
       },
     }),
   };
