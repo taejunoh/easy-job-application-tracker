@@ -1111,10 +1111,13 @@ function lockArtifactBoundary(path, boundary) {
 }
 
 async function removeOwnedArtifacts(capability, artifacts, fsApi) {
-  for (const artifact of artifacts) {
+  const uniqueArtifacts = [...new Map(
+    artifacts.map((artifact) => [artifact.path, artifact]),
+  ).values()];
+  for (const artifact of uniqueArtifacts) {
     await assertPathIdentity(artifact.path, artifact.identity, fsApi, "journal lock artifact");
   }
-  for (const artifact of artifacts) {
+  for (const artifact of uniqueArtifacts) {
     await revalidateRunCapability(
       capability,
       lockArtifactBoundary(artifact.path, "before-mutation"),
@@ -1130,7 +1133,18 @@ async function removeOwnedArtifacts(capability, artifacts, fsApi) {
   }
 }
 
-async function moveStaleLockToTombstone({
+async function readOptionalArtifact(path, fsApi, label) {
+  try {
+    const stat = await fsApi.lstat(path);
+    assertPrivateRegularFile(stat, label);
+    return stat;
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function publishStaleLockTombstone({
   capability,
   fsApi,
   lockPath,
@@ -1139,16 +1153,65 @@ async function moveStaleLockToTombstone({
   tombstonePath,
 }) {
   await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
+  let destination = await readOptionalArtifact(
+    tombstonePath,
+    fsApi,
+    "journal lock tombstone destination",
+  );
+  if (destination !== null && !sameIdentity(destination, staleLock.identity)) {
+    throw new Error("journal lock tombstone destination is a foreign existing file");
+  }
   await revalidateRunCapability(capability, {
-    purpose: "journal-lock",
+    purpose: "journal-tombstone",
+    id: tombstoneId,
     boundary: "before-mutation",
   });
   await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
-  await fsApi.rename(lockPath, tombstonePath);
+  if (destination === null) {
+    try {
+      await fsApi.link(lockPath, tombstonePath);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      destination = await readOptionalArtifact(
+        tombstonePath,
+        fsApi,
+        "journal lock tombstone destination",
+      );
+      if (destination === null || !sameIdentity(destination, staleLock.identity)) {
+        throw new Error("journal lock tombstone destination appeared with foreign ownership", {
+          cause: error,
+        });
+      }
+    }
+  }
   await fsyncDirectory(dirname(lockPath), fsApi);
   await revalidateRunCapability(capability, {
     purpose: "journal-tombstone",
     id: tombstoneId,
+    boundary: "after-sync",
+  });
+  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock source");
+  await assertPathIdentity(
+    tombstonePath,
+    staleLock.identity,
+    fsApi,
+    "published journal lock tombstone",
+  );
+  await revalidateRunCapability(capability, {
+    purpose: "journal-lock",
+    boundary: "before-mutation",
+  });
+  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock source");
+  await assertPathIdentity(
+    tombstonePath,
+    staleLock.identity,
+    fsApi,
+    "published journal lock tombstone",
+  );
+  await fsApi.unlink(lockPath);
+  await fsyncDirectory(dirname(lockPath), fsApi);
+  await revalidateRunCapability(capability, {
+    purpose: "journal-lock",
     boundary: "after-sync",
   });
   await assertPathAbsent(lockPath, fsApi, "stale journal lock source");
@@ -1156,7 +1219,7 @@ async function moveStaleLockToTombstone({
     tombstonePath,
     staleLock.identity,
     fsApi,
-    "renamed journal lock tombstone",
+    "durable journal lock tombstone",
   );
   return { ...staleLock, path: tombstonePath };
 }
@@ -1192,12 +1255,16 @@ export async function reclaimJournalLock(options, callback) {
   }
   let moved = null;
   if (staleLock !== null) {
-    const tombstoneId = randomUUID();
-    const tombstonePath = deriveRunPath(capability, {
+    const residue = priorTombstones.find((artifact) =>
+      sameIdentity(artifact.identity, staleLock.identity));
+    const tombstoneId = residue === undefined
+      ? randomUUID()
+      : residue.path.split("/").at(-1).slice(TOMBSTONE_PREFIX.length);
+    const tombstonePath = residue?.path ?? deriveRunPath(capability, {
       purpose: "journal-tombstone",
       id: tombstoneId,
     });
-    moved = await moveStaleLockToTombstone({
+    moved = await publishStaleLockTombstone({
       capability,
       fsApi,
       lockPath,
@@ -1269,12 +1336,16 @@ async function cleanupTerminalJournalArtifactsCore({ capability, writersStopped,
 
   let moved = null;
   if (staleLock !== null) {
-    const tombstoneId = randomUUID();
-    const tombstonePath = deriveRunPath(capability, {
+    const residue = priorTombstones.find((artifact) =>
+      sameIdentity(artifact.identity, staleLock.identity));
+    const tombstoneId = residue === undefined
+      ? randomUUID()
+      : residue.path.split("/").at(-1).slice(TOMBSTONE_PREFIX.length);
+    const tombstonePath = residue?.path ?? deriveRunPath(capability, {
       purpose: "journal-tombstone",
       id: tombstoneId,
     });
-    moved = await moveStaleLockToTombstone({
+    moved = await publishStaleLockTombstone({
       capability,
       fsApi,
       lockPath,

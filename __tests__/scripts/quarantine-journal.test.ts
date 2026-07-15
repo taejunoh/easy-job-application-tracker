@@ -366,7 +366,7 @@ const result = await withQuarantineRunCapability({
       process.umask(priorUmask);
     }
   }
-  if (request.operation === "rename-post-sync-replacement") {
+  if (request.operation === "link-post-sync-replacement") {
     await appendAll(capability, request.records);
     const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
     await fsPromises.writeFile(lockPath, lockBytes(), { mode: 0o600 });
@@ -375,8 +375,8 @@ const result = await withQuarantineRunCapability({
     let replaced = false;
     const replacementFs = {
       ...fsPromises,
-      rename: async (source, target) => {
-        const value = await fsPromises.rename(source, target);
+      link: async (source, target) => {
+        const value = await fsPromises.link(source, target);
         if (source === lockPath) destination = target;
         return value;
       },
@@ -411,6 +411,52 @@ const result = await withQuarantineRunCapability({
       fsApi: useFsApi(replacementFs),
     }));
     return { outcome, destination, parentSynced, replaced, entries: await snapshot() };
+  }
+  if (request.operation === "tombstone-link-contract") {
+    await appendAll(capability, request.records);
+    const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+    await fsPromises.writeFile(lockPath, lockBytes(), { mode: 0o600 });
+    const residuePath = deriveRunPath(capability, {
+      purpose: "journal-tombstone",
+      id: "11111111-1111-4111-8111-111111111111",
+    });
+    if (request.case === "matching-residue") {
+      await fsPromises.link(lockPath, residuePath);
+    }
+    let linkCalls = 0;
+    let renameCalls = 0;
+    let destination;
+    const protocolFs = {
+      ...fsPromises,
+      link: async (source, target) => {
+        linkCalls += 1;
+        destination = target;
+        if (request.case === "foreign-race") {
+          await fsPromises.writeFile(target, "foreign", { flag: "wx", mode: 0o600 });
+          await fsPromises.chmod(target, 0o600);
+        }
+        return fsPromises.link(source, target);
+      },
+      rename: async (...args) => {
+        renameCalls += 1;
+        if (request.case === "matching-residue") {
+          throw new Error("rename must not publish a tombstone");
+        }
+        return fsPromises.rename(...args);
+      },
+    };
+    const outcome = await capture(() => journal.cleanupTerminalJournalArtifacts({
+      capability,
+      writersStopped: true,
+      fsApi: useFsApi(protocolFs),
+    }));
+    return {
+      outcome,
+      linkCalls,
+      renameCalls,
+      destination,
+      entries: await snapshot(),
+    };
   }
   if (request.operation === "terminal-cleanup") {
     await appendAll(capability, request.records);
@@ -1193,7 +1239,14 @@ function invoke(root: string, request: Record<string, unknown>) {
   );
 }
 
-function killTerminalCleanup(root: string, boundary: "after-lock-acquired" | "after-tombstone-rename") {
+function killTerminalCleanup(
+  root: string,
+  boundary:
+    | "after-lock-acquired"
+    | "after-tombstone-link"
+    | "after-link-sync"
+    | "after-source-unlink",
+) {
   const source = `
 import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
@@ -1204,28 +1257,53 @@ const root = process.argv[1];
 const repoRoot = join(root, "repo");
 const quarantineRoot = join(root, "quarantine");
 const runRoot = join(quarantineRoot, "tx-0001");
-let renamed = false;
+let linked = false;
 const crashFs = {
   ...fsPromises,
   createReadStream,
   lstatSync,
   realpathSync,
-  rename: async (...args) => {
-    const value = await fsPromises.rename(...args);
-    if (${JSON.stringify(boundary)} === "after-tombstone-rename" && !renamed) {
-      renamed = true;
+  link: async (...args) => {
+    const value = await fsPromises.link(...args);
+    linked = true;
+    if (${JSON.stringify(boundary)} === "after-tombstone-link") {
       process.kill(process.pid, "SIGKILL");
     }
+    return value;
+  },
+  unlink: async (path) => {
+    const value = await fsPromises.unlink(path);
+    if (
+      linked &&
+      ${JSON.stringify(boundary)} === "after-source-unlink" &&
+      String(path).endsWith("/journal.lock")
+    ) process.kill(process.pid, "SIGKILL");
     return value;
   },
   open: async (path, flags, mode) => {
     const handle = await fsPromises.open(path, flags, mode);
     if (
-      ${JSON.stringify(boundary)} !== "after-lock-acquired" ||
-      !String(path).endsWith("/quarantine/tx-0001/journal.lock") ||
-      !String(flags).includes("x")
-    ) return handle;
-    process.kill(process.pid, "SIGKILL");
+      ${JSON.stringify(boundary)} === "after-lock-acquired" &&
+      String(path).endsWith("/quarantine/tx-0001/journal.lock") &&
+      String(flags).includes("x")
+    ) process.kill(process.pid, "SIGKILL");
+    if (
+      linked &&
+      ${JSON.stringify(boundary)} === "after-link-sync" &&
+      String(path).endsWith("/quarantine/tx-0001")
+    ) {
+      return new Proxy(handle, {
+        get(target, property) {
+          if (property === "sync") return async () => {
+            const value = await target.sync();
+            process.kill(process.pid, "SIGKILL");
+            return value;
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }
     return handle;
   },
 };
@@ -1442,9 +1520,9 @@ describe("capability-bound durable quarantine journal", () => {
     })).toEqual({ lockMode: 0o600, journalMode: 0o600 });
   });
 
-  it("revalidates the renamed tombstone after parent sync and preserves a replacement", () => {
-    const result = invoke(join(fixture, "rename-post-sync-replacement"), {
-      operation: "rename-post-sync-replacement",
+  it("revalidates the linked tombstone after parent sync and preserves a replacement", () => {
+    const result = invoke(join(fixture, "link-post-sync-replacement"), {
+      operation: "link-post-sync-replacement",
       records: terminalRecords.ROLLED_BACK,
     });
     expect(result).toMatchObject({ parentSynced: true, replaced: true });
@@ -1456,6 +1534,35 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.entries[name]).toMatchObject({ kind: "file" });
     expect(result.entries[name].bytes).toBe(Buffer.from("foreign").toString("base64"));
     expect(result.entries[`${name}.owned`]).toMatchObject({ kind: "file" });
+  });
+
+  it("never replaces a foreign tombstone created at the link seam", () => {
+    const result = invoke(join(fixture, "tombstone-foreign-link-race"), {
+      operation: "tombstone-link-contract",
+      case: "foreign-race",
+      records: terminalRecords.ROLLED_BACK,
+    });
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/exist|foreign|ownership|tombstone/i) },
+    });
+    expect(result.linkCalls).toBe(1);
+    expect(result.renameCalls).toBe(0);
+    expect(result.entries["journal.lock"]).toBeDefined();
+    const name = String(result.destination).split("/").at(-1) as string;
+    expect(result.entries[name].bytes).toBe(Buffer.from("foreign").toString("base64"));
+  });
+
+  it("adopts a matching hard-link residue and removes only the stale source", () => {
+    const result = invoke(join(fixture, "tombstone-matching-link-residue"), {
+      operation: "tombstone-link-contract",
+      case: "matching-residue",
+      records: terminalRecords.ROLLED_BACK,
+    });
+    expect(result.outcome.ok).toBe(true);
+    expect(result.linkCalls).toBe(0);
+    expect(result.renameCalls).toBe(0);
+    expect(result.entries).toEqual({ "journal.log": expect.any(Object) });
   });
 
   it.each(Object.entries(terminalRecords))(
@@ -1573,7 +1680,12 @@ describe("capability-bound durable quarantine journal", () => {
     },
   );
 
-  it.each(["after-lock-acquired", "after-tombstone-rename"] as const)(
+  it.each([
+    "after-lock-acquired",
+    "after-tombstone-link",
+    "after-link-sync",
+    "after-source-unlink",
+  ] as const)(
     "retries cleanup without appending after real SIGKILL %s",
     (boundary) => {
       const root = join(fixture, `sigkill-${boundary}`);
