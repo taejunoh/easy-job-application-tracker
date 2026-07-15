@@ -220,11 +220,21 @@ also directory-`fsync`ed.
 Stale-lock recovery is a separate `reclaimJournalLock` operation that requires
 `writersStopped === true`. It rejects and preserves symlink, non-regular,
 oversized, and malformed complete locks. Only valid checksummed metadata or a
-recognizable creation-torn frame, including a zero-byte file left after `wx`,
-is reclaimable. Recovery atomically renames the old lock to a unique tombstone,
+recognizable creation-torn frame is reclaimable. Creation-torn means zero bytes
+or a strict byte prefix of the exact frame: partial length bytes must prefix an
+admissible PID-dependent body length, and any partial body must be a possible
+canonical ASCII object and deterministic-checksum prefix. Random bytes,
+impossible lengths, invalid UTF-8, and invalid canonical prefixes remain fatal
+and unchanged. Recovery atomically renames the old lock to a unique tombstone,
 `fsync`s the parent, durably creates a new `wx` lock, and invokes recovery with
-an append function under that held lock. It removes the tombstone and new lock,
-then `fsync`s the parent, only after the recovery journal operation is durable.
+an append function under that held lock. The capability is active only while
+that callback runs and becomes inactive on both successful and failed callback
+exit, before cleanup. Each append compares the held lock handle's device/inode
+with a non-symlink regular-file `lstat` of the current lock path before journal
+mutation. Sequential awaited callback appends are allowed; leaked capabilities
+and missing, replaced, or non-regular lock paths are rejected without journal
+changes. It removes the tombstone and new lock, then `fsync`s the parent, only
+after the recovery journal operation is durable.
 A current PID with a different owner token is treated as possible PID reuse:
 ordinary append still fails and only explicit attested recovery may proceed.
 Tests use actual child-process `SIGKILL` after `wx` and after metadata `fsync`;

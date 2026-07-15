@@ -7,11 +7,25 @@ import { parseInventorySummary } from "./quarantine-inventory.mjs";
 const ZERO_HASH = "0".repeat(64);
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
-const MAX_LOCK_BODY_BYTES = 4 * 1024;
 const ENVELOPE_KEYS = ["sequence", "previousHash", "event", "payload", "recordHash"];
 const LOCK_KEYS = ["version", "ownerToken", "pid", "checksum"];
 const OWNER_TOKEN_PATTERN =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+const LOCK_BODY_PREFIX = '{"version":1,"ownerToken":"';
+const LOCK_BODY_AFTER_OWNER = '","pid":';
+const LOCK_BODY_AFTER_PID = ',"checksum":"';
+const LOCK_BODY_SUFFIX = '"}';
+const OWNER_TOKEN_BYTES = 36;
+const CHECKSUM_BYTES = 64;
+const LOCK_BODY_FIXED_BYTES =
+  LOCK_BODY_PREFIX.length +
+  OWNER_TOKEN_BYTES +
+  LOCK_BODY_AFTER_OWNER.length +
+  LOCK_BODY_AFTER_PID.length +
+  CHECKSUM_BYTES +
+  LOCK_BODY_SUFFIX.length;
+const MIN_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + 1;
+const MAX_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + String(Number.MAX_SAFE_INTEGER).length;
 const ENTRY_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 
@@ -399,14 +413,99 @@ function malformedLock(message, cause) {
   return new Error(`malformed journal lock: ${message}`, cause === undefined ? undefined : { cause });
 }
 
+function lockLengthPrefixIsPossible(input) {
+  for (let bodyLength = MIN_LOCK_BODY_BYTES; bodyLength <= MAX_LOCK_BODY_BYTES; bodyLength += 1) {
+    const encoded = Buffer.alloc(4);
+    encoded.writeUInt32BE(bodyLength);
+    if (encoded.subarray(0, input.length).equals(input)) return true;
+  }
+  return false;
+}
+
+function canonicalLockBodyPattern(pidDigits) {
+  const exact = (value) => [...value].map((character) => `=${character}`);
+  const pattern = [...exact(LOCK_BODY_PREFIX)];
+  for (let index = 0; index < OWNER_TOKEN_BYTES; index += 1) {
+    if ([8, 13, 18, 23].includes(index)) pattern.push("=-");
+    else if (index === 14) pattern.push("uuid-version");
+    else if (index === 19) pattern.push("uuid-variant");
+    else pattern.push("hex");
+  }
+  pattern.push(...exact(LOCK_BODY_AFTER_OWNER));
+  pattern.push("pid-first", ...Array.from({ length: pidDigits - 1 }, () => "digit"));
+  pattern.push(...exact(LOCK_BODY_AFTER_PID));
+  pattern.push(...Array.from({ length: CHECKSUM_BYTES }, () => "hex"));
+  pattern.push(...exact(LOCK_BODY_SUFFIX));
+  return pattern;
+}
+
+function lockPatternCharacterIsValid(pattern, character) {
+  if (pattern.startsWith("=")) return character === pattern.slice(1);
+  if (pattern === "hex") return /^[a-f0-9]$/u.test(character);
+  if (pattern === "uuid-version") return /^[1-5]$/u.test(character);
+  if (pattern === "uuid-variant") return /^[89ab]$/u.test(character);
+  if (pattern === "pid-first") return /^[1-9]$/u.test(character);
+  if (pattern === "digit") return /^[0-9]$/u.test(character);
+  return false;
+}
+
+function assertPossibleCanonicalLockBodyPrefix(rawBody, bodyLength) {
+  if ([...rawBody].some((byte) => byte > 0x7f)) {
+    throw malformedLock("torn body is not a canonical ASCII prefix");
+  }
+  const pidDigits = bodyLength - LOCK_BODY_FIXED_BYTES;
+  const pattern = canonicalLockBodyPattern(pidDigits);
+  if (pattern.length !== bodyLength) throw malformedLock("declared length is impossible");
+  const prefix = rawBody.toString("ascii");
+  for (let index = 0; index < prefix.length; index += 1) {
+    if (!lockPatternCharacterIsValid(pattern[index], prefix[index])) {
+      throw malformedLock("torn body is not a canonical prefix");
+    }
+  }
+
+  const ownerStart = LOCK_BODY_PREFIX.length;
+  const ownerEnd = ownerStart + OWNER_TOKEN_BYTES;
+  const pidStart = ownerEnd + LOCK_BODY_AFTER_OWNER.length;
+  const pidEnd = pidStart + pidDigits;
+  const observedPid = prefix.slice(pidStart, Math.min(prefix.length, pidEnd));
+  if (observedPid.length > 0) {
+    const remainingDigits = pidDigits - observedPid.length;
+    const minimumCompletion = BigInt(`${observedPid}${"0".repeat(remainingDigits)}`);
+    if (minimumCompletion > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw malformedLock("torn PID prefix cannot complete safely");
+    }
+  }
+
+  const checksumStart = pidEnd + LOCK_BODY_AFTER_PID.length;
+  const observedChecksum = prefix.slice(
+    checksumStart,
+    Math.min(prefix.length, checksumStart + CHECKSUM_BYTES),
+  );
+  if (observedChecksum.length > 0) {
+    const ownerToken = prefix.slice(ownerStart, ownerEnd);
+    const pid = Number(prefix.slice(pidStart, pidEnd));
+    if (!lockChecksum(1, ownerToken, pid).startsWith(observedChecksum)) {
+      throw malformedLock("torn checksum prefix cannot complete with valid integrity");
+    }
+  }
+}
+
 function parseLockFrame(input) {
   if (input.length === 0) return { torn: true, metadata: null };
-  if (input.length < 4) return { torn: true, metadata: null };
+  if (input.length < 4) {
+    if (!lockLengthPrefixIsPossible(input)) throw malformedLock("length prefix is impossible");
+    return { torn: true, metadata: null };
+  }
 
   const bodyLength = input.readUInt32BE(0);
-  if (bodyLength > MAX_LOCK_BODY_BYTES) throw malformedLock("frame is too large");
+  if (bodyLength < MIN_LOCK_BODY_BYTES || bodyLength > MAX_LOCK_BODY_BYTES) {
+    throw malformedLock("declared length is impossible");
+  }
   const frameLength = 4 + bodyLength;
-  if (input.length < frameLength) return { torn: true, metadata: null };
+  if (input.length < frameLength) {
+    assertPossibleCanonicalLockBodyPrefix(input.subarray(4), bodyLength);
+    return { torn: true, metadata: null };
+  }
   if (input.length !== frameLength) throw malformedLock("frame has trailing bytes");
 
   const rawBody = input.subarray(4);
@@ -469,8 +568,9 @@ async function createJournalLock(lockPath, fsApi) {
   }
 }
 
-async function appendUnderHeldLock({ journalPath, event, payload, fsApi }) {
+async function appendUnderHeldLock({ journalPath, event, payload, fsApi, assertLockOwned }) {
   if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
+  await assertLockOwned?.();
   const handle = await fsApi.open(journalPath, "a+", 0o600);
   let record;
   try {
@@ -494,16 +594,20 @@ async function appendUnderHeldLock({ journalPath, event, payload, fsApi }) {
     length.writeUInt32BE(body.length);
 
     if (replayed.truncatedTail) {
+      await assertLockOwned?.();
       await handle.truncate(replayed.validEndOffset);
       await handle.sync();
       await fsyncDirectory(dirname(journalPath), fsApi);
     }
+    await assertLockOwned?.();
     await writeComplete(handle, Buffer.concat([length, body]));
     await handle.sync();
+    await assertLockOwned?.();
   } finally {
     await handle.close();
   }
   await fsyncDirectory(dirname(journalPath), fsApi);
+  await assertLockOwned?.();
   return record;
 }
 
@@ -530,6 +634,25 @@ async function readStaleLock(lockPath, fsApi) {
     return parseLockFrame(await readCompleteFile(handle));
   } finally {
     await handle.close();
+  }
+}
+
+async function assertHeldLockOwnership(lockPath, lockHandle, fsApi) {
+  let held;
+  let current;
+  try {
+    [held, current] = await Promise.all([lockHandle.stat(), fsApi.lstat(lockPath)]);
+  } catch (error) {
+    throw new Error("journal recovery lock ownership cannot be verified", { cause: error });
+  }
+  if (
+    !held.isFile() ||
+    current.isSymbolicLink() ||
+    !current.isFile() ||
+    held.dev !== current.dev ||
+    held.ino !== current.ino
+  ) {
+    throw new Error("journal recovery lock ownership mismatch");
   }
 }
 
@@ -584,27 +707,55 @@ export async function reclaimJournalLock({
   let recoverySucceeded = false;
   try {
     recoveryLock = await createJournalLock(lockPath, fsApi);
+    const capability = { active: true };
     let appendInProgress = false;
     let durableAppends = 0;
+    const assertCapabilityOwnsLock = async () => {
+      if (!capability.active) {
+        throw new Error("journal recovery append capability is inactive");
+      }
+      await assertHeldLockOwnership(lockPath, recoveryLock.handle, fsApi);
+      if (!capability.active) {
+        throw new Error("journal recovery append capability is inactive");
+      }
+    };
     const append = async ({ event, payload }) => {
+      if (!capability.active) {
+        throw new Error("journal recovery append capability is inactive");
+      }
       if (appendInProgress) throw new Error("journal recovery append is already in progress");
       appendInProgress = true;
       try {
-        const record = await appendUnderHeldLock({ journalPath, event, payload, fsApi });
+        const record = await appendUnderHeldLock({
+          journalPath,
+          event,
+          payload,
+          fsApi,
+          assertLockOwned: assertCapabilityOwnsLock,
+        });
         durableAppends += 1;
         return record;
       } finally {
         appendInProgress = false;
       }
     };
-    const result = await recovery({
-      append,
-      staleLock: staleLock.metadata,
-      staleLockTorn: staleLock.torn,
-    });
+    let result;
+    try {
+      result = await recovery({
+        append,
+        staleLock: staleLock.metadata,
+        staleLockTorn: staleLock.torn,
+      });
+    } finally {
+      capability.active = false;
+    }
+    if (appendInProgress) {
+      throw new Error("journal recovery callback returned during an append");
+    }
     if (durableAppends === 0) {
       throw new Error("journal lock recovery requires a durable journal append");
     }
+    await assertHeldLockOwnership(lockPath, recoveryLock.handle, fsApi);
     recoverySucceeded = true;
     return result;
   } finally {

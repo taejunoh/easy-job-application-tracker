@@ -124,6 +124,77 @@ try {
         payload: request.record.payload,
       }),
     });
+  } else if (request.operation === "reclaim-leaked-capability") {
+    let leakedAppend;
+    let recoveryError = null;
+    try {
+      await journal.reclaimJournalLock({
+        journalPath: request.journalPath,
+        writersStopped: true,
+        recovery: async ({ append }) => {
+          leakedAppend = append;
+          if (request.callbackOutcome === "failure") {
+            throw new Error("injected recovery callback failure");
+          }
+          return append({
+            event: request.record.event,
+            payload: request.record.payload,
+          });
+        },
+      });
+    } catch (error) {
+      recoveryError = error.message;
+    }
+    const beforeLeak = await journal.replayJournal(request.journalPath);
+    const beforeLeakBytes = await fsPromises.readFile(request.journalPath);
+    let leakedError = null;
+    try {
+      await leakedAppend({
+        event: request.leakedRecord.event,
+        payload: request.leakedRecord.payload,
+      });
+    } catch (error) {
+      leakedError = error.message;
+    }
+    const afterLeak = await journal.replayJournal(request.journalPath);
+    const afterLeakBytes = await fsPromises.readFile(request.journalPath);
+    result = {
+      recoveryError,
+      leakedError,
+      beforeLeak,
+      afterLeak,
+      bytesUnchanged: beforeLeakBytes.equals(afterLeakBytes),
+    };
+  } else if (request.operation === "reclaim-mutated-lock") {
+    result = await journal.reclaimJournalLock({
+      journalPath: request.journalPath,
+      writersStopped: true,
+      recovery: async ({ append }) => {
+        const lockPath = request.journalPath + ".lock";
+        await fsPromises.rm(lockPath);
+        if (request.mutation === "replacement") {
+          await fsPromises.writeFile(lockPath, "attacker", { mode: 0o600 });
+        } else if (request.mutation === "directory") {
+          await fsPromises.mkdir(lockPath);
+        }
+        return append({
+          event: request.record.event,
+          payload: request.record.payload,
+        });
+      },
+    });
+  } else if (request.operation === "reclaim-multiple") {
+    result = await journal.reclaimJournalLock({
+      journalPath: request.journalPath,
+      writersStopped: true,
+      recovery: async ({ append }) => {
+        const appended = [];
+        for (const record of request.records) {
+          appended.push(await append({ event: record.event, payload: record.payload }));
+        }
+        return appended;
+      },
+    });
   } else if (request.operation === "transition") {
     result = journal.validateTransition(request.state, request.event);
   }
@@ -170,7 +241,7 @@ function replay(journalPath: string) {
 function killAppendAtLockBoundary(
   journalPath: string,
   record: (typeof happyRecords)[number],
-  crashAt: "after-wx" | "after-lock-fsync",
+  crashAt: "after-wx" | "during-lock-write" | "after-lock-fsync",
 ) {
   const source = `
 import * as journal from ${JSON.stringify(journalModuleUrl)};
@@ -187,6 +258,12 @@ const fsApi = {
     }
     return new Proxy(handle, {
       get(target, property) {
+        if (property === "write" && path === request.journalPath + ".lock" && request.crashAt === "during-lock-write") {
+          return async (buffer) => {
+            await target.write(buffer.subarray(0, 11));
+            process.kill(process.pid, "SIGKILL");
+          };
+        }
         if (property === "sync" && path === request.journalPath + ".lock") {
           return async () => {
             const result = await target.sync();
@@ -223,6 +300,12 @@ function encodeJournalLock(ownerToken: string, pid: number, checksumOverride?: s
   const length = Buffer.alloc(4);
   length.writeUInt32BE(body.length);
   return Buffer.concat([length, body]);
+}
+
+function frameLockPrefix(bodyLength: number, bodyPrefix = Buffer.alloc(0)) {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(bodyLength);
+  return Buffer.concat([length, bodyPrefix]);
 }
 
 function syncPath(path: string) {
@@ -547,7 +630,7 @@ describe("durable quarantine journal", () => {
     ]);
   });
 
-  it.each(["after-wx", "after-lock-fsync"] as const)(
+  it.each(["after-wx", "during-lock-write", "after-lock-fsync"] as const)(
     "recovers explicitly after an actual SIGKILL %s boundary",
     (crashAt) => {
       const path = join(fixture, `sigkill-${crashAt}`, "journal.log");
@@ -560,6 +643,8 @@ describe("durable quarantine journal", () => {
       const staleLock = readFileSync(lockPath);
       if (crashAt === "after-wx") {
         expect(staleLock).toHaveLength(0);
+      } else if (crashAt === "during-lock-write") {
+        expect(staleLock).toHaveLength(11);
       } else {
         expect(lstatSync(lockPath).mode & 0o777).toBe(0o600);
         expect(staleLock.readUInt32BE(0)).toBe(staleLock.length - 4);
@@ -680,6 +765,153 @@ describe("durable quarantine journal", () => {
     });
     expect(replay(path)).toMatchObject({ state: "MOVING" });
   });
+
+  it.each([1, 2, 3])(
+    "accepts a %i-byte exact lock-length prefix only through attested recovery",
+    (prefixBytes) => {
+      const path = join(fixture, `torn-lock-length-${prefixBytes}`, "journal.log");
+      appendMany(path, happyRecords.slice(0, 1));
+      const lockPath = `${path}.lock`;
+      const frame = encodeJournalLock("99999999-9999-4999-8999-999999999999", process.pid);
+      writeFileSync(lockPath, frame.subarray(0, prefixBytes), { mode: 0o600 });
+
+      invokeJournal({
+        operation: "reclaim",
+        journalPath: path,
+        writersStopped: true,
+        record: happyRecords[1],
+      });
+      expect(replay(path)).toMatchObject({ state: "MOVING" });
+    },
+  );
+
+  it.each((() => {
+    const ownerToken = "55555555-5555-4555-8555-555555555555";
+    const minimumFrame = encodeJournalLock(ownerToken, 1);
+    const minimumBodyLength = minimumFrame.readUInt32BE(0);
+    const maximumBodyLength = encodeJournalLock(ownerToken, Number.MAX_SAFE_INTEGER).readUInt32BE(0);
+    const completeBody = minimumFrame.subarray(4).toString("ascii");
+    const checksumStart = completeBody.indexOf('"checksum":"') + '"checksum":"'.length;
+    const invalidChecksumPrefix = Buffer.from(completeBody.slice(0, checksumStart + 1));
+    invalidChecksumPrefix[invalidChecksumPrefix.length - 1] =
+      invalidChecksumPrefix.at(-1) === 0x66 ? 0x65 : 0x66;
+    return [
+      ["declared-one-byte-body", Buffer.from([0, 0, 0, 1])],
+      ["random-one-byte-header", Buffer.from([0xa7])],
+      ["random-two-byte-header", Buffer.from([0, 0xf1])],
+      ["random-three-byte-header", Buffer.from([0, 0, 0xf1])],
+      ["impossible-short-body", frameLockPrefix(minimumBodyLength - 1)],
+      ["impossible-long-body", frameLockPrefix(maximumBodyLength + 1)],
+      ["invalid-utf8-body-prefix", frameLockPrefix(minimumBodyLength, Buffer.from([0xff]))],
+      [
+        "invalid-canonical-body-prefix",
+        frameLockPrefix(minimumBodyLength, Buffer.from('{"version":2')),
+      ],
+      [
+        "invalid-owner-token-prefix",
+        frameLockPrefix(
+          minimumBodyLength,
+          Buffer.from('{"version":1,"ownerToken":"z'),
+        ),
+      ],
+      [
+        "invalid-checksum-prefix",
+        frameLockPrefix(minimumBodyLength, invalidChecksumPrefix),
+      ],
+    ];
+  })())("rejects and preserves impossible torn lock prefix %s", (label, malformed) => {
+    const path = join(fixture, `impossible-torn-${label}`, "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    const lockPath = `${path}.lock`;
+    writeFileSync(lockPath, malformed, { mode: 0o600 });
+
+    expect(() =>
+      invokeJournal({
+        operation: "reclaim",
+        journalPath: path,
+        writersStopped: true,
+        record: happyRecords[1],
+      }),
+    ).toThrow(/lock/u);
+    expect(readFileSync(lockPath)).toEqual(malformed);
+    expect(replay(path).records).toHaveLength(1);
+  });
+
+  it.each(["success", "failure"])(
+    "expires a leaked recovery append capability after callback %s",
+    (callbackOutcome) => {
+      const path = join(fixture, `leaked-capability-${callbackOutcome}`, "journal.log");
+      appendMany(path, happyRecords.slice(0, 1));
+      writeFileSync(
+        `${path}.lock`,
+        encodeJournalLock("66666666-6666-4666-8666-666666666666", process.pid),
+        { mode: 0o600 },
+      );
+
+      const result = invokeJournal({
+        operation: "reclaim-leaked-capability",
+        journalPath: path,
+        callbackOutcome,
+        record: happyRecords[1],
+        leakedRecord: callbackOutcome === "success" ? happyRecords[2] : happyRecords[1],
+      }).result;
+      expect(result.recoveryError).toBe(
+        callbackOutcome === "success" ? null : "injected recovery callback failure",
+      );
+      expect(result.leakedError).toMatch(/capability|inactive|expired|lock ownership/u);
+      expect(result.bytesUnchanged).toBe(true);
+      const expectedRecords = callbackOutcome === "success" ? 2 : 1;
+      expect(result.beforeLeak.records).toHaveLength(expectedRecords);
+      expect(result.afterLeak.records).toEqual(result.beforeLeak.records);
+    },
+  );
+
+  it("allows sequential multiple appends while the recovery callback is active", () => {
+    const path = join(fixture, "multiple-recovery-appends", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    writeFileSync(
+      `${path}.lock`,
+      encodeJournalLock("88888888-8888-4888-8888-888888888888", process.pid),
+      { mode: 0o600 },
+    );
+
+    const result = invokeJournal({
+      operation: "reclaim-multiple",
+      journalPath: path,
+      records: happyRecords.slice(1, 3),
+    }).result;
+    expect(result.map((record: { sequence: number }) => record.sequence)).toEqual([2, 3]);
+    expect(replay(path).records.map((record: { event: string }) => record.event)).toEqual([
+      "PREPARED",
+      "MOVING",
+      "MOVE_INTENT",
+    ]);
+  });
+
+  it.each(["missing", "replacement", "directory"])(
+    "rejects recovery append after the held lock path becomes %s",
+    (mutation) => {
+      const path = join(fixture, `mutated-recovery-lock-${mutation}`, "journal.log");
+      appendMany(path, happyRecords.slice(0, 1));
+      writeFileSync(
+        `${path}.lock`,
+        encodeJournalLock("77777777-7777-4777-8777-777777777777", process.pid),
+        { mode: 0o600 },
+      );
+      const journalBefore = readFileSync(path);
+
+      expect(() =>
+        invokeJournal({
+          operation: "reclaim-mutated-lock",
+          journalPath: path,
+          mutation,
+          record: happyRecords[1],
+        }),
+      ).toThrow(/lock|ownership/u);
+      expect(readFileSync(path)).toEqual(journalBefore);
+      expect(replay(path).records).toHaveLength(1);
+    },
+  );
 
   it.each(["symlink", "directory", "oversize"])(
     "rejects and preserves a %s stale-lock inode",
