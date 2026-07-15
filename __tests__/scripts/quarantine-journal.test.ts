@@ -67,6 +67,7 @@ const terminalRecords = {
 
 const workerSource = `
 import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { dirname, join } from "node:path";
 import * as journal from ${JSON.stringify(journalModuleUrl)};
@@ -83,6 +84,23 @@ await fsPromises.mkdir(repoRoot, { recursive: true, mode: 0o700 });
 await fsPromises.mkdir(runRoot, { recursive: true, mode: 0o700 });
 await fsPromises.chmod(quarantineRoot, 0o700);
 await fsPromises.chmod(runRoot, 0o700);
+const capabilityFsMethods = [
+  "lstat", "realpath", "mkdir", "open", "readdir", "rm", "rename", "unlink", "link",
+  "opendir", "readlink", "createReadStream", "lstatSync", "realpathSync",
+];
+const baseFsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+let activeFsApi = baseFsApi;
+const boundFsApi = Object.fromEntries(capabilityFsMethods.map((method) => [
+  method,
+  (...args) => {
+    const receiver = typeof activeFsApi[method] === "function" ? activeFsApi : baseFsApi;
+    return Reflect.apply(receiver[method], receiver, args);
+  },
+]));
+const useFsApi = (fsApi) => {
+  activeFsApi = fsApi;
+  return boundFsApi;
+};
 
 const lockBytes = (ownerToken = randomUUID()) => {
   const identity = { version: 1, ownerToken, pid: process.pid };
@@ -106,7 +124,7 @@ const snapshot = async () => {
   }
   return entries;
 };
-const appendAll = async (capability, values, fsApi = fsPromises, faultHook) =>
+const appendAll = async (capability, values, fsApi = boundFsApi, faultHook) =>
   journal.withJournalLock({ capability, fsApi }, async (heldLock) => {
     const appended = [];
     for (const value of values) {
@@ -168,7 +186,107 @@ const result = await withQuarantineRunCapability({
   quarantineRoot,
   transactionId,
   writersStopped: true,
+  fsApi: boundFsApi,
 }, async (capability) => {
+  if (request.operation === "closed-options") {
+    const definitions = {
+      replay: {
+        allowed: ["capability", "fsApi", "maxBytes"],
+        required: ["capability"],
+        values: { capability, fsApi: boundFsApi, maxBytes: 1024 },
+      },
+      lock: {
+        allowed: ["capability", "fsApi"],
+        required: ["capability"],
+        values: { capability, fsApi: boundFsApi },
+      },
+      append: {
+        allowed: ["capability", "heldLock", "event", "payload", "fsApi", "faultHook"],
+        required: ["capability", "heldLock", "event", "payload"],
+        values: {
+          capability,
+          heldLock: Object.freeze(Object.create(null)),
+          event: "UNKNOWN",
+          payload: {},
+          fsApi: boundFsApi,
+          faultHook: undefined,
+        },
+      },
+      reclaim: {
+        allowed: ["capability", "writersStopped", "fsApi"],
+        required: ["capability", "writersStopped"],
+        values: { capability, writersStopped: false, fsApi: boundFsApi },
+      },
+      cleanup: {
+        allowed: ["capability", "writersStopped", "fsApi"],
+        required: ["capability", "writersStopped"],
+        values: { capability, writersStopped: false, fsApi: boundFsApi },
+      },
+    };
+    const invokeApi = (api, options) => {
+      if (api === "replay") return journal.replayJournal(options);
+      if (api === "lock") return journal.withJournalLock(options, async () => "locked");
+      if (api === "append") return journal.appendJournalRecord(options);
+      if (api === "reclaim") {
+        return journal.reclaimJournalLock(options, async () => "recovered");
+      }
+      return journal.cleanupTerminalJournalArtifacts(options);
+    };
+    const distinctCounts = Object.fromEntries(capabilityFsMethods.map((method) => [method, 0]));
+    const distinctFsApi = Object.fromEntries(capabilityFsMethods.map((method) => [
+      method,
+      (...args) => {
+        distinctCounts[method] += 1;
+        return Reflect.apply(baseFsApi[method], baseFsApi, args);
+      },
+    ]));
+    const results = {};
+    for (const [api, definition] of Object.entries(definitions)) {
+      const unknown = { ...definition.values, extra: true };
+      const symbol = { ...definition.values };
+      symbol[Symbol("extra")] = true;
+      const inherited = Object.create(definition.values);
+      const missing = {};
+      for (const required of definition.required) {
+        const value = { ...definition.values };
+        delete value[required];
+        missing[required] = await capture(() => invokeApi(api, value));
+      }
+      const counts = Object.fromEntries(definition.allowed.map((key) => [key, 0]));
+      const getterOptions = {};
+      for (const key of definition.allowed) {
+        Object.defineProperty(getterOptions, key, {
+          enumerable: true,
+          get() {
+            counts[key] += 1;
+            return definition.values[key];
+          },
+        });
+      }
+      const mismatch = { ...definition.values, fsApi: distinctFsApi };
+      const explicitUndefined = { ...definition.values, fsApi: undefined };
+      const omitted = { ...definition.values };
+      delete omitted.fsApi;
+      results[api] = {
+        unknown: await capture(() => invokeApi(api, unknown)),
+        symbol: await capture(() => invokeApi(api, symbol)),
+        missing,
+        array: await capture(() => invokeApi(api, [])),
+        function: await capture(() => invokeApi(api, function Options() {})),
+        inherited: await capture(() => invokeApi(api, inherited)),
+        getter: await capture(() => invokeApi(api, getterOptions)),
+        getterCounts: counts,
+        mismatch: await capture(() => invokeApi(api, mismatch)),
+        explicitUndefined: await capture(() => invokeApi(api, explicitUndefined)),
+        omitted: await capture(() => invokeApi(api, omitted)),
+      };
+    }
+    return {
+      results,
+      distinctCounts,
+      files: await snapshot(),
+    };
+  }
   if (request.operation === "terminal-cleanup") {
     await appendAll(capability, request.records);
     await seedArtifacts(capability);
@@ -195,7 +313,7 @@ const result = await withQuarantineRunCapability({
     await journal.cleanupTerminalJournalArtifacts({
       capability,
       writersStopped: true,
-      fsApi: trackedFs,
+      fsApi: useFsApi(trackedFs),
     });
     const afterBytes = await fsPromises.readFile(journalPath);
     const after = await journal.replayJournal({ capability });
@@ -278,7 +396,7 @@ const result = await withQuarantineRunCapability({
       const outcome = await capture(() => journal.cleanupTerminalJournalArtifacts({
         capability,
         writersStopped: true,
-        fsApi: raceFs,
+        fsApi: useFsApi(raceFs),
       }));
       return { outcome, before, after: await snapshot(), tombstonePath };
     }
@@ -286,7 +404,7 @@ const result = await withQuarantineRunCapability({
     const outcome = await capture(() => journal.cleanupTerminalJournalArtifacts({
       capability,
       writersStopped: request.case === "false-attestation" ? false : true,
-      fsApi: fsPromises,
+      fsApi: boundFsApi,
     }));
     return { outcome, before, after: await snapshot(), tombstonePath };
   }
@@ -305,13 +423,13 @@ const result = await withQuarantineRunCapability({
       await fsPromises.writeFile(lockPath, lockBytes(), { mode: 0o600 });
     };
     const outcome = await capture(() => journal.withJournalLock(
-      { capability, fsApi: fsPromises },
+      { capability, fsApi: boundFsApi },
       (heldLock) => journal.appendJournalRecord({
         capability,
         heldLock,
         event: request.records[1].event,
         payload: request.records[1].payload,
-        fsApi: fsPromises,
+        fsApi: boundFsApi,
         faultHook: async (phase) => {
           if (phase === request.phase) await replace();
         },
@@ -321,7 +439,7 @@ const result = await withQuarantineRunCapability({
     const beforeRecovery = await journal.replayJournal({ capability });
       const foreignPreserved = await fsPromises.lstat(lockPath).then(() => true, () => false);
     await journal.reclaimJournalLock(
-      { capability, writersStopped: true, fsApi: fsPromises },
+      { capability, writersStopped: true, fsApi: boundFsApi },
       async (heldLock) => {
         const replayed = await journal.replayJournal({ capability });
         const candidatePresent = replayed.records.some(
@@ -333,7 +451,7 @@ const result = await withQuarantineRunCapability({
           heldLock,
           event: next.event,
           payload: next.payload,
-          fsApi: fsPromises,
+          fsApi: boundFsApi,
         });
       },
     );
@@ -362,13 +480,13 @@ const result = await withQuarantineRunCapability({
       await fsPromises.writeFile(lockPath, lockBytes(), { mode: 0o600 });
     };
     const outcome = await capture(() => journal.reclaimJournalLock(
-      { capability, writersStopped: true, fsApi: fsPromises },
+      { capability, writersStopped: true, fsApi: boundFsApi },
       (heldLock) => journal.appendJournalRecord({
         capability,
         heldLock,
         event: request.records[1].event,
         payload: request.records[1].payload,
-        fsApi: fsPromises,
+        fsApi: boundFsApi,
         faultHook: async (phase) => {
           if (phase === request.phase) await replace();
         },
@@ -377,7 +495,7 @@ const result = await withQuarantineRunCapability({
     const afterBytes = await fsPromises.readFile(journalPath);
     const foreignPreserved = await fsPromises.lstat(lockPath).then(() => true, () => false);
     await journal.reclaimJournalLock(
-      { capability, writersStopped: true, fsApi: fsPromises },
+      { capability, writersStopped: true, fsApi: boundFsApi },
       async (heldLock) => {
         const replayed = await journal.replayJournal({ capability });
         const candidatePresent = replayed.records.some(
@@ -389,7 +507,7 @@ const result = await withQuarantineRunCapability({
           heldLock,
           event: next.event,
           payload: next.payload,
-          fsApi: fsPromises,
+          fsApi: boundFsApi,
         });
       },
     );
@@ -471,7 +589,7 @@ const result = await withQuarantineRunCapability({
   if (request.operation === "recover-moving") {
     const before = await journal.replayJournal({ capability });
     await journal.reclaimJournalLock(
-      { capability, writersStopped: true, fsApi: fsPromises },
+      { capability, writersStopped: true, fsApi: boundFsApi },
       async (heldLock) => {
         const replayed = await journal.replayJournal({ capability });
         const movingPresent = replayed.records.some((record) => record.event === "MOVING");
@@ -481,7 +599,7 @@ const result = await withQuarantineRunCapability({
           heldLock,
           event: next.event,
           payload: next.payload,
-          fsApi: fsPromises,
+          fsApi: boundFsApi,
         });
       },
     );
@@ -513,13 +631,13 @@ const result = await withQuarantineRunCapability({
       },
     };
     return capture(() => journal.withJournalLock(
-      { capability, fsApi: failureFs },
+      { capability, fsApi: useFsApi(failureFs) },
       (heldLock) => journal.appendJournalRecord({
         capability,
         heldLock,
         event: request.record.event,
         payload: request.record.payload,
-        fsApi: failureFs,
+        fsApi: useFsApi(failureFs),
         faultHook: async (phase) => {
           if (phase === "after-journal-sync") throw new Error("injected append failure");
         },
@@ -554,15 +672,15 @@ const result = await withQuarantineRunCapability({
       heldLock,
       event: request.record.event,
       payload: request.record.payload,
-      fsApi: failureFs,
+      fsApi: useFsApi(failureFs),
     });
     const outcome = request.mode === "recovery"
       ? await capture(() => journal.reclaimJournalLock(
-        { capability, writersStopped: true, fsApi: failureFs },
+        { capability, writersStopped: true, fsApi: useFsApi(failureFs) },
         append,
       ))
       : await capture(() => journal.withJournalLock(
-        { capability, fsApi: failureFs },
+        { capability, fsApi: useFsApi(failureFs) },
         append,
       ));
     return { outcome, replayed: await journal.replayJournal({ capability }) };
@@ -606,16 +724,16 @@ const result = await withQuarantineRunCapability({
         heldLock,
         event: request.record.event,
         payload: request.record.payload,
-        fsApi: failureFs,
+        fsApi: useFsApi(failureFs),
       });
     };
     const outcome = request.mode === "recovery"
       ? await capture(() => journal.reclaimJournalLock(
-        { capability, writersStopped: true, fsApi: failureFs },
+        { capability, writersStopped: true, fsApi: useFsApi(failureFs) },
         append,
       ))
       : await capture(() => journal.withJournalLock(
-        { capability, fsApi: failureFs },
+        { capability, fsApi: useFsApi(failureFs) },
         append,
       ));
     return {
@@ -644,13 +762,13 @@ const result = await withQuarantineRunCapability({
       }
       : fsPromises;
     const outcome = await capture(() => journal.withJournalLock(
-      { capability, fsApi: failureFs },
+      { capability, fsApi: useFsApi(failureFs) },
       (heldLock) => journal.appendJournalRecord({
         capability,
         heldLock,
         event: request.record.event,
         payload: request.record.payload,
-        fsApi: failureFs,
+        fsApi: useFsApi(failureFs),
         faultHook: request.case === "precheck"
           ? async (phase) => {
             if (phase === "before-mutation") throw new Error("injected precheck failure");
@@ -720,21 +838,24 @@ const result = await withQuarantineRunCapability({
         return value;
       },
     };
-    const recover = async (fsApi) => journal.reclaimJournalLock(
-      { capability, writersStopped: true, fsApi },
-      async (heldLock) => {
-        const replayed = await journal.replayJournal({ capability });
-        const movingPresent = replayed.records.some((record) => record.event === "MOVING");
-        const next = movingPresent ? request.nextRecord : request.movingRecord;
-        return journal.appendJournalRecord({
-          capability,
-          heldLock,
-          event: next.event,
-          payload: next.payload,
-          fsApi,
-        });
-      },
-    );
+    const recover = async (fsApi) => {
+      useFsApi(fsApi);
+      return journal.reclaimJournalLock(
+        { capability, writersStopped: true, fsApi: boundFsApi },
+        async (heldLock) => {
+          const replayed = await journal.replayJournal({ capability });
+          const movingPresent = replayed.records.some((record) => record.event === "MOVING");
+          const next = movingPresent ? request.nextRecord : request.movingRecord;
+          return journal.appendJournalRecord({
+            capability,
+            heldLock,
+            event: next.event,
+            payload: next.payload,
+            fsApi: boundFsApi,
+          });
+        },
+      );
+    };
     const first = await capture(() => recover(failureFs));
     const retry = await capture(() => recover(failureFs));
     const replayed = await journal.replayJournal({ capability });
@@ -752,7 +873,7 @@ const result = await withQuarantineRunCapability({
     await fsPromises.rm(lockPath);
     let callbackCalls = 0;
     const outcome = await capture(() => journal.reclaimJournalLock(
-      { capability, writersStopped: true, fsApi: fsPromises },
+      { capability, writersStopped: true, fsApi: boundFsApi },
       async (heldLock) => {
         callbackCalls += 1;
         return journal.appendJournalRecord({
@@ -760,7 +881,7 @@ const result = await withQuarantineRunCapability({
           heldLock,
           event: request.record.event,
           payload: request.record.payload,
-          fsApi: fsPromises,
+          fsApi: boundFsApi,
         });
       },
     ));
@@ -809,29 +930,32 @@ const result = await withQuarantineRunCapability({
     };
     if (request.case === "sync") {
       return capture(() => journal.withJournalLock(
-        { capability, fsApi: failureFs },
+        { capability, fsApi: useFsApi(failureFs) },
         async () => "unreachable",
       ));
     }
-    return capture(() => journal.replayJournal({ capability, fsApi: failureFs }));
+    return capture(() => journal.replayJournal({
+      capability,
+      fsApi: useFsApi(failureFs),
+    }));
   }
   if (request.operation === "overlapping") {
     const settled = await journal.withJournalLock(
-      { capability, fsApi: fsPromises },
+      { capability, fsApi: boundFsApi },
       (heldLock) => Promise.allSettled([
         journal.appendJournalRecord({
           capability,
           heldLock,
           event: request.record.event,
           payload: request.record.payload,
-          fsApi: fsPromises,
+          fsApi: boundFsApi,
         }),
         journal.appendJournalRecord({
           capability,
           heldLock,
           event: request.record.event,
           payload: request.record.payload,
-          fsApi: fsPromises,
+          fsApi: boundFsApi,
         }),
       ]),
     );
@@ -876,13 +1000,13 @@ const result = await withQuarantineRunCapability({
       },
     };
     const outcome = await capture(() => journal.withJournalLock(
-      { capability, fsApi: trackedFs },
+      { capability, fsApi: useFsApi(trackedFs) },
       (heldLock) => journal.appendJournalRecord({
         capability,
         heldLock,
         event: request.record.event,
         payload: request.record.payload,
-        fsApi: trackedFs,
+        fsApi: useFsApi(trackedFs),
       }),
     ));
     return { outcome, events };
@@ -905,7 +1029,7 @@ const result = await withQuarantineRunCapability({
       },
     };
     const outcome = await capture(() => journal.reclaimJournalLock(
-      { capability, writersStopped: false, fsApi: guardedFs },
+      { capability, writersStopped: false, fsApi: useFsApi(guardedFs) },
       async () => "unreachable",
     ));
     return { outcome, inspections };
@@ -937,6 +1061,7 @@ function invoke(root: string, request: Record<string, unknown>) {
 
 function killTerminalCleanup(root: string, boundary: "after-lock-acquired" | "after-tombstone-rename") {
   const source = `
+import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { join } from "node:path";
 import * as journal from ${JSON.stringify(journalModuleUrl)};
@@ -948,6 +1073,9 @@ const runRoot = join(quarantineRoot, "tx-0001");
 let renamed = false;
 const crashFs = {
   ...fsPromises,
+  createReadStream,
+  lstatSync,
+  realpathSync,
   rename: async (...args) => {
     const value = await fsPromises.rename(...args);
     if (${JSON.stringify(boundary)} === "after-tombstone-rename" && !renamed) {
@@ -967,7 +1095,13 @@ const crashFs = {
     return handle;
   },
 };
-await withQuarantineRunCapability({ repoRoot, quarantineRoot, transactionId: "tx-0001", writersStopped: true },
+await withQuarantineRunCapability({
+  repoRoot,
+  quarantineRoot,
+  transactionId: "tx-0001",
+  writersStopped: true,
+  fsApi: crashFs,
+},
   (capability) => journal.cleanupTerminalJournalArtifacts({ capability, writersStopped: true, fsApi: crashFs }));
 `;
   return spawnSync(process.execPath, ["--input-type=module", "--eval", source, root], {
@@ -980,6 +1114,7 @@ function killOrdinaryAppend(
   boundary: "after-lock-create" | "after-lock-fsync" | "partial-frame" | "full-frame-before-cleanup",
 ) {
   const source = `
+import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { join } from "node:path";
 import * as journal from ${JSON.stringify(journalModuleUrl)};
@@ -990,6 +1125,9 @@ const quarantineRoot = join(root, "quarantine");
 const boundary = ${JSON.stringify(boundary)};
 const crashFs = {
   ...fsPromises,
+  createReadStream,
+  lstatSync,
+  realpathSync,
   open: async (path, flags, mode) => {
     const handle = await fsPromises.open(path, flags, mode);
     const value = String(path);
@@ -1034,7 +1172,13 @@ const crashFs = {
     return handle;
   },
 };
-await withQuarantineRunCapability({ repoRoot, quarantineRoot, transactionId: "tx-0001", writersStopped: true },
+await withQuarantineRunCapability({
+  repoRoot,
+  quarantineRoot,
+  transactionId: "tx-0001",
+  writersStopped: true,
+  fsApi: crashFs,
+},
   (capability) => journal.withJournalLock({ capability, fsApi: crashFs },
     (heldLock) => journal.appendJournalRecord({
       capability,
@@ -1058,6 +1202,73 @@ describe("capability-bound durable quarantine journal", () => {
   const fixture = mkdtempSync(join(tmpdir(), "quarantine-journal-capability-"));
 
   afterAll(() => rmSync(fixture, { recursive: true, force: true }));
+
+  it("closes and snapshots every public journal option record before bound I/O", () => {
+    const result = invoke(join(fixture, "closed-options"), {
+      operation: "closed-options",
+    }) as {
+      results: Record<string, {
+        unknown: { ok: boolean; error: { message: string } };
+        symbol: { ok: boolean; error: { message: string } };
+        missing: Record<string, { ok: boolean; error: { message: string } }>;
+        array: { ok: boolean; error: { message: string } };
+        function: { ok: boolean; error: { message: string } };
+        inherited: { ok: boolean; error: { message: string } };
+        getterCounts: Record<string, number>;
+        mismatch: { ok: boolean; error: { message: string } };
+        explicitUndefined: { ok: boolean; error: { message: string } };
+        omitted: { ok: boolean; error?: { message: string } };
+      }>;
+      distinctCounts: Record<string, number>;
+      files: Record<string, unknown>;
+    };
+    for (const api of ["replay", "lock", "append", "reclaim", "cleanup"]) {
+      const observed = result.results[api];
+      expect(observed.unknown).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/unknown field/i) },
+      });
+      expect(observed.symbol).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/unknown field/i) },
+      });
+      for (const missing of Object.values(observed.missing)) {
+        expect(missing).toMatchObject({
+          ok: false,
+          error: { message: expect.stringMatching(/missing field/i) },
+        });
+      }
+      for (const shape of [observed.array, observed.function, observed.inherited]) {
+        expect(shape).toMatchObject({
+          ok: false,
+          error: { message: expect.stringMatching(/plain object/i) },
+        });
+      }
+      expect(Object.values(observed.getterCounts).every((count) => count === 1)).toBe(true);
+      expect(observed.mismatch).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/filesystem|source|context/i) },
+      });
+      expect(observed.explicitUndefined).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/filesystem|source|context/i) },
+      });
+      if (api === "replay" || api === "lock") {
+        expect(observed.omitted.ok).toBe(true);
+      } else {
+        expect(observed.omitted).toMatchObject({
+          ok: false,
+          error: {
+            message: expect.stringMatching(
+              api === "append" ? /held-lock/i : /writers.*stopped|attestation/i,
+            ),
+          },
+        });
+      }
+    }
+    expect(Object.values(result.distinctCounts).every((count) => count === 0)).toBe(true);
+    expect(result.files).toEqual({});
+  });
 
   it.each(Object.entries(terminalRecords))(
     "cleans validated stale artifacts at terminal tip %s without changing the journal",

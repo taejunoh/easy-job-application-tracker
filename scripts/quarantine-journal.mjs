@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import * as fsPromises from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { parseInventorySummary } from "./quarantine-inventory.mjs";
@@ -7,6 +6,7 @@ import {
   deriveRunPath,
   revalidateRunCapability,
 } from "./quarantine-run-capability.mjs";
+import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
 
 const ZERO_HASH = "0".repeat(64);
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
@@ -157,6 +157,28 @@ function isPlainObject(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
+}
+
+function snapshotOptions(value, allowed, required, label) {
+  if (!isPlainObject(value)) throw new TypeError(`${label} must be a plain object`);
+  const keys = Reflect.ownKeys(value);
+  for (const key of keys) {
+    if (typeof key !== "string" || !allowed.includes(key)) {
+      throw new TypeError(`${label} has an unknown field: ${String(key)}`);
+    }
+  }
+  for (const key of required) {
+    if (!keys.includes(key)) throw new TypeError(`${label} is missing field: ${key}`);
+  }
+  const snapshot = Object.create(null);
+  for (const key of keys) snapshot[key] = value[key];
+  return Object.freeze(snapshot);
+}
+
+function boundFsApi(input) {
+  return Object.hasOwn(input, "fsApi")
+    ? getRunFsContext(input.capability, input.fsApi)
+    : getRunFsContext(input.capability);
 }
 
 function canonicalize(value, seen = new Set()) {
@@ -659,12 +681,16 @@ async function readJournalSnapshot({ capability, fsApi, maxBytes = MAX_FRAME_BYT
   });
 }
 
-export async function replayJournal({
-  capability,
-  fsApi = fsPromises,
-  maxBytes = MAX_FRAME_BYTES,
-}) {
-  return (await readJournalSnapshot({ capability, fsApi, maxBytes })).replayed;
+export async function replayJournal(options) {
+  const input = snapshotOptions(
+    options,
+    ["capability", "fsApi", "maxBytes"],
+    ["capability"],
+    "journal replay options",
+  );
+  const fsApi = boundFsApi(input);
+  const maxBytes = input.maxBytes === undefined ? MAX_FRAME_BYTES : input.maxBytes;
+  return (await readJournalSnapshot({ capability: input.capability, fsApi, maxBytes })).replayed;
 }
 
 async function createJournalLock({ capability, fsApi }) {
@@ -798,8 +824,19 @@ async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callba
   return { created, result, state };
 }
 
-export async function withJournalLock({ capability, fsApi = fsPromises }, callback) {
-  return (await runWithJournalLock({ capability, fsApi, removeOnSuccess: true }, callback)).result;
+export async function withJournalLock(options, callback) {
+  const input = snapshotOptions(
+    options,
+    ["capability", "fsApi"],
+    ["capability"],
+    "journal lock options",
+  );
+  const fsApi = boundFsApi(input);
+  return (await runWithJournalLock({
+    capability: input.capability,
+    fsApi,
+    removeOnSuccess: true,
+  }, callback)).result;
 }
 
 async function writeCompleteAt(handle, buffer, position) {
@@ -936,15 +973,22 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
   return result;
 }
 
-export async function appendJournalRecord({
-  capability,
-  heldLock,
-  event,
-  payload,
-  fsApi = fsPromises,
-  faultHook,
-}) {
-  return appendUnderHeldLock({ capability, heldLock, event, payload, fsApi, faultHook });
+export async function appendJournalRecord(options) {
+  const input = snapshotOptions(
+    options,
+    ["capability", "heldLock", "event", "payload", "fsApi", "faultHook"],
+    ["capability", "heldLock", "event", "payload"],
+    "journal append options",
+  );
+  const fsApi = boundFsApi(input);
+  return appendUnderHeldLock({
+    capability: input.capability,
+    heldLock: input.heldLock,
+    event: input.event,
+    payload: input.payload,
+    fsApi,
+    faultHook: input.faultHook,
+  });
 }
 
 async function readStaleLock(path, fsApi) {
@@ -1007,11 +1051,16 @@ async function removeOwnedArtifacts(artifacts, fsApi) {
   }
 }
 
-export async function reclaimJournalLock(
-  { capability, writersStopped, fsApi = fsPromises },
-  callback,
-) {
-  if (writersStopped !== true) {
+export async function reclaimJournalLock(options, callback) {
+  const input = snapshotOptions(
+    options,
+    ["capability", "writersStopped", "fsApi"],
+    ["capability", "writersStopped"],
+    "journal lock recovery options",
+  );
+  const fsApi = boundFsApi(input);
+  const capability = input.capability;
+  if (input.writersStopped !== true) {
     throw new Error("journal lock recovery requires writers-stopped attestation");
   }
   if (typeof callback !== "function") {
@@ -1019,7 +1068,11 @@ export async function reclaimJournalLock(
   }
   const before = await readJournalSnapshot({ capability, fsApi });
   if (TERMINAL_CLEANUP_STATES.has(before.replayed.state)) {
-    return cleanupTerminalJournalArtifacts({ capability, writersStopped, fsApi });
+    return cleanupTerminalJournalArtifactsCore({
+      capability,
+      writersStopped: input.writersStopped,
+      fsApi,
+    });
   }
   const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
   const priorTombstones = await validatedTombstones(capability, fsApi);
@@ -1092,11 +1145,7 @@ function sameTerminalSnapshot(before, after) {
   );
 }
 
-export async function cleanupTerminalJournalArtifacts({
-  capability,
-  writersStopped,
-  fsApi = fsPromises,
-}) {
+async function cleanupTerminalJournalArtifactsCore({ capability, writersStopped, fsApi }) {
   if (writersStopped !== true) {
     throw new Error("terminal journal cleanup requires writers-stopped attestation");
   }
@@ -1153,4 +1202,19 @@ export async function cleanupTerminalJournalArtifacts({
     fsApi,
   );
   return run.result;
+}
+
+export async function cleanupTerminalJournalArtifacts(options) {
+  const input = snapshotOptions(
+    options,
+    ["capability", "writersStopped", "fsApi"],
+    ["capability", "writersStopped"],
+    "terminal journal cleanup options",
+  );
+  const fsApi = boundFsApi(input);
+  return cleanupTerminalJournalArtifactsCore({
+    capability: input.capability,
+    writersStopped: input.writersStopped,
+    fsApi,
+  });
 }
