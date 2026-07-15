@@ -86,15 +86,20 @@ canonical files.
 
 The cleanup tool performs these pre-move gates before moving anything:
 
-1. require the expected repository root, branch, and commit;
+1. require the repository root plus the operator-supplied expected branch and
+   expected HEAD commit for that invocation; neither value is hardcoded;
 2. require no tracked or staged changes;
 3. inventory the numbered copies with NUL-safe path handling;
 4. classify all 65 copies and write the manifest and divergent diffs;
 5. verify sufficient disk space and quarantine permissions.
 
 After the archive is written, every quarantined file is re-hashed and compared
-with the pre-move manifest. Only verified files are removed from their original
-paths. A partial failure stops the transaction and leaves the manifest marked
+with the pre-move manifest. Source and generated content use copy, verification,
+and only then unlink/removal so the safety rule also holds when the repository
+and quarantine are on different filesystems. Symlink targets, file modes,
+relative paths, sizes, and file hashes participate in a deterministic generated
+tree inventory. Only verified files are removed from their original paths. A
+partial failure stops the transaction and leaves the manifest marked
 incomplete; it never deletes an unverified source.
 
 The complete `node_modules` and `.next` directories are moved to
@@ -143,9 +148,10 @@ SIGINT and SIGTERM, and verifies within bounded deadlines:
 - no local credential file remains;
 - no partial or published dump/fingerprint output remains.
 
-The test skips with a clear reason when Docker is unavailable locally, while CI
-must run it in an environment where Docker is available. Fake-Docker and direct
-child tests remain as fast coverage.
+The test skips with a clear reason when Docker is unavailable and the test was
+not explicitly requested. An explicit request, including CI, fails rather than
+skips when Docker or the expected PostgreSQL 17 container is unavailable.
+Fake-Docker and direct child tests remain as fast coverage.
 
 The existing supervisor is not redesigned unless this test reproduces an
 orphan or bounded-cleanup failure. A reproduction stops this subproject before
@@ -170,8 +176,11 @@ well.
 
 - Source rollback restores quarantined files to their exact original relative
   paths and modes. It never merges them into canonical files.
-- Generated rollback moves the regenerated directories aside and restores the
-  quarantined `node_modules` and `.next` trees.
+- Generated rollback copies the regenerated directories into
+  `rollback/regenerated-before-restore/<UTC timestamp>/` inside the quarantine,
+  verifies that inventory, removes the regenerated originals, and restores the
+  quarantined `node_modules` and `.next` trees with the same copy-verify-remove
+  transaction.
 - Runbook and test changes use an ordinary Git revert.
 - If hash verification, installation, tests, build, or real-Docker assertions
   fail, stop with the quarantine intact and report the exact failing gate.
