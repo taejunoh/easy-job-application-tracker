@@ -4,7 +4,7 @@
 
 **Goal:** Quarantine every numbered workspace copy without data loss, regenerate a deterministic local environment, route manual backups through the hardened coordinator, and prove real-Docker interruption cleanup.
 
-**Architecture:** A built-in-only Node CLI streams deterministic inventories and atomically moves source copies plus complete generated roots into an external quarantine on the same filesystem. A hash-chained, fsync-backed append-only journal is the recovery authority for apply, rollback, and restore; strict path/schema validation and derived payload paths prevent a modified manifest from escaping the approved roots. Operations changes remain separate: a documentation contract replaces raw database-URL backup arguments, while a focused PostgreSQL 17 Docker test proves signal cleanup using the existing coordinator and CI service container.
+**Architecture:** A built-in-only Node CLI opens a callback-scoped opaque run capability, streams FD-bounded deterministic inventories, and atomically moves source copies plus complete generated roots into an external quarantine on the same filesystem. A hash-chained, fsync-backed append-only journal is the recovery authority; immutable digest-named manifest generations and one atomic root pointer make publication crash-safe, while every writer derives and revalidates its path through the live capability. Operations changes remain separate: a documentation contract replaces raw database-URL backup arguments, while a focused PostgreSQL 17 Docker test proves signal cleanup using the existing coordinator and CI service container.
 
 **Tech Stack:** Node.js 22 ESM, Git CLI, Jest/ts-jest, PostgreSQL 17, Docker, GitHub Actions, Markdown operations contracts
 
@@ -12,396 +12,459 @@
 
 ## File map
 
-- Create `scripts/quarantine-path-policy.mjs`: closed schemas, normalized relative-path policy, resolve-under-root guards, fixed generated-root allowlist, entry-ID derivation, and same-device checks.
-- Create `scripts/quarantine-inventory.mjs`: bounded-memory file hashing and deterministic streaming JSONL inventories with digest/count/byte summaries.
-- Create `scripts/quarantine-journal.mjs`: mode-`0600` length-framed hash-chain append, fsync, replay, torn-tail handling, and lifecycle validation.
-- Create `scripts/quarantine-manifest.mjs`: closed manifest schema, atomic checksum/current-pointer publication, and four-day validation metadata.
+- Create `scripts/quarantine-run-capability.mjs`: callback-scoped opaque writer authority, validated run identity, purpose/ID path derivation, and phase-boundary revalidation.
+- Modify `scripts/quarantine-path-policy.mjs`: retain closed schemas, normalized relative-path policy, resolve-under-root guards, fixed generated-root allowlist, entry-ID derivation, and same-device checks.
+- Modify `scripts/quarantine-inventory.mjs`: bounded-memory file hashing and deterministic streaming JSONL inventories with digest/count/byte summaries.
+- Modify `scripts/quarantine-journal.mjs`: mode-`0600` length-framed hash-chain append, fsync, replay, torn-tail handling, and lifecycle validation.
+- Modify `scripts/quarantine-manifest.mjs`: pure closed manifest builder, immutable digest-named generations, canonical root-level current pointer, and four-day validation metadata.
 - Create `scripts/quarantine-transaction.mjs`: preflight, atomic apply moves, destination verification, crash reconciliation, explicit resume, and reverse-order rollback.
 - Create `scripts/quarantine-restore.mjs`: active-tree rollback moves, quarantined-payload restore, restore replay, and conflict preservation.
 - Replace `scripts/quarantine-numbered-copies-support.mjs` with a thin compatibility facade exporting the focused modules.
 - Create `scripts/quarantine-numbered-copies.mjs`: thin CLI with `inspect`, `apply`, `recover`, `mark-validated`, and `restore` subcommands.
 - Replace `__tests__/scripts/quarantine-numbered-copies.test.ts` with behavior-level apply, recovery, restore, and CLI tests.
-- Create `__tests__/scripts/quarantine-path-policy.test.ts`, `quarantine-inventory.test.ts`, and `quarantine-journal.test.ts` for focused security, RSS, and replay tests.
+- Create `__tests__/scripts/quarantine-run-capability.test.ts`, `quarantine-path-policy.test.ts`, `quarantine-inventory.test.ts`, `quarantine-journal.test.ts`, and `quarantine-manifest.test.ts` for focused capability, security, RSS, replay, and publication tests.
 - Modify `package.json`: expose `cleanup:quarantine` and `test:backup:docker`.
 - Modify `docs/operations/production-runbook.md` and its workflow contract test.
 - Create `__tests__/scripts/create-snapshot-backup.docker.integration.test.ts`: real PostgreSQL 17 Docker signal proof.
 - Modify `.github/workflows/ci.yml`, `__tests__/ci/workflow-contract.test.ts`, and `README.md`.
 
-### Task 1: Replace unsafe quarantine primitives with focused durable modules
+### Task 1A: Establish the callback-scoped run capability
+
+**Dependency:** This task runs first. Tasks 1B, 1C, and 1D start only after its commit is available.
 
 **Files:**
-- Create: `scripts/quarantine-path-policy.mjs`
-- Create: `scripts/quarantine-inventory.mjs`
-- Create: `scripts/quarantine-journal.mjs`
-- Create: `scripts/quarantine-manifest.mjs`
-- Create: `__tests__/scripts/quarantine-path-policy.test.ts`
-- Create: `__tests__/scripts/quarantine-inventory.test.ts`
-- Create: `__tests__/scripts/quarantine-journal.test.ts`
+- Create: `scripts/quarantine-run-capability.mjs`
+- Create: `__tests__/scripts/quarantine-run-capability.test.ts`
 
-- [ ] **Step 1: Write closed-path-policy attack tests**
+- [ ] **Step 1: Write the capability RED suite**
 
-Import these exact interfaces:
+Import these exact exports:
 
 ```ts
 import {
-  assertPathUnderRoot,
-  assertSameDevice,
-  canonicalPathForNumberedCopy,
-  derivePayloadPath,
-  parseManifestEntry,
-} from "../../scripts/quarantine-path-policy.mjs";
-
-it.each(["../victim", "/tmp/victim", "src/../victim", "src/\0victim", "src//victim"])(
-  "rejects unsafe manifest paths: %s",
-  (relativePath) => expect(() => parseManifestEntry(validEntry({ relativePath }))).toThrow(),
-);
-
-it("rejects unknown manifest fields", () => {
-  expect(() => parseManifestEntry({ ...validEntry(), attackerPath: "../victim" })).toThrow(
-    /unknown field/u,
-  );
-});
-
-it("derives destinations from validated IDs rather than stored paths", () => {
-  const entry = parseManifestEntry(validEntry({ id: "copy-0001" }));
-  expect(derivePayloadPath(runRoot, entry)).toBe(join(runRoot, "payload/source-copies/copy-0001"));
-});
+  deriveRunPath,
+  revalidateRunCapability,
+  withQuarantineRunCapability,
+} from "../../scripts/quarantine-run-capability.mjs";
 ```
 
-Also require final-component numbered suffix mapping, fixed generated roots
-`node_modules|.next`, root symlink rejection, inner symlinks as leaf entries,
-Unicode normalization rejection, resolve-under-root containment, quarantine
-outside the repository, device mismatch rejection, and `EXDEV` propagation.
-For a source-copy entry, require that the original path matches the numbered
-suffix and that its canonical path exactly equals the derived canonical path.
+Use this exact public contract:
 
-- [ ] **Step 2: Run the path suite to verify RED**
+```ts
+type InventoryPhase = "pre" | "moved-pass-1" | "moved-pass-2" | "restore-active";
+
+type RunPurpose =
+  | "journal" | "journal-lock" | "journal-tombstone"
+  | "manifest-generation" | "manifest-temporary"
+  | "current-pointer" | "current-temporary"
+  | "inventory" | "inventory-work"
+  | "payload" | "rollback" | "conflict" | "divergent-diff";
+
+withQuarantineRunCapability(
+  {
+    repoRoot: string;
+    quarantineRoot: string;
+    transactionId: string;
+    writersStopped: true;
+    fsApi?: object;
+  },
+  async (capability: object) => unknown,
+): Promise<unknown>;
+
+deriveRunPath(
+  capability: object,
+  request: { purpose: RunPurpose; id?: string; phase?: InventoryPhase },
+): string;
+
+revalidateRunCapability(
+  capability: object,
+  request: { purpose: RunPurpose; id?: string; phase?: InventoryPhase; boundary: "before-mutation" | "after-sync" },
+): Promise<void>;
+```
+
+Test `writersStopped !== true`, forged `{}` capabilities, callback leakage after
+both resolve and reject, invalid purpose/ID/phase combinations, quarantine inside
+the repository, root or run symlinks, mode other than `0700`, device mismatch,
+and replacement of the root/run with a different `dev` or `ino`. Independently
+replace each derived journal, inventory, and manifest parent with a symlink;
+both derivation/revalidation must reject and an external sentinel must remain
+unchanged. Prove all returned destinations are derived from the approved real
+root and one validated transaction ID, never from a caller path.
+
+- [ ] **Step 2: Run capability RED**
 
 ```bash
-npm test -- --runInBand __tests__/scripts/quarantine-path-policy.test.ts
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts
 ```
 
-Expected: FAIL because `quarantine-path-policy.mjs` does not exist.
+Expected: FAIL with `Cannot find module '../../scripts/quarantine-run-capability.mjs'`.
 
-- [ ] **Step 3: Implement the minimal path and schema policy**
+- [ ] **Step 3: Implement the opaque capability and exact path table**
 
-Export:
+Use module-private `WeakSet`/`WeakMap` state and deactivate the object in a
+`finally` before callback settlement returns to its caller. Record real root/run
+paths plus `dev`, `ino`, and mode from `lstat`/`realpath`; require the repository
+and quarantine root to have equal `dev`. Implement a closed table equivalent to:
 
 ```js
-export const GENERATED_ROOTS = Object.freeze(["node_modules", ".next"]);
-export function canonicalPathForNumberedCopy(relativePath) {}
-export function parseManifestEntry(value) {}
-export function assertPathUnderRoot(root, relativePath) {}
-export function derivePayloadPath(runRoot, entry) {}
-export async function assertSameDevice(repoRoot, quarantineRoot, fsApi) {}
+const PURPOSES = Object.freeze({
+  journal: ({ runRoot }) => join(runRoot, "journal.log"),
+  "journal-lock": ({ runRoot }) => join(runRoot, "journal.lock"),
+  "journal-tombstone": ({ runRoot, id }) => join(runRoot, `journal.lock.tombstone.${id}`),
+  "manifest-generation": ({ runRoot, id }) => join(runRoot, "manifests", `${id}.json`),
+  "manifest-temporary": ({ runRoot, id }) => join(runRoot, "manifests", `.${id}.tmp`),
+  "current-pointer": ({ quarantineRoot }) => join(quarantineRoot, "current"),
+  "current-temporary": ({ quarantineRoot, id }) => join(quarantineRoot, `.current.${id}.tmp`),
+  inventory: ({ runRoot, id, phase }) => join(runRoot, "inventories", phase, `${id}.jsonl`),
+  "inventory-work": ({ runRoot, id }) => join(runRoot, "inventories", "work", `${id}.bin`),
+  payload: ({ runRoot, id }) => derivedPayloadFromValidatedId(runRoot, id),
+  rollback: ({ runRoot, id }) => join(runRoot, "rollback", "regenerated-before-restore", id),
+  conflict: ({ runRoot, id }) => join(runRoot, "conflicts", id),
+  "divergent-diff": ({ runRoot, id }) => join(runRoot, "divergent-diffs", `${id}.patch`),
+});
 ```
 
-Use `/^(.*) ([2-9][0-9]*)(\.[^/]+)$/u` on the final component only. Require
-plain objects with exact key sets and NFC-normalized POSIX relative paths. Reject
-absolute, empty, `.`, `..`, NUL, backslash, duplicate separator, symlink-root,
-and resolved-escape inputs. Compare `lstat().dev`; translate neither a mismatch
-nor `EXDEV` into a copy operation.
+`derivedPayloadFromValidatedId` maps `copy-NNNN` to
+`payload/source-copies/copy-NNNN`, `generated-next` to
+`payload/generated/.next`, and `generated-node-modules` to
+`payload/generated/node_modules`. Temporary and work IDs are validated opaque
+IDs generated by the owning writer; tombstones use the strict journal tombstone
+grammar; `restore-active` accepts only a validated restore ID while the other
+inventory phases accept only a manifest entry ID. Validate each selected parent
+as a mode-`0700` non-symlink directory and realpath-contained under the recorded
+root before returning a path and at both mutation boundaries.
 
-- [ ] **Step 4: Verify path GREEN and commit**
+- [ ] **Step 4: Run capability GREEN and commit**
 
 ```bash
-npm test -- --runInBand __tests__/scripts/quarantine-path-policy.test.ts
-git add scripts/quarantine-path-policy.mjs __tests__/scripts/quarantine-path-policy.test.ts
-git commit -m "feat: enforce quarantine path policy"
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts
+git diff --check
+git add scripts/quarantine-run-capability.mjs __tests__/scripts/quarantine-run-capability.test.ts
+git commit -m "feat: bind quarantine writers to run capability"
 ```
 
-- [ ] **Step 5: Write streaming inventory and RSS tests**
+Expected: the capability suite PASSes, `git diff --check` is silent, and the
+commit contains only the two listed files.
 
-Import `hashFileStream`, `writeInventoryJsonl`, `parseInventoryRecord`, and
-`parseInventorySummary`.
-Require the summary parser to accept exactly `{ sha256, entries, bytes }` and
-reject unknown or missing keys, malformed hashes, and negative or unsafe
-integers. Build a synthetic generated tree containing exactly 40,000 small
-files, two nested directories, and one leaf symlink; the inventory excludes its
-root and therefore contains 40,003 entries. Require deterministic JSONL and
-summary equality across two independent passes:
+### Task 1B: Harden journal ownership and terminal cleanup
 
-```ts
-expect(second.summary).toEqual(first.summary);
-expect(second.summary).toMatchObject({ entries: 40003 });
-expect(readFileSync(second.path, "utf8").split("\n")[0]).toContain('"type":"directory"');
-```
+**Dependency:** Task 1A. This task may run in parallel with Tasks 1C and 1D.
+It modifies only the journal source and journal test.
 
-Spawn the inventory worker with `node --expose-gc`, capture peak RSS from its
-JSON summary, and require `peakRssBytes < 160 * 1024 * 1024`. Monkey-patch or
-inject payload `readFile` to throw, proving regular-file bodies are consumed via
-`createReadStream`. Require bytewise path order, mode/type/size/hash/link-target
-coverage, no symlink traversal, mode `0600`, and a manifest-sized summary of
-only `{ sha256, entries, bytes }`.
-Directory inventories exclude the root itself and emit only exact
-`{ scope: "relative", path, ...typeMetadata }` descendants. Relative paths are
-NFC POSIX paths and reject empty, absolute, backslash, NUL, duplicate-separator,
-`.`-component, and `..`-component forms. A regular-file root emits exactly
-`{ scope: "root", type: "file", mode, size, sha256 }` with no `path`, while a
-symlink root remains rejected. Consumers must branch on `scope` before resolving
-a relative path. Equal file bytes and mode therefore produce identical JSONL
-and summary bytes regardless of the root basename.
+**Files:**
+- Modify: `scripts/quarantine-journal.mjs`
+- Modify: `__tests__/scripts/quarantine-journal.test.ts`
 
-- [ ] **Step 6: Verify inventory RED, implement streaming inventory, and verify GREEN**
+- [ ] **Step 1: Write journal RED cases for the five reviewed gaps**
 
-```bash
-npm test -- --runInBand __tests__/scripts/quarantine-inventory.test.ts
-```
-
-Expected first result: FAIL because `quarantine-inventory.mjs` is missing.
-Implement:
+Use these exact exports/signatures:
 
 ```js
-export async function hashFileStream(absolutePath, options = {}) {}
-export async function writeInventoryJsonl({ root, outputPath, fsApi }) {}
-export function parseInventoryRecord(value) {}
-export function parseInventorySummary(value) {}
-export async function compareInventorySummary(expected, observed) {}
-export async function fsyncTree(root, fsApi) {}
+export async function replayJournal({ capability, fsApi, maxBytes = 16 * 1024 * 1024 }) {}
+export async function withJournalLock({ capability, fsApi }, callback) {}
+export async function appendJournalRecord({ capability, heldLock, event, payload, fsApi, faultHook }) {}
+export async function reclaimJournalLock({ capability, writersStopped, fsApi }, callback) {}
+export async function cleanupTerminalJournalArtifacts({ capability, writersStopped, fsApi }) {}
+export function validateTransition(previousEvent, nextEvent) {}
 ```
 
-Use `createReadStream`, incremental SHA-256, bounded directory batches, sorted
-UTF-8 path buffers, backpressure-aware JSONL writes, `FileHandle.sync()`, and
-`lstat`/`readlink` without following symlinks. Then run the same Jest command and
-require PASS plus RSS below the bound.
+For each terminal tip `ROLLED_BACK`, `RESTORED`, and `INCOMPLETE_CONFLICT`, seed
+a stale valid lock/tombstone, call cleanup, and assert exact journal bytes and
+tip are unchanged, no event is appended, only validated artifacts are removed,
+and the parent is synced. Repeat with `VALIDATED`, a nonterminal tip, a torn
+tail, false attestation, malformed artifact, symlink, and lock replacement;
+assert every artifact remains byte-for-byte unchanged.
 
-- [ ] **Step 7: Commit streaming inventory**
-
-```bash
-git add scripts/quarantine-inventory.mjs __tests__/scripts/quarantine-inventory.test.ts
-git commit -m "feat: stream quarantine inventories"
-```
-
-- [ ] **Step 8: Write journal framing, replay, and crash-boundary tests**
-
-Import:
+Run ordinary append and recovery append through the same held-lock callback and
+test identical checks immediately before mutation, after journal sync, and
+before cleanup. Replace the lock at each seam. Before mutation, expect unchanged
+journal bytes. After mutation begins, expect:
 
 ```ts
-import {
-  appendJournalRecord,
-  replayJournal,
-  validateTransition,
-} from "../../scripts/quarantine-journal.mjs";
+expect(error).toMatchObject({
+  name: "IndeterminateJournalAppendError",
+  expectedSequence: candidate.sequence,
+  expectedRecordHash: candidate.recordHash,
+});
 ```
 
-Test the complete state graph and supplementary interruption simulations:
-exception injection after journal file creation, frame append, and fsync, plus
-step-limited filesystem moves after payload rename, payload fsync, parent fsync,
-verification, and `MOVED` append. Those harnesses demonstrate replay invariants
-but are not process-crash proof.
-Additionally terminate real child processes with `SIGKILL` immediately after
-lock `wx` creation and immediately after lock-metadata `fsync`; normal append
-must reject both stale locks, while explicit attested reclaim appends the next
-event with an intact sequence and hash chain. A torn final frame must replay to
-the preceding record; a malformed middle frame, changed
-payload, unknown key, sequence gap, hash mismatch, or illegal transition must
-fail closed. Assert the journal is mode `0600` and every successful append calls
-both file `sync()` and parent-directory sync before resolving.
+Explicit attested recovery must reconcile the candidate to exactly one record.
+No case may delete the foreign replacement. Add real child-process `SIGKILL`
+hooks after terminal cleanup lock acquisition and after stale-lock tombstone
+rename; replay must remain terminal and cleanup retry must append no event.
 
-Journal envelopes and event payloads are independent closed schemas. Add a
-table-driven payload-validator test for every event already present in the
-transition graph. At minimum require these exact shapes:
-
-```ts
-type InventorySummary = {
-  sha256: string;
-  entries: number;
-  bytes: number;
-};
-
-type RequiredJournalPayloads = {
-  PREPARED: { transactionId: string; manifestSha256: string };
-  MOVING: Record<string, never>;
-  MOVE_INTENT: { id: string; expected: InventorySummary };
-  MOVED: { id: string; observed: InventorySummary };
-  VERIFYING: Record<string, never>;
-  QUARANTINED: { manifestSha256: string };
-};
-```
-
-Lifecycle-only events outside this minimum accept exactly `{}` unless their
-Task 2 transition contract defines a narrower entry-ID or inventory-summary
-payload. `RECOVERY_REQUIRED` accepts exactly `{ entryIds: string[] }`, while
-`INCOMPLETE_CONFLICT` accepts exactly `{ conflictEntryIds: string[] }`; both
-arrays must be non-empty, bytewise sorted, unique validated entry IDs. Tests
-must prove that an empty-payload event rejects
-one unknown key; `PREPARED` rejects a missing or extra field, invalid transaction
-ID, and invalid checksum; `MOVE_INTENT` and `MOVED` reject unknown fields, invalid
-entry IDs, invalid nested summary keys, hashes, counts, and byte sizes. Replay
-must reject a canonical, correctly re-hashed frame whose event payload violates
-its event schema. Assert that every event in the transition map has a payload
-parser, so adding a transition without a schema fails the suite.
-
-- [ ] **Step 9: Verify journal RED, implement durable replay, and verify GREEN**
+- [ ] **Step 2: Run journal RED**
 
 ```bash
 npm test -- --runInBand __tests__/scripts/quarantine-journal.test.ts
 ```
 
-Expected first result: FAIL because `quarantine-journal.mjs` is missing.
-Implement length-prefixed canonical JSON frames whose envelope is exactly:
+Expected: FAIL on terminal cleanup because the existing recovery path attempts
+an append, and FAIL on ordinary lock replacement because the existing ordinary
+appender lacks recovery-equivalent ownership/indeterminate handling.
 
-```ts
-type JournalFrame = {
-  sequence: number;
-  previousHash: string;
-  event: string;
-  payload: Record<string, unknown>;
-  recordHash: string;
-};
+- [ ] **Step 3: Implement cleanup-only terminal locking and shared append core**
+
+Require every journal/lock/tombstone path through `deriveRunPath(capability, …)`;
+remove public raw journal and lock path parameters. Make ordinary append and
+recovery call one private core:
+
+```js
+async function appendUnderHeldLock({ capability, heldLock, candidate, fsApi }) {
+  await assertOwnedLockAtPath(heldLock, "before-mutation");
+  let mutationStarted = false;
+  try {
+    mutationStarted = true;
+    await writeAndSyncCandidate(candidate);
+    await assertOwnedLockAtPath(heldLock, "after-sync");
+    return candidate;
+  } catch (error) {
+    if (!mutationStarted) throw error;
+    throw new IndeterminateJournalAppendError(candidate, error);
+  }
+}
 ```
 
-Hash the canonical envelope without `recordHash`, append one complete frame,
-`sync()` the handle, and fsync its directory. Replay ignores only an incomplete
-final length/body pair and reports the last valid byte offset. Appends create a
-mode-`0600` lock with `wx`, keep its handle open, and write one length-framed
-canonical `{ version: 1, ownerToken, pid, checksum }` record. They `fsync` the
-lock and parent directory before touching the journal, then use the same journal
-handle to revalidate, truncate only a recognized torn tail, sync the truncation
-and parent, and append. `EEXIST` always fails; normal append never uses TTL or
-PID-liveness reclamation and never races concurrent appenders.
+Cleanup-only records the complete terminal tip, validates all artifacts, moves
+the stale lock to a derived tombstone, syncs, acquires a new held lock, replays
+and compares the same tip, conditionally removes only owned validated artifacts,
+and syncs again. It never calls the append core, never truncates, and rejects a
+torn tail. Lock cleanup unlinks only after `dev`/`ino` equality; close failure
+preserves the primary indeterminate error and attaches supplemental cause data.
 
-Export `reclaimJournalLock` as the only stale-lock recovery primitive. It
-requires `writersStopped === true`. That attests that no other apply, recovery,
-or restore operation and no repository, quarantine, journal, or lock writer
-runs for the entire recovery call. Missing attestation fails before journal,
-lock, or tombstone mutation. Recovery rejects symlink, non-regular, oversized,
-and malformed complete locks without changing them, and accepts only a valid
-checksummed lock or a recognizable creation-torn frame. The latter is either
-zero bytes or a strict byte prefix of the exact framed lock: its partial length
-must prefix an admissible body length, a complete length must match the allowed
-PID-dependent range, and partial body bytes must prefix the canonical ASCII
-object grammar and its deterministic checksum. Random bytes, impossible
-lengths, invalid UTF-8, and invalid canonical prefixes are preserved and fatal.
-It atomically renames the stale lock to a unique tombstone, `fsync`s the parent,
-creates and durably publishes a new `wx` lock, and runs a recovery callback with
-an append function under that held lock. Only after the recovery journal append
-is durable may it remove the new lock and tombstone and `fsync` the parent.
-The append capability is active only inside that callback; callback exit on
-success or failure invalidates it before cleanup. Device/inode checks between
-the held handle and current regular-file lock path provide cooperative
-serialization and intrusion detection under the writer attestation; built-in
-Node path locks cannot make a separate journal write atomic against hostile
-concurrent pathname replacement. A mismatch before truncate/write begins is an
-ordinary ownership error and leaves journal bytes unchanged. Any error after
-truncate or frame write begins is an exported
-`IndeterminateJournalAppendError` with exact `expectedSequence` and
-`expectedRecordHash`. The caller does not run a destructive seam or blindly
-retry that event: it explicitly replays, accepts the candidate at most once,
-and either records a missing candidate or advances with only the next legal
-event. Indeterminate recovery preserves its current lock and tombstones.
-If closing that recovery lock also fails, the indeterminate error remains the
-primary error and the close failure is supplemental `AggregateError` cause
-metadata; a lone close failure is surfaced normally. Both cases preserve the
-lock and tombstones.
-
-Sequential awaited appends inside the callback remain valid; stored
-capabilities are rejected. Successful later recovery revalidates and removes
-all prior well-formed lock tombstones plus the current lock, then `fsync`s the
-parent. A malformed, non-regular, or malformed-name tombstone is never deleted
-automatically and fails closed before recovery mutation. Actual partial and
-complete-frame `SIGKILL` tests require replay to contain the candidate zero or
-one time before reconciliation and exactly once afterward.
-Current-PID/different-token locks model PID reuse: ordinary append still fails,
-while explicitly attested recovery is permitted.
-Replay validates every complete frame, event-specific
-payload, and lifecycle edge. Implement an exact payload-parser table keyed by
-event and invoke it during both append and replay; accepting an arbitrary plain
-object after canonicalization is forbidden. Task 2 may add fields only by first
-adding the corresponding RED exact-schema tests and updating the documented
-event contract.
-Run the same Jest command and require PASS.
-
-- [ ] **Step 10: Implement the small manifest publisher with RED/GREEN tests**
-
-Add manifest tests to `quarantine-journal.test.ts` that reject unknown fields and
-path-bearing current pointers, verify atomic temporary-file replacement, verify
-file/directory fsync ordering, and require:
-
-```ts
-type InventorySummary = {
-  sha256: string;
-  entries: number;
-  bytes: number;
-};
-
-type ManifestEntry =
-  | {
-      id: string;
-      kind: "source-copy";
-      relativePath: string;
-      canonicalRelativePath: string;
-      mode: number;
-      size: number;
-      sha256: string;
-      canonicalSize: number;
-      canonicalSha256: string;
-      classification: "identical" | "divergent";
-      historyMatch: string | null;
-      preMoveInventory: InventorySummary;
-    }
-  | {
-      id: "generated-next";
-      kind: "generated-root";
-      relativePath: ".next";
-      mode: number;
-      preMoveInventory: InventorySummary;
-    }
-  | {
-      id: "generated-node-modules";
-      kind: "generated-root";
-      relativePath: "node_modules";
-      mode: number;
-      preMoveInventory: InventorySummary;
-    };
-```
-
-The manifest parser owns this enriched exact-key union. Keep the path-policy
-parser focused on the locator fields and export a reusable closed
-`parseInventorySummary` from `quarantine-inventory.mjs`; do not duplicate hash,
-count, or byte validation in transaction code. Inventory files are derived as
-`inventories/pre/<validated-entry-id>.jsonl`, so reject any `inventoryPath`,
-`payloadPath`, destination, rollback path, or other free-form path field.
-
-Add positive source-copy and generated-root fixtures plus failures for every
-missing/unknown field, malformed hash, unsafe mode, negative or unsafe integer,
-invalid classification/hash relationship, invalid history match, source
-summary not equal to one entry/source byte size, duplicate ID, duplicate
-relative path, unsorted entries, nondeterministic `copy-NNNN` IDs, a missing or
-duplicate generated root, and generated IDs/paths that are not exactly
-`generated-next`/`.next` and `generated-node-modules`/`node_modules`. Require
-the complete manifest entry array to use bytewise relative-path order and to
-contain both generated roots exactly once. The transaction's invocation-supplied
-expected copy count is checked in Task 2 and is not stored as a free-form
-manifest override.
-
-Also require validation metadata behavior:
-
-```ts
-expect(marked).toMatchObject({
-  retentionDays: 4,
-  deletionRequiresConfirmation: true,
-  deleteAfter: "2026-07-18T12:00:00.000Z",
-});
-```
-
-Run the suite to see missing exports, then create
-`scripts/quarantine-manifest.mjs` exporting `readManifest`, `publishManifest`,
-and `markQuarantineValidated`. Compose the locator parser and exported inventory
-summary parser into the enriched manifest-entry parser, enforce cross-entry and
-cross-field invariants before publication and after reading, and keep all
-normalized objects canonical. The current pointer contains only a validated
-transaction ID, never a path. A Task 2 runtime summary/reference may point to
-the validated manifest entry ID and its `preMoveInventory`, but cannot replace
-or weaken the manifest schema. Rerun and require PASS.
-
-- [ ] **Step 11: Commit journal and manifest primitives**
+- [ ] **Step 4: Run journal GREEN and commit**
 
 ```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-journal.test.ts
 git diff --check
-git add scripts/quarantine-inventory.mjs scripts/quarantine-journal.mjs scripts/quarantine-manifest.mjs __tests__/scripts/quarantine-inventory.test.ts __tests__/scripts/quarantine-journal.test.ts
-git commit -m "feat: add durable quarantine journal"
+git add scripts/quarantine-journal.mjs __tests__/scripts/quarantine-journal.test.ts
+git commit -m "fix: harden quarantine journal ownership"
 ```
+
+Expected: both suites PASS, the diff check is silent, and the commit does not
+modify capability, manifest, inventory, transaction, restore, facade, or docs.
+
+### Task 1C: Replace mutable manifests with immutable generations
+
+**Dependency:** Task 1A. This task may run in parallel with Tasks 1B and 1D.
+It modifies only the manifest source and its dedicated test.
+
+**Files:**
+- Modify: `scripts/quarantine-manifest.mjs`
+- Create: `__tests__/scripts/quarantine-manifest.test.ts`
+
+- [ ] **Step 1: Write manifest-generation RED tests**
+
+Import and preserve exactly these five APIs:
+
+```js
+export function buildValidatedManifest(value) {}
+export async function writeManifestGeneration({ capability, manifest, fsApi, faultHook }) {}
+export async function activateManifestGeneration({ capability, transactionId, manifestSha256, appendValidated, fsApi, faultHook }) {}
+export async function readCurrentManifestPointer({ capability, fsApi, maxBytes = 4096 }) {}
+export async function readManifestGeneration({ capability, manifestSha256, fsApi, maxBytes = 4 * 1024 * 1024 }) {}
+```
+
+The pointer parser accepts exactly:
+
+```ts
+type CurrentManifestPointer = {
+  schemaVersion: 1;
+  transactionId: string;
+  manifestSha256: string;
+};
+```
+
+Test unknown/missing/path fields, uppercase or malformed digests, an oversized
+pointer above 4 KiB, an oversized generation above 4 MiB, canonical-byte digest
+mismatch, and an existing digest filename with different bytes. Require pure
+`buildValidatedManifest` to enforce the exact source-copy/generated-root union,
+cross-field invariants, unique and bytewise-sorted IDs/paths, deterministic
+`copy-NNNN` IDs, and both fixed generated roots.
+
+Inject a crash after each boundary: generation temporary-file sync, generation
+rename, generation-directory sync, pointer temporary-file sync, pointer rename,
+and quarantine-root sync. After each crash, `readCurrentManifestPointer` plus
+`readManifestGeneration` must return the old or new complete generation, and
+the old generation must remain readable. Assert `appendValidated` is called
+exactly once after the generation directory sync and before pointer temporary
+write, with `{ manifestSha256 }`. Inject temporary cleanup failure and require
+the primary publication error plus cleanup error to be preserved without
+deleting an existing generation or pointer.
+
+```ts
+expect(publicationError).toBeInstanceOf(AggregateError);
+expect((publicationError as AggregateError).errors).toEqual([primaryError, cleanupError]);
+```
+
+- [ ] **Step 2: Run manifest RED**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-manifest.test.ts
+```
+
+Expected: FAIL because the pre-amendment publisher does not export the five
+immutable-generation APIs.
+
+- [ ] **Step 3: Implement immutable write, activation, and validated reads**
+
+Canonicalize the pure builder result, hash those exact bytes, and derive
+`manifests/<sha256>.json` through the live capability. Create/sync a mode-`0600`
+temporary, rename without replacing a different generation, and sync the
+manifest directory. Activation then calls `appendValidated` and publishes the
+canonical pointer via a mode-`0600` temporary, rename-over-`current`, and root
+sync. Revalidate capability identity before each mutation phase and after its
+last sync. Readers derive paths from the validated digest, enforce byte limits
+before parsing, compare filename/content digest, and rerun the closed builder.
+Delete the pre-amendment mutable generation, checksum-sidecar, ID-only pointer,
+and run-local pointer protocol.
+
+- [ ] **Step 4: Run manifest GREEN and commit**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-manifest.test.ts
+git diff --check
+git add scripts/quarantine-manifest.mjs __tests__/scripts/quarantine-manifest.test.ts
+git commit -m "feat: publish immutable quarantine manifests"
+```
+
+Expected: both suites PASS, all crash-matrix assertions return only complete
+generations, and the commit contains only the two listed files.
+
+### Task 1D: Bound inventory and durability traversal
+
+**Dependency:** Task 1A. This task may run in parallel with Tasks 1B and 1C.
+It modifies only the inventory source and inventory test.
+
+**Files:**
+- Modify: `scripts/quarantine-inventory.mjs`
+- Modify: `__tests__/scripts/quarantine-inventory.test.ts`
+
+- [ ] **Step 1: Write iterative traversal RED tests**
+
+Use these exact exports/signatures:
+
+```js
+export async function hashFileStream(absolutePath, { fsApi, onHandleCount } = {}) {}
+export function parseInventoryRecord(value) {}
+export function parseInventorySummary(value) {}
+export async function writeInventoryJsonl({ capability, root, entryId, phase, fsApi, limits, metrics }) {}
+export async function compareInventorySummary(expected, observed) {}
+export async function fsyncTree({ capability, root, entryId, purpose, fsApi, limits, metrics }) {}
+```
+
+`parseInventoryRecord` accepts either exact root-file metadata with no `path`,
+or exact relative descendant metadata whose NFC POSIX path rejects empty,
+absolute, backslash, NUL, duplicate separator, `.`, and `..` components.
+`writeInventoryJsonl` derives its output from capability + validated entry or
+restore ID + phase; it accepts no caller-selected output. `fsyncTree` accepts no
+caller destination path.
+
+Use a virtual filesystem 10,000 directories deep and assert no recursion error,
+`metrics.maxOpenDirectoryHandles <= 1`, and
+`metrics.maxTraversalAndHashHandles <= 2`. Force more than 32 sorted chunks and
+assert `metrics.maxMergeReaders <= 32`. Verify iterative durability order:
+
+```ts
+expect(syncOrder).toEqual([
+  "file:root/a/b/data.bin",
+  "directory:root/a/b",
+  "directory:root/a",
+  "directory:root",
+]);
+```
+
+Build a real 40,000-entry fixture, run a child with `node --expose-gc`, and
+require peak RSS below `160 * 1024 * 1024`, identical JSONL/digest across two
+passes, chunk flush at 4,096 records or 8 MiB, frontier spill at 1,024 records
+or 8 MiB, and merge fan-in at most 32. Inject payload `readFile` to throw and
+prove file bodies use `createReadStream`. Add root-symlink and inner-symlink
+tests proving targets are never opened, hashed, traversed, or synced.
+
+- [ ] **Step 2: Run inventory RED**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-inventory.test.ts
+```
+
+Expected: FAIL on the 10,000-deep fixture with stack/open-handle assertions and
+FAIL because the pre-amendment writer lacks live-capability output derivation.
+
+- [ ] **Step 3: Implement bounded iterative inventory and post-order fsync**
+
+Read one directory, close it, and enqueue only a bounded frontier. Spill
+overflow to a capability-derived mode-`0600` work file. Produce deterministic
+bytewise order with 4,096-record/8-MiB sorted chunks and multi-pass k-way merge
+of at most 32 readers. Keep no more than one directory handle, or two total
+while hashing one regular file. Stream final JSONL once with backpressure and
+incremental SHA-256. Implement `fsyncTree` with iterative post-order frames,
+opening and closing a directory only at its sync point. Use `lstat`/`readlink`
+and never follow a symlink. Revalidate the capability-derived inventory/work
+parents before mutation and after final file/parent sync.
+
+- [ ] **Step 4: Run inventory GREEN and commit**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-inventory.test.ts
+git diff --check
+git add scripts/quarantine-inventory.mjs __tests__/scripts/quarantine-inventory.test.ts
+git commit -m "feat: bound quarantine inventory traversal"
+```
+
+Expected: both suites PASS, the 40,000-entry worker reports RSS below 160 MiB,
+all handle counters remain within bounds, and the commit contains only the two
+listed files.
+
+### Task 1E: Integrate and review the hardened primitives
+
+**Dependency DAG:** Task 1A first; Tasks 1B, 1C, and 1D in parallel after 1A
+with non-overlapping source/test files; Task 1E after all three. Worker agents
+must not edit this plan, the design spec, transaction/restore/facade files, or
+each other's files.
+
+**Files:**
+- Verify: `scripts/quarantine-run-capability.mjs`
+- Verify: `scripts/quarantine-journal.mjs`
+- Verify: `scripts/quarantine-manifest.mjs`
+- Verify: `scripts/quarantine-inventory.mjs`
+- Verify: their four dedicated test files and the existing path-policy and behavior suites
+
+- [ ] **Step 1: Run the complete focused primitive gate**
+
+```bash
+npm test -- --runInBand \
+  __tests__/scripts/quarantine-run-capability.test.ts \
+  __tests__/scripts/quarantine-path-policy.test.ts \
+  __tests__/scripts/quarantine-journal.test.ts \
+  __tests__/scripts/quarantine-manifest.test.ts \
+  __tests__/scripts/quarantine-inventory.test.ts \
+  __tests__/scripts/quarantine-numbered-copies.test.ts
+```
+
+Expected: every listed suite PASSes. Any failure blocks Task 2 and returns to
+the owning Task 1A-1D RED/GREEN loop before review.
+
+- [ ] **Step 2: Run the full repository gate**
+
+```bash
+npm test -- --runInBand --no-cache
+git diff --check
+```
+
+Expected: full Jest PASSes and `git diff --check` is silent. Record exact suite,
+test, skipped-test, duration, and peak-RSS evidence without printing file bodies.
+
+- [ ] **Step 3: Obtain independent specification and quality reviews**
+
+Give both reviewers the approved design, commits from Tasks 1A-1D, focused/full
+test output, and the five RED matrices: capability/symlink, terminal/SIGKILL,
+ordinary lock replacement, immutable manifest crash, and bounded traversal.
+The specification reviewer maps every design requirement to code and tests; the
+quality reviewer independently probes path replacement, journal uncertainty,
+manifest interruption, deep traversal, and RSS. Task 2 and all mutation of the
+original checkout remain blocked until both reports contain exactly zero
+Critical and zero Important findings. Fixes repeat the affected RED/GREEN suite,
+both reviews, the focused gate, full Jest, and `git diff --check`.
 
 ### Task 2: Replace transaction orchestration, restore, and CLI; then quarantine
 
@@ -458,17 +521,27 @@ Create `scripts/quarantine-transaction.mjs` exporting:
 ```js
 export async function inspectWorkspace(options) {}
 export async function quarantineWorkspace(options) {}
-export async function recoverQuarantine({ runDirectory, action, writersStopped, fsApi }) {}
+export async function recoverQuarantine({ repoRoot, quarantineRoot, transactionId, action, writersStopped, fsApi }) {}
 ```
 
 Discovery uses `git status --porcelain=v1 -z --untracked-files=all`, argument
-arrays, and two identical NUL-safe passes. `quarantineWorkspace` writes durable
-`PREPARED`, then for every entry performs `MOVE_INTENT -> recheck -> rename ->
-payload fsync -> destination-parent fsync -> source-parent fsync -> streaming
-destination inventory -> MOVED`. Persisting the destination directory first
-avoids a deliberate neither-name durability window. After all entries, perform
-two independent destination passes, assert all sources absent and no numbered
-residue, then append `QUARANTINED` and publish the manifest.
+arrays, and two identical NUL-safe passes. Every mutating/recovery entry point
+opens `withQuarantineRunCapability` and passes the callback-scoped capability to
+journal, inventory, manifest, payload, conflict, and rollback writers; no
+transaction API accepts or derives authority from a caller-selected run path.
+`quarantineWorkspace` builds and durably writes the initial immutable manifest
+generation, writes `PREPARED`, then for every entry performs `MOVE_INTENT ->
+recheck -> rename -> iterative payload fsync -> destination-parent fsync ->
+source-parent fsync -> capability-derived destination inventory -> MOVED`.
+Persisting the destination directory first avoids a deliberate neither-name
+durability window. After all entries, perform two independent destination
+passes, assert all sources absent and no numbered residue, append `QUARANTINED`,
+and write the verified but unactivated immutable generation. The later
+`mark-validated` operation, only after clean regeneration succeeds, builds and
+writes the validation-timestamp generation and calls
+`activateManifestGeneration`; its `VALIDATED` append occurs before the canonical
+root-level pointer replacement. No phase writes a mutable generation or
+run-local pointer.
 
 - [ ] **Step 4: Add replay, mutation, and concurrency RED tests**
 
@@ -528,32 +601,35 @@ consumed, and journal state `RESTORED`.
 Create `scripts/quarantine-restore.mjs` exporting:
 
 ```js
-export async function restoreQuarantine({ runDirectory, writersStopped, fsApi }) {}
-export async function recoverRestore({ runDirectory, action, writersStopped, fsApi }) {}
+export async function restoreQuarantine({ repoRoot, quarantineRoot, transactionId, writersStopped, fsApi }) {}
+export async function recoverRestore({ repoRoot, quarantineRoot, transactionId, action, writersStopped, fsApi }) {}
 ```
 
-Append `RESTORE_PREPARED`; stream-inventory the active generated tree; atomically
-move it to `rollback/regenerated-before-restore/<restore-id>`; fsync and journal
-that move; then atomically move the original payload into the active location.
-Never unlink an active tree. Reuse journal replay and the conflict matrix. Run
-the behavior suite and require all restore crash cases PASS.
+Both supported functions open a live run capability. Append `RESTORE_PREPARED`;
+write the active generated-tree inventory
+to its capability-derived inventory path; atomically move the tree to the
+capability-derived rollback destination; iteratively fsync and journal that
+move; then atomically move the original payload into the active location. Never
+unlink an active tree. Reuse journal replay and the conflict matrix. Run the
+behavior suite and require all restore crash cases PASS.
 
 - [ ] **Step 9: Replace the facade and add spawned-CLI RED tests**
 
 Make `quarantine-numbered-copies-support.mjs` export only the approved public
-functions from the six focused modules. Test these exact CLI forms:
+functions from the seven focused modules, including the run-capability module.
+Test these exact CLI forms:
 
 ```text
 npm run cleanup:quarantine -- inspect --repo-root <abs> --quarantine-root <abs> --expected-branch <name> --expected-head <sha> --expected-count <n>
 npm run cleanup:quarantine -- apply --repo-root <abs> --quarantine-root <abs> --expected-branch <name> --expected-head <sha> --expected-count <n> --writers-stopped
-npm run cleanup:quarantine -- recover --run-directory <abs> --action resume|rollback --writers-stopped
-npm run cleanup:quarantine -- mark-validated --run-directory <abs>
-npm run cleanup:quarantine -- restore --run-directory <abs> --writers-stopped
+npm run cleanup:quarantine -- recover --repo-root <abs> --quarantine-root <abs> --transaction-id <id> --action resume|rollback --writers-stopped
+npm run cleanup:quarantine -- mark-validated --repo-root <abs> --quarantine-root <abs> --transaction-id <id> --writers-stopped
+npm run cleanup:quarantine -- restore --repo-root <abs> --quarantine-root <abs> --transaction-id <id> --writers-stopped
 ```
 
 Require missing attestation, relative roots, unknown flags, unknown commands,
 nonterminal conflicts, and path-bearing pointer attacks to exit nonzero without
-printing file bodies. Output only counts, state, run-directory identifier,
+printing file bodies. Output only counts, state, transaction identifier,
 validation time, and deletion deadline.
 
 - [ ] **Step 10: Implement the CLI and package script, then verify GREEN**
@@ -568,7 +644,7 @@ add:
 Run:
 
 ```bash
-npm test -- --runInBand __tests__/scripts/quarantine-path-policy.test.ts __tests__/scripts/quarantine-inventory.test.ts __tests__/scripts/quarantine-journal.test.ts __tests__/scripts/quarantine-numbered-copies.test.ts
+npm test -- --runInBand __tests__/scripts/quarantine-run-capability.test.ts __tests__/scripts/quarantine-path-policy.test.ts __tests__/scripts/quarantine-inventory.test.ts __tests__/scripts/quarantine-journal.test.ts __tests__/scripts/quarantine-manifest.test.ts __tests__/scripts/quarantine-numbered-copies.test.ts
 git diff --check
 ```
 
@@ -620,7 +696,8 @@ device gate differs.
 - [ ] **Step 15: Apply and verify the external quarantine**
 
 Run `apply` with the same arguments, same `EXPECTED_HEAD`, and
-`--writers-stopped`. Record the returned run directory privately. Replay the
+`--writers-stopped`. Record the returned validated transaction ID privately.
+Resolve its audit data only through the capability and immutable pointer APIs. Replay the
 journal, verify modes `0700`/`0600`, require state `QUARANTINED`, two matching
 post-move inventory passes, absent sources, and four divergent classifications
 without printing any diff contents.
@@ -645,7 +722,8 @@ the quarantine, stop, and report the exact gate before considering explicit
 
 - [ ] **Step 17: Mark validation and establish retention**
 
-Run `mark-validated --run-directory "$RUN_DIRECTORY"`. Require a replayable
+Run `mark-validated --repo-root "$TARGET" --quarantine-root "$QUARANTINE" \
+--transaction-id "$TRANSACTION_ID" --writers-stopped`. Require a replayable
 `VALIDATED` state, `deleteAfter` exactly four full UTC days after `validatedAt`,
 and `deletionRequiresConfirmation: true`. Create a reminder for final review and
 explicit deletion confirmation; never schedule or perform automatic deletion.
