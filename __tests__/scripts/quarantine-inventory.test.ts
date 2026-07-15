@@ -70,6 +70,7 @@ import {
 import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
@@ -518,6 +519,93 @@ try {
       fsApi,
       metrics: {},
     }), fsApi);
+  } else if (request.operation === "fresh-read-count") {
+    let workReads = 0;
+    const fsApi = {
+      ...baseFsApi,
+      createReadStream: (path, options) => {
+        if (path.includes("/inventories/work/")) workReads += 1;
+        return createReadStream(path, options);
+      },
+    };
+    result = await withCapability(async (capability) => {
+      const summary = await inventory.writeInventoryJsonl({
+        capability, root: request.root, entryId: "generated-next", phase: "pre",
+        fsApi, metrics: {},
+      });
+      return { summary, workReads };
+    }, fsApi);
+  } else if (request.operation === "stream-teardown") {
+    let opened = 0;
+    let closed = 0;
+    let active = 0;
+    let workCreateCount = 0;
+    let publicationTempPath;
+    const fsApi = {
+      ...baseFsApi,
+      createReadStream: (path, options) => {
+        opened += 1;
+        active += 1;
+        let stream;
+        if (path.includes("/inventories/work/")) {
+          const underlying = createReadStream(path, { ...options, highWaterMark: 32 });
+          stream = Readable.from((async function* () {
+            for await (const chunk of underlying) {
+              yield chunk;
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+          })());
+          if (options?.encoding) stream.setEncoding(options.encoding);
+        } else {
+          stream = createReadStream(path, options);
+        }
+        stream.once("close", () => {
+          closed += 1;
+          active -= 1;
+        });
+        return stream;
+      },
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (flags === "wx" && path.includes("/inventories/work/")) {
+          workCreateCount += 1;
+          if (workCreateCount === 2) publicationTempPath = path;
+        }
+        if (path !== publicationTempPath) return handle;
+        return {
+          chmod: (...args) => handle.chmod(...args),
+          stat: (...args) => handle.stat(...args),
+          sync: (...args) => handle.sync(...args),
+          close: (...args) => handle.close(...args),
+          write: async () => { throw new Error("injected consumer output failure"); },
+        };
+      },
+    };
+    result = await withCapability(async (capability) => {
+      let failure;
+      try {
+        await inventory.writeInventoryJsonl({
+          capability, root: request.root, entryId: "generated-next", phase: "pre",
+          fsApi, metrics: {},
+        });
+      } catch (error) {
+        failure = {
+          message: error.message,
+          errors: error.errors?.map((item) => item.message) ?? [error.message],
+        };
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+      const workProbe = deriveRunPath(capability, {
+        purpose: "inventory-work", id: "123e4567-e89b-42d3-a456-426614174000",
+      });
+      return {
+        failure,
+        opened,
+        closed,
+        active,
+        workNames: await fsPromises.readdir(join(workProbe, "..")),
+      };
+    }, fsApi);
   } else if (request.operation === "hash") {
     let handles = 0;
     let maxHandles = 0;
@@ -698,6 +786,49 @@ describe("bounded quarantine inventory", () => {
       workNames: string[];
     };
     expect(result.repeated).toEqual(result.summary);
+    expect(result.workNames).toEqual([]);
+  });
+
+  it("reads final merge inputs exactly once on a fresh publication path", () => {
+    const nextTransaction = "inventory-fresh-single-pass";
+    createRun(quarantineRoot, nextTransaction);
+    const source = join(repoRoot, "fresh-single-pass.txt");
+    writeFileSync(source, "single-pass");
+    const result = runWorker({
+      operation: "fresh-read-count",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: source,
+    }).result as { summary: { entries: number }; workReads: number };
+    expect(result.summary.entries).toBe(1);
+    expect(result.workReads).toBe(1);
+  });
+
+  it("closes every merge input when a multi-line consumer throws after the first line", () => {
+    const nextTransaction = "inventory-stream-teardown";
+    createRun(quarantineRoot, nextTransaction);
+    const source = join(repoRoot, "stream-teardown");
+    privateDirectory(source);
+    for (let index = 0; index < 64; index += 1) {
+      writeFileSync(join(source, `file-${String(index).padStart(2, "0")}`), "x");
+    }
+    const result = runWorker({
+      operation: "stream-teardown",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: source,
+    }).result as {
+      failure: { errors: string[] };
+      opened: number;
+      closed: number;
+      active: number;
+      workNames: string[];
+    };
+    expect(result.failure.errors[0]).toBe("injected consumer output failure");
+    expect(result.opened).toBe(result.closed);
+    expect(result.active).toBe(0);
     expect(result.workNames).toEqual([]);
   });
 

@@ -811,16 +811,17 @@ async function* mergeSortedFiles(files, fsApi, metrics, compareValues = compareR
     }
   } catch (error) {
     primaryError = error;
+  } finally {
+    const cleanupErrors = [];
+    for (const source of sources) {
+      cleanupErrors.push(...(await closeLineSource(source)));
+    }
+    throwPrimaryAndCleanup(
+      primaryError,
+      cleanupErrors,
+      "inventory merge and stream teardown both failed",
+    );
   }
-  const cleanupErrors = [];
-  for (const source of sources) {
-    cleanupErrors.push(...(await closeLineSource(source)));
-  }
-  throwPrimaryAndCleanup(
-    primaryError,
-    cleanupErrors,
-    "inventory merge and stream teardown both failed",
-  );
 }
 
 async function mergeToWork(files, context, compareValues) {
@@ -938,6 +939,25 @@ async function inventoryFileMatches(path, expected, fsApi, label) {
   };
 }
 
+async function inventoryFileState(path, fsApi, label) {
+  try {
+    const identity = await fsApi.lstat(path);
+    assertPrivateRegularFile(identity, label);
+    return { exists: true, identity };
+  } catch (error) {
+    if (error?.code === "ENOENT") return { exists: false };
+    throw error;
+  }
+}
+
+function sameInventoryContent(left, right) {
+  return (
+    left.sha256 === right.sha256 &&
+    left.entries === right.entries &&
+    left.contentBytes === right.contentBytes
+  );
+}
+
 async function writeFinalInventory({
   capability,
   outputPath,
@@ -948,28 +968,46 @@ async function writeFinalInventory({
   fsApi,
   metrics,
 }) {
-  const expected = await summarizeInventoryLines(inputs, fsApi, metrics);
   const temporaryId = inventoryPublicationId(entryId, phase);
   const temporaryPath = deriveRunPath(capability, {
     purpose: "inventory-work",
     id: temporaryId,
   });
-  const finalBefore = await inventoryFileMatches(
+  const finalState = await inventoryFileState(
     outputPath,
-    expected,
     fsApi,
     "published inventory",
   );
-  if (finalBefore.exists && !finalBefore.matches) {
-    throw new Error("published inventory conflicts with complete inventory bytes");
-  }
-
-  let temporary = await inventoryFileMatches(
+  const temporaryState = await inventoryFileState(
     temporaryPath,
-    expected,
     fsApi,
     "stale inventory publication temporary",
   );
+  let expected;
+  let finalBefore = finalState;
+  let temporary = temporaryState;
+  if (finalState.exists || temporaryState.exists) {
+    expected = await summarizeInventoryLines(inputs, fsApi, metrics);
+    if (finalState.exists) {
+      finalBefore = await inventoryFileMatches(
+        outputPath,
+        expected,
+        fsApi,
+        "published inventory",
+      );
+    }
+    if (temporaryState.exists) {
+      temporary = await inventoryFileMatches(
+        temporaryPath,
+        expected,
+        fsApi,
+        "stale inventory publication temporary",
+      );
+    }
+  }
+  if (finalBefore.exists && !finalBefore.matches) {
+    throw new Error("published inventory conflicts with complete inventory bytes");
+  }
   if (finalBefore.exists && finalBefore.matches) {
     observeCoordinatorReferences(
       metrics,
@@ -1002,8 +1040,9 @@ async function writeFinalInventory({
   if (!temporary.exists) {
     let ownedIdentity;
     let primaryError;
+    let created;
     try {
-      await createPrivateFile(
+      created = await createPrivateFile(
         {
           capability,
           path: temporaryPath,
@@ -1013,18 +1052,30 @@ async function writeFinalInventory({
           metrics,
         },
         async (handle) => {
+          const digest = createHash("sha256");
+          let entries = 0;
+          let contentBytes = 0;
           async function* framedLines() {
             for await (const line of mergeSortedFiles(inputs, fsApi, metrics)) {
-              yield `${line}\n`;
+              const framed = Buffer.from(`${line}\n`);
+              digest.update(framed);
+              entries += 1;
+              contentBytes += framed.length;
+              yield framed;
             }
           }
           await writeBuffers(handle, framedLines());
           metrics.mergePasses += 1;
+          return { sha256: digest.digest("hex"), entries, contentBytes };
         },
         (identity) => {
           ownedIdentity = identity;
         },
       );
+      if (expected !== undefined && !sameInventoryContent(expected, created.value)) {
+        throw new Error("inventory inputs changed while recreating publication temporary");
+      }
+      expected ??= created.value;
       temporary = { exists: true, matches: true, identity: ownedIdentity };
     } catch (error) {
       primaryError = error;
