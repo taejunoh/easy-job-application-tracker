@@ -2423,6 +2423,104 @@ describe("capability-bound durable quarantine journal", () => {
   });
 
   it.each([
+    ["apply includes one completed intent", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+      records.recoveryCopy1,
+    ]],
+    ["apply resume retains completed intent", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+      { event: "MOVE_INTENT", payload: { id: "copy-0002", expected: validSummary } },
+      {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ["copy-0001", "copy-0002"] },
+      },
+      records.moving,
+      { event: "MOVED", payload: { id: "copy-0002", observed: validSummary } },
+      records.verifying,
+      records.quarantined,
+    ]],
+    ["apply rollback reverses completed intents", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+      { event: "MOVE_INTENT", payload: { id: "copy-0002", expected: validSummary } },
+      { event: "MOVED", payload: { id: "copy-0002", observed: validSummary } },
+      {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ["copy-0001", "copy-0002"] },
+      },
+      records.rollingBack,
+      { event: "ROLLBACK_INTENT", payload: { id: "copy-0002" } },
+      { event: "ROLLED_BACK_ENTRY", payload: { id: "copy-0002" } },
+      { event: "ROLLBACK_INTENT", payload: { id: "copy-0001" } },
+      { event: "ROLLED_BACK_ENTRY", payload: { id: "copy-0001" } },
+      records.rolledBack,
+    ]],
+    ["restore includes one completed intent", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
+      { event: "RECOVERY_REQUIRED", payload: { entryIds: ["generated-next"] } },
+    ]],
+    ["restore resume retains completed intent", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
+      { event: "RESTORE_INTENT", payload: { id: "generated-node-modules" } },
+      {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ["generated-next", "generated-node-modules"] },
+      },
+      records.restoring,
+      { event: "RESTORED_ENTRY", payload: { id: "generated-node-modules" } },
+      records.restored,
+    ]],
+    ["restore rollback reverses completed intents", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
+      { event: "RESTORE_INTENT", payload: { id: "generated-node-modules" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-node-modules" } },
+      {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ["generated-next", "generated-node-modules"] },
+      },
+      records.restoreRollingBack,
+      {
+        event: "RESTORE_ROLLBACK_INTENT",
+        payload: { id: "generated-node-modules" },
+      },
+      {
+        event: "RESTORE_ROLLED_BACK_ENTRY",
+        payload: { id: "generated-node-modules" },
+      },
+      { event: "RESTORE_ROLLBACK_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORE_ROLLED_BACK_ENTRY", payload: { id: "generated-next" } },
+      records.restoreAbortedToQuarantined,
+    ]],
+  ])("accepts full durable intent recovery: %s", (_label, lifecycle) => {
+    const result = invoke(join(fixture, `all-intents-${_label.replaceAll(" ", "-")}`), {
+      operation: "append-valid-lifecycle",
+      records: lifecycle,
+    });
+    expect(result.truncatedTail).toBe(false);
+    expect(result.records).toHaveLength(lifecycle.length);
+  });
+
+  it.each([
     ["apply non-empty without intent", [records.prepared, records.moving], {
       event: "RECOVERY_REQUIRED",
       payload: { entryIds: ["copy-0001"] },
@@ -2435,6 +2533,25 @@ describe("capability-bound durable quarantine journal", () => {
       event: "RECOVERY_REQUIRED",
       payload: { entryIds: ["copy-0002"] },
     }],
+    ["apply empty after completed intent", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+    ], { event: "RECOVERY_REQUIRED", payload: { entryIds: [] } }],
+    ["apply wrong ID after completed intent", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+    ], { event: "RECOVERY_REQUIRED", payload: { entryIds: ["copy-0002"] } }],
+    ["apply omits completed intent", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+      { event: "MOVE_INTENT", payload: { id: "copy-0002", expected: validSummary } },
+    ], { event: "RECOVERY_REQUIRED", payload: { entryIds: ["copy-0002"] } }],
     ["restore empty after intent", [
       ...quarantinedPrefix,
       records.restorePrepared,
@@ -2452,6 +2569,34 @@ describe("capability-bound durable quarantine journal", () => {
       records.restoring,
       { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
     ], { event: "RECOVERY_REQUIRED", payload: { entryIds: ["generated-node-modules"] } }],
+    ["restore empty after completed intent", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
+    ], { event: "RECOVERY_REQUIRED", payload: { entryIds: [] } }],
+    ["restore wrong ID after completed intent", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
+    ], {
+      event: "RECOVERY_REQUIRED",
+      payload: { entryIds: ["generated-node-modules"] },
+    }],
+    ["restore omits completed intent", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
+      { event: "RESTORE_INTENT", payload: { id: "generated-node-modules" } },
+    ], {
+      event: "RECOVERY_REQUIRED",
+      payload: { entryIds: ["generated-node-modules"] },
+    }],
     ["apply recovery cannot enter RESTORING", [
       records.prepared,
       records.moving,

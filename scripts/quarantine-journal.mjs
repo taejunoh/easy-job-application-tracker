@@ -440,17 +440,12 @@ export function validateTransition(state, event) {
   return nextState;
 }
 
-function bytewiseSorted(values) {
-  return [...values].sort((left, right) =>
-    Buffer.compare(Buffer.from(left), Buffer.from(right)));
-}
-
 function assertExactEntryIds(actual, expected, label) {
   if (
     actual.length !== expected.length ||
     actual.some((value, index) => value !== expected[index])
   ) {
-    throw new Error(`${label} must equal the exact sorted unresolved intent IDs`);
+    throw new Error(`${label} must equal all durable intent IDs in forward order`);
   }
 }
 
@@ -506,8 +501,6 @@ function validateJournalSemantics(records) {
         previousState === "RESTORE_PREPARED" || previousState === "RESTORING";
       recoveryContext = restoreContext ? "restore" : "apply";
       const intents = restoreContext ? restoreIntents : applyIntents;
-      const completed = restoreContext ? restoreCompleted : applyCompleted;
-      const unresolved = bytewiseSorted(intents.filter((id) => !completed.has(id)));
       const noIntentState = restoreContext
         ? previousState === "RESTORE_PREPARED" || previousState === "RESTORING"
         : previousState === "PREPARED" || previousState === "MOVING";
@@ -518,7 +511,7 @@ function validateJournalSemantics(records) {
       } else {
         assertExactEntryIds(
           record.payload.entryIds,
-          unresolved,
+          intents,
           "RECOVERY_REQUIRED entryIds",
         );
       }
