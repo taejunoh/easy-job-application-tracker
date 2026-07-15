@@ -9,12 +9,14 @@ import {
   revalidateRunCapability,
 } from "./quarantine-run-capability.mjs";
 
+const MAX_WORK_REFERENCES = 4096;
 const DEFAULT_LIMITS = Object.freeze({
   sortChunkRecords: 4096,
   sortChunkBytes: 8 * 1024 * 1024,
   frontierRecords: 1024,
   frontierBytes: 8 * 1024 * 1024,
   mergeFanIn: 32,
+  coordinatorReferences: MAX_WORK_REFERENCES,
 });
 const LIMIT_KEYS = Object.freeze(Object.keys(DEFAULT_LIMITS));
 const DEFAULT_FS_API = Object.freeze({ ...fsPromises, createReadStream });
@@ -89,10 +91,31 @@ function normalizeMetrics(value, limits) {
     frontierRecordLimit: limits.frontierRecords,
     frontierByteLimit: limits.frontierBytes,
     mergeFanInLimit: limits.mergeFanIn,
+    coordinatorReferenceLimit: limits.coordinatorReferences,
     maxWorkFileMode: 0,
     minWorkFileMode: 0o600,
+    maxCoordinatorReferences: 0,
   });
   return metrics;
+}
+
+function observeCoordinatorReferences(metrics, count, label) {
+  if (count > metrics.coordinatorReferenceLimit) {
+    throw new Error(
+      `${label} exceeded the fixed ${metrics.coordinatorReferenceLimit} reference ceiling`,
+    );
+  }
+  metrics.maxCoordinatorReferences = Math.max(metrics.maxCoordinatorReferences, count);
+}
+
+function pushCoordinatorReference(values, value, metrics, label) {
+  if (values.length >= metrics.coordinatorReferenceLimit) {
+    throw new Error(
+      `${label} reached the fixed ${metrics.coordinatorReferenceLimit} reference ceiling`,
+    );
+  }
+  values.push(value);
+  observeCoordinatorReferences(metrics, values.length, label);
 }
 
 function createHandleMetrics(metrics) {
@@ -216,7 +239,7 @@ async function openPrivateFile({
   id,
   fsApi,
   metrics,
-}) {
+}, onOwned) {
   await revalidateRunCapability(
     capability,
     purposeRequest(purpose, id, "before-mutation"),
@@ -224,6 +247,22 @@ async function openPrivateFile({
   const handle = await fsApi.open(path, "wx", 0o600);
   let identity;
   try {
+    const identityErrors = [];
+    for (let attempt = 0; attempt < 3 && identity === undefined; attempt += 1) {
+      try {
+        identity = await handle.stat();
+      } catch (error) {
+        identityErrors.push(error);
+      }
+    }
+    if (identity === undefined) {
+      throw new AggregateError(
+        identityErrors,
+        `${purpose} file identity could not be established; evidence preserved`,
+      );
+    }
+    assertRegularFile(identity, `${purpose} file`);
+    onOwned?.(identity);
     await handle.chmod(0o600);
     identity = await handle.stat();
     assertPrivateRegularFile(identity, `${purpose} file`);
@@ -272,8 +311,7 @@ async function finishPrivateFile({
 }
 
 async function createPrivateFile(context, writer, onOwned) {
-  const opened = await openPrivateFile(context);
-  onOwned?.(opened.identity);
+  const opened = await openPrivateFile(context, onOwned);
   let primaryError;
   let value;
   try {
@@ -532,9 +570,14 @@ function workRequest(id, boundary) {
 }
 
 function createWorkManager({ capability, fsApi, metrics }) {
-  const files = [];
+  const files = new Map();
 
   async function create(lines) {
+    if (files.size >= metrics.coordinatorReferenceLimit - 1) {
+      throw new Error(
+        `inventory work files reached the fixed ${metrics.coordinatorReferenceLimit} reference ceiling reserve`,
+      );
+    }
     const id = randomUUID();
     const path = deriveRunPath(capability, { purpose: "inventory-work", id });
     const context = { capability, path, purpose: "inventory-work", id, fsApi, metrics };
@@ -544,7 +587,8 @@ function createWorkManager({ capability, fsApi, metrics }) {
       (handle) => writeBuffers(handle, lines),
       (identity) => {
         file = { id, path, identity, removed: false };
-        files.push(file);
+        files.set(path, file);
+        observeCoordinatorReferences(metrics, files.size, "inventory work files");
       },
     );
     return file;
@@ -560,13 +604,14 @@ function createWorkManager({ capability, fsApi, metrics }) {
     }
     await fsApi.unlink(file.path);
     file.removed = true;
+    files.delete(file.path);
     await fsyncDirectory(dirname(file.path), fsApi);
     await revalidateRunCapability(capability, workRequest(file.id, "after-sync"));
   }
 
   async function cleanup(primaryError) {
     const cleanupErrors = [];
-    for (const file of files) {
+    for (const file of files.values()) {
       if (file.removed) continue;
       try {
         await remove(file);
@@ -581,21 +626,67 @@ function createWorkManager({ capability, fsApi, metrics }) {
     );
   }
 
-  return Object.freeze({ create, remove, cleanup });
+  return Object.freeze({
+    create,
+    remove,
+    cleanup,
+    activeCount: () => files.size,
+  });
 }
 
 async function readLines(file, fsApi) {
+  const stream = fsApi.createReadStream(file.path, { encoding: "utf8" });
   const reader = createInterface({
-    input: fsApi.createReadStream(file.path, { encoding: "utf8" }),
+    input: stream,
     crlfDelay: Infinity,
   });
   const lines = [];
+  let primaryError;
   try {
     for await (const line of reader) lines.push(line);
+  } catch (error) {
+    primaryError = error;
   } finally {
-    reader.close();
+    const cleanupErrors = await closeLineSource({ reader, stream });
+    throwPrimaryAndCleanup(
+      primaryError,
+      cleanupErrors,
+      "inventory line read and stream teardown both failed",
+    );
   }
   return lines;
+}
+
+async function destroyReadStream(stream) {
+  if (stream.closed) return;
+  await new Promise((resolve, reject) => {
+    const onClose = () => {
+      stream.off("error", onError);
+      resolve();
+    };
+    const onError = (error) => {
+      stream.off("close", onClose);
+      reject(error);
+    };
+    stream.once("close", onClose);
+    stream.once("error", onError);
+    stream.destroy();
+  });
+}
+
+async function closeLineSource(source) {
+  const errors = [];
+  try {
+    source.reader.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    await destroyReadStream(source.stream);
+  } catch (error) {
+    errors.push(error);
+  }
+  return errors;
 }
 
 async function* walkTree({ root, fsApi, limits, metrics, handles, work }) {
@@ -607,7 +698,12 @@ async function* walkTree({ root, fsApi, limits, metrics, handles, work }) {
   const spillFrontier = async () => {
     if (frontier.length === 0) return;
     const lines = frontier.map((entry) => `${JSON.stringify(entry)}\n`);
-    spills.push(await work.create(lines));
+    pushCoordinatorReference(
+      spills,
+      await work.create(lines),
+      metrics,
+      "inventory frontier spills",
+    );
     metrics.frontierSpills += 1;
     frontier.length = 0;
     frontierBytes = 0;
@@ -677,14 +773,16 @@ async function writeSortedChunk(records, work) {
 
 async function* mergeSortedFiles(files, fsApi, metrics, compareValues = compareRecords) {
   const sources = files.map((file) => {
+    const stream = fsApi.createReadStream(file.path, { encoding: "utf8" });
     const reader = createInterface({
-      input: fsApi.createReadStream(file.path, { encoding: "utf8" }),
+      input: stream,
       crlfDelay: Infinity,
     });
-    return { reader, iterator: reader[Symbol.asyncIterator](), current: null };
+    return { stream, reader, iterator: reader[Symbol.asyncIterator](), current: null };
   });
   metrics.maxMergeReaders = Math.max(metrics.maxMergeReaders, sources.length);
   if (sources.length > 32) throw new Error("inventory merge opened more than 32 readers");
+  let primaryError;
   try {
     for (const source of sources) {
       const next = await source.iterator.next();
@@ -703,7 +801,7 @@ async function* mergeSortedFiles(files, fsApi, metrics, compareValues = compareR
           selected = index;
         }
       }
-      if (selected === -1) return;
+      if (selected === -1) break;
       const source = sources[selected];
       yield source.current.line;
       const next = await source.iterator.next();
@@ -711,9 +809,18 @@ async function* mergeSortedFiles(files, fsApi, metrics, compareValues = compareR
         ? null
         : { line: next.value, value: JSON.parse(next.value) };
     }
-  } finally {
-    for (const source of sources) source.reader.close();
+  } catch (error) {
+    primaryError = error;
   }
+  const cleanupErrors = [];
+  for (const source of sources) {
+    cleanupErrors.push(...(await closeLineSource(source)));
+  }
+  throwPrimaryAndCleanup(
+    primaryError,
+    cleanupErrors,
+    "inventory merge and stream teardown both failed",
+  );
 }
 
 async function mergeToWork(files, context, compareValues) {
@@ -736,7 +843,12 @@ async function reduceMergeFiles(files, context, compareValues = compareRecords) 
     const next = [];
     for (let offset = 0; offset < current.length; offset += context.limits.mergeFanIn) {
       const group = current.slice(offset, offset + context.limits.mergeFanIn);
-      next.push(await mergeToWork(group, context, compareValues));
+      pushCoordinatorReference(
+        next,
+        await mergeToWork(group, context, compareValues),
+        context.metrics,
+        "inventory merge outputs",
+      );
     }
     for (const file of current) await context.work.remove(file);
     current = next;
@@ -747,37 +859,83 @@ async function reduceMergeFiles(files, context, compareValues = compareRecords) 
 
 async function removeOwnedInventoryOutput({
   capability,
-  outputPath,
-  entryId,
-  phase,
+  path,
+  id,
   identity,
   fsApi,
 }) {
   await revalidateRunCapability(capability, {
-    purpose: "inventory",
-    id: entryId,
-    phase,
+    purpose: "inventory-work",
+    id,
     boundary: "before-mutation",
   });
   let current;
   try {
-    current = await fsApi.lstat(outputPath);
+    current = await fsApi.lstat(path);
   } catch (error) {
     if (error?.code === "ENOENT") return;
     throw error;
   }
-  assertRegularFile(current, "partial inventory output");
+  assertRegularFile(current, "inventory publication temporary");
   if (identity === undefined || !sameIdentity(identity, current)) {
-    throw new Error("partial inventory output ownership changed; foreign replacement preserved");
+    throw new Error("inventory publication temporary ownership changed; foreign replacement preserved");
   }
-  await fsApi.unlink(outputPath);
-  await fsyncDirectory(dirname(outputPath), fsApi);
+  await fsApi.unlink(path);
+  await fsyncDirectory(dirname(path), fsApi);
   await revalidateRunCapability(capability, {
-    purpose: "inventory",
-    id: entryId,
-    phase,
+    purpose: "inventory-work",
+    id,
     boundary: "after-sync",
   });
+}
+
+function inventoryPublicationId(entryId, phase) {
+  const digest = createHash("sha256")
+    .update("quarantine-inventory-publication\0")
+    .update(entryId)
+    .update("\0")
+    .update(phase)
+    .digest("hex");
+  return (
+    `${digest.slice(0, 8)}-${digest.slice(8, 12)}-` +
+    `4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`
+  );
+}
+
+async function summarizeInventoryLines(inputs, fsApi, metrics) {
+  const digest = createHash("sha256");
+  let entries = 0;
+  let contentBytes = 0;
+  for await (const line of mergeSortedFiles(inputs, fsApi, metrics)) {
+    const framed = Buffer.from(`${line}\n`);
+    digest.update(framed);
+    contentBytes += framed.length;
+    entries += 1;
+  }
+  metrics.mergePasses += 1;
+  return { sha256: digest.digest("hex"), entries, contentBytes };
+}
+
+async function inventoryFileMatches(path, expected, fsApi, label) {
+  let before;
+  try {
+    before = await fsApi.lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { exists: false };
+    throw error;
+  }
+  assertPrivateRegularFile(before, label);
+  const hashed = await hashFileStream(path, { fsApi });
+  const after = await fsApi.lstat(path);
+  assertPrivateRegularFile(after, label);
+  if (!sameIdentity(before, after) || before.size !== after.size) {
+    throw new Error(`${label} identity or size changed while being verified`);
+  }
+  return {
+    exists: true,
+    matches: hashed.bytes === expected.contentBytes && hashed.sha256 === expected.sha256,
+    identity: after,
+  };
 }
 
 async function writeFinalInventory({
@@ -786,100 +944,162 @@ async function writeFinalInventory({
   entryId,
   phase,
   inputs,
+  work,
   fsApi,
   metrics,
 }) {
+  const expected = await summarizeInventoryLines(inputs, fsApi, metrics);
+  const temporaryId = inventoryPublicationId(entryId, phase);
+  const temporaryPath = deriveRunPath(capability, {
+    purpose: "inventory-work",
+    id: temporaryId,
+  });
+  const finalBefore = await inventoryFileMatches(
+    outputPath,
+    expected,
+    fsApi,
+    "published inventory",
+  );
+  if (finalBefore.exists && !finalBefore.matches) {
+    throw new Error("published inventory conflicts with complete inventory bytes");
+  }
+
+  let temporary = await inventoryFileMatches(
+    temporaryPath,
+    expected,
+    fsApi,
+    "stale inventory publication temporary",
+  );
+  if (finalBefore.exists && finalBefore.matches) {
+    observeCoordinatorReferences(
+      metrics,
+      work.activeCount() + (temporary.exists ? 1 : 0),
+      "inventory recovery references",
+    );
+    for (const file of inputs) await work.remove(file);
+    if (temporary.exists) {
+      await removeOwnedInventoryOutput({
+        capability,
+        path: temporaryPath,
+        id: temporaryId,
+        identity: temporary.identity,
+        fsApi,
+      });
+    }
+    return { sha256: expected.sha256, entries: expected.entries };
+  }
+
+  if (temporary.exists && !temporary.matches) {
+    await removeOwnedInventoryOutput({
+      capability,
+      path: temporaryPath,
+      id: temporaryId,
+      identity: temporary.identity,
+      fsApi,
+    });
+    temporary = { exists: false };
+  }
+  if (!temporary.exists) {
+    let ownedIdentity;
+    let primaryError;
+    try {
+      await createPrivateFile(
+        {
+          capability,
+          path: temporaryPath,
+          purpose: "inventory-work",
+          id: temporaryId,
+          fsApi,
+          metrics,
+        },
+        async (handle) => {
+          async function* framedLines() {
+            for await (const line of mergeSortedFiles(inputs, fsApi, metrics)) {
+              yield `${line}\n`;
+            }
+          }
+          await writeBuffers(handle, framedLines());
+          metrics.mergePasses += 1;
+        },
+        (identity) => {
+          ownedIdentity = identity;
+        },
+      );
+      temporary = { exists: true, matches: true, identity: ownedIdentity };
+    } catch (error) {
+      primaryError = error;
+    }
+    if (primaryError !== undefined) {
+      const cleanupErrors = [];
+      if (ownedIdentity !== undefined) {
+        try {
+          await removeOwnedInventoryOutput({
+            capability,
+            path: temporaryPath,
+            id: temporaryId,
+            identity: ownedIdentity,
+            fsApi,
+          });
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      throwPrimaryAndCleanup(
+        primaryError,
+        cleanupErrors,
+        "inventory publication temporary failure and cleanup both failed",
+      );
+    }
+  }
+
+  observeCoordinatorReferences(
+    metrics,
+    work.activeCount() + 1,
+    "inventory work files and publication temporary",
+  );
+
+  for (const file of inputs) await work.remove(file);
+
   await revalidateRunCapability(capability, {
     purpose: "inventory",
     id: entryId,
     phase,
     boundary: "before-mutation",
   });
-  const handle = await fsApi.open(outputPath, "wx", 0o600);
-  let identity;
-  let primaryError;
-  const cleanupErrors = [];
-  const digest = createHash("sha256");
-  let entries = 0;
   try {
-    identity = await handle.stat();
-    assertRegularFile(identity, "inventory output");
-    await handle.chmod(0o600);
-    identity = await handle.stat();
-    assertPrivateRegularFile(identity, "inventory output");
-    const current = await fsApi.lstat(outputPath);
-    assertPrivateRegularFile(current, "inventory output");
-    if (!sameIdentity(identity, current)) {
-      throw new Error("inventory output ownership changed after open");
-    }
-    let position = 0;
-    if (inputs.length > 0) {
-      for await (const line of mergeSortedFiles(inputs, fsApi, metrics)) {
-        const framed = Buffer.from(`${line}\n`);
-        digest.update(framed);
-        let offset = 0;
-        while (offset < framed.length) {
-          const result = await handle.write(
-            framed,
-            offset,
-            framed.length - offset,
-            position + offset,
-          );
-          if (result.bytesWritten === 0) throw new Error("inventory output write made no progress");
-          offset += result.bytesWritten;
-        }
-        position += framed.length;
-        entries += 1;
-      }
-      metrics.mergePasses += 1;
-    }
-    await handle.sync();
+    await fsApi.link(temporaryPath, outputPath);
   } catch (error) {
-    primaryError = error;
-  }
-  try {
-    await handle.close();
-  } catch (error) {
-    cleanupErrors.push(error);
-  }
-  if (primaryError === undefined && cleanupErrors.length === 0) {
-    try {
-      await fsyncDirectory(dirname(outputPath), fsApi);
-      await revalidateRunCapability(capability, {
-        purpose: "inventory",
-        id: entryId,
-        phase,
-        boundary: "after-sync",
-      });
-      const after = await fsApi.lstat(outputPath);
-      assertPrivateRegularFile(after, "inventory output");
-      if (!sameIdentity(identity, after)) {
-        throw new Error("inventory output ownership changed after sync");
-      }
-    } catch (error) {
-      primaryError = error;
-    }
-  }
-  if (primaryError !== undefined || cleanupErrors.length > 0) {
-    try {
-      await removeOwnedInventoryOutput({
-        capability,
-        outputPath,
-        entryId,
-        phase,
-        identity,
-        fsApi,
-      });
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
-    throwPrimaryAndCleanup(
-      primaryError,
-      cleanupErrors,
-      "inventory output failure and owned cleanup both failed",
+    if (error?.code !== "EEXIST") throw error;
+    const existing = await inventoryFileMatches(
+      outputPath,
+      expected,
+      fsApi,
+      "existing published inventory",
     );
+    if (!existing.exists || !existing.matches) {
+      throw new Error("existing published inventory conflicts with complete inventory bytes");
+    }
   }
-  return { sha256: digest.digest("hex"), entries };
+  const published = await fsApi.lstat(outputPath);
+  assertPrivateRegularFile(published, "published inventory");
+  if (!sameIdentity(temporary.identity, published)) {
+    throw new Error("published inventory is not the no-replace link of its complete temporary");
+  }
+  await fsyncDirectory(dirname(outputPath), fsApi);
+  await revalidateRunCapability(capability, {
+    purpose: "inventory",
+    id: entryId,
+    phase,
+    boundary: "after-sync",
+  });
+  await removeOwnedInventoryOutput({
+    capability,
+    path: temporaryPath,
+    id: temporaryId,
+    identity: temporary.identity,
+    fsApi,
+  });
+  return { sha256: expected.sha256, entries: expected.entries };
 }
 
 export async function writeInventoryJsonl(options) {
@@ -897,6 +1117,7 @@ export async function writeInventoryJsonl(options) {
     "opendir",
     "readlink",
     "open",
+    "link",
     "unlink",
     "createReadStream",
   ]);
@@ -921,7 +1142,12 @@ export async function writeInventoryJsonl(options) {
 
   const flush = async () => {
     if (records.length === 0) return;
-    chunks.push(await writeSortedChunk(records, work));
+    pushCoordinatorReference(
+      chunks,
+      await writeSortedChunk(records, work),
+      metrics,
+      "inventory sort chunks",
+    );
     metrics.chunkFiles += 1;
     records = [];
     recordBytes = 0;
@@ -960,6 +1186,7 @@ export async function writeInventoryJsonl(options) {
       entryId: input.entryId,
       phase: input.phase,
       inputs: finalInputs,
+      work,
       fsApi,
       metrics,
     });
@@ -1015,8 +1242,11 @@ export async function fsyncTree(options) {
   const flushPostorder = async () => {
     if (postorderFrames.length === 0) return;
     postorderFrames.sort(comparePostorderTasks);
-    postorderChunks.push(
+    pushCoordinatorReference(
+      postorderChunks,
       await work.create(postorderFrames.map((frame) => `${JSON.stringify(frame)}\n`)),
+      metrics,
+      "inventory postorder chunks",
     );
     metrics.postorderSpills += 1;
     postorderFrames = [];

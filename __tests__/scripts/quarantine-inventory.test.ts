@@ -1,10 +1,12 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -46,6 +48,16 @@ function createRun(quarantineRoot: string, transactionId: string) {
   privateDirectory(runRoot);
   for (const path of RUN_DIRECTORIES) privateDirectory(join(runRoot, path));
   return runRoot;
+}
+
+function publicationId(entryId: string, phase: string) {
+  const digest = createHash("sha256")
+    .update("quarantine-inventory-publication\0")
+    .update(entryId)
+    .update("\0")
+    .update(phase)
+    .digest("hex");
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
 }
 
 function runWorker(request: Record<string, unknown>): WorkerResult {
@@ -133,12 +145,32 @@ try {
         metrics,
         ...(request.injectOutput ? { outputPath: request.injectOutput } : {}),
       });
+      let repeated;
+      if (request.repeat) {
+        repeated = await inventory.writeInventoryJsonl({
+          capability,
+          root: request.root,
+          entryId: request.entryId ?? "generated-next",
+          phase: request.phase ?? "pre",
+          fsApi: baseFsApi,
+          metrics: {},
+        });
+      }
       const output = deriveRunPath(capability, {
         purpose: "inventory",
         id: request.entryId ?? "generated-next",
         phase: request.phase ?? "pre",
       });
-      return { summary, metrics, output };
+      const workProbe = deriveRunPath(capability, {
+        purpose: "inventory-work", id: "123e4567-e89b-42d3-a456-426614174000",
+      });
+      return {
+        summary,
+        repeated,
+        metrics,
+        output,
+        workNames: await fsPromises.readdir(join(workProbe, "..")),
+      };
     });
   } else if (request.operation === "fsync") {
     result = await withCapability(async (capability) => {
@@ -218,9 +250,18 @@ try {
     }, hybrid);
   } else if (request.operation === "cleanup-replacement") {
     let firstWorkPath;
+    let readStreamCount = 0;
     const workLstatCounts = new Map();
     const fsApi = {
       ...baseFsApi,
+      createReadStream: (path, options) => {
+        readStreamCount += 1;
+        const stream = createReadStream(path, options);
+        if (readStreamCount === 2) {
+          setImmediate(() => stream.destroy(new Error("primary publish failure")));
+        }
+        return stream;
+      },
       lstat: async (path) => {
         if (path.includes("/inventories/work/") && !path.endsWith(".owned")) {
           const count = (workLstatCounts.get(path) ?? 0) + 1;
@@ -233,10 +274,6 @@ try {
           }
         }
         return fsPromises.lstat(path);
-      },
-      open: async (path, flags, mode) => {
-        if (path.endsWith(".jsonl")) throw new Error("primary publish failure");
-        return fsPromises.open(path, flags, mode);
       },
     };
     result = await withCapability(async (capability) => {
@@ -260,13 +297,23 @@ try {
     }, fsApi);
   } else if (request.operation === "output-cleanup") {
     let outputPath;
+    let publicationTempPath;
+    let workCreateCount = 0;
     let outputLstatCount = 0;
     let outputWriteCount = 0;
     let faultActive = true;
+    let streamsOpened = 0;
+    let streamsClosed = 0;
     const fsApi = {
       ...baseFsApi,
+      createReadStream: (path, options) => {
+        streamsOpened += 1;
+        const stream = createReadStream(path, options);
+        stream.once("close", () => { streamsClosed += 1; });
+        return stream;
+      },
       lstat: async (path) => {
-        if (path === outputPath) {
+        if (path === publicationTempPath) {
           outputLstatCount += 1;
           if (faultActive && request.case === "foreign" && outputLstatCount === 2) {
             await fsPromises.rename(path, path + ".owned");
@@ -278,7 +325,11 @@ try {
       },
       open: async (path, flags, mode) => {
         const handle = await fsPromises.open(path, flags, mode);
-        if (path !== outputPath || !faultActive) return handle;
+        if (flags === "wx" && path.includes("/inventories/work/")) {
+          workCreateCount += 1;
+          if (workCreateCount === 2) publicationTempPath = path;
+        }
+        if (path !== publicationTempPath || !faultActive) return handle;
         return {
           chmod: (...args) => handle.chmod(...args),
           stat: (...args) => handle.stat(...args),
@@ -315,18 +366,158 @@ try {
       }
       faultActive = false;
       if (request.case === "foreign") {
+        await new Promise((resolve) => setImmediate(resolve));
         return {
           failure,
-          foreignBytes: await fsPromises.readFile(outputPath, "utf8"),
-          ownedBytes: await fsPromises.readFile(outputPath + ".owned", "utf8"),
+          foreignBytes: await fsPromises.readFile(publicationTempPath, "utf8"),
+          ownedBytes: await fsPromises.readFile(publicationTempPath + ".owned", "utf8"),
+          streamsOpened,
+          streamsClosed,
         };
       }
       const retry = await inventory.writeInventoryJsonl({
         capability, root: request.root, entryId: "generated-next", phase: "pre",
         fsApi, metrics: {},
       });
-      return { failure, retry, outputBytes: await fsPromises.readFile(outputPath, "utf8") };
+      await new Promise((resolve) => setImmediate(resolve));
+      return {
+        failure,
+        retry,
+        outputBytes: await fsPromises.readFile(outputPath, "utf8"),
+        streamsOpened,
+        streamsClosed,
+      };
     }, fsApi);
+  } else if (request.operation === "work-setup-fault") {
+    let faultActive = true;
+    let workPath;
+    let statCalls = 0;
+    let lstatFaulted = false;
+    const fsApi = {
+      ...baseFsApi,
+      lstat: async (path) => {
+        if (
+          faultActive &&
+          !lstatFaulted &&
+          path === workPath &&
+          request.case === "lstat"
+        ) {
+          lstatFaulted = true;
+          throw new Error("injected work lstat failure");
+        }
+        return fsPromises.lstat(path);
+      },
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (!path.includes("/inventories/work/")) return handle;
+        workPath ??= path;
+        return {
+          write: (...args) => handle.write(...args),
+          sync: (...args) => handle.sync(...args),
+          close: (...args) => handle.close(...args),
+          chmod: async (...args) => {
+            if (faultActive && request.case === "chmod") {
+              throw new Error("injected work chmod failure");
+            }
+            return handle.chmod(...args);
+          },
+          stat: async (...args) => {
+            statCalls += 1;
+            if (
+              faultActive &&
+              ((request.case === "stat-transient" && statCalls === 1) ||
+                request.case === "stat-permanent")
+            ) {
+              throw new Error("injected work stat failure");
+            }
+            return handle.stat(...args);
+          },
+        };
+      },
+    };
+    result = await withCapability(async (capability) => {
+      let failure;
+      try {
+        await inventory.writeInventoryJsonl({
+          capability, root: request.root, entryId: "generated-next", phase: "pre",
+          fsApi, metrics: {},
+        });
+      } catch (error) {
+        failure = {
+          message: error.message,
+          errors: error.errors?.map((item) => item.message) ?? [error.message],
+        };
+      }
+      if (request.case === "stat-transient") {
+        const workProbe = deriveRunPath(capability, {
+          purpose: "inventory-work", id: "123e4567-e89b-42d3-a456-426614174000",
+        });
+        return {
+          failure,
+          workNames: await fsPromises.readdir(join(workProbe, "..")),
+        };
+      }
+      if (request.case === "stat-permanent") {
+        const workProbe = deriveRunPath(capability, {
+          purpose: "inventory-work", id: "123e4567-e89b-42d3-a456-426614174000",
+        });
+        return {
+          failure,
+          workNames: await fsPromises.readdir(join(workProbe, "..")),
+        };
+      }
+      faultActive = false;
+      const retry = await inventory.writeInventoryJsonl({
+        capability, root: request.root, entryId: "generated-next", phase: "pre",
+        fsApi, metrics: {},
+      });
+      const workProbe = deriveRunPath(capability, {
+        purpose: "inventory-work", id: "123e4567-e89b-42d3-a456-426614174000",
+      });
+      return {
+        failure,
+        retry,
+        workNames: await fsPromises.readdir(join(workProbe, "..")),
+      };
+    }, fsApi);
+  } else if (request.operation === "crash-publication") {
+    let workCreateCount = 0;
+    let publicationTempPath;
+    let linked = false;
+    const fsApi = {
+      ...baseFsApi,
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (flags === "wx" && path.includes("/inventories/work/")) {
+          workCreateCount += 1;
+          if (workCreateCount === 2) publicationTempPath = path;
+        }
+        return handle;
+      },
+      link: async (source, destination) => {
+        await fsPromises.link(source, destination);
+        linked = true;
+        if (request.boundary === "link") process.kill(process.pid, "SIGKILL");
+      },
+      unlink: async (path) => {
+        await fsPromises.unlink(path);
+        if (
+          linked &&
+          path === publicationTempPath &&
+          request.boundary === "temp-unlink"
+        ) {
+          process.kill(process.pid, "SIGKILL");
+        }
+      },
+    };
+    await withCapability((capability) => inventory.writeInventoryJsonl({
+      capability,
+      root: request.root,
+      entryId: "generated-next",
+      phase: "pre",
+      fsApi,
+      metrics: {},
+    }), fsApi);
   } else if (request.operation === "hash") {
     let handles = 0;
     let maxHandles = 0;
@@ -355,6 +546,18 @@ try {
   clearInterval(sampler);
 }
 `;
+  if (request.expectSignal) {
+    const child = spawnSync(
+      process.execPath,
+      ["--expose-gc", "--input-type=module", "--eval", source],
+      {
+        encoding: "utf8",
+        input: JSON.stringify(request),
+        maxBuffer: 64 * 1024 * 1024,
+      },
+    );
+    return { result: { signal: child.signal }, peakRssBytes: 0 };
+  }
   const child = JSON.parse(
     execFileSync(process.execPath, ["--expose-gc", "--input-type=module", "--eval", source], {
       encoding: "utf8",
@@ -421,6 +624,7 @@ describe("bounded quarantine inventory", () => {
     expect(result.firstMetrics.frontierRecordLimit).toBe(1024);
     expect(result.firstMetrics.frontierByteLimit).toBe(8 * 1024 * 1024);
     expect(result.firstMetrics.frontierSpills).toBeGreaterThan(0);
+    expect(result.firstMetrics.maxCoordinatorReferences).toBeLessThanOrEqual(4096);
     expect(lstatSync(result.firstOutput).mode & 0o7777).toBe(0o600);
     const records = readFileSync(result.firstOutput, "utf8").trimEnd().split("\n").map(JSON.parse);
     const paths = records.map((record) => record.path);
@@ -476,6 +680,98 @@ describe("bounded quarantine inventory", () => {
     expect(readFileSync(sentinel, "utf8")).toBe("sentinel");
   });
 
+  it("reuses an exact published inventory and leaves no deterministic work temp", () => {
+    const nextTransaction = "inventory-repeat-publication";
+    createRun(quarantineRoot, nextTransaction);
+    const source = join(repoRoot, "repeat-publication.txt");
+    writeFileSync(source, "repeat");
+    const result = runWorker({
+      operation: "one-pass",
+      repeat: true,
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: source,
+    }).result as {
+      summary: Record<string, unknown>;
+      repeated: Record<string, unknown>;
+      workNames: string[];
+    };
+    expect(result.repeated).toEqual(result.summary);
+    expect(result.workNames).toEqual([]);
+  });
+
+  it.each(["link", "temp-unlink"])(
+    "recovers an exact inventory after a real SIGKILL at the %s boundary",
+    (boundary) => {
+      const nextTransaction = `inventory-crash-${boundary}`;
+      createRun(quarantineRoot, nextTransaction);
+      const source = join(repoRoot, `crash-${boundary}.txt`);
+      writeFileSync(source, "crash-recovery");
+      const crashed = runWorker({
+        operation: "crash-publication",
+        expectSignal: true,
+        boundary,
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        root: source,
+      });
+      expect((crashed.result as { signal: string }).signal).toBe("SIGKILL");
+      const recovered = runWorker({
+        operation: "one-pass",
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        root: source,
+      }).result as {
+        summary: { entries: number; bytes: number; sha256: string };
+        workNames: string[];
+        output: string;
+      };
+      expect(recovered.summary).toMatchObject({ entries: 1, bytes: 14 });
+      expect(recovered.summary.sha256).toMatch(/^[a-f0-9]{64}$/u);
+      expect(recovered.workNames).toEqual([]);
+      expect(readFileSync(recovered.output, "utf8").endsWith("\n")).toBe(true);
+    },
+  );
+
+  it("replaces an incomplete deterministic temp but never an existing mismatched final", () => {
+    const staleTransaction = "inventory-stale-publication";
+    const staleRun = createRun(quarantineRoot, staleTransaction);
+    const source = join(repoRoot, "stale-publication.txt");
+    writeFileSync(source, "complete");
+    const stalePath = join(
+      staleRun,
+      "inventories/work",
+      `${publicationId("generated-next", "pre")}.bin`,
+    );
+    writeFileSync(stalePath, "partial", { mode: 0o600 });
+    chmodSync(stalePath, 0o600);
+    const recovered = runWorker({
+      operation: "one-pass",
+      repoRoot,
+      quarantineRoot,
+      transactionId: staleTransaction,
+      root: source,
+    }).result as { workNames: string[] };
+    expect(recovered.workNames).toEqual([]);
+
+    const conflictTransaction = "inventory-final-conflict";
+    const conflictRun = createRun(quarantineRoot, conflictTransaction);
+    const finalPath = join(conflictRun, "inventories/pre/generated-next.jsonl");
+    writeFileSync(finalPath, "foreign-final", { mode: 0o600 });
+    chmodSync(finalPath, 0o600);
+    expect(() => runWorker({
+      operation: "one-pass",
+      repoRoot,
+      quarantineRoot,
+      transactionId: conflictTransaction,
+      root: source,
+    })).toThrow(/conflict|published inventory/i);
+    expect(readFileSync(finalPath, "utf8")).toBe("foreign-final");
+  });
+
   it("limits a multipass merge to 32 readers", () => {
     const nextTransaction = "inventory-many-chunks";
     createRun(quarantineRoot, nextTransaction);
@@ -503,6 +799,7 @@ describe("bounded quarantine inventory", () => {
         frontierRecords: 100_000,
         frontierBytes: 64 * 1024 * 1024,
         mergeFanIn: 1_000,
+        coordinatorReferences: 1_000_000,
       },
     }).result as { metrics: Record<string, number> };
     expect(result.metrics.sortChunkRecordLimit).toBeLessThanOrEqual(4096);
@@ -510,7 +807,27 @@ describe("bounded quarantine inventory", () => {
     expect(result.metrics.frontierRecordLimit).toBeLessThanOrEqual(1024);
     expect(result.metrics.frontierByteLimit).toBeLessThanOrEqual(8 * 1024 * 1024);
     expect(result.metrics.mergeFanInLimit).toBeLessThanOrEqual(32);
+    expect(result.metrics.coordinatorReferenceLimit).toBeLessThanOrEqual(4096);
   }, 120_000);
+
+  it("fails closed and cleans active work at a lowered coordinator-cap seam", () => {
+    const nextTransaction = "inventory-coordinator-seam";
+    const nextRun = createRun(quarantineRoot, nextTransaction);
+    const source = join(repoRoot, "coordinator-seam");
+    privateDirectory(source);
+    for (let index = 0; index < 8; index += 1) {
+      writeFileSync(join(source, `file-${index}`), "x");
+    }
+    expect(() => runWorker({
+      operation: "one-pass",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: source,
+      limits: { sortChunkRecords: 1, coordinatorReferences: 4 },
+    })).toThrow(/reference ceiling|work files/i);
+    expect(readdirSync(join(nextRun, "inventories/work"))).toEqual([]);
+  });
 
   it("hashes file bodies through createReadStream and reports handle counts", () => {
     expect(runWorker({ operation: "hash", root: join(leaf, "file-00001.txt") }).result).toEqual({
@@ -654,6 +971,9 @@ describe("bounded quarantine inventory", () => {
       }
       expect(result.retry).toMatchObject({ entries: 1, bytes: 10 });
       expect(result.outputBytes.endsWith("\n")).toBe(true);
+      expect((result as typeof result & { streamsOpened: number }).streamsOpened).toBe(
+        (result as typeof result & { streamsClosed: number }).streamsClosed,
+      );
     },
     120_000,
   );
@@ -681,5 +1001,64 @@ describe("bounded quarantine inventory", () => {
     ]);
     expect(result.foreignBytes).toBe("foreign");
     expect(result.ownedBytes).toBe("");
+  });
+
+  it.each(["chmod", "lstat"])(
+    "removes an early-owned work file after %s setup failure so retry is clean",
+    (failureCase) => {
+      const nextTransaction = `inventory-work-${failureCase}`;
+      createRun(quarantineRoot, nextTransaction);
+      const source = join(repoRoot, `work-${failureCase}.txt`);
+      writeFileSync(source, "work");
+      const result = runWorker({
+        operation: "work-setup-fault",
+        case: failureCase,
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        root: source,
+      }).result as {
+        failure: { message: string };
+        retry: { entries: number };
+        workNames: string[];
+      };
+      expect(result.failure.message).toMatch(new RegExp(failureCase, "i"));
+      expect(result.retry.entries).toBe(1);
+      expect(result.workNames).toEqual([]);
+    },
+  );
+
+  it("retries the first handle stat while open before any setup mutation", () => {
+    const nextTransaction = "inventory-work-stat-transient";
+    createRun(quarantineRoot, nextTransaction);
+    const source = join(repoRoot, "work-stat-transient.txt");
+    writeFileSync(source, "work");
+    const result = runWorker({
+      operation: "work-setup-fault",
+      case: "stat-transient",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: source,
+    }).result as { failure?: unknown; workNames: string[] };
+    expect(result.failure).toBeUndefined();
+    expect(result.workNames).toEqual([]);
+  });
+
+  it("preserves evidence when an exclusive handle identity cannot be established", () => {
+    const nextTransaction = "inventory-work-stat-permanent";
+    createRun(quarantineRoot, nextTransaction);
+    const source = join(repoRoot, "work-stat-permanent.txt");
+    writeFileSync(source, "work");
+    const result = runWorker({
+      operation: "work-setup-fault",
+      case: "stat-permanent",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: source,
+    }).result as { failure: { message: string; errors: string[] }; workNames: string[] };
+    expect(result.failure.message).toMatch(/identity|stat/i);
+    expect(result.workNames).toHaveLength(1);
   });
 });
