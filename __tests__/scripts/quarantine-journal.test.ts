@@ -153,6 +153,11 @@ const capture = async (callback) => {
         expectedSequence: error.expectedSequence ?? null,
         expectedRecordHash: error.expectedRecordHash ?? null,
         cleanupError: error.cleanupError?.message ?? null,
+        causeName: error.cause?.name ?? null,
+        causeCleanupError: error.cause?.cleanupError?.message ?? null,
+        causeErrors: error.cause instanceof AggregateError
+          ? error.cause.errors.map((cause) => cause.message)
+          : [],
       },
     };
   }
@@ -640,6 +645,211 @@ const result = await withQuarantineRunCapability({
       ]));
     }
     return capture(() => journal.replayJournal({ capability }));
+  }
+  if (request.operation === "retry-cleanup") {
+    await appendAll(capability, [request.prefix]);
+    await seedArtifacts(capability);
+    const successfulRemovals = [];
+    let removalCalls = 0;
+    const failureFs = {
+      ...fsPromises,
+      rm: async (path, options) => {
+        removalCalls += 1;
+        if (removalCalls === 2) throw new Error("injected cleanup interruption");
+        const value = await fsPromises.rm(path, options);
+        successfulRemovals.push(String(path).split("/").at(-1));
+        return value;
+      },
+    };
+    const recover = async (fsApi) => journal.reclaimJournalLock(
+      { capability, writersStopped: true, fsApi },
+      async (heldLock) => {
+        const replayed = await journal.replayJournal({ capability });
+        const movingPresent = replayed.records.some((record) => record.event === "MOVING");
+        const next = movingPresent ? request.nextRecord : request.movingRecord;
+        return journal.appendJournalRecord({
+          capability,
+          heldLock,
+          event: next.event,
+          payload: next.payload,
+          fsApi,
+        });
+      },
+    );
+    const first = await capture(() => recover(failureFs));
+    const retry = await capture(() => recover(failureFs));
+    const replayed = await journal.replayJournal({ capability });
+    return {
+      first,
+      retry,
+      successfulRemovals,
+      replayed,
+      names: (await fsPromises.readdir(runRoot)).sort(),
+    };
+  }
+  if (request.operation === "tombstone-only") {
+    await appendAll(capability, request.records);
+    const { lockPath } = await seedArtifacts(capability);
+    await fsPromises.rm(lockPath);
+    let callbackCalls = 0;
+    const outcome = await capture(() => journal.reclaimJournalLock(
+      { capability, writersStopped: true, fsApi: fsPromises },
+      async (heldLock) => {
+        callbackCalls += 1;
+        return journal.appendJournalRecord({
+          capability,
+          heldLock,
+          event: request.record.event,
+          payload: request.record.payload,
+          fsApi: fsPromises,
+        });
+      },
+    ));
+    return {
+      outcome,
+      callbackCalls,
+      replayed: await journal.replayJournal({ capability }),
+      names: (await fsPromises.readdir(runRoot)).sort(),
+    };
+  }
+  if (request.operation === "primary-close") {
+    const journalPath = deriveRunPath(capability, { purpose: "journal" });
+    if (request.case !== "sync") {
+      if (request.case === "malformed") {
+        await fsPromises.writeFile(journalPath, Buffer.from([0, 0, 0, 1, 0xff]), {
+          mode: 0o600,
+        });
+      } else {
+        await appendAll(capability, [request.record]);
+      }
+    }
+    const failureFs = {
+      ...fsPromises,
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        const isJournalRead = String(path) === journalPath && String(flags) === "r";
+        const isLockCreate = String(path).endsWith("/journal.lock") && String(flags).includes("x");
+        if (!isJournalRead && !isLockCreate) return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === "read" && request.case === "read") {
+              return async () => { throw new Error("injected read primary"); };
+            }
+            if (property === "sync" && request.case === "sync") {
+              return async () => { throw new Error("injected sync primary"); };
+            }
+            if (property === "close") return async () => {
+              await target.close();
+              throw new Error("injected supplemental close failure");
+            };
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+    if (request.case === "sync") {
+      return capture(() => journal.withJournalLock(
+        { capability, fsApi: failureFs },
+        async () => "unreachable",
+      ));
+    }
+    return capture(() => journal.replayJournal({ capability, fsApi: failureFs }));
+  }
+  if (request.operation === "overlapping") {
+    const settled = await journal.withJournalLock(
+      { capability, fsApi: fsPromises },
+      (heldLock) => Promise.allSettled([
+        journal.appendJournalRecord({
+          capability,
+          heldLock,
+          event: request.record.event,
+          payload: request.record.payload,
+          fsApi: fsPromises,
+        }),
+        journal.appendJournalRecord({
+          capability,
+          heldLock,
+          event: request.record.event,
+          payload: request.record.payload,
+          fsApi: fsPromises,
+        }),
+      ]),
+    );
+    return {
+      statuses: settled.map((entry) => entry.status).sort(),
+      replayed: await journal.replayJournal({ capability }),
+    };
+  }
+  if (request.operation === "transitions") {
+    return request.edges.map(([previous, next]) => journal.validateTransition(previous, next));
+  }
+  if (request.operation === "append-valid-lifecycle") {
+    await appendAll(capability, request.records);
+    return journal.replayJournal({ capability });
+  }
+  if (request.operation === "durability") {
+    const events = [];
+    let directorySyncs = 0;
+    const trackedFs = {
+      ...fsPromises,
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === "sync") return async () => {
+              const isDirectory = String(path).endsWith("/quarantine/tx-0001");
+              events.push(isDirectory ? "parent-sync" : String(path).endsWith("journal.log")
+                ? "journal-sync"
+                : "lock-sync");
+              if (isDirectory) {
+                directorySyncs += 1;
+                if (request.failParent && directorySyncs === 2) {
+                  throw new Error("injected parent sync failure");
+                }
+              }
+              return target.sync();
+            };
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+    const outcome = await capture(() => journal.withJournalLock(
+      { capability, fsApi: trackedFs },
+      (heldLock) => journal.appendJournalRecord({
+        capability,
+        heldLock,
+        event: request.record.event,
+        payload: request.record.payload,
+        fsApi: trackedFs,
+      }),
+    ));
+    return { outcome, events };
+  }
+  if (request.operation === "false-attestation-inspection") {
+    let inspections = 0;
+    const guardedFs = {
+      ...fsPromises,
+      lstat: async (...args) => {
+        inspections += 1;
+        return fsPromises.lstat(...args);
+      },
+      readdir: async (...args) => {
+        inspections += 1;
+        return fsPromises.readdir(...args);
+      },
+      open: async (...args) => {
+        inspections += 1;
+        return fsPromises.open(...args);
+      },
+    };
+    const outcome = await capture(() => journal.reclaimJournalLock(
+      { capability, writersStopped: false, fsApi: guardedFs },
+      async () => "unreachable",
+    ));
+    return { outcome, inspections };
   }
   if (request.operation === "api-contract") {
     return {
@@ -1147,6 +1357,196 @@ describe("capability-bound durable quarantine journal", () => {
       });
     },
   );
+
+  it("retries an interrupted partial cleanup with tombstones first and the owned lock last", () => {
+    const result = invoke(join(fixture, "retry-partial-cleanup"), {
+      operation: "retry-cleanup",
+      prefix: records.prepared,
+      movingRecord: records.moving,
+      nextRecord: records.moveIntent,
+    });
+    expect(result.first.ok).toBe(false);
+    expect(result.retry.ok).toBe(true);
+    expect(result.replayed.records.filter(
+      (record: { event: string }) => record.event === "MOVING",
+    )).toHaveLength(1);
+    expect(result.successfulRemovals.at(-1)).toBe("journal.lock");
+    expect(result.successfulRemovals.slice(0, -1).every(
+      (name: string) => name.startsWith("journal.lock.tombstone."),
+    )).toBe(true);
+    expect(result.names).toEqual(["journal.log", "sentinel"]);
+  });
+
+  it("recovers a nonterminal tombstone-only state under a fresh held lock", () => {
+    const result = invoke(join(fixture, "tombstone-only-nonterminal"), {
+      operation: "tombstone-only",
+      records: [records.prepared],
+      record: records.moving,
+    });
+    expect(result.outcome.ok).toBe(true);
+    expect(result.callbackCalls).toBe(1);
+    expect(result.replayed).toMatchObject({ state: "MOVING", truncatedTail: false });
+    expect(result.names).toEqual(["journal.log", "sentinel"]);
+  });
+
+  it("routes a terminal tombstone-only reclaim through cleanup without invoking recovery", () => {
+    const result = invoke(join(fixture, "tombstone-only-terminal"), {
+      operation: "tombstone-only",
+      records: terminalRecords.ROLLED_BACK,
+      record: records.moving,
+    });
+    expect(result.outcome.ok).toBe(true);
+    expect(result.callbackCalls).toBe(0);
+    expect(result.replayed.state).toBe("ROLLED_BACK");
+    expect(result.replayed.records).toHaveLength(terminalRecords.ROLLED_BACK.length);
+    expect(result.names).toEqual(["journal.log", "sentinel"]);
+  });
+
+  it.each([
+    ["malformed", /malformed journal/u],
+    ["read", /injected read primary/u],
+    ["sync", /injected sync primary/u],
+  ])("preserves the %s primary when handle close also fails", (caseName, expected) => {
+    const result = invoke(join(fixture, `primary-close-${caseName}`), {
+      operation: "primary-close",
+      case: caseName,
+      record: records.prepared,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toMatch(expected);
+    expect(result.error.cleanupError).toBe("injected supplemental close failure");
+    expect(result.error.causeName).toBe("AggregateError");
+    expect(result.error.causeErrors).toContain("injected supplemental close failure");
+  });
+
+  it("excludes overlapping appends under one held-lock capability", () => {
+    const result = invoke(join(fixture, "overlapping-append"), {
+      operation: "overlapping",
+      record: records.prepared,
+    });
+    expect(result.statuses).toEqual(["fulfilled", "rejected"]);
+    expect(result.replayed.records).toHaveLength(1);
+    expect(result.replayed.records[0]).toMatchObject({ sequence: 1, event: "PREPARED" });
+  });
+
+  const transitionEdges = [
+    [null, "PREPARED", "PREPARED"],
+    ["PREPARED", "MOVING", "MOVING"],
+    ["MOVING", "MOVE_INTENT", "MOVING"],
+    ["MOVING", "MOVED", "MOVING"],
+    ["MOVING", "VERIFYING", "VERIFYING"],
+    ["MOVING", "RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
+    ["MOVING", "INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
+    ["VERIFYING", "QUARANTINED", "QUARANTINED"],
+    ["VERIFYING", "RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
+    ["VERIFYING", "INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
+    ["RECOVERY_REQUIRED", "MOVING", "MOVING"],
+    ["RECOVERY_REQUIRED", "RESTORING", "RESTORING"],
+    ["RECOVERY_REQUIRED", "ROLLING_BACK", "ROLLING_BACK"],
+    ["RECOVERY_REQUIRED", "INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
+    ["ROLLING_BACK", "ROLLBACK_INTENT", "ROLLING_BACK"],
+    ["ROLLING_BACK", "ROLLED_BACK_ENTRY", "ROLLING_BACK"],
+    ["ROLLING_BACK", "ROLLED_BACK", "ROLLED_BACK"],
+    ["ROLLING_BACK", "INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
+    ["QUARANTINED", "VALIDATED", "VALIDATED"],
+    ["QUARANTINED", "RESTORE_PREPARED", "RESTORE_PREPARED"],
+    ["VALIDATED", "RESTORE_PREPARED", "RESTORE_PREPARED"],
+    ["RESTORE_PREPARED", "RESTORING", "RESTORING"],
+    ["RESTORING", "RESTORE_INTENT", "RESTORING"],
+    ["RESTORING", "RESTORED_ENTRY", "RESTORING"],
+    ["RESTORING", "RESTORED", "RESTORED"],
+    ["RESTORING", "RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
+    ["RESTORING", "INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
+  ] as const;
+
+  it("covers every legal transition-table edge", () => {
+    const result = invoke(join(fixture, "all-transition-edges"), {
+      operation: "transitions",
+      edges: transitionEdges.map(([previous, next]) => [previous, next]),
+    });
+    expect(result).toEqual(transitionEdges.map(([, , expected]) => expected));
+  });
+
+  it.each([
+    ["moving", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+      records.verifying,
+      records.quarantined,
+      records.validated,
+    ]],
+    ["rollback", [
+      records.prepared,
+      records.moving,
+      records.recoveryRequired,
+      records.rollingBack,
+      { event: "ROLLBACK_INTENT", payload: { id: "copy-0001" } },
+      { event: "ROLLED_BACK_ENTRY", payload: { id: "copy-0001" } },
+      records.rolledBack,
+    ]],
+    ["restore", [
+      records.prepared,
+      records.moving,
+      records.verifying,
+      records.quarantined,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "copy-0001" } },
+      { event: "RESTORED_ENTRY", payload: { id: "copy-0001" } },
+      records.restored,
+    ]],
+  ])("accepts every event parser in a valid %s lifecycle", (_label, lifecycle) => {
+    const result = invoke(join(fixture, `valid-lifecycle-${_label}`), {
+      operation: "append-valid-lifecycle",
+      records: lifecycle,
+    });
+    expect(result.truncatedTail).toBe(false);
+    expect(result.records).toHaveLength(lifecycle.length);
+  });
+
+  it("syncs each journal file before its parent directory", () => {
+    const result = invoke(join(fixture, "durability-order"), {
+      operation: "durability",
+      record: records.prepared,
+    });
+    expect(result.outcome.ok).toBe(true);
+    expect(result.events.slice(0, 4)).toEqual([
+      "lock-sync",
+      "parent-sync",
+      "journal-sync",
+      "parent-sync",
+    ]);
+  });
+
+  it("reports a parent-directory fsync failure after journal sync as indeterminate", () => {
+    const result = invoke(join(fixture, "parent-fsync-failure"), {
+      operation: "durability",
+      record: records.prepared,
+      failParent: true,
+    });
+    expect(result.events.slice(0, 4)).toEqual([
+      "lock-sync",
+      "parent-sync",
+      "journal-sync",
+      "parent-sync",
+    ]);
+    expect(result.outcome.error).toMatchObject({
+      name: "IndeterminateJournalAppendError",
+      expectedSequence: 1,
+      expectedRecordHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+  });
+
+  it("rejects false writersStopped before inspecting any stale artifact", () => {
+    const result = invoke(join(fixture, "false-attestation-no-inspection"), {
+      operation: "false-attestation-inspection",
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.outcome.error.message).toMatch(/writers.*stopped|attestation/u);
+    expect(result.inspections).toBe(0);
+  });
 
   it("ignores a torn final tail, then truncates and appends at the next sequence", () => {
     const result = invoke(join(fixture, "torn-repair"), {

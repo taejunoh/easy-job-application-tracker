@@ -66,6 +66,33 @@ function attachCleanupError(primaryError, cleanupError) {
   return primaryError;
 }
 
+async function closePreservingPrimary(handle, primaryError) {
+  let closeError;
+  try {
+    await handle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (primaryError !== undefined) {
+    throw closeError === undefined
+      ? primaryError
+      : attachCleanupError(primaryError, closeError);
+  }
+  if (closeError !== undefined) throw closeError;
+}
+
+async function withHandle(handle, callback) {
+  let result;
+  let primaryError;
+  try {
+    result = await callback(handle);
+  } catch (error) {
+    primaryError = error;
+  }
+  await closePreservingPrimary(handle, primaryError);
+  return result;
+}
+
 const TRANSITIONS = new Map([
   ["<START>", new Map([["PREPARED", "PREPARED"]])],
   ["PREPARED", new Map([["MOVING", "MOVING"]])],
@@ -410,11 +437,7 @@ async function readCompleteFile(handle, maxBytes = MAX_FRAME_BYTES) {
 
 async function fsyncDirectory(path, fsApi) {
   const parent = await fsApi.open(path, "r");
-  try {
-    await parent.sync();
-  } finally {
-    await parent.close();
-  }
+  await withHandle(parent, (handle) => handle.sync());
 }
 
 function lockChecksum(version, ownerToken, pid) {
@@ -621,21 +644,19 @@ async function readJournalSnapshot({ capability, fsApi, maxBytes = MAX_FRAME_BYT
   }
   if (before.size > maxBytes) throw new Error("journal is too large");
   const handle = await fsApi.open(journalPath, "r");
-  try {
-    const opened = await handle.stat();
+  return withHandle(handle, async (openedHandle) => {
+    const opened = await openedHandle.stat();
     if (!opened.isFile() || !sameIdentity(before, opened) || opened.size !== before.size) {
       throw new Error("journal changed while being inspected");
     }
-    const bytes = await readCompleteFile(handle, maxBytes);
+    const bytes = await readCompleteFile(openedHandle, maxBytes);
     return {
       bytes,
       identity: { dev: opened.dev, ino: opened.ino },
       journalPath,
       replayed: replayJournalBuffer(bytes),
     };
-  } finally {
-    await handle.close();
-  }
+  });
 }
 
 export async function replayJournal({
@@ -679,8 +700,7 @@ async function createJournalLock({ capability, fsApi }) {
       metadata: encoded.metadata,
     };
   } catch (error) {
-    await handle.close().catch(() => {});
-    throw error;
+    return closePreservingPrimary(handle, error);
   }
 }
 
@@ -821,8 +841,7 @@ async function openJournalForMutation(snapshot, fsApi) {
     }
     return handle;
   } catch (error) {
-    await handle.close().catch(() => {});
-    throw error;
+    return closePreservingPrimary(handle, error);
   }
 }
 
@@ -902,21 +921,10 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
         : error;
   }
   state.appendInProgress = false;
-  let closeError;
-  try {
-    await journal?.handle.close();
-  } catch (error) {
-    closeError = error;
-  }
-  if (primaryError !== undefined) {
-    throw closeError === undefined
-      ? primaryError
-      : attachCleanupError(primaryError, closeError);
-  }
-  if (closeError !== undefined) {
-    throw mutationStarted && candidate !== undefined
-      ? indeterminate(candidate, closeError)
-      : closeError;
+  if (journal !== undefined) {
+    await closePreservingPrimary(journal.handle, primaryError);
+  } else if (primaryError !== undefined) {
+    throw primaryError;
   }
   return result;
 }
@@ -939,19 +947,17 @@ async function readStaleLock(path, fsApi) {
   }
   if (before.size > 4 + MAX_LOCK_BODY_BYTES) throw new Error("journal lock is too large");
   const handle = await fsApi.open(path, "r");
-  try {
-    const opened = await handle.stat();
+  return withHandle(handle, async (openedHandle) => {
+    const opened = await openedHandle.stat();
     if (!opened.isFile() || !sameIdentity(opened, before) || opened.size !== before.size) {
       throw new Error("journal lock changed while being inspected");
     }
     return {
-      ...parseLockFrame(await readCompleteFile(handle, 4 + MAX_LOCK_BODY_BYTES)),
+      ...parseLockFrame(await readCompleteFile(openedHandle, 4 + MAX_LOCK_BODY_BYTES)),
       identity: { dev: opened.dev, ino: opened.ino },
       path,
     };
-  } finally {
-    await handle.close();
-  }
+  });
 }
 
 async function readOptionalStaleLock(path, fsApi) {
@@ -987,8 +993,11 @@ async function removeOwnedArtifacts(artifacts, fsApi) {
   for (const artifact of artifacts) {
     await assertPathIdentity(artifact.path, artifact.identity, fsApi, "journal lock artifact");
   }
-  for (const artifact of artifacts) await fsApi.rm(artifact.path);
-  if (artifacts.length > 0) await fsyncDirectory(dirname(artifacts[0].path), fsApi);
+  for (const artifact of artifacts) {
+    await assertPathIdentity(artifact.path, artifact.identity, fsApi, "journal lock artifact");
+    await fsApi.rm(artifact.path);
+    await fsyncDirectory(dirname(artifact.path), fsApi);
+  }
 }
 
 export async function reclaimJournalLock(
@@ -1001,40 +1010,61 @@ export async function reclaimJournalLock(
   if (typeof callback !== "function") {
     throw new TypeError("journal lock recovery callback is required");
   }
+  const before = await readJournalSnapshot({ capability, fsApi });
+  if (TERMINAL_CLEANUP_STATES.has(before.replayed.state)) {
+    return cleanupTerminalJournalArtifacts({ capability, writersStopped, fsApi });
+  }
   const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
   const priorTombstones = await validatedTombstones(capability, fsApi);
-  const staleLock = await readStaleLock(lockPath, fsApi);
-  const tombstoneId = randomUUID();
-  const tombstonePath = deriveRunPath(capability, {
-    purpose: "journal-tombstone",
-    id: tombstoneId,
-  });
-  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
-  await revalidateRunCapability(capability, {
-    purpose: "journal-lock",
-    boundary: "before-mutation",
-  });
-  await fsApi.rename(lockPath, tombstonePath);
-  await fsyncDirectory(dirname(lockPath), fsApi);
-  await revalidateRunCapability(capability, {
-    purpose: "journal-tombstone",
-    id: tombstoneId,
-    boundary: "after-sync",
-  });
-  const moved = { ...staleLock, path: tombstonePath };
+  const staleLock = await readOptionalStaleLock(lockPath, fsApi);
+  if (staleLock === null && priorTombstones.length === 0) {
+    throw new Error("journal lock recovery requires a stale lock or tombstone");
+  }
+  let moved = null;
+  if (staleLock !== null) {
+    const tombstoneId = randomUUID();
+    const tombstonePath = deriveRunPath(capability, {
+      purpose: "journal-tombstone",
+      id: tombstoneId,
+    });
+    await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
+    await revalidateRunCapability(capability, {
+      purpose: "journal-lock",
+      boundary: "before-mutation",
+    });
+    await fsApi.rename(lockPath, tombstonePath);
+    await fsyncDirectory(dirname(lockPath), fsApi);
+    await revalidateRunCapability(capability, {
+      purpose: "journal-tombstone",
+      id: tombstoneId,
+      boundary: "after-sync",
+    });
+    moved = { ...staleLock, path: tombstonePath };
+  }
+  const staleEvidence = staleLock ?? priorTombstones.at(-1);
   const run = await runWithJournalLock(
     { capability, fsApi, removeOnSuccess: false },
-    (heldLock) => callback(heldLock, Object.freeze({
-      staleLock: staleLock.metadata,
-      staleLockTorn: staleLock.torn,
-    })),
+    async (heldLock) => {
+      const rechecked = await readJournalSnapshot({ capability, fsApi });
+      if (!sameTerminalSnapshot(before, rechecked)) {
+        throw new Error("journal tip changed during lock recovery");
+      }
+      return callback(heldLock, Object.freeze({
+        staleLock: staleEvidence.metadata,
+        staleLockTorn: staleEvidence.torn,
+      }));
+    },
   );
   if (run.state.durableAppends === 0) {
     throw new Error("journal lock recovery requires a durable journal append");
   }
   try {
     await removeOwnedArtifacts(
-      [{ path: run.created.lockPath, identity: run.created.identity }, moved, ...priorTombstones],
+      [
+        ...priorTombstones,
+        ...(moved === null ? [] : [moved]),
+        { path: run.created.lockPath, identity: run.created.identity },
+      ],
       fsApi,
     );
   } catch (error) {
@@ -1109,9 +1139,9 @@ export async function cleanupTerminalJournalArtifacts({
   );
   await removeOwnedArtifacts(
     [
-      { path: run.created.lockPath, identity: run.created.identity },
-      ...(moved === null ? [] : [moved]),
       ...priorTombstones,
+      ...(moved === null ? [] : [moved]),
+      { path: run.created.lockPath, identity: run.created.identity },
     ],
     fsApi,
   );
