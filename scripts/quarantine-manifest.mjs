@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import * as fsPromises from "node:fs/promises";
 import { basename, dirname, isAbsolute } from "node:path";
 
 import { parseInventorySummary } from "./quarantine-inventory.mjs";
@@ -8,6 +7,7 @@ import {
   deriveRunPath,
   revalidateRunCapability,
 } from "./quarantine-run-capability.mjs";
+import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
 
 const RETENTION_DAYS = 4;
 const MAX_GENERATION_BYTES = 4 * 1024 * 1024;
@@ -47,7 +47,6 @@ const GENERATED_ENTRY_KEYS = ["id", "kind", "relativePath", "mode", "preMoveInve
 const ALL_ENTRY_KEYS = [...new Set([...SOURCE_ENTRY_KEYS, ...GENERATED_ENTRY_KEYS])];
 const INVENTORY_KEYS = ["sha256", "entries", "bytes"];
 const POINTER_KEYS = ["schemaVersion", "transactionId", "manifestSha256"];
-const FS_METHODS = ["lstat", "open", "link", "unlink", "rename"];
 
 function isPlainObject(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -324,18 +323,10 @@ export function buildValidatedManifest(value) {
   });
 }
 
-function normalizeFsApi(value) {
-  const adapter = value === undefined ? fsPromises : value;
-  if (!isPlainObject(adapter)) throw new TypeError("filesystem adapter must be a plain object");
-  const normalized = Object.create(null);
-  for (const method of FS_METHODS) {
-    const implementation = adapter[method];
-    if (typeof implementation !== "function") {
-      throw new TypeError(`filesystem adapter must provide ${method}`);
-    }
-    normalized[method] = (...args) => Reflect.apply(implementation, adapter, args);
-  }
-  return Object.freeze(normalized);
+function getBoundFsApi(input) {
+  return Object.hasOwn(input, "fsApi")
+    ? getRunFsContext(input.capability, input.fsApi)
+    : getRunFsContext(input.capability);
 }
 
 function normalizeFaultHook(value) {
@@ -558,6 +549,33 @@ function parseEnsureValidatedResult(value, expectedDigest) {
   return Object.freeze({ status: result.status, manifestSha256 });
 }
 
+async function readManifestGenerationSnapshot({
+  capability,
+  manifestSha256,
+  fsApi,
+  maxBytes,
+}) {
+  const path = deriveRunPath(capability, {
+    purpose: "manifest-generation",
+    id: manifestSha256,
+  });
+  const snapshot = await readBoundedSnapshot(path, fsApi, maxBytes, "manifest generation");
+  if (digestBytes(snapshot.bytes) !== manifestSha256) {
+    throw new Error("manifest generation content digest does not match its filename");
+  }
+  const manifest = buildValidatedManifest(parseJson(snapshot.bytes, "manifest generation"));
+  if (!snapshot.bytes.equals(canonicalBytes(manifest))) {
+    throw new Error("manifest generation JSON is not canonical");
+  }
+  assertGenerationTransaction(path, manifest.transactionId);
+  return {
+    manifest,
+    path,
+    bytes: snapshot.bytes,
+    identity: snapshot.identity,
+  };
+}
+
 export async function writeManifestGeneration(options) {
   const input = snapshotRecord(
     options,
@@ -565,7 +583,7 @@ export async function writeManifestGeneration(options) {
     ["capability", "manifest"],
     "manifest generation write options",
   );
-  const fsApi = normalizeFsApi(input.fsApi);
+  const fsApi = getBoundFsApi(input);
   const faultHook = normalizeFaultHook(input.faultHook);
   const manifest = buildValidatedManifest(input.manifest);
   const bytes = canonicalBytes(manifest);
@@ -582,6 +600,8 @@ export async function writeManifestGeneration(options) {
   });
   assertGenerationTransaction(generationPath, manifest.transactionId);
   let temporaryIdentity;
+  let generationIdentity;
+  let publicationAccepted = false;
   let primaryError;
   try {
     await revalidateRunCapability(input.capability, {
@@ -650,20 +670,23 @@ export async function writeManifestGeneration(options) {
     });
     try {
       await fsApi.link(temporaryPath, generationPath);
+      generationIdentity = temporaryIdentity;
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
-      const existing = await readBoundedFile(
+      const existing = await readBoundedSnapshot(
         generationPath,
         fsApi,
         MAX_GENERATION_BYTES,
         "existing manifest generation",
       );
-      if (digestBytes(existing) !== manifestSha256 || !existing.equals(bytes)) {
+      if (digestBytes(existing.bytes) !== manifestSha256 || !existing.bytes.equals(bytes)) {
         throw new Error("existing manifest generation conflicts with its digest name", {
           cause: error,
         });
       }
+      generationIdentity = existing.identity;
     }
+    publicationAccepted = true;
     await invokeFaultHook(faultHook, "after-generation-publish");
     await fsyncDirectory(dirname(generationPath), fsApi);
     await invokeFaultHook(faultHook, "after-generation-directory-sync");
@@ -672,12 +695,27 @@ export async function writeManifestGeneration(options) {
       id: manifestSha256,
       boundary: "after-sync",
     });
+    const durable = await readBoundedSnapshot(
+      generationPath,
+      fsApi,
+      bytes.length,
+      "durable manifest generation",
+    );
+    if (!sameIdentity(generationIdentity, durable.identity)) {
+      throw new Error("manifest generation identity changed after directory sync");
+    }
+    if (!durable.bytes.equals(bytes) || digestBytes(durable.bytes) !== manifestSha256) {
+      throw new Error("manifest generation bytes changed after directory sync");
+    }
   } catch (error) {
     primaryError = error;
   }
 
   const cleanupErrors = [];
-  if (temporaryIdentity !== undefined) {
+  if (
+    temporaryIdentity !== undefined &&
+    (primaryError === undefined || !publicationAccepted)
+  ) {
     try {
       await removeOwnedTemporary({
         capability: input.capability,
@@ -712,29 +750,40 @@ export async function activateManifestGeneration(options) {
   if (typeof input.appendValidated !== "function") {
     throw new TypeError("appendValidated must be a function");
   }
-  const fsApi = normalizeFsApi(input.fsApi);
+  const fsApi = getBoundFsApi(input);
   const faultHook = normalizeFaultHook(input.faultHook);
-  const generation = await readManifestGeneration({
+  const generationSnapshot = await readManifestGenerationSnapshot({
     capability: input.capability,
     manifestSha256,
     fsApi,
+    maxBytes: MAX_GENERATION_BYTES,
   });
+  const generation = generationSnapshot.manifest;
   if (generation.transactionId !== transactionId) {
     throw new Error("manifest generation transaction ID mismatch");
   }
   if (generation.state !== "VALIDATED") {
     throw new Error("only a VALIDATED manifest generation can be activated");
   }
-  const generationPath = deriveRunPath(input.capability, {
-    purpose: "manifest-generation",
-    id: manifestSha256,
-  });
+  const generationPath = generationSnapshot.path;
   await fsyncDirectory(dirname(generationPath), fsApi);
   await revalidateRunCapability(input.capability, {
     purpose: "manifest-generation",
     id: manifestSha256,
     boundary: "after-sync",
   });
+  const durableGeneration = await readManifestGenerationSnapshot({
+    capability: input.capability,
+    manifestSha256,
+    fsApi,
+    maxBytes: MAX_GENERATION_BYTES,
+  });
+  if (!sameIdentity(generationSnapshot.identity, durableGeneration.identity)) {
+    throw new Error("manifest generation identity changed across directory sync");
+  }
+  if (!generationSnapshot.bytes.equals(durableGeneration.bytes)) {
+    throw new Error("manifest generation bytes changed across directory sync");
+  }
   const ensureResult = await input.appendValidated(Object.freeze({ manifestSha256 }));
   parseEnsureValidatedResult(ensureResult, manifestSha256);
   await invokeFaultHook(faultHook, "after-ensure-validated");
@@ -823,6 +872,18 @@ export async function activateManifestGeneration(options) {
       purpose: "current-pointer",
       boundary: "after-sync",
     });
+    const durableCurrent = await readBoundedSnapshot(
+      currentPath,
+      fsApi,
+      pointerBytes.length,
+      "durable current pointer",
+    );
+    if (!sameIdentity(temporaryIdentity, durableCurrent.identity)) {
+      throw new Error("current pointer identity changed after root directory sync");
+    }
+    if (!durableCurrent.bytes.equals(pointerBytes)) {
+      throw new Error("current pointer bytes changed after root directory sync");
+    }
   } catch (error) {
     primaryError = error;
   }
@@ -858,7 +919,7 @@ export async function readCurrentManifestPointer(options) {
     ["capability"],
     "current pointer read options",
   );
-  const fsApi = normalizeFsApi(input.fsApi);
+  const fsApi = getBoundFsApi(input);
   const maxBytes = Math.min(
     assertMaxBytes(
       input.maxBytes === undefined ? 4096 : input.maxBytes,
@@ -886,7 +947,7 @@ export async function readManifestGeneration(options) {
     "manifest generation read options",
   );
   const manifestSha256 = assertSha256(input.manifestSha256, "manifest generation SHA-256");
-  const fsApi = normalizeFsApi(input.fsApi);
+  const fsApi = getBoundFsApi(input);
   const maxBytes = Math.min(
     assertMaxBytes(
       input.maxBytes === undefined ? MAX_GENERATION_BYTES : input.maxBytes,
@@ -894,18 +955,10 @@ export async function readManifestGeneration(options) {
     ),
     MAX_GENERATION_BYTES,
   );
-  const path = deriveRunPath(input.capability, {
-    purpose: "manifest-generation",
-    id: manifestSha256,
-  });
-  const bytes = await readBoundedFile(path, fsApi, maxBytes, "manifest generation");
-  if (digestBytes(bytes) !== manifestSha256) {
-    throw new Error("manifest generation content digest does not match its filename");
-  }
-  const manifest = buildValidatedManifest(parseJson(bytes, "manifest generation"));
-  if (!bytes.equals(canonicalBytes(manifest))) {
-    throw new Error("manifest generation JSON is not canonical");
-  }
-  assertGenerationTransaction(path, manifest.transactionId);
-  return manifest;
+  return (await readManifestGenerationSnapshot({
+    capability: input.capability,
+    manifestSha256,
+    fsApi,
+    maxBytes,
+  })).manifest;
 }

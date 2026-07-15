@@ -91,7 +91,7 @@ type Outcome =
 
 const workerSource = `
 import { createHash } from "node:crypto";
-import { lstatSync, realpathSync } from "node:fs";
+import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { dirname, join } from "node:path";
 import * as manifestApi from ${JSON.stringify(manifestModuleUrl)};
@@ -132,7 +132,7 @@ await fsPromises.mkdir(manifestsRoot, { recursive: true, mode: 0o700 });
 await fsPromises.chmod(quarantineRoot, 0o700);
 await fsPromises.chmod(runRoot, 0o700);
 await fsPromises.chmod(manifestsRoot, 0o700);
-const baseFsApi = { ...fsPromises, lstatSync, realpathSync };
+const baseFsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
 const adapterEvents = [];
 const adapterState = {
   failLink: false,
@@ -141,6 +141,7 @@ const adapterState = {
   chmodBoundary: null,
   staleSwapPath: null,
   staleSwapLstats: 0,
+  durableSwap: null,
 };
 const fsApi = {
   ...baseFsApi,
@@ -160,6 +161,56 @@ const fsApi = {
       adapterEvents.push("pointer-temp-open");
     }
     const handle = await baseFsApi.open(path, flags, mode);
+    if (
+      flags === "r" &&
+      adapterState.durableSwap !== null &&
+      path === adapterState.durableSwap.directory &&
+      !adapterState.durableSwap.complete
+    ) {
+      return new Proxy(handle, {
+        get(target, property) {
+          if (property === "sync") return async () => {
+            await target.sync();
+            if (adapterState.durableSwap.complete) return;
+            adapterState.durableSwap.complete = true;
+            const original = await baseFsApi.readFile(adapterState.durableSwap.path);
+            await baseFsApi.rename(
+              adapterState.durableSwap.path,
+              adapterState.durableSwap.path + ".owned",
+            );
+            await baseFsApi.writeFile(
+              adapterState.durableSwap.path,
+              adapterState.durableSwap.foreign ? "foreign" : original,
+              { mode: 0o600 },
+            );
+            await baseFsApi.chmod(adapterState.durableSwap.path, 0o600);
+          };
+          const member = Reflect.get(target, property, target);
+          return typeof member === "function" ? member.bind(target) : member;
+        },
+      });
+    }
+    if (
+      request.operation === "reader-handle-mismatch" &&
+      path === join(realpathSync(quarantineRoot), "current")
+    ) {
+      return new Proxy(handle, {
+        get(target, property) {
+          if (property === "stat") return async () => {
+            const stat = await target.stat();
+            return new Proxy(stat, {
+              get(current, key) {
+                if (key === "ino") return Number(current.ino) + 1;
+                const member = Reflect.get(current, key, current);
+                return typeof member === "function" ? member.bind(current) : member;
+              },
+            });
+          };
+          const member = Reflect.get(target, property, target);
+          return typeof member === "function" ? member.bind(target) : member;
+        },
+      });
+    }
     const isSelectedTemporary =
       flags === "wx" &&
       ((adapterState.temporaryTarget === "generation" && path.includes("/manifests/.")) ||
@@ -902,6 +953,168 @@ const result = await (async () => {
         externalNames: (await fsPromises.readdir(external)).sort(),
       };
     }
+    if (request.operation === "adapter-contract") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const written = await manifestApi.writeManifestGeneration({
+        capability,
+        manifest: built,
+        fsApi,
+      });
+      await manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: written.manifestSha256,
+        appendValidated: async (payload) => appendedResult(payload),
+        fsApi,
+      });
+      let distinctIo = 0;
+      const distinctFs = Object.fromEntries(
+        Object.entries(baseFsApi).map(([name, implementation]) => [name, (...args) => {
+          distinctIo += 1;
+          return implementation(...args);
+        }]),
+      );
+      const calls = [
+        ["write", (fsValue, includeFs) => manifestApi.writeManifestGeneration({
+          capability,
+          manifest: built,
+          ...(includeFs ? { fsApi: fsValue } : {}),
+        })],
+        ["activate", (fsValue, includeFs) => manifestApi.activateManifestGeneration({
+          capability,
+          transactionId,
+          manifestSha256: written.manifestSha256,
+          appendValidated: async (payload) => appendedResult(payload),
+          ...(includeFs ? { fsApi: fsValue } : {}),
+        })],
+        ["pointer", (fsValue, includeFs) => manifestApi.readCurrentManifestPointer({
+          capability,
+          ...(includeFs ? { fsApi: fsValue } : {}),
+        })],
+        ["generation", (fsValue, includeFs) => manifestApi.readManifestGeneration({
+          capability,
+          manifestSha256: written.manifestSha256,
+          ...(includeFs ? { fsApi: fsValue } : {}),
+        })],
+      ];
+      const distinct = [];
+      const explicitUndefined = [];
+      for (const [name, call] of calls) {
+        distinct.push([name, await capture(() => call(distinctFs, true))]);
+        explicitUndefined.push([name, await capture(() => call(undefined, true))]);
+      }
+      const originalMethods = Object.fromEntries(
+        Object.keys(fsApi).map((name) => [name, fsApi[name]]),
+      );
+      for (const name of Object.keys(fsApi)) {
+        fsApi[name] = () => { throw new Error("mutated source method: " + name); };
+      }
+      const omitted = [];
+      try {
+        for (const [name, call] of calls) {
+          omitted.push([name, await capture(() => call(undefined, false))]);
+        }
+      } finally {
+        Object.assign(fsApi, originalMethods);
+      }
+      return { distinct, explicitUndefined, omitted, distinctIo };
+    }
+    if (request.operation === "generation-post-sync-swap") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const manifestBytes = Buffer.from(JSON.stringify(built) + "\\n");
+      const digest = createHash("sha256").update(manifestBytes).digest("hex");
+      const generationPath = deriveRunPath(capability, {
+        purpose: "manifest-generation",
+        id: digest,
+      });
+      adapterState.durableSwap = {
+        directory: dirname(generationPath),
+        path: generationPath,
+        foreign: false,
+        complete: false,
+      };
+      const outcome = await capture(() => manifestApi.writeManifestGeneration({
+        capability,
+        manifest: built,
+        fsApi,
+      }));
+      return {
+        outcome,
+        swapComplete: adapterState.durableSwap.complete,
+        ownedPresent: await fsPromises.access(generationPath + ".owned")
+          .then(() => true, () => false),
+        temporaryNames: (await fsPromises.readdir(manifestsRoot))
+          .filter((name) => name.startsWith(".")).sort(),
+      };
+    }
+    if (request.operation === "activation-generation-post-sync-swap") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const written = await manifestApi.writeManifestGeneration({
+        capability,
+        manifest: built,
+        fsApi,
+      });
+      const generationPath = deriveRunPath(capability, {
+        purpose: "manifest-generation",
+        id: written.manifestSha256,
+      });
+      adapterState.durableSwap = {
+        directory: dirname(generationPath),
+        path: generationPath,
+        foreign: false,
+        complete: false,
+      };
+      let appendCalls = 0;
+      const outcome = await capture(() => manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: written.manifestSha256,
+        appendValidated: async (payload) => {
+          appendCalls += 1;
+          return appendedResult(payload);
+        },
+        fsApi,
+      }));
+      return {
+        outcome,
+        appendCalls,
+        ownedPresent: await fsPromises.access(generationPath + ".owned")
+          .then(() => true, () => false),
+      };
+    }
+    if (request.operation === "pointer-post-sync-swap") {
+      const built = manifestApi.buildValidatedManifest(request.value);
+      const written = await manifestApi.writeManifestGeneration({
+        capability,
+        manifest: built,
+        fsApi,
+      });
+      const currentPath = deriveRunPath(capability, { purpose: "current-pointer" });
+      adapterState.durableSwap = {
+        directory: dirname(currentPath),
+        path: currentPath,
+        foreign: true,
+        complete: false,
+      };
+      let appendCalls = 0;
+      const outcome = await capture(() => manifestApi.activateManifestGeneration({
+        capability,
+        transactionId,
+        manifestSha256: written.manifestSha256,
+        appendValidated: async (payload) => {
+          appendCalls += 1;
+          return appendedResult(payload);
+        },
+        fsApi,
+      }));
+      return {
+        outcome,
+        appendCalls,
+        currentBytes: await fsPromises.readFile(currentPath, "utf8"),
+        ownedPresent: await fsPromises.access(currentPath + ".owned")
+          .then(() => true, () => false),
+      };
+    }
     if (request.operation === "reader-handle-mismatch") {
       const pointer = Buffer.from(JSON.stringify({
         schemaVersion: 1,
@@ -911,31 +1124,8 @@ const result = await (async () => {
       const path = deriveRunPath(capability, { purpose: "current-pointer" });
       await fsPromises.writeFile(path, pointer, { mode: 0o600 });
       await fsPromises.chmod(path, 0o600);
-      const mismatchFs = {
-        ...fsApi,
-        async open(openPath, flags) {
-          const handle = await fsApi.open(openPath, flags);
-          if (openPath !== path) return handle;
-          return new Proxy(handle, {
-            get(target, property) {
-              if (property === "stat") return async () => {
-                const stat = await target.stat();
-                return new Proxy(stat, {
-                  get(current, key) {
-                    if (key === "ino") return Number(current.ino) + 1;
-                    const member = Reflect.get(current, key, current);
-                    return typeof member === "function" ? member.bind(current) : member;
-                  },
-                });
-              };
-              const member = Reflect.get(target, property, target);
-              return typeof member === "function" ? member.bind(target) : member;
-            },
-          });
-        },
-      };
       return capture(() => manifestApi.readCurrentManifestPointer({
-        capability, fsApi: mismatchFs,
+        capability, fsApi,
       }));
     }
     throw new Error("unknown operation");
@@ -1095,6 +1285,60 @@ describe("immutable quarantine manifest generations", () => {
     ]);
     expect(result.names).toEqual([`${manifestSha256}.json`]);
     expect(result.rootNames).toEqual(["current", "tx-0001"]);
+  });
+
+  it("binds every capability API to the original frozen filesystem context", () => {
+    const result = invoke({ operation: "adapter-contract", value: validManifest });
+    for (const outcomes of [result.distinct, result.explicitUndefined]) {
+      expect(outcomes).toEqual([
+        ["write", { ok: false, error: expect.objectContaining({ name: "TypeError" }) }],
+        ["activate", { ok: false, error: expect.objectContaining({ name: "TypeError" }) }],
+        ["pointer", { ok: false, error: expect.objectContaining({ name: "TypeError" }) }],
+        ["generation", { ok: false, error: expect.objectContaining({ name: "TypeError" }) }],
+      ]);
+    }
+    expect(result.distinctIo).toBe(0);
+    expect(result.omitted).toEqual([
+      ["write", { ok: true, value: expect.objectContaining({ manifestSha256: expect.any(String) }) }],
+      ["activate", { ok: true, value: expect.objectContaining({ manifestSha256: expect.any(String) }) }],
+      ["pointer", { ok: true, value: expect.objectContaining({ manifestSha256: expect.any(String) }) }],
+      ["generation", { ok: true, value: validManifest }],
+    ]);
+  });
+
+  it("rejects a generation inode swap after directory sync and preserves its temporary evidence", () => {
+    const result = invoke({ operation: "generation-post-sync-swap", value: validManifest });
+    expect(result.swapComplete).toBe(true);
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/identity|changed/i) },
+    });
+    expect(result.ownedPresent).toBe(true);
+    expect(result.temporaryNames).toHaveLength(1);
+  });
+
+  it("revalidates the same generation inode across directory sync before VALIDATED append", () => {
+    const result = invoke({
+      operation: "activation-generation-post-sync-swap",
+      value: validManifest,
+    });
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/identity|changed/i) },
+    });
+    expect(result.appendCalls).toBe(0);
+    expect(result.ownedPresent).toBe(true);
+  });
+
+  it("rejects a foreign current replacement after root sync", () => {
+    const result = invoke({ operation: "pointer-post-sync-swap", value: validManifest });
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/identity|canonical|changed/i) },
+    });
+    expect(result.appendCalls).toBe(1);
+    expect(result.currentBytes).toBe("foreign");
+    expect(result.ownedPresent).toBe(true);
   });
 
   it.each([
