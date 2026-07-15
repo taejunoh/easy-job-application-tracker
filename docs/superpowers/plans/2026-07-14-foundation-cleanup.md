@@ -4,7 +4,7 @@
 
 **Goal:** Quarantine every numbered workspace copy without data loss, regenerate a deterministic local environment, route manual backups through the hardened coordinator, and prove real-Docker interruption cleanup.
 
-**Architecture:** A built-in-only Node CLI inventories a target Git checkout, copies source and generated content into an external quarantine, verifies hashes and tree inventories, and removes originals only after verification. Operations changes remain separate: a documentation contract replaces raw database-URL backup arguments, while a focused PostgreSQL 17 Docker test proves signal cleanup using the existing coordinator and CI service container.
+**Architecture:** A built-in-only Node CLI streams deterministic inventories and atomically moves source copies plus complete generated roots into an external quarantine on the same filesystem. A hash-chained, fsync-backed append-only journal is the recovery authority for apply, rollback, and restore; strict path/schema validation and derived payload paths prevent a modified manifest from escaping the approved roots. Operations changes remain separate: a documentation contract replaces raw database-URL backup arguments, while a focused PostgreSQL 17 Docker test proves signal cleanup using the existing coordinator and CI service container.
 
 **Tech Stack:** Node.js 22 ESM, Git CLI, Jest/ts-jest, PostgreSQL 17, Docker, GitHub Actions, Markdown operations contracts
 
@@ -12,206 +12,423 @@
 
 ## File map
 
-- Create `scripts/quarantine-numbered-copies-support.mjs`: inventory, hashing, copy-verify-remove, manifest, validation, and restore functions.
-- Create `scripts/quarantine-numbered-copies.mjs`: thin CLI with `inspect`, `apply`, `mark-validated`, and `restore` subcommands.
-- Create `__tests__/scripts/quarantine-numbered-copies.test.ts`: synthetic-repository safety tests.
+- Create `scripts/quarantine-path-policy.mjs`: closed schemas, normalized relative-path policy, resolve-under-root guards, fixed generated-root allowlist, entry-ID derivation, and same-device checks.
+- Create `scripts/quarantine-inventory.mjs`: bounded-memory file hashing and deterministic streaming JSONL inventories with digest/count/byte summaries.
+- Create `scripts/quarantine-journal.mjs`: mode-`0600` length-framed hash-chain append, fsync, replay, torn-tail handling, and lifecycle validation.
+- Create `scripts/quarantine-manifest.mjs`: closed manifest schema, atomic checksum/current-pointer publication, and four-day validation metadata.
+- Create `scripts/quarantine-transaction.mjs`: preflight, atomic apply moves, destination verification, crash reconciliation, explicit resume, and reverse-order rollback.
+- Create `scripts/quarantine-restore.mjs`: active-tree rollback moves, quarantined-payload restore, restore replay, and conflict preservation.
+- Replace `scripts/quarantine-numbered-copies-support.mjs` with a thin compatibility facade exporting the focused modules.
+- Create `scripts/quarantine-numbered-copies.mjs`: thin CLI with `inspect`, `apply`, `recover`, `mark-validated`, and `restore` subcommands.
+- Replace `__tests__/scripts/quarantine-numbered-copies.test.ts` with behavior-level apply, recovery, restore, and CLI tests.
+- Create `__tests__/scripts/quarantine-path-policy.test.ts`, `quarantine-inventory.test.ts`, and `quarantine-journal.test.ts` for focused security, RSS, and replay tests.
 - Modify `package.json`: expose `cleanup:quarantine` and `test:backup:docker`.
 - Modify `docs/operations/production-runbook.md` and its workflow contract test.
 - Create `__tests__/scripts/create-snapshot-backup.docker.integration.test.ts`: real PostgreSQL 17 Docker signal proof.
 - Modify `.github/workflows/ci.yml`, `__tests__/ci/workflow-contract.test.ts`, and `README.md`.
 
-### Task 1: Implement quarantine inventory and transactions
+### Task 1: Replace unsafe quarantine primitives with focused durable modules
 
 **Files:**
-- Create: `scripts/quarantine-numbered-copies-support.mjs`
-- Create: `__tests__/scripts/quarantine-numbered-copies.test.ts`
+- Create: `scripts/quarantine-path-policy.mjs`
+- Create: `scripts/quarantine-inventory.mjs`
+- Create: `scripts/quarantine-journal.mjs`
+- Create: `scripts/quarantine-manifest.mjs`
+- Create: `__tests__/scripts/quarantine-path-policy.test.ts`
+- Create: `__tests__/scripts/quarantine-inventory.test.ts`
+- Create: `__tests__/scripts/quarantine-journal.test.ts`
 
-- [ ] **Step 1: Write failing path and inventory tests**
+- [ ] **Step 1: Write closed-path-policy attack tests**
 
-Create a temporary Git repository in every test. Commit canonical files, then
-create one identical and one divergent copy. Import these exact interfaces:
+Import these exact interfaces:
 
 ```ts
 import {
+  assertPathUnderRoot,
+  assertSameDevice,
   canonicalPathForNumberedCopy,
-  inspectWorkspace,
-} from "../../scripts/quarantine-numbered-copies-support.mjs";
+  derivePayloadPath,
+  parseManifestEntry,
+} from "../../scripts/quarantine-path-policy.mjs";
 
-it.each([
-  ["src/server-env 2.ts", "src/server-env.ts"],
-  ["scripts/verify-invalid-startup 3.mjs", "scripts/verify-invalid-startup.mjs"],
-  ["src/version2.ts", null],
-  ["src/dir 2/file.ts", null],
-])("maps only final numbered filename suffixes", (input, expected) => {
-  expect(canonicalPathForNumberedCopy(input)).toBe(expected);
+it.each(["../victim", "/tmp/victim", "src/../victim", "src/\0victim", "src//victim"])(
+  "rejects unsafe manifest paths: %s",
+  (relativePath) => expect(() => parseManifestEntry(validEntry({ relativePath }))).toThrow(),
+);
+
+it("rejects unknown manifest fields", () => {
+  expect(() => parseManifestEntry({ ...validEntry(), attackerPath: "../victim" })).toThrow(
+    /unknown field/u,
+  );
 });
 
-it("classifies Git-visible copies without retaining file bodies", async () => {
-  const fixture = await createFixtureRepository();
-  const inventory = await inspectWorkspace({
-    repoRoot: fixture.root,
-    expectedBranch: "main",
-    expectedHead: fixture.head,
-    expectedCount: 2,
-  });
-  expect(inventory.summary).toEqual({ total: 2, identical: 1, divergent: 1 });
-  expect(JSON.stringify(inventory)).not.toContain("divergent unpublished body");
+it("derives destinations from validated IDs rather than stored paths", () => {
+  const entry = parseManifestEntry(validEntry({ id: "copy-0001" }));
+  expect(derivePayloadPath(runRoot, entry)).toBe(join(runRoot, "payload/source-copies/copy-0001"));
 });
 ```
 
-The fixture uses `git init --initial-branch=main`, local test-only user
-configuration, and never reads the real checkout.
+Also require final-component numbered suffix mapping, fixed generated roots
+`node_modules|.next`, root symlink rejection, inner symlinks as leaf entries,
+Unicode normalization rejection, resolve-under-root containment, quarantine
+outside the repository, device mismatch rejection, and `EXDEV` propagation.
+For a source-copy entry, require that the original path matches the numbered
+suffix and that its canonical path exactly equals the derived canonical path.
 
-- [ ] **Step 2: Verify RED and commit the regression tests**
+- [ ] **Step 2: Run the path suite to verify RED**
 
 ```bash
-npm test -- --runInBand __tests__/scripts/quarantine-numbered-copies.test.ts
-git add __tests__/scripts/quarantine-numbered-copies.test.ts
-git commit -m "test: specify workspace quarantine inventory"
+npm test -- --runInBand __tests__/scripts/quarantine-path-policy.test.ts
 ```
 
-Expected: test fails because the support module is missing, then the test-only
-commit succeeds.
+Expected: FAIL because `quarantine-path-policy.mjs` does not exist.
 
-- [ ] **Step 3: Implement deterministic read-only inventory**
+- [ ] **Step 3: Implement the minimal path and schema policy**
 
 Export:
 
 ```js
+export const GENERATED_ROOTS = Object.freeze(["node_modules", ".next"]);
 export function canonicalPathForNumberedCopy(relativePath) {}
-export async function inspectWorkspace(options) {}
+export function parseManifestEntry(value) {}
+export function assertPathUnderRoot(root, relativePath) {}
+export function derivePayloadPath(runRoot, entry) {}
+export async function assertSameDevice(repoRoot, quarantineRoot, fsApi) {}
 ```
 
-Use `/^(.*) ([2-9][0-9]*)(\.[^/]+)$/u` only on the final path component.
-Call Git through argument arrays, parse
-`git status --porcelain=v1 -z --untracked-files=all` NUL-safely, reject
-tracked/staged changes, and require invocation-supplied branch, HEAD, and copy
-count. Require the quarantine root to be outside the repository and require
-available space greater than the deterministic source/generated inventory size.
-Each record contains repository/HEAD metadata, timestamps, relative path,
-quarantine path, canonical path, mode, size, SHA-256,
-`identical|divergent`, and a historical canonical commit when verified.
-Divergent history matching compares the copy hash with
-`git show <commit>:<canonical>` for commits returned by
-`git log --all --format=%H -- <canonical>`.
+Use `/^(.*) ([2-9][0-9]*)(\.[^/]+)$/u` on the final component only. Require
+plain objects with exact key sets and NFC-normalized POSIX relative paths. Reject
+absolute, empty, `.`, `..`, NUL, backslash, duplicate separator, symlink-root,
+and resolved-escape inputs. Compare `lstat().dev`; translate neither a mismatch
+nor `EXDEV` into a copy operation.
 
-- [ ] **Step 4: Add failing transaction and rollback tests**
+- [ ] **Step 4: Verify path GREEN and commit**
 
-Extend the import with `quarantineWorkspace`, `markQuarantineValidated`, and
-`restoreQuarantine`, then require these behaviors:
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-path-policy.test.ts
+git add scripts/quarantine-path-policy.mjs __tests__/scripts/quarantine-path-policy.test.ts
+git commit -m "feat: enforce quarantine path policy"
+```
+
+- [ ] **Step 5: Write streaming inventory and RSS tests**
+
+Import `hashFileStream` and `writeInventoryJsonl`. Build a synthetic generated
+tree containing exactly 40,000 small files, two nested directories, and one leaf
+symlink; the inventory excludes its root and therefore contains 40,003 entries.
+Require deterministic JSONL and summary equality across two independent passes:
 
 ```ts
-it("copies, rehashes, and only then removes originals", async () => {
-  const fixture = await createFixtureRepository({ includeGeneratedTrees: true });
-  const result = await quarantineWorkspace({
-    repoRoot: fixture.root,
-    quarantineRoot: fixture.quarantineRoot,
-    expectedBranch: "main",
-    expectedHead: fixture.head,
-    expectedCount: 2,
-    now: new Date("2026-07-14T12:00:00.000Z"),
-  });
-  expect(result.manifest.status).toBe("quarantined");
-  expect(await pathExists(join(fixture.root, "src/example 2.ts"))).toBe(false);
-  expect(await pathExists(join(fixture.root, "node_modules"))).toBe(false);
-  expect(await pathExists(join(fixture.root, ".next"))).toBe(false);
-  expect((await stat(result.runDirectory)).mode & 0o777).toBe(0o700);
-  expect((await stat(result.manifestPath)).mode & 0o777).toBe(0o600);
+expect(second.summary).toEqual(first.summary);
+expect(second.summary).toMatchObject({ entries: 40003 });
+expect(readFileSync(second.path, "utf8").split("\n")[0]).toContain('"type":"directory"');
+```
+
+Spawn the inventory worker with `node --expose-gc`, capture peak RSS from its
+JSON summary, and require `peakRssBytes < 160 * 1024 * 1024`. Monkey-patch or
+inject payload `readFile` to throw, proving regular-file bodies are consumed via
+`createReadStream`. Require bytewise path order, mode/type/size/hash/link-target
+coverage, no symlink traversal, mode `0600`, and a manifest-sized summary of
+only `{ sha256, entries, bytes }`.
+
+- [ ] **Step 6: Verify inventory RED, implement streaming inventory, and verify GREEN**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-inventory.test.ts
+```
+
+Expected first result: FAIL because `quarantine-inventory.mjs` is missing.
+Implement:
+
+```js
+export async function hashFileStream(absolutePath, options = {}) {}
+export async function writeInventoryJsonl({ root, outputPath, fsApi }) {}
+export async function compareInventorySummary(expected, observed) {}
+export async function fsyncTree(root, fsApi) {}
+```
+
+Use `createReadStream`, incremental SHA-256, bounded directory batches, sorted
+UTF-8 path buffers, backpressure-aware JSONL writes, `FileHandle.sync()`, and
+`lstat`/`readlink` without following symlinks. Then run the same Jest command and
+require PASS plus RSS below the bound.
+
+- [ ] **Step 7: Commit streaming inventory**
+
+```bash
+git add scripts/quarantine-inventory.mjs __tests__/scripts/quarantine-inventory.test.ts
+git commit -m "feat: stream quarantine inventories"
+```
+
+- [ ] **Step 8: Write journal framing, replay, and crash-boundary tests**
+
+Import:
+
+```ts
+import {
+  appendJournalRecord,
+  replayJournal,
+  validateTransition,
+} from "../../scripts/quarantine-journal.mjs";
+```
+
+Test the complete state graph and a table of interruption points after file
+create, frame append, frame fsync, payload rename, payload fsync, source-parent
+fsync, destination-parent fsync, verification, and `MOVED` append. A torn final
+frame must replay to the preceding record; a malformed middle frame, changed
+payload, unknown key, sequence gap, hash mismatch, or illegal transition must
+fail closed. Assert the journal is mode `0600` and every successful append calls
+both file `sync()` and parent-directory sync before resolving.
+
+- [ ] **Step 9: Verify journal RED, implement durable replay, and verify GREEN**
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-journal.test.ts
+```
+
+Expected first result: FAIL because `quarantine-journal.mjs` is missing.
+Implement length-prefixed canonical JSON frames whose envelope is exactly:
+
+```ts
+type JournalFrame = {
+  sequence: number;
+  previousHash: string;
+  event: string;
+  payload: Record<string, unknown>;
+  recordHash: string;
+};
+```
+
+Hash the canonical envelope without `recordHash`, append one complete frame,
+`sync()` the handle, and fsync its directory. Replay ignores only an incomplete
+final length/body pair and validates every complete frame and lifecycle edge.
+Run the same Jest command and require PASS.
+
+- [ ] **Step 10: Implement the small manifest publisher with RED/GREEN tests**
+
+Add manifest tests to `quarantine-journal.test.ts` that reject unknown fields and
+path-bearing current pointers, verify atomic temporary-file replacement, verify
+file/directory fsync ordering, and require:
+
+```ts
+expect(marked).toMatchObject({
+  retentionDays: 4,
+  deletionRequiresConfirmation: true,
+  deleteAfter: "2026-07-18T12:00:00.000Z",
 });
 ```
 
-Also test branch mismatch, HEAD mismatch, count mismatch, tracked change, staged
-change, a deliberately corrupted destination, checksum mismatch, symlink
-handling, validation before regeneration, and restore. Every precondition or
-verification failure must leave the corresponding original present. Include
-explicit failures for a quarantine root inside the repository and insufficient
-available space through an injected `statfs` result.
+Run the suite to see missing exports, then create
+`scripts/quarantine-manifest.mjs` exporting `readManifest`, `publishManifest`,
+and `markQuarantineValidated`. The current pointer contains only a validated
+transaction ID, never a path. Rerun and require PASS.
 
-- [ ] **Step 5: Implement copy-verify-remove, manifest, validation, and restore**
-
-Use `lstat`, `readlink`, and built-in filesystem APIs. Recursively inventory
-sorted entries as `{ path, type, mode, size, sha256, linkTarget }`. Create the
-run directory with mode `0700` and manifest/diff files with `0600`.
-Copy source files and complete `node_modules`/`.next` trees, compare source and
-destination inventories, and only then remove originals. Persist
-`status: copying` before transfer and atomically replace it with
-`status: quarantined`; write `manifest.sha256`.
-Write one mode-`0600` unified diff per divergent copy under
-`divergent-diffs/`; never embed diff or file bodies in the manifest or CLI
-output.
-
-`markQuarantineValidated` verifies the checksum and clean regenerated trees,
-then writes `validatedAt`, `retentionDays: 4`, `deleteAfter` exactly four days
-later, and `deletionRequiresConfirmation: true`.
-`restoreQuarantine` first archives regenerated trees under
-`rollback/regenerated-before-restore/<UTC timestamp>/`, verifies them, and
-restores originals with the same copy-verify-remove transaction.
-
-Never use shell interpolation, `eval`, raw `rm -rf`, or rename-only transfer.
-
-- [ ] **Step 6: Verify GREEN and commit**
+- [ ] **Step 11: Commit journal and manifest primitives**
 
 ```bash
-npm test -- --runInBand __tests__/scripts/quarantine-numbered-copies.test.ts
 git diff --check
-git add scripts/quarantine-numbered-copies-support.mjs __tests__/scripts/quarantine-numbered-copies.test.ts
-git commit -m "feat: add verified workspace quarantine transaction"
+git add scripts/quarantine-journal.mjs scripts/quarantine-manifest.mjs __tests__/scripts/quarantine-journal.test.ts
+git commit -m "feat: add durable quarantine journal"
 ```
 
-### Task 2: Add the CLI and perform the approved quarantine
+### Task 2: Replace transaction orchestration, restore, and CLI; then quarantine
 
 **Files:**
+- Create: `scripts/quarantine-transaction.mjs`
+- Create: `scripts/quarantine-restore.mjs`
+- Replace: `scripts/quarantine-numbered-copies-support.mjs`
 - Create: `scripts/quarantine-numbered-copies.mjs`
+- Replace: `__tests__/scripts/quarantine-numbered-copies.test.ts`
 - Modify: `package.json`
 - Operate on: `/Users/taejunoh/Desktop/LFG/easy-job-application-tracker`
 
-- [ ] **Step 1: Add failing spawned-CLI tests**
+- [ ] **Step 1: Rewrite behavior tests for preflight and atomic apply**
 
-Against temporary repositories only, assert:
+Each test creates and commits its own temporary Git repository. Import
+`inspectWorkspace` and `quarantineWorkspace` from the support facade. Require
+branch, HEAD, count, clean-index, writer-attestation, two-stable-pass,
+outside-repository, non-symlink-root, same-device, and absent-destination gates.
+The happy path includes two source copies plus `node_modules` and `.next`:
 
 ```ts
-expect(runCli(["inspect", ...validArgs])).toMatchObject({ code: 0, stderr: "" });
-expect(runCli(["apply", ...validArgs])).toMatchObject({ code: 0, stderr: "" });
-expect(runCli(["mark-validated", "--manifest", manifestPath]))
-  .toMatchObject({ code: 0, stderr: "" });
-expect(runCli(["restore", "--manifest", manifestPath]))
-  .toMatchObject({ code: 0, stderr: "" });
+const result = await quarantineWorkspace({
+  repoRoot: fixture.root,
+  quarantineRoot: fixture.quarantineRoot,
+  expectedBranch: "main",
+  expectedHead: fixture.head,
+  expectedCount: 2,
+  writersStopped: true,
+  now: new Date("2026-07-14T12:00:00.000Z"),
+});
+expect(result.status).toBe("QUARANTINED");
+expect(result.movedEntries).toBe(4);
+expect(await pathExists(join(fixture.root, "src/example 2.ts"))).toBe(false);
+expect(await pathExists(join(fixture.root, "node_modules"))).toBe(false);
+expect(await pathExists(join(fixture.root, ".next"))).toBe(false);
 ```
 
-The fixture recreates clean `node_modules` and `.next` directories after
-`apply` and before `mark-validated`; `restore` then proves the regenerated
-trees are archived before the originals return.
+Inject `rename` throwing `EXDEV` and require a fatal result, no copy call, no
+source removal, and durable recovery state.
 
-Missing commands, relative roots, expectation mismatches, and premature
-validation exit nonzero without printing file bodies.
-
-- [ ] **Step 2: Verify RED, implement CLI, and add package script**
-
-The only supported forms are:
-
-```text
-npm run cleanup:quarantine -- inspect --repo-root <abs> --quarantine-root <abs> --expected-branch <name> --expected-head <sha> --expected-count <n>
-npm run cleanup:quarantine -- apply --repo-root <abs> --quarantine-root <abs> --expected-branch <name> --expected-head <sha> --expected-count <n>
-npm run cleanup:quarantine -- mark-validated --manifest <abs>
-npm run cleanup:quarantine -- restore --manifest <abs>
-```
-
-Add `"cleanup:quarantine": "node scripts/quarantine-numbered-copies.mjs"`.
-Output JSON summaries only: counts, status, run directory, manifest path,
-validation time, and deletion deadline.
-
-- [ ] **Step 3: Verify GREEN and commit**
+- [ ] **Step 2: Run apply tests to verify RED**
 
 ```bash
 npm test -- --runInBand __tests__/scripts/quarantine-numbered-copies.test.ts
-git diff --check
-git add scripts/quarantine-numbered-copies.mjs package.json package-lock.json __tests__/scripts/quarantine-numbered-copies.test.ts
-git commit -m "feat: add workspace quarantine CLI"
 ```
 
-- [ ] **Step 4: Inspect the original checkout without mutation**
+Expected: FAIL because the old facade does not implement the approved atomic
+move contract and the focused transaction module is missing.
 
-Run from the feature worktree after the original checkout is back on `main`:
+- [ ] **Step 3: Implement inspect and atomic apply minimally**
+
+Create `scripts/quarantine-transaction.mjs` exporting:
+
+```js
+export async function inspectWorkspace(options) {}
+export async function quarantineWorkspace(options) {}
+export async function recoverQuarantine({ runDirectory, action, writersStopped, fsApi }) {}
+```
+
+Discovery uses `git status --porcelain=v1 -z --untracked-files=all`, argument
+arrays, and two identical NUL-safe passes. `quarantineWorkspace` writes durable
+`PREPARED`, then for every entry performs `MOVE_INTENT -> recheck -> rename ->
+payload fsync -> destination-parent fsync -> source-parent fsync -> streaming
+destination inventory -> MOVED`. Persisting the destination directory first
+avoids a deliberate neither-name durability window. After all entries, perform
+two independent destination passes, assert all sources absent and no numbered
+residue, then append `QUARANTINED` and publish the manifest.
+
+- [ ] **Step 4: Add replay, mutation, and concurrency RED tests**
+
+Parameterize a subprocess fault hook after every durable boundary and terminate
+the worker with `SIGKILL`. For each run, invoke explicit recovery and assert the
+filesystem/journal matrix:
+
+```ts
+it.each(["resume", "rollback"])("recovers every crash boundary via %s", async (action) => {
+  const recovered = await recoverKilledFixture({ action });
+  expect(recovered.lostPaths).toEqual([]);
+  expect(recovered.overwrittenPaths).toEqual([]);
+  expect(["QUARANTINED", "ROLLED_BACK", "INCOMPLETE_CONFLICT"]).toContain(recovered.status);
+});
+```
+
+Separately recreate a source after its move, mutate only the moved destination,
+mutate both sides, and remove both sides. Require the approved reconciliation
+matrix, reverse-order rollback, preservation under `conflicts/`, and refusal of
+new apply/restore while a journal is nonterminal.
+
+- [ ] **Step 5: Implement explicit resume and rollback, then verify GREEN**
+
+Replay the journal before any filesystem action. Reconcile source/destination
+existence and summaries exactly as the design specifies. Resume only verified
+moves; rollback in reverse durable order. Never delete or overwrite a recreated
+source. Use `INCOMPLETE_CONFLICT` for preserved two-sided evidence and fatal-stop
+when both sides are absent. Run:
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-numbered-copies.test.ts
+```
+
+Expected: all apply, crash, mutation, concurrency, and `EXDEV` cases PASS.
+
+- [ ] **Step 6: Commit atomic transaction replacement**
+
+```bash
+git diff --check
+git add scripts/quarantine-transaction.mjs __tests__/scripts/quarantine-numbered-copies.test.ts
+git commit -m "feat: replace quarantine with atomic journaled moves"
+```
+
+- [ ] **Step 7: Add restore crash-matrix RED tests**
+
+After a successful apply, create regenerated `node_modules` and `.next`, then
+terminate restore after each journal append, active-tree rename, payload fsync,
+destination-parent fsync, source-parent fsync, and original-tree rename. Require
+that explicit recovery leaves
+every tree in exactly one durable location. Test source-copy recreation and
+generated-root conflicts without overwrites. On success require active originals
+restored, regenerated trees under the derived rollback path, quarantine payload
+consumed, and journal state `RESTORED`.
+
+- [ ] **Step 8: Implement restore atomic moves and verify GREEN**
+
+Create `scripts/quarantine-restore.mjs` exporting:
+
+```js
+export async function restoreQuarantine({ runDirectory, writersStopped, fsApi }) {}
+export async function recoverRestore({ runDirectory, action, writersStopped, fsApi }) {}
+```
+
+Append `RESTORE_PREPARED`; stream-inventory the active generated tree; atomically
+move it to `rollback/regenerated-before-restore/<restore-id>`; fsync and journal
+that move; then atomically move the original payload into the active location.
+Never unlink an active tree. Reuse journal replay and the conflict matrix. Run
+the behavior suite and require all restore crash cases PASS.
+
+- [ ] **Step 9: Replace the facade and add spawned-CLI RED tests**
+
+Make `quarantine-numbered-copies-support.mjs` export only the approved public
+functions from the six focused modules. Test these exact CLI forms:
+
+```text
+npm run cleanup:quarantine -- inspect --repo-root <abs> --quarantine-root <abs> --expected-branch <name> --expected-head <sha> --expected-count <n>
+npm run cleanup:quarantine -- apply --repo-root <abs> --quarantine-root <abs> --expected-branch <name> --expected-head <sha> --expected-count <n> --writers-stopped
+npm run cleanup:quarantine -- recover --run-directory <abs> --action resume|rollback --writers-stopped
+npm run cleanup:quarantine -- mark-validated --run-directory <abs>
+npm run cleanup:quarantine -- restore --run-directory <abs> --writers-stopped
+```
+
+Require missing attestation, relative roots, unknown flags, unknown commands,
+nonterminal conflicts, and path-bearing pointer attacks to exit nonzero without
+printing file bodies. Output only counts, state, run-directory identifier,
+validation time, and deletion deadline.
+
+- [ ] **Step 10: Implement the CLI and package script, then verify GREEN**
+
+Create the thin argument parser in `scripts/quarantine-numbered-copies.mjs` and
+add:
+
+```json
+"cleanup:quarantine": "node scripts/quarantine-numbered-copies.mjs"
+```
+
+Run:
+
+```bash
+npm test -- --runInBand __tests__/scripts/quarantine-path-policy.test.ts __tests__/scripts/quarantine-inventory.test.ts __tests__/scripts/quarantine-journal.test.ts __tests__/scripts/quarantine-numbered-copies.test.ts
+git diff --check
+```
+
+Expected: all focused suites PASS and the diff check is silent.
+
+- [ ] **Step 11: Commit restore, facade, and CLI**
+
+```bash
+git add scripts/quarantine-restore.mjs scripts/quarantine-numbered-copies-support.mjs scripts/quarantine-numbered-copies.mjs package.json package-lock.json __tests__/scripts/quarantine-numbered-copies.test.ts
+git commit -m "feat: add recoverable quarantine restore CLI"
+```
+
+- [ ] **Step 12: Obtain independent security and code-quality review**
+
+Give reviewers the design, commits from Tasks 1-2, and the six required test
+matrices: path attacks, journal replay/SIGKILL, concurrency mutation, same-device
+and `EXDEV`, restore interruption, and RSS. Do not operate on the original
+checkout until both reviewers report no critical or important findings and the
+focused tests plus full Jest pass.
+
+- [ ] **Step 13: Replace the obsolete commit history only after review**
+
+Do not reset or rebase while developing the replacement. After the reviewed
+implementation is green, create a safety tag or backup branch, then use an
+interactive rebase to rewrite `848e440` as the new behavior-test history and
+drop or squash-replace the unsafe implementation commits `30f16a2`, `a087008`,
+`abc82a5`, `7375de5`, and `2c27ecc`. Preserve the original design/plan commits
+and this amendment. Re-run every focused suite, full Jest, and `git diff --check`
+against the rewritten branch before merge.
+
+- [ ] **Step 14: Inspect the original checkout without mutation**
+
+Stop all writers first. Run from the feature worktree while the original
+checkout remains on `main`:
 
 ```bash
 TARGET=/Users/taejunoh/Desktop/LFG/easy-job-application-tracker
@@ -222,17 +439,19 @@ node scripts/quarantine-numbered-copies.mjs inspect \
   --expected-branch main --expected-head "$EXPECTED_HEAD" --expected-count 65
 ```
 
-Require exactly 65 total, 61 identical, and 4 divergent. Stop if any value,
-branch, or HEAD differs.
+Require exactly 65 total, 61 identical, and 4 divergent; require repository and
+quarantine `dev` values to match. Stop if any count, branch, HEAD, quiescence, or
+device gate differs.
 
-- [ ] **Step 5: Apply and verify the external quarantine**
+- [ ] **Step 15: Apply and verify the external quarantine**
 
-Run `apply` with the identical arguments and same `EXPECTED_HEAD`. Record the
-returned manifest path privately. Verify manifest checksum and mode `0600`,
-run-directory mode `0700`, `status: quarantined`, and four divergent
-classifications without printing diff contents.
+Run `apply` with the same arguments, same `EXPECTED_HEAD`, and
+`--writers-stopped`. Record the returned run directory privately. Replay the
+journal, verify modes `0700`/`0600`, require state `QUARANTINED`, two matching
+post-move inventory passes, absent sources, and four divergent classifications
+without printing any diff contents.
 
-- [ ] **Step 6: Regenerate and validate the original checkout**
+- [ ] **Step 16: Regenerate and validate the original checkout**
 
 ```bash
 npm ci
@@ -247,14 +466,15 @@ npm run build
 
 Run in `$TARGET`. Require no numbered entries in source, regenerated
 `node_modules`, or `.next`, and require clean Git status. On failure preserve
-the quarantine and report before considering `restore`.
+the quarantine, stop, and report the exact gate before considering explicit
+`recover --rollback` or `restore`.
 
-- [ ] **Step 7: Mark validation and establish retention**
+- [ ] **Step 17: Mark validation and establish retention**
 
-Run `mark-validated --manifest "$MANIFEST_PATH"`. Require four-day UTC
-`deleteAfter` and `deletionRequiresConfirmation: true`. Create a reminder for
-that timestamp to review the manifest and request final deletion confirmation;
-never schedule automatic deletion.
+Run `mark-validated --run-directory "$RUN_DIRECTORY"`. Require a replayable
+`VALIDATED` state, `deleteAfter` exactly four full UTC days after `validatedAt`,
+and `deletionRequiresConfirmation: true`. Create a reminder for final review and
+explicit deletion confirmation; never schedule or perform automatic deletion.
 
 ### Task 3: Route manual backups through the coordinator
 
@@ -395,7 +615,7 @@ comes from branch CI using its PostgreSQL 17 service container.
 - [ ] **Step 1: Run focused and full local gates**
 
 ```bash
-npm test -- --runInBand __tests__/scripts/quarantine-numbered-copies.test.ts __tests__/ci/production-backup-workflow-contract.test.ts __tests__/ci/workflow-contract.test.ts __tests__/scripts/create-snapshot-backup.integration.test.ts
+npm test -- --runInBand __tests__/scripts/quarantine-path-policy.test.ts __tests__/scripts/quarantine-inventory.test.ts __tests__/scripts/quarantine-journal.test.ts __tests__/scripts/quarantine-numbered-copies.test.ts __tests__/ci/production-backup-workflow-contract.test.ts __tests__/ci/workflow-contract.test.ts __tests__/scripts/create-snapshot-backup.integration.test.ts
 npm ls --depth=0
 npm run check:audit
 npm run lint -- --max-warnings=0

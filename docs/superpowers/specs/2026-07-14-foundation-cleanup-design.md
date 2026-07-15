@@ -40,9 +40,24 @@ The design targets `main` at merge commit `78c403f`.
 
 ## Chosen approach
 
-Use evidence-first quarantine, clean regeneration, and test-first operations
-hardening. This is safer than selective deletion and less disruptive than
-replacing the whole active checkout.
+Use a same-filesystem atomic-move quarantine backed by a durable append-only
+journal, followed by clean regeneration and test-first operations hardening.
+This replaces the earlier copy-verify-remove design. Atomic `rename` preserves
+the original inode and avoids copying roughly 894 MB of generated content, while
+the journal makes every interrupted transition observable and recoverable.
+
+The tool has two non-negotiable operating gates:
+
+1. all development servers, builds, package installs, editors or other processes
+   that can write `node_modules`, `.next`, or numbered-copy paths are stopped;
+2. the repository and external quarantine root are on the same filesystem
+   device according to `lstat().dev`.
+
+The operator explicitly attests writer quiescence on `apply`, recovery, and
+restore. Stable preflight passes can detect some concurrent changes but cannot
+make an open writer safe. A device mismatch or `EXDEV` is fatal; there is no
+copy fallback. A future cross-device workflow requires a separately reviewed
+durable streaming-copy design.
 
 ### Quarantine layout
 
@@ -50,61 +65,138 @@ Create one external directory per cleanup run:
 
 ```text
 ~/Library/Application Support/easy-job-application-tracker/quarantine/
+  current
   <UTC timestamp>/
+    journal.log
     manifest.json
     manifest.sha256
+    inventories/
+      pre/<entry-id>.jsonl
+      moved-pass-1/<entry-id>.jsonl
+      moved-pass-2/<entry-id>.jsonl
     divergent-diffs/
-    source-copies/
-    generated/
-      node_modules/
-      .next/
+    payload/
+      source-copies/<entry-id>
+      generated/node_modules/
+      generated/.next/
+    rollback/
+      regenerated-before-restore/<restore-id>/
+    conflicts/
 ```
 
-The run directory must have mode `0700`. Manifest and diff files must have mode
-`0600`. `source-copies/` preserves every path relative to the repository root.
+The quarantine root and run directory must have mode `0700`. The ID-only
+`current` pointer, journal, manifest, checksum, inventory, and diff files must
+have mode `0600`. Quarantine payload paths are
+derived only from validated entry IDs and the fixed generated-root allowlist;
+untrusted manifest or journal path strings never become filesystem destinations.
 No quarantined content lives under the repository, so Git, Jest, ESLint, and
 Next.js cannot rediscover it.
 
-The manifest records:
+The small manifest records:
 
 - repository root and exact HEAD commit;
-- creation and validation timestamps in UTC;
-- original relative path and quarantine relative path;
+- transaction ID, creation and validation timestamps in UTC;
+- each validated original relative path, entry ID, and fixed payload kind;
 - canonical relative path when one exists;
-- byte length and SHA-256 of both copy and canonical file;
+- byte length and SHA-256 of both copy and canonical file for source copies;
 - classification as `identical` or `divergent`;
 - Git-history match when verified;
 - file mode;
-- generated-tree directory hashes or deterministic inventories;
+- per-entry inventory digest, entry count, and byte count rather than embedded
+  directory entries;
 - retention deadline and deletion status.
 
 Unified diffs and verified Git-history matches for all four divergent files are
 stored in `divergent-diffs/`. No divergent content is automatically merged into
 canonical files.
 
-### Quarantine transaction
+Manifest, journal, inventory, and CLI inputs use closed schemas: unknown keys,
+absolute paths, empty or `.`/`..` components, NUL bytes, non-normalized Unicode
+or path encodings, and paths outside the repository are rejected. The only
+generated roots are exactly `node_modules` and `.next`; every source-copy path
+must match the numbered-copy suffix rule and its stored canonical path must equal
+the value derived from that rule. Repository and generated-root symlinks are
+rejected. Inner symlinks are inventoried as leaf entries and are never followed.
+Every resolved path passes a resolve-under-root guard before any read, rename,
+restore, or deletion operation.
 
-The cleanup tool performs these pre-move gates before moving anything:
+### Quarantine transaction and durable journal
 
-1. require the repository root plus the operator-supplied expected branch and
-   expected HEAD commit for that invocation; neither value is hardcoded;
-2. require no tracked or staged changes;
-3. inventory the numbered copies with NUL-safe path handling;
-4. classify all 65 copies and write the manifest and divergent diffs;
-5. verify sufficient disk space and quarantine permissions.
+The journal is the authoritative transaction record. It is a mode-`0600`,
+append-only sequence of length-framed canonical JSON records. Every record has a
+monotonic sequence, previous-record hash, payload, and record hash. Each append
+is flushed and `fsync`ed before the corresponding destructive transition; new
+files and rename operations also `fsync` their containing directories. A torn
+final frame is ignored during replay. Any malformed non-final frame, sequence
+gap, hash-chain break, unknown field, or illegal state transition is fatal.
 
-After the archive is written, every quarantined file is re-hashed and compared
-with the pre-move manifest. Source and generated content use copy, verification,
-and only then unlink/removal so the safety rule also holds when the repository
-and quarantine are on different filesystems. Symlink targets, file modes,
-relative paths, sizes, and file hashes participate in a deterministic generated
-tree inventory. Only verified files are removed from their original paths. A
-partial failure stops the transaction and leaves the manifest marked
-incomplete; it never deletes an unverified source.
+The durable lifecycle is:
 
-The complete `node_modules` and `.next` directories are moved to
-`generated/`. Selectively removing numbered generated files is not allowed
-because it can leave polluted nested directories and an untrustworthy install.
+```text
+PREPARED -> MOVING -> VERIFYING -> QUARANTINED -> VALIDATED
+                 \-> RECOVERY_REQUIRED -> ROLLING_BACK -> ROLLED_BACK
+                 \-> INCOMPLETE_CONFLICT
+QUARANTINED|VALIDATED -> RESTORE_PREPARED -> RESTORING -> RESTORED
+```
+
+`INCOMPLETE_CONFLICT` is terminal until an operator resolves the preserved
+source and destination evidence. A new `apply` or `restore` is refused whenever
+the current transaction has a nonterminal journal. Recovery is explicit through
+`recover --resume` or `recover --rollback`; rollback is the safer documented
+default.
+
+Before moving anything, the tool:
+
+1. requires the invocation-supplied repository root, expected branch, expected
+   HEAD, expected numbered-copy count, and writer-quiescence attestation;
+2. requires no tracked or staged changes and two stable numbered-path discovery
+   passes;
+3. rejects symlink roots and verifies the external quarantine path is outside
+   the repository, mode-restricted, writable, and on the same device;
+4. streams deterministic pre-move inventories to JSONL, computes their SHA-256,
+   entry count, and byte count, and records only those summaries in the manifest;
+5. writes and `fsync`s the manifest, divergent diffs, initial inventories,
+   checksum, run directory, and durable `PREPARED` journal record.
+
+Inventory is always streaming. Regular-file hashes use `createReadStream`; tree
+entries are emitted in deterministic bytewise path order to mode-`0600` JSONL.
+No payload file or full generated-tree inventory is loaded into memory, and the
+manifest never embeds the tens of thousands of generated entries.
+
+For each source copy and each complete generated root, the tool:
+
+1. appends and `fsync`s a `MOVE_INTENT` containing the validated entry ID and
+   expected source inventory summary;
+2. rechecks source identity and the absence of the derived destination;
+3. atomically renames the source inode to the derived quarantine destination;
+4. recursively `fsync`s the moved payload, then the destination parent, then the
+   source parent; persisting the destination name before the source-name removal
+   ensures a crash can produce the old name or both names, but not a deliberate
+   neither-name durability window;
+5. streams and verifies the destination inventory;
+6. appends and `fsync`s `MOVED` with the observed summary.
+
+After all moves, two independent streaming destination-inventory passes must
+match the pre-move summaries. All original sources must remain absent and no
+unexpected numbered-path residue may exist. Only then does the transaction
+append `QUARANTINED` and publish the small manifest checksum/current pointer.
+Selective cleanup within `node_modules` or `.next` is forbidden.
+
+Crash replay reconciles every durable move intent against filesystem reality:
+
+- source present, destination absent: the move did not occur;
+- source absent, destination present: verify and fsync the moved payload, then
+  durably record the completed move;
+- source and destination both present: preserve both as concurrent recreation,
+  mark a conflict, and roll back only unrelated entries;
+- source and destination both absent: stop as fatal evidence loss;
+- destination summary differs while source is absent: move the mutated payload
+  back to its source during rollback;
+- destination summary differs while both exist: preserve both and mark a
+  conflict without overwriting either.
+
+Rollback runs entries in reverse durable-journal order. It never deletes or
+overwrites a recreated source to make room for quarantined content.
 
 ### Clean regeneration
 
@@ -174,13 +266,19 @@ well.
 
 ## Rollback
 
-- Source rollback restores quarantined files to their exact original relative
-  paths and modes. It never merges them into canonical files.
-- Generated rollback copies the regenerated directories into
-  `rollback/regenerated-before-restore/<UTC timestamp>/` inside the quarantine,
-  verifies that inventory, removes the regenerated originals, and restores the
-  quarantined `node_modules` and `.next` trees with the same copy-verify-remove
-  transaction.
+- Source rollback atomically moves quarantined files to their exact validated
+  original relative paths and modes in reverse journal order. It never merges
+  them into canonical files and never overwrites a concurrently recreated path.
+- Generated restore first appends `RESTORE_PREPARED`, inventories the active
+  regenerated tree, and atomically moves that tree into the derived
+  `rollback/regenerated-before-restore/<restore-id>/` path. It fsyncs and records
+  that move before atomically moving the quarantined original tree into the
+  active path. It never unlinks the active tree to make room.
+- Restore uses the same replay matrix and explicit recovery commands as apply.
+  A crash can therefore resume or reverse each atomic move without guessing.
+- A successful restore consumes the quarantined payload but retains the
+  manifest, inventories, checksum, and journal as its audit record. Regenerated
+  rollback content remains quarantined until explicit disposition.
 - Runbook and test changes use an ordinary Git revert.
 - If hash verification, installation, tests, build, or real-Docker assertions
   fail, stop with the quarantine intact and report the exact failing gate.
@@ -191,6 +289,17 @@ well.
   or production response bodies.
 - Use NUL-safe path enumeration and argument arrays; do not evaluate filenames
   as shell code.
+- Treat manifests, inventories, journal frames, current pointers, and restore
+  arguments as untrusted. Validate closed schemas and derive payload paths from
+  validated IDs; a checksum is corruption evidence, not authorization.
+- Require writer quiescence and same-device identity on apply, recovery, and
+  restore. `EXDEV` is fatal and never triggers a copy fallback.
+- Stream payload hashes and JSONL inventories with bounded memory. Never call
+  `readFile` on payload bodies or serialize a complete generated tree into one
+  JSON value.
+- Fsync payload data, append-only journal transitions, and both sides of every
+  rename before advancing state. For cross-directory moves, fsync the destination
+  parent before the source parent.
 - Do not read browser storage, local credential files, or production secrets as
   part of workspace cleanup.
 - A post-merge production-backup workflow dispatch may validate the changed
@@ -202,7 +311,7 @@ well.
 The subproject is complete when:
 
 1. all 65 source copies and both generated trees are recoverable from a
-   verified external quarantine;
+   same-device atomic-move quarantine whose journal replays cleanly;
 2. the active checkout contains no numbered copies and has a deterministic
    dependency tree;
 3. lint, typecheck, full tests, extension checks, build, and relevant backup
@@ -212,4 +321,7 @@ The subproject is complete when:
 5. actual Docker interruption evidence proves no remote dump or control-file
    residue, or the project stops for a separately approved runner redesign;
 6. the quarantine deadline is four days after validation and deletion still
-   requires final explicit confirmation.
+   requires final explicit confirmation;
+7. path/schema attack tests, crash-boundary replay, concurrent recreation and
+   mutation, same-device/`EXDEV`, restore interruption, and bounded-memory RSS
+   tests pass without overwriting or losing either side of a conflict.
