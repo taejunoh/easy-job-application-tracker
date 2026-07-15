@@ -11,13 +11,14 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const journalModuleUrl = pathToFileURL(
@@ -73,6 +74,18 @@ const wrappedFs = needsWrappedFs ? {
     });
   },
 } : undefined;
+const errorDetails = (error) => ({
+  name: error.name,
+  code: error.code ?? null,
+  message: error.message,
+  expectedSequence: error.expectedSequence ?? null,
+  expectedRecordHash: error.expectedRecordHash ?? null,
+});
+const listLockResidues = async () => {
+  const directory = dirname(request.journalPath);
+  const prefix = request.journalPath.split("/").at(-1) + ".lock.reclaim-";
+  return (await fsPromises.readdir(directory)).filter((name) => name.startsWith(prefix)).sort();
+};
 try {
   let result;
   if (request.operation === "append-many") {
@@ -195,6 +208,171 @@ try {
         return appended;
       },
     });
+  } else if (request.operation === "reclaim-race-boundary") {
+    const lockPath = request.journalPath + ".lock";
+    const intrudedPath = lockPath + ".intruded-" + request.boundary;
+    let ownershipChecks = 0;
+    let trackOwnership = false;
+    let replaced = false;
+    let destructiveSeamCalls = 0;
+    const replaceLockPath = async () => {
+      if (replaced) return;
+      replaced = true;
+      await fsPromises.rename(lockPath, intrudedPath);
+      await fsPromises.writeFile(lockPath, "attacker", { mode: 0o600 });
+    };
+    const raceFs = {
+      ...fsPromises,
+      lstat: async (path) => {
+        if (trackOwnership && path === lockPath) {
+          ownershipChecks += 1;
+          if (request.boundary === "before-last-precheck" && ownershipChecks === 2) {
+            await replaceLockPath();
+          }
+        }
+        return fsPromises.lstat(path);
+      },
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (path !== request.journalPath) return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === "write") {
+              return async (...args) => {
+                if (request.boundary === "after-precheck-before-write") {
+                  await replaceLockPath();
+                }
+                return target.write(...args);
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+    const before = await fsPromises.readFile(request.journalPath);
+    let caught = null;
+    try {
+      await journal.reclaimJournalLock({
+        journalPath: request.journalPath,
+        writersStopped: true,
+        fsApi: raceFs,
+        recovery: async ({ append }) => {
+          trackOwnership = true;
+          const record = await append({
+            event: request.record.event,
+            payload: request.record.payload,
+          });
+          if (request.seamSource) {
+            await fsPromises.rename(request.seamSource, request.seamDestination);
+          }
+          destructiveSeamCalls += 1;
+          return record;
+        },
+      });
+    } catch (error) {
+      caught = errorDetails(error);
+    }
+    const after = await fsPromises.readFile(request.journalPath);
+    result = {
+      caught,
+      destructiveSeamCalls,
+      rawBytesUnchanged: before.equals(after),
+      replayed: await journal.replayJournal(request.journalPath),
+      residues: await listLockResidues(),
+    };
+  } else if (request.operation === "reclaim-indeterminate-sync") {
+    let destructiveSeamCalls = 0;
+    let injected = false;
+    const syncFailureFs = {
+      ...fsPromises,
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (path !== request.journalPath) return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === "sync") {
+              return async () => {
+                const synced = await target.sync();
+                if (!injected) {
+                  injected = true;
+                  throw new Error("injected failure after journal sync");
+                }
+                return synced;
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+    let caught = null;
+    try {
+      await journal.reclaimJournalLock({
+        journalPath: request.journalPath,
+        writersStopped: true,
+        fsApi: syncFailureFs,
+        recovery: async ({ append }) => {
+          const record = await append({
+            event: request.record.event,
+            payload: request.record.payload,
+          });
+          if (request.seamSource) {
+            await fsPromises.rename(request.seamSource, request.seamDestination);
+          }
+          destructiveSeamCalls += 1;
+          return record;
+        },
+      });
+    } catch (error) {
+      caught = errorDetails(error);
+    }
+    result = {
+      caught,
+      destructiveSeamCalls,
+      replayed: await journal.replayJournal(request.journalPath),
+      lockExists: await fsPromises.lstat(request.journalPath + ".lock").then(() => true, () => false),
+      residues: await listLockResidues(),
+    };
+  } else if (request.operation === "reconcile-indeterminate") {
+    const before = await journal.replayJournal(request.journalPath);
+    const candidate = before.records.find((record) =>
+      record.sequence === request.expectedSequence &&
+      record.recordHash === request.expectedRecordHash
+    );
+    let candidateAppendCalls = 0;
+    const appended = await journal.reclaimJournalLock({
+      journalPath: request.journalPath,
+      writersStopped: true,
+      recovery: async ({ append }) => {
+        if (!candidate) {
+          candidateAppendCalls += 1;
+          const recoveredCandidate = await append({
+            event: request.candidateRecord.event,
+            payload: request.candidateRecord.payload,
+          });
+          if (
+            recoveredCandidate.sequence !== request.expectedSequence ||
+            recoveredCandidate.recordHash !== request.expectedRecordHash
+          ) {
+            throw new Error("recovered indeterminate candidate identity mismatch");
+          }
+        }
+        return append({
+          event: request.nextRecord.event,
+          payload: request.nextRecord.payload,
+        });
+      },
+    });
+    result = {
+      appended,
+      candidateAppendCalls,
+      replayed: await journal.replayJournal(request.journalPath),
+      residues: await listLockResidues(),
+      lockExists: await fsPromises.lstat(request.journalPath + ".lock").then(() => true, () => false),
+    };
   } else if (request.operation === "transition") {
     result = journal.validateTransition(request.state, request.event);
   }
@@ -292,6 +470,52 @@ await journal.appendJournalRecord({
   });
 }
 
+function killAppendAtJournalWrite(
+  journalPath: string,
+  record: (typeof happyRecords)[number],
+  writeKind: "partial" | "complete",
+) {
+  const source = `
+import * as journal from ${JSON.stringify(journalModuleUrl)};
+import * as fsPromises from "node:fs/promises";
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const request = JSON.parse(input);
+const fsApi = {
+  ...fsPromises,
+  open: async (path, flags, mode) => {
+    const handle = await fsPromises.open(path, flags, mode);
+    if (path !== request.journalPath) return handle;
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === "write") {
+          return async (buffer) => {
+            const written = request.writeKind === "partial"
+              ? buffer.subarray(0, Math.max(1, Math.floor(buffer.length / 2)))
+              : buffer;
+            await target.write(written);
+            process.kill(process.pid, "SIGKILL");
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  },
+};
+await journal.appendJournalRecord({
+  journalPath: request.journalPath,
+  event: request.record.event,
+  payload: request.record.payload,
+  fsApi,
+});
+`;
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    encoding: "utf8",
+    input: JSON.stringify({ journalPath, record, writeKind }),
+  });
+}
+
 function encodeJournalLock(ownerToken: string, pid: number, checksumOverride?: string) {
   const identity = { version: 1, ownerToken, pid };
   const checksum =
@@ -306,6 +530,11 @@ function frameLockPrefix(bodyLength: number, bodyPrefix = Buffer.alloc(0)) {
   const length = Buffer.alloc(4);
   length.writeUInt32BE(bodyLength);
   return Buffer.concat([length, bodyPrefix]);
+}
+
+function lockResidueNames(journalPath: string) {
+  const prefix = `${basename(journalPath)}.lock.reclaim-`;
+  return readdirSync(dirname(journalPath)).filter((name) => name.startsWith(prefix)).sort();
 }
 
 function syncPath(path: string) {
@@ -529,7 +758,7 @@ describe("durable quarantine journal", () => {
         });
         throw new Error("fault injection did not interrupt append");
       } catch (error) {
-        expect((error as Error).message).toMatch(/injected crash/u);
+        expect((error as Error).message).toMatch(/indeterminate/u);
         durabilityEvents = (error as Error & { durabilityEvents?: string[] }).durabilityEvents ?? [];
       }
       const replayed = replay(path);
@@ -889,7 +1118,7 @@ describe("durable quarantine journal", () => {
   });
 
   it.each(["missing", "replacement", "directory"])(
-    "rejects recovery append after the held lock path becomes %s",
+    "rejects recovery append when the lock path becomes %s before its precheck",
     (mutation) => {
       const path = join(fixture, `mutated-recovery-lock-${mutation}`, "journal.log");
       appendMany(path, happyRecords.slice(0, 1));
@@ -910,6 +1139,227 @@ describe("durable quarantine journal", () => {
       ).toThrow(/lock|ownership/u);
       expect(readFileSync(path)).toEqual(journalBefore);
       expect(replay(path).records).toHaveLength(1);
+    },
+  );
+
+  it("keeps a last-precheck ownership mismatch ordinary and leaves journal bytes unchanged", () => {
+    const path = join(fixture, "race-before-last-precheck", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    writeFileSync(
+      `${path}.lock`,
+      encodeJournalLock("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", process.pid),
+      { mode: 0o600 },
+    );
+
+    const result = invokeJournal({
+      operation: "reclaim-race-boundary",
+      journalPath: path,
+      boundary: "before-last-precheck",
+      record: happyRecords[1],
+    }).result;
+    expect(result.caught).toMatchObject({
+      name: "Error",
+      code: null,
+      expectedSequence: null,
+      expectedRecordHash: null,
+    });
+    expect(result.caught.name).not.toBe("IndeterminateJournalAppendError");
+    expect(result.rawBytesUnchanged).toBe(true);
+    expect(result.replayed.records).toHaveLength(1);
+    expect(result.destructiveSeamCalls).toBe(0);
+  });
+
+  it("reports a post-write ownership mismatch as an indeterminate candidate", () => {
+    const path = join(fixture, "race-after-last-precheck", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    const seamSource = join(dirname(path), "payload-source");
+    const seamDestination = join(dirname(path), "payload-destination");
+    writeFileSync(seamSource, "payload");
+    writeFileSync(
+      `${path}.lock`,
+      encodeJournalLock("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", process.pid),
+      { mode: 0o600 },
+    );
+
+    const result = invokeJournal({
+      operation: "reclaim-race-boundary",
+      journalPath: path,
+      boundary: "after-precheck-before-write",
+      record: happyRecords[1],
+      seamSource,
+      seamDestination,
+    }).result;
+    const candidates = result.replayed.records.filter(
+      (record: { event: string }) => record.event === "MOVING",
+    );
+    expect(result.caught).toEqual({
+      name: "IndeterminateJournalAppendError",
+      code: "ERR_INDETERMINATE_JOURNAL_APPEND",
+      message: expect.stringMatching(/indeterminate/u),
+      expectedSequence: 2,
+      expectedRecordHash: candidates[0].recordHash,
+    });
+    expect(result.rawBytesUnchanged).toBe(false);
+    expect(candidates).toHaveLength(1);
+    expect(result.destructiveSeamCalls).toBe(0);
+    expect(existsSync(seamSource)).toBe(true);
+    expect(existsSync(seamDestination)).toBe(false);
+    expect(result.residues).toHaveLength(1);
+  });
+
+  it("preserves locks and blocks the destructive seam for an indeterminate synced append", () => {
+    const path = join(fixture, "indeterminate-preserved", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    const seamSource = join(dirname(path), "payload-source");
+    const seamDestination = join(dirname(path), "payload-destination");
+    writeFileSync(seamSource, "payload");
+    writeFileSync(
+      `${path}.lock`,
+      encodeJournalLock("cccccccc-cccc-4ccc-8ccc-cccccccccccc", process.pid),
+      { mode: 0o600 },
+    );
+
+    const result = invokeJournal({
+      operation: "reclaim-indeterminate-sync",
+      journalPath: path,
+      record: happyRecords[1],
+      seamSource,
+      seamDestination,
+    }).result;
+    const candidate = result.replayed.records[1];
+    expect(result.caught).toEqual({
+      name: "IndeterminateJournalAppendError",
+      code: "ERR_INDETERMINATE_JOURNAL_APPEND",
+      message: expect.stringMatching(/indeterminate/u),
+      expectedSequence: 2,
+      expectedRecordHash: candidate.recordHash,
+    });
+    expect(candidate).toMatchObject({ sequence: 2, event: "MOVING" });
+    expect(result.destructiveSeamCalls).toBe(0);
+    expect(existsSync(seamSource)).toBe(true);
+    expect(existsSync(seamDestination)).toBe(false);
+    expect(result.lockExists).toBe(true);
+    expect(result.residues).toHaveLength(1);
+  });
+
+  it("reconciles an indeterminate candidate once and removes every validated residue", () => {
+    const path = join(fixture, "indeterminate-reconciled", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    writeFileSync(
+      `${path}.lock`,
+      encodeJournalLock("dddddddd-dddd-4ddd-8ddd-dddddddddddd", process.pid),
+      { mode: 0o600 },
+    );
+    const interrupted = invokeJournal({
+      operation: "reclaim-indeterminate-sync",
+      journalPath: path,
+      record: happyRecords[1],
+    }).result;
+    const candidate = interrupted.replayed.records[1];
+
+    const reconciled = invokeJournal({
+      operation: "reconcile-indeterminate",
+      journalPath: path,
+      expectedSequence: candidate.sequence,
+      expectedRecordHash: candidate.recordHash,
+      candidateRecord: happyRecords[1],
+      nextRecord: happyRecords[2],
+    }).result;
+    expect(reconciled.candidateAppendCalls).toBe(0);
+    expect(reconciled.appended).toMatchObject({ sequence: 3, event: "MOVE_INTENT" });
+    expect(reconciled.replayed.records.map((record: { event: string }) => record.event)).toEqual([
+      "PREPARED",
+      "MOVING",
+      "MOVE_INTENT",
+    ]);
+    expect(
+      reconciled.replayed.records.filter(
+        (record: { recordHash: string }) => record.recordHash === candidate.recordHash,
+      ),
+    ).toHaveLength(1);
+    expect(reconciled.lockExists).toBe(false);
+    expect(reconciled.residues).toEqual([]);
+  });
+
+  it.each(["malformed", "directory"])(
+    "fails closed without deleting a %s prior tombstone residue",
+    (kind) => {
+      const path = join(fixture, `invalid-tombstone-${kind}`, "journal.log");
+      appendMany(path, happyRecords.slice(0, 1));
+      const lockPath = `${path}.lock`;
+      const lockBytes = encodeJournalLock(
+        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        process.pid,
+      );
+      writeFileSync(lockPath, lockBytes, { mode: 0o600 });
+      const residue = `${lockPath}.reclaim-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee`;
+      if (kind === "directory") mkdirSync(residue);
+      else writeFileSync(residue, "malformed", { mode: 0o600 });
+      const journalBefore = readFileSync(path);
+
+      expect(() =>
+        invokeJournal({
+          operation: "reclaim",
+          journalPath: path,
+          writersStopped: true,
+          record: happyRecords[1],
+        }),
+      ).toThrow(/lock|tombstone/u);
+      expect(readFileSync(path)).toEqual(journalBefore);
+      expect(readFileSync(lockPath)).toEqual(lockBytes);
+      expect(lstatSync(residue)[kind === "directory" ? "isDirectory" : "isFile"]()).toBe(true);
+    },
+  );
+
+  it("does not inspect or mutate residues without stopped-writer attestation", () => {
+    const path = join(fixture, "false-attestation-residue", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    const lockPath = `${path}.lock`;
+    const lockBytes = encodeJournalLock("ffffffff-ffff-4fff-8fff-ffffffffffff", process.pid);
+    const residue = `${lockPath}.reclaim-ffffffff-ffff-4fff-8fff-ffffffffffff`;
+    const residueBytes = Buffer.from("do-not-inspect-or-remove");
+    writeFileSync(lockPath, lockBytes, { mode: 0o600 });
+    writeFileSync(residue, residueBytes, { mode: 0o600 });
+    const journalBefore = readFileSync(path);
+
+    expect(() =>
+      invokeJournal({
+        operation: "reclaim",
+        journalPath: path,
+        writersStopped: false,
+        record: happyRecords[1],
+      }),
+    ).toThrow(/writers.*stopped|attest/u);
+    expect(readFileSync(path)).toEqual(journalBefore);
+    expect(readFileSync(lockPath)).toEqual(lockBytes);
+    expect(readFileSync(residue)).toEqual(residueBytes);
+  });
+
+  it.each(["partial", "complete"] as const)(
+    "recovers an actual SIGKILL %s journal write with the candidate exactly once",
+    (writeKind) => {
+      const path = join(fixture, `sigkill-journal-${writeKind}`, "journal.log");
+      appendMany(path, happyRecords.slice(0, 1));
+
+      const killed = killAppendAtJournalWrite(path, happyRecords[1], writeKind);
+      expect(killed.signal).toBe("SIGKILL");
+      expect(existsSync(`${path}.lock`)).toBe(true);
+      const interrupted = replay(path);
+      expect(interrupted.records.filter((record: { event: string }) => record.event === "MOVING"))
+        .toHaveLength(writeKind === "complete" ? 1 : 0);
+      expect(interrupted.truncatedTail).toBe(writeKind === "partial");
+
+      invokeJournal({
+        operation: "reclaim",
+        journalPath: path,
+        writersStopped: true,
+        record: writeKind === "complete" ? happyRecords[2] : happyRecords[1],
+      });
+      const recovered = replay(path);
+      expect(recovered.records.filter((record: { event: string }) => record.event === "MOVING"))
+        .toHaveLength(1);
+      expect(recovered.truncatedTail).toBe(false);
+      expect(lockResidueNames(path)).toEqual([]);
     },
   );
 

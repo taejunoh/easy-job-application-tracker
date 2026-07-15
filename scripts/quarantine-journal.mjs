@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { parseInventorySummary } from "./quarantine-inventory.mjs";
 
@@ -11,6 +11,8 @@ const ENVELOPE_KEYS = ["sequence", "previousHash", "event", "payload", "recordHa
 const LOCK_KEYS = ["version", "ownerToken", "pid", "checksum"];
 const OWNER_TOKEN_PATTERN =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+const TOMBSTONE_TOKEN_PATTERN =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 const LOCK_BODY_PREFIX = '{"version":1,"ownerToken":"';
 const LOCK_BODY_AFTER_OWNER = '","pid":';
 const LOCK_BODY_AFTER_PID = ',"checksum":"';
@@ -28,6 +30,16 @@ const MIN_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + 1;
 const MAX_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + String(Number.MAX_SAFE_INTEGER).length;
 const ENTRY_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
+
+export class IndeterminateJournalAppendError extends Error {
+  constructor({ cause, expectedSequence, expectedRecordHash }) {
+    super("journal append is indeterminate after mutation began", { cause });
+    this.name = "IndeterminateJournalAppendError";
+    this.code = "ERR_INDETERMINATE_JOURNAL_APPEND";
+    this.expectedSequence = expectedSequence;
+    this.expectedRecordHash = expectedRecordHash;
+  }
+}
 
 const TRANSITIONS = new Map([
   ["<START>", new Map([["PREPARED", "PREPARED"]])],
@@ -570,45 +582,60 @@ async function createJournalLock(lockPath, fsApi) {
 
 async function appendUnderHeldLock({ journalPath, event, payload, fsApi, assertLockOwned }) {
   if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
-  await assertLockOwned?.();
-  const handle = await fsApi.open(journalPath, "a+", 0o600);
   let record;
+  let mutationStarted = false;
   try {
-    await handle.chmod(0o600);
-    const replayed = replayJournalBuffer(await readCompleteFile(handle));
-    validateTransition(replayed.state, event);
-    const canonicalPayload = canonicalize(parseEventPayload(event, payload));
-    const sequence = replayed.records.length + 1;
-    const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
-    const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
-    record = {
-      sequence,
-      previousHash,
-      event,
-      payload: canonicalPayload,
-      recordHash,
-    };
-    const body = Buffer.from(JSON.stringify(record));
-    if (body.length > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
-    const length = Buffer.alloc(4);
-    length.writeUInt32BE(body.length);
+    await assertLockOwned?.();
+    const handle = await fsApi.open(journalPath, "a+", 0o600);
+    try {
+      await handle.chmod(0o600);
+      const replayed = replayJournalBuffer(await readCompleteFile(handle));
+      validateTransition(replayed.state, event);
+      const canonicalPayload = canonicalize(parseEventPayload(event, payload));
+      const sequence = replayed.records.length + 1;
+      const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
+      const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
+      record = {
+        sequence,
+        previousHash,
+        event,
+        payload: canonicalPayload,
+        recordHash,
+      };
+      const body = Buffer.from(JSON.stringify(record));
+      if (body.length > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
+      const length = Buffer.alloc(4);
+      length.writeUInt32BE(body.length);
 
-    if (replayed.truncatedTail) {
+      if (replayed.truncatedTail) {
+        await assertLockOwned?.();
+        mutationStarted = true;
+        await handle.truncate(replayed.validEndOffset);
+        await handle.sync();
+        await fsyncDirectory(dirname(journalPath), fsApi);
+      }
       await assertLockOwned?.();
-      await handle.truncate(replayed.validEndOffset);
+      mutationStarted = true;
+      await writeComplete(handle, Buffer.concat([length, body]));
       await handle.sync();
-      await fsyncDirectory(dirname(journalPath), fsApi);
+      await assertLockOwned?.();
+    } finally {
+      await handle.close();
     }
+    await fsyncDirectory(dirname(journalPath), fsApi);
     await assertLockOwned?.();
-    await writeComplete(handle, Buffer.concat([length, body]));
-    await handle.sync();
-    await assertLockOwned?.();
-  } finally {
-    await handle.close();
+    return record;
+  } catch (error) {
+    if (mutationStarted && record !== undefined) {
+      if (error instanceof IndeterminateJournalAppendError) throw error;
+      throw new IndeterminateJournalAppendError({
+        cause: error,
+        expectedSequence: record.sequence,
+        expectedRecordHash: record.recordHash,
+      });
+    }
+    throw error;
   }
-  await fsyncDirectory(dirname(journalPath), fsApi);
-  await assertLockOwned?.();
-  return record;
 }
 
 async function readStaleLock(lockPath, fsApi) {
@@ -635,6 +662,34 @@ async function readStaleLock(lockPath, fsApi) {
   } finally {
     await handle.close();
   }
+}
+
+async function validatedTombstoneResidues(lockPath, fsApi) {
+  const parentPath = dirname(lockPath);
+  const prefix = `${basename(lockPath)}.reclaim-`;
+  const entries = await fsApi.readdir(parentPath, { withFileTypes: true });
+  const residues = [];
+  for (const entry of entries) {
+    if (!entry.name.startsWith(prefix)) continue;
+    const ownerToken = entry.name.slice(prefix.length);
+    if (!TOMBSTONE_TOKEN_PATTERN.test(ownerToken)) {
+      throw new Error(`malformed journal lock tombstone name: ${entry.name}`);
+    }
+    const residuePath = join(parentPath, entry.name);
+    try {
+      await readStaleLock(residuePath, fsApi);
+    } catch (error) {
+      throw new Error(`invalid journal lock tombstone: ${entry.name}`, { cause: error });
+    }
+    residues.push(residuePath);
+  }
+  return residues.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+}
+
+async function removeValidatedLockResidues(paths, fsApi) {
+  for (const path of paths) await readStaleLock(path, fsApi);
+  for (const path of paths) await fsApi.rm(path);
+  if (paths.length > 0) await fsyncDirectory(dirname(paths[0]), fsApi);
 }
 
 async function assertHeldLockOwnership(lockPath, lockHandle, fsApi) {
@@ -698,6 +753,7 @@ export async function reclaimJournalLock({
   }
 
   const lockPath = `${journalPath}.lock`;
+  const priorTombstones = await validatedTombstoneResidues(lockPath, fsApi);
   const staleLock = await readStaleLock(lockPath, fsApi);
   const tombstonePath = `${lockPath}.reclaim-${randomUUID()}`;
   await fsApi.rename(lockPath, tombstonePath);
@@ -761,9 +817,10 @@ export async function reclaimJournalLock({
   } finally {
     await recoveryLock?.handle.close();
     if (recoverySucceeded) {
-      await fsApi.rm(lockPath);
-      await fsApi.rm(tombstonePath);
-      await fsyncDirectory(dirname(journalPath), fsApi);
+      await removeValidatedLockResidues(
+        [lockPath, tombstonePath, ...priorTombstones],
+        fsApi,
+      );
     }
   }
 }

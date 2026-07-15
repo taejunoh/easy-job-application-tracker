@@ -262,8 +262,11 @@ and parent, and append. `EEXIST` always fails; normal append never uses TTL or
 PID-liveness reclamation and never races concurrent appenders.
 
 Export `reclaimJournalLock` as the only stale-lock recovery primitive. It
-requires `writersStopped === true`, rejects symlink, non-regular, oversized, and
-malformed complete locks without changing them, and accepts only a valid
+requires `writersStopped === true`. That attests that no other apply, recovery,
+or restore operation and no repository, quarantine, journal, or lock writer
+runs for the entire recovery call. Missing attestation fails before journal,
+lock, or tombstone mutation. Recovery rejects symlink, non-regular, oversized,
+and malformed complete locks without changing them, and accepts only a valid
 checksummed lock or a recognizable creation-torn frame. The latter is either
 zero bytes or a strict byte prefix of the exact framed lock: its partial length
 must prefix an admissible body length, a complete length must match the allowed
@@ -275,11 +278,26 @@ creates and durably publishes a new `wx` lock, and runs a recovery callback with
 an append function under that held lock. Only after the recovery journal append
 is durable may it remove the new lock and tombstone and `fsync` the parent.
 The append capability is active only inside that callback; callback exit on
-success or failure invalidates it before cleanup. Every append verifies the
-held lock handle and current lock path are the same regular-file device/inode
-before journal mutation. Sequential awaited appends inside the callback remain
-valid, but stored capabilities and missing, replaced, or non-regular lock paths
-fail without changing the journal.
+success or failure invalidates it before cleanup. Device/inode checks between
+the held handle and current regular-file lock path provide cooperative
+serialization and intrusion detection under the writer attestation; built-in
+Node path locks cannot make a separate journal write atomic against hostile
+concurrent pathname replacement. A mismatch before truncate/write begins is an
+ordinary ownership error and leaves journal bytes unchanged. Any error after
+truncate or frame write begins is an exported
+`IndeterminateJournalAppendError` with exact `expectedSequence` and
+`expectedRecordHash`. The caller does not run a destructive seam or blindly
+retry that event: it explicitly replays, accepts the candidate at most once,
+and either records a missing candidate or advances with only the next legal
+event. Indeterminate recovery preserves its current lock and tombstones.
+
+Sequential awaited appends inside the callback remain valid; stored
+capabilities are rejected. Successful later recovery revalidates and removes
+all prior well-formed lock tombstones plus the current lock, then `fsync`s the
+parent. A malformed, non-regular, or malformed-name tombstone is never deleted
+automatically and fails closed before recovery mutation. Actual partial and
+complete-frame `SIGKILL` tests require replay to contain the candidate zero or
+one time before reconciliation and exactly once afterward.
 Current-PID/different-token locks model PID reuse: ordinary append still fails,
 while explicitly attested recovery is permitted.
 Replay validates every complete frame, event-specific

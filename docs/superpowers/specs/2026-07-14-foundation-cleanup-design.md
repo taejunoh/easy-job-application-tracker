@@ -54,8 +54,10 @@ The tool has two non-negotiable operating gates:
    device according to `lstat().dev`.
 
 The operator explicitly attests writer quiescence on `apply`, recovery, and
-restore. Stable preflight passes can detect some concurrent changes but cannot
-make an open writer safe. A device mismatch or `EXDEV` is fatal; there is no
+restore. For the full operation, no other apply, recovery, or restore and no
+repository, quarantine, journal, or lock writer may run. Stable preflight
+passes can detect some concurrent changes but cannot make an open writer safe.
+A device mismatch or `EXDEV` is fatal; there is no
 copy fallback. A future cross-device workflow requires a separately reviewed
 durable streaming-copy design.
 
@@ -218,7 +220,8 @@ and `fsync`s the file and parent directory before appending. Lock removal is
 also directory-`fsync`ed.
 
 Stale-lock recovery is a separate `reclaimJournalLock` operation that requires
-`writersStopped === true`. It rejects and preserves symlink, non-regular,
+`writersStopped === true`; false attestation fails before journal, lock, or
+tombstone mutation. It rejects and preserves symlink, non-regular,
 oversized, and malformed complete locks. Only valid checksummed metadata or a
 recognizable creation-torn frame is reclaimable. Creation-torn means zero bytes
 or a strict byte prefix of the exact frame: partial length bytes must prefix an
@@ -230,11 +233,26 @@ and unchanged. Recovery atomically renames the old lock to a unique tombstone,
 an append function under that held lock. The capability is active only while
 that callback runs and becomes inactive on both successful and failed callback
 exit, before cleanup. Each append compares the held lock handle's device/inode
-with a non-symlink regular-file `lstat` of the current lock path before journal
-mutation. Sequential awaited callback appends are allowed; leaked capabilities
-and missing, replaced, or non-regular lock paths are rejected without journal
-changes. It removes the tombstone and new lock, then `fsync`s the parent, only
-after the recovery journal operation is durable.
+with a non-symlink regular-file `lstat` of the current lock path. This is
+cooperative serialization and intrusion detection under the attestation, not
+an atomic defense against hostile concurrent pathname replacement: built-in
+Node cannot atomically couple that path check to a separate journal write.
+
+A mismatch before journal truncate/write begins is an ordinary ownership error
+with unchanged journal bytes. Once truncate or frame write begins, every later
+error is `IndeterminateJournalAppendError` with the candidate's
+`expectedSequence` and `expectedRecordHash`. The caller stops before any
+destructive seam, preserves the current recovery lock and tombstones, and never
+blindly retries the same event. The next explicit attested recovery replays the
+journal, accepts the candidate zero or one time, appends it only if absent, or
+advances with the next legal event if present. Partial and complete-frame
+`SIGKILL` cases must finish with that candidate exactly once.
+
+Sequential awaited callback appends are allowed; leaked capabilities are
+rejected. On success, recovery revalidates and removes the current lock and all
+prior well-formed tombstone residues, then `fsync`s the parent. Malformed names,
+malformed frames, symlinks, and non-regular tombstones are preserved and fatal
+before recovery mutation.
 A current PID with a different owner token is treated as possible PID reuse:
 ordinary append still fails and only explicit attested recovery may proceed.
 Tests use actual child-process `SIGKILL` after `wx` and after metadata `fsync`;
