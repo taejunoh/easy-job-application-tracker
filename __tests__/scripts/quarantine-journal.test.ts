@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,24 @@ const capabilityModuleUrl = pathToFileURL(
 
 const manifestSha256 = "a".repeat(64);
 const validSummary = { sha256: "b".repeat(64), entries: 1, bytes: 1 };
+const restoreId = "22222222-2222-4222-8222-222222222222";
+const inventoryRecord = {
+  scope: "root",
+  type: "file",
+  mode: 0o600,
+  size: 1,
+  sha256: "c".repeat(64),
+};
+const inventoryBytes = Buffer.from(`${JSON.stringify(inventoryRecord)}\n`);
+const restoreInventorySummary = {
+  sha256: createHash("sha256").update(inventoryBytes).digest("hex"),
+  entries: 1,
+  bytes: 1,
+};
+const activeGenerated = (nextInventory: typeof restoreInventorySummary | null = null) => [
+  { id: "generated-next", inventory: nextInventory },
+  { id: "generated-node-modules", inventory: null },
+];
 const records = {
   prepared: {
     event: "PREPARED",
@@ -25,6 +44,10 @@ const records = {
   },
   recoveryRequired: {
     event: "RECOVERY_REQUIRED",
+    payload: { entryIds: [] },
+  },
+  recoveryCopy1: {
+    event: "RECOVERY_REQUIRED",
     payload: { entryIds: ["copy-0001"] },
   },
   rollingBack: { event: "ROLLING_BACK", payload: {} },
@@ -36,8 +59,20 @@ const records = {
   verifying: { event: "VERIFYING", payload: {} },
   quarantined: { event: "QUARANTINED", payload: {} },
   validated: { event: "VALIDATED", payload: { manifestSha256 } },
-  restorePrepared: { event: "RESTORE_PREPARED", payload: {} },
+  restorePrepared: {
+    event: "RESTORE_PREPARED",
+    payload: { restoreId, activeGenerated: activeGenerated() },
+  },
   restoring: { event: "RESTORING", payload: {} },
+  restoreRollingBack: { event: "RESTORE_ROLLING_BACK", payload: {} },
+  restoreAbortedToQuarantined: {
+    event: "RESTORE_ABORTED_TO_QUARANTINED",
+    payload: {},
+  },
+  restoreAbortedToValidated: {
+    event: "RESTORE_ABORTED_TO_VALIDATED",
+    payload: {},
+  },
   restored: { event: "RESTORED", payload: {} },
 } as const;
 
@@ -188,6 +223,26 @@ const result = await withQuarantineRunCapability({
   writersStopped: true,
   fsApi: boundFsApi,
 }, async (capability) => {
+  for (const backing of request.inventoryBackings ?? []) {
+    await fsPromises.mkdir(join(runRoot, "inventories", "restore-active"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const inventoryPath = deriveRunPath(capability, {
+      purpose: "inventory",
+      phase: "restore-active",
+      id: backing.id,
+    });
+    if (backing.kind === "symlink") {
+      const victim = join(request.root, "inventory-victim-" + backing.id);
+      await fsPromises.writeFile(victim, Buffer.from(backing.base64, "base64"), { mode: 0o600 });
+      await fsPromises.symlink(victim, inventoryPath);
+    } else {
+      await fsPromises.writeFile(inventoryPath, Buffer.from(backing.base64, "base64"), {
+        mode: backing.mode ?? 0o600,
+      });
+    }
+  }
   if (request.operation === "closed-options") {
     const definitions = {
       replay: {
@@ -748,14 +803,64 @@ const result = await withQuarantineRunCapability({
       };
     }
     const outcome = await capture(() => appendAll(capability, [request.record]));
+    const replayed = await journal.replayJournal({ capability });
+    const lastActiveGenerated = replayed.records.at(-1)?.payload?.activeGenerated;
     return {
       outcome,
       bytesUnchanged: before.equals(await fsPromises.readFile(journalPath).catch((error) => {
         if (error.code === "ENOENT") return Buffer.alloc(0);
         throw error;
       })),
-      replayed: await journal.replayJournal({ capability }),
+      replayed,
+      activeGeneratedFrozen: lastActiveGenerated === undefined
+        ? null
+        : Object.isFrozen(lastActiveGenerated),
     };
+  }
+  if (request.operation === "restore-backing-replay") {
+    await appendAll(capability, request.records);
+    const journalPath = deriveRunPath(capability, { purpose: "journal" });
+    const journalBytes = await fsPromises.readFile(journalPath);
+    const inventoryPath = deriveRunPath(capability, {
+      purpose: "inventory",
+      phase: "restore-active",
+      id: request.id,
+    });
+    if (request.mutation === "content") {
+      await fsPromises.writeFile(inventoryPath, "mutated\\n", { mode: 0o600 });
+    } else if (request.mutation === "mode") {
+      await fsPromises.chmod(inventoryPath, 0o644);
+    } else if (request.mutation === "symlink") {
+      const victim = join(request.root, "replay-inventory-victim");
+      await fsPromises.writeFile(victim, "victim\\n", { mode: 0o600 });
+      await fsPromises.rm(inventoryPath);
+      await fsPromises.symlink(victim, inventoryPath);
+    } else if (request.mutation === "missing") {
+      await fsPromises.rm(inventoryPath);
+    }
+    const outcome = await capture(() => journal.replayJournal({ capability }));
+    return {
+      outcome,
+      bytesUnchanged: journalBytes.equals(await fsPromises.readFile(journalPath)),
+    };
+  }
+  if (request.operation === "restore-backing-stream-fault") {
+    let closes = 0;
+    const faultFs = {
+      ...fsPromises,
+      createReadStream: (...args) => {
+        const stream = createReadStream(...args);
+        stream.once("close", () => { closes += 1; });
+        stream.once("data", () => stream.destroy(new Error("injected inventory stream failure")));
+        return stream;
+      },
+    };
+    const outcome = await capture(() => appendAll(
+      capability,
+      request.records,
+      useFsApi(faultFs),
+    ));
+    return { outcome, closes };
   }
   if (request.operation === "recover-moving") {
     const before = await journal.replayJournal({ capability });
@@ -1799,6 +1904,174 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.bytesUnchanged).toBe(true);
   });
 
+  const quarantinedPrefix = [
+    records.prepared,
+    records.moving,
+    records.verifying,
+    records.quarantined,
+  ];
+
+  it.each([
+    ["missing restoreId", { activeGenerated: activeGenerated() }],
+    ["unknown key", { restoreId, activeGenerated: activeGenerated(), extra: true }],
+    ["invalid restoreId", { restoreId: "restore-1", activeGenerated: activeGenerated() }],
+    ["missing generated record", { restoreId, activeGenerated: activeGenerated().slice(0, 1) }],
+    ["swapped generated records", { restoreId, activeGenerated: activeGenerated().toReversed() }],
+    ["duplicate generated IDs", {
+      restoreId,
+      activeGenerated: [activeGenerated()[0], activeGenerated()[0]],
+    }],
+    ["sparse generated records", (() => {
+      const values = activeGenerated();
+      delete values[0];
+      return { restoreId, activeGenerated: values };
+    })()],
+    ["unknown generated-record key", {
+      restoreId,
+      activeGenerated: [
+        { ...activeGenerated()[0], extra: true },
+        activeGenerated()[1],
+      ],
+    }],
+    ["malformed inventory summary", {
+      restoreId,
+      activeGenerated: activeGenerated({ ...restoreInventorySummary, entries: -1 }),
+    }],
+  ])("rejects RESTORE_PREPARED %s", (label, payload) => {
+    const result = invoke(join(fixture, `restore-prepared-${label.replaceAll(" ", "-")}`), {
+      operation: "journal-regression",
+      case: "invalid-payload",
+      prefix: quarantinedPrefix,
+      record: { event: "RESTORE_PREPARED", payload },
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
+  });
+
+  it("accepts exact null inventory records without backing JSONL", () => {
+    const result = invoke(join(fixture, "restore-prepared-null-inventories"), {
+      operation: "journal-regression",
+      case: "valid-payload",
+      prefix: quarantinedPrefix,
+      record: records.restorePrepared,
+    });
+    expect(result.outcome.ok).toBe(true);
+    expect(result.replayed.records.at(-1).payload).toEqual(records.restorePrepared.payload);
+    expect(result.activeGeneratedFrozen).toBe(true);
+    expect(result.replayed.records.at(-1).payload.activeGenerated).toHaveLength(2);
+  });
+
+  it("accepts a matching durable restore-active inventory", () => {
+    const result = invoke(join(fixture, "restore-prepared-backed-inventory"), {
+      operation: "journal-regression",
+      case: "valid-payload",
+      prefix: quarantinedPrefix,
+      record: {
+        event: "RESTORE_PREPARED",
+        payload: { restoreId, activeGenerated: activeGenerated(restoreInventorySummary) },
+      },
+      inventoryBackings: [{
+        id: "generated-next",
+        base64: inventoryBytes.toString("base64"),
+      }],
+    });
+    expect(result.outcome.ok).toBe(true);
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["digest mismatch", { ...restoreInventorySummary, sha256: "d".repeat(64) }],
+    ["entry-count mismatch", { ...restoreInventorySummary, entries: 2 }],
+    ["byte-count mismatch", { ...restoreInventorySummary, bytes: 2 }],
+  ])("rejects a non-null restore inventory with %s backing", (label, summary) => {
+    const result = invoke(join(fixture, `restore-backing-${label.replaceAll(" ", "-")}`), {
+      operation: "journal-regression",
+      case: "invalid-payload",
+      prefix: quarantinedPrefix,
+      record: {
+        event: "RESTORE_PREPARED",
+        payload: {
+          restoreId,
+          activeGenerated: activeGenerated(summary ?? restoreInventorySummary),
+        },
+      },
+      inventoryBackings: label === "missing" ? [] : [{
+        id: "generated-next",
+        base64: inventoryBytes.toString("base64"),
+      }],
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
+  });
+
+  it.each([
+    ["wrong-mode", { mode: 0o644 }],
+    ["symlink", { kind: "symlink" }],
+  ])("rejects a restore inventory backing that is a %s", (label, backing) => {
+    const result = invoke(join(fixture, `restore-backing-${label}`), {
+      operation: "journal-regression",
+      case: "invalid-payload",
+      prefix: quarantinedPrefix,
+      record: {
+        event: "RESTORE_PREPARED",
+        payload: { restoreId, activeGenerated: activeGenerated(restoreInventorySummary) },
+      },
+      inventoryBackings: [{
+        id: "generated-next",
+        base64: inventoryBytes.toString("base64"),
+        ...backing,
+      }],
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
+  });
+
+  it.each(["content", "mode", "symlink", "missing"])(
+    "rejects %s mutation of RESTORE_PREPARED backing during replay",
+    (mutation) => {
+      const result = invoke(join(fixture, `restore-replay-${mutation}`), {
+        operation: "restore-backing-replay",
+        records: [
+          ...quarantinedPrefix,
+          {
+            event: "RESTORE_PREPARED",
+            payload: { restoreId, activeGenerated: activeGenerated(restoreInventorySummary) },
+          },
+        ],
+        id: "generated-next",
+        mutation,
+        inventoryBackings: [{
+          id: "generated-next",
+          base64: inventoryBytes.toString("base64"),
+        }],
+      });
+      expect(result.outcome.ok).toBe(false);
+      expect(result.bytesUnchanged).toBe(true);
+    },
+  );
+
+  it("closes a failed restore inventory stream and preserves its primary error", () => {
+    const result = invoke(join(fixture, "restore-backing-stream-fault"), {
+      operation: "restore-backing-stream-fault",
+      records: [
+        ...quarantinedPrefix,
+        {
+          event: "RESTORE_PREPARED",
+          payload: { restoreId, activeGenerated: activeGenerated(restoreInventorySummary) },
+        },
+      ],
+      inventoryBackings: [{
+        id: "generated-next",
+        base64: inventoryBytes.toString("base64"),
+      }],
+    });
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/injected inventory stream failure/u) },
+    });
+    expect(result.closes).toBe(1);
+  });
+
   it.each([
     ["MOVE_INTENT", [records.prepared, records.moving], {
       event: "MOVE_INTENT",
@@ -1836,6 +2109,29 @@ describe("capability-bound durable quarantine journal", () => {
       records.restorePrepared,
       records.restoring,
     ], { event: "RESTORED_ENTRY", payload: { id: "generic-slug" } }],
+    ["RESTORE_ROLLBACK_INTENT", [
+      records.prepared,
+      records.moving,
+      records.verifying,
+      records.quarantined,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RECOVERY_REQUIRED", payload: { entryIds: ["generated-next"] } },
+      records.restoreRollingBack,
+    ], { event: "RESTORE_ROLLBACK_INTENT", payload: { id: "generic-slug" } }],
+    ["RESTORE_ROLLED_BACK_ENTRY", [
+      records.prepared,
+      records.moving,
+      records.verifying,
+      records.quarantined,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RECOVERY_REQUIRED", payload: { entryIds: ["generated-next"] } },
+      records.restoreRollingBack,
+      { event: "RESTORE_ROLLBACK_INTENT", payload: { id: "generated-next" } },
+    ], { event: "RESTORE_ROLLED_BACK_ENTRY", payload: { id: "generic-slug" } }],
     ["RECOVERY_REQUIRED", [records.prepared, records.moving], {
       event: "RECOVERY_REQUIRED",
       payload: { entryIds: ["generic-slug"] },
@@ -2036,6 +2332,7 @@ describe("capability-bound durable quarantine journal", () => {
   const transitionEdges = [
     [null, "PREPARED", "PREPARED"],
     ["PREPARED", "MOVING", "MOVING"],
+    ["PREPARED", "RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
     ["MOVING", "MOVE_INTENT", "MOVING"],
     ["MOVING", "MOVED", "MOVING"],
     ["MOVING", "VERIFYING", "VERIFYING"],
@@ -2047,6 +2344,7 @@ describe("capability-bound durable quarantine journal", () => {
     ["RECOVERY_REQUIRED", "MOVING", "MOVING"],
     ["RECOVERY_REQUIRED", "RESTORING", "RESTORING"],
     ["RECOVERY_REQUIRED", "ROLLING_BACK", "ROLLING_BACK"],
+    ["RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK", "RESTORE_ROLLING_BACK"],
     ["RECOVERY_REQUIRED", "INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
     ["ROLLING_BACK", "ROLLBACK_INTENT", "ROLLING_BACK"],
     ["ROLLING_BACK", "ROLLED_BACK_ENTRY", "ROLLING_BACK"],
@@ -2056,11 +2354,21 @@ describe("capability-bound durable quarantine journal", () => {
     ["QUARANTINED", "RESTORE_PREPARED", "RESTORE_PREPARED"],
     ["VALIDATED", "RESTORE_PREPARED", "RESTORE_PREPARED"],
     ["RESTORE_PREPARED", "RESTORING", "RESTORING"],
+    ["RESTORE_PREPARED", "RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
     ["RESTORING", "RESTORE_INTENT", "RESTORING"],
     ["RESTORING", "RESTORED_ENTRY", "RESTORING"],
     ["RESTORING", "RESTORED", "RESTORED"],
     ["RESTORING", "RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
     ["RESTORING", "INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
+    ["RESTORE_ROLLING_BACK", "RESTORE_ROLLBACK_INTENT", "RESTORE_ROLLING_BACK"],
+    ["RESTORE_ROLLING_BACK", "RESTORE_ROLLED_BACK_ENTRY", "RESTORE_ROLLING_BACK"],
+    [
+      "RESTORE_ROLLING_BACK",
+      "RESTORE_ABORTED_TO_QUARANTINED",
+      "QUARANTINED",
+    ],
+    ["RESTORE_ROLLING_BACK", "RESTORE_ABORTED_TO_VALIDATED", "VALIDATED"],
+    ["RESTORE_ROLLING_BACK", "INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
   ] as const;
 
   it("covers every legal transition-table edge", () => {
@@ -2069,6 +2377,156 @@ describe("capability-bound durable quarantine journal", () => {
       edges: transitionEdges.map(([previous, next]) => [previous, next]),
     });
     expect(result).toEqual(transitionEdges.map(([, , expected]) => expected));
+  });
+
+  it.each([
+    ["PREPARED apply resume", [
+      records.prepared,
+      records.recoveryRequired,
+      records.moving,
+    ]],
+    ["MOVING apply rollback", [
+      records.prepared,
+      records.moving,
+      records.recoveryRequired,
+      records.rollingBack,
+      records.rolledBack,
+    ]],
+    ["RESTORE_PREPARED abort to QUARANTINED", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.recoveryRequired,
+      records.restoreRollingBack,
+      records.restoreAbortedToQuarantined,
+    ]],
+    ["RESTORING abort to VALIDATED", [
+      ...quarantinedPrefix,
+      records.validated,
+      records.restorePrepared,
+      records.restoring,
+      records.recoveryRequired,
+      records.restoreRollingBack,
+      records.restoreAbortedToValidated,
+    ]],
+  ])("accepts exact no-intent recovery path: %s", (_label, lifecycle) => {
+    const result = invoke(join(fixture, `no-intent-${_label.replaceAll(" ", "-")}`), {
+      operation: "append-valid-lifecycle",
+      records: lifecycle,
+    });
+    expect(result.state).toBe(lifecycle.at(-1) === records.moving
+      ? "MOVING"
+      : lifecycle.at(-1) === records.rolledBack
+        ? "ROLLED_BACK"
+        : lifecycle.at(-1) === records.restoreAbortedToQuarantined
+          ? "QUARANTINED"
+          : "VALIDATED");
+  });
+
+  it.each([
+    ["apply non-empty without intent", [records.prepared, records.moving], {
+      event: "RECOVERY_REQUIRED",
+      payload: { entryIds: ["copy-0001"] },
+    }],
+    ["apply empty after intent", [records.prepared, records.moving, records.moveIntent], {
+      event: "RECOVERY_REQUIRED",
+      payload: { entryIds: [] },
+    }],
+    ["apply wrong unresolved IDs", [records.prepared, records.moving, records.moveIntent], {
+      event: "RECOVERY_REQUIRED",
+      payload: { entryIds: ["copy-0002"] },
+    }],
+    ["restore empty after intent", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+    ], { event: "RECOVERY_REQUIRED", payload: { entryIds: [] } }],
+    ["restore non-empty without intent", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+    ], { event: "RECOVERY_REQUIRED", payload: { entryIds: ["generated-next"] } }],
+    ["restore wrong unresolved IDs", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+    ], { event: "RECOVERY_REQUIRED", payload: { entryIds: ["generated-node-modules"] } }],
+    ["apply recovery cannot enter RESTORING", [
+      records.prepared,
+      records.moving,
+      records.recoveryRequired,
+    ], records.restoring],
+    ["restore recovery cannot enter MOVING", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.recoveryRequired,
+    ], records.moving],
+    ["restore recovery cannot enter ROLLING_BACK", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.recoveryRequired,
+    ], records.rollingBack],
+    ["quarantined restore cannot abort to VALIDATED", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.recoveryRequired,
+      records.restoreRollingBack,
+    ], records.restoreAbortedToValidated],
+    ["validated restore cannot abort to QUARANTINED", [
+      ...quarantinedPrefix,
+      records.validated,
+      records.restorePrepared,
+      records.recoveryRequired,
+      records.restoreRollingBack,
+    ], records.restoreAbortedToQuarantined],
+  ])("rejects history-invalid recovery: %s", (label, prefix, record) => {
+    const result = invoke(join(fixture, `history-invalid-${label.replaceAll(" ", "-")}`), {
+      operation: "journal-regression",
+      case: "semantic",
+      prefix,
+      record,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
+  });
+
+  it.each([
+    ["apply", [
+      records.prepared,
+      records.moving,
+      records.moveIntent,
+      {
+        event: "MOVE_INTENT",
+        payload: { id: "copy-0002", expected: validSummary },
+      },
+      {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ["copy-0001", "copy-0002"] },
+      },
+      records.rollingBack,
+    ], { event: "ROLLBACK_INTENT", payload: { id: "copy-0001" } }],
+    ["restore", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORE_INTENT", payload: { id: "generated-node-modules" } },
+      {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ["generated-next", "generated-node-modules"] },
+      },
+      records.restoreRollingBack,
+    ], { event: "RESTORE_ROLLBACK_INTENT", payload: { id: "generated-next" } }],
+  ])("rejects non-reverse first %s rollback intent", (label, prefix, record) => {
+    const result = invoke(join(fixture, `rollback-order-${label}`), {
+      operation: "journal-regression",
+      case: "semantic",
+      prefix,
+      record,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.bytesUnchanged).toBe(true);
   });
 
   it.each([
@@ -2084,7 +2542,8 @@ describe("capability-bound durable quarantine journal", () => {
     ["rollback", [
       records.prepared,
       records.moving,
-      records.recoveryRequired,
+      records.moveIntent,
+      records.recoveryCopy1,
       records.rollingBack,
       { event: "ROLLBACK_INTENT", payload: { id: "copy-0001" } },
       { event: "ROLLED_BACK_ENTRY", payload: { id: "copy-0001" } },
@@ -2100,6 +2559,23 @@ describe("capability-bound durable quarantine journal", () => {
       { event: "RESTORE_INTENT", payload: { id: "copy-0001" } },
       { event: "RESTORED_ENTRY", payload: { id: "copy-0001" } },
       records.restored,
+    ]],
+    ["restore rollback", [
+      records.prepared,
+      records.moving,
+      records.verifying,
+      records.quarantined,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ["generated-next"] },
+      },
+      records.restoreRollingBack,
+      { event: "RESTORE_ROLLBACK_INTENT", payload: { id: "generated-next" } },
+      { event: "RESTORE_ROLLED_BACK_ENTRY", payload: { id: "generated-next" } },
+      records.restoreAbortedToQuarantined,
     ]],
   ])("accepts every event parser in a valid %s lifecycle", (_label, lifecycle) => {
     const result = invoke(join(fixture, `valid-lifecycle-${_label}`), {

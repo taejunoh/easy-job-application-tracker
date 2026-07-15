@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
-import { parseInventorySummary } from "./quarantine-inventory.mjs";
+import {
+  parseInventoryRecord,
+  parseInventorySummary,
+} from "./quarantine-inventory.mjs";
 import {
   deriveRunPath,
   revalidateRunCapability,
@@ -34,6 +37,10 @@ const MIN_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + 1;
 const MAX_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + String(Number.MAX_SAFE_INTEGER).length;
 const ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
+const RESTORE_ID =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+const GENERATED_IDS = Object.freeze(["generated-next", "generated-node-modules"]);
+const MAX_INVENTORY_LINE_BYTES = 1024 * 1024;
 
 export class IndeterminateJournalAppendError extends Error {
   constructor({ cause, expectedSequence, expectedRecordHash }) {
@@ -95,7 +102,13 @@ async function withHandle(handle, callback) {
 
 const TRANSITIONS = new Map([
   ["<START>", new Map([["PREPARED", "PREPARED"]])],
-  ["PREPARED", new Map([["MOVING", "MOVING"]])],
+  [
+    "PREPARED",
+    new Map([
+      ["MOVING", "MOVING"],
+      ["RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
+    ]),
+  ],
   [
     "MOVING",
     new Map([
@@ -120,6 +133,7 @@ const TRANSITIONS = new Map([
       ["MOVING", "MOVING"],
       ["RESTORING", "RESTORING"],
       ["ROLLING_BACK", "ROLLING_BACK"],
+      ["RESTORE_ROLLING_BACK", "RESTORE_ROLLING_BACK"],
       ["INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
     ]),
   ],
@@ -140,7 +154,13 @@ const TRANSITIONS = new Map([
     ]),
   ],
   ["VALIDATED", new Map([["RESTORE_PREPARED", "RESTORE_PREPARED"]])],
-  ["RESTORE_PREPARED", new Map([["RESTORING", "RESTORING"]])],
+  [
+    "RESTORE_PREPARED",
+    new Map([
+      ["RESTORING", "RESTORING"],
+      ["RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
+    ]),
+  ],
   [
     "RESTORING",
     new Map([
@@ -148,6 +168,16 @@ const TRANSITIONS = new Map([
       ["RESTORED_ENTRY", "RESTORING"],
       ["RESTORED", "RESTORED"],
       ["RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
+      ["INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
+    ]),
+  ],
+  [
+    "RESTORE_ROLLING_BACK",
+    new Map([
+      ["RESTORE_ROLLBACK_INTENT", "RESTORE_ROLLING_BACK"],
+      ["RESTORE_ROLLED_BACK_ENTRY", "RESTORE_ROLLING_BACK"],
+      ["RESTORE_ABORTED_TO_QUARANTINED", "QUARANTINED"],
+      ["RESTORE_ABORTED_TO_VALIDATED", "VALIDATED"],
       ["INCOMPLETE_CONFLICT", "INCOMPLETE_CONFLICT"],
     ]),
   ],
@@ -193,7 +223,10 @@ function canonicalize(value, seen = new Set()) {
   if (seen.has(value)) throw new TypeError("canonical JSON rejects cycles");
   seen.add(value);
   try {
-    if (Array.isArray(value)) return value.map((entry) => canonicalize(entry, seen));
+    if (Array.isArray(value)) {
+      const result = value.map((entry) => canonicalize(entry, seen));
+      return Object.isFrozen(value) ? Object.freeze(result) : result;
+    }
     if (!isPlainObject(value)) throw new TypeError("payload must contain plain objects");
     const result = {};
     for (const key of Object.keys(value).sort()) {
@@ -202,7 +235,7 @@ function canonicalize(value, seen = new Set()) {
       }
       result[key] = canonicalize(value[key], seen);
     }
-    return result;
+    return Object.isFrozen(value) ? Object.freeze(result) : result;
   } finally {
     seen.delete(value);
   }
@@ -214,11 +247,14 @@ function canonicalHashInput(sequence, previousHash, event, payload) {
 
 function assertPayloadKeys(payload, expectedKeys, event) {
   if (!isPlainObject(payload)) throw new TypeError(`${event} payload must be a plain object`);
-  for (const key of Object.keys(payload)) {
-    if (!expectedKeys.includes(key)) throw new TypeError(`unknown field in ${event} payload: ${key}`);
+  const keys = Reflect.ownKeys(payload);
+  for (const key of keys) {
+    if (typeof key !== "string" || !expectedKeys.includes(key)) {
+      throw new TypeError(`unknown field in ${event} payload: ${String(key)}`);
+    }
   }
   for (const key of expectedKeys) {
-    if (!Object.hasOwn(payload, key)) throw new TypeError(`missing field in ${event} payload: ${key}`);
+    if (!keys.includes(key)) throw new TypeError(`missing field in ${event} payload: ${key}`);
   }
 }
 
@@ -246,10 +282,12 @@ function parseEntryPayload(event, payload) {
   return Object.freeze({ id: parseEntryId(payload.id) });
 }
 
-function parseSortedEntryIds(event, payload, key) {
+function parseSortedEntryIds(event, payload, key, { allowEmpty = false } = {}) {
   assertPayloadKeys(payload, [key], event);
-  if (!Array.isArray(payload[key]) || payload[key].length === 0) {
-    throw new TypeError(`${event} payload ${key} must be a non-empty array`);
+  if (!Array.isArray(payload[key]) || (!allowEmpty && payload[key].length === 0)) {
+    throw new TypeError(
+      `${event} payload ${key} must be ${allowEmpty ? "an array" : "a non-empty array"}`,
+    );
   }
   const values = payload[key].map((value) => parseEntryId(value));
   for (let index = 1; index < values.length; index += 1) {
@@ -258,6 +296,37 @@ function parseSortedEntryIds(event, payload, key) {
     }
   }
   return Object.freeze({ [key]: Object.freeze(values) });
+}
+
+function parseRestoreId(value) {
+  if (typeof value !== "string" || !RESTORE_ID.test(value)) {
+    throw new TypeError("RESTORE_PREPARED payload restore ID is invalid");
+  }
+  return value;
+}
+
+function parseActiveGenerated(value) {
+  if (
+    !Array.isArray(value) ||
+    value.length !== GENERATED_IDS.length ||
+    Reflect.ownKeys(value).length !== GENERATED_IDS.length + 1 ||
+    Reflect.ownKeys(value).some((key, index) =>
+      key !== (index < GENERATED_IDS.length ? String(index) : "length"))
+  ) {
+    throw new TypeError("RESTORE_PREPARED activeGenerated must be a dense fixed array");
+  }
+  return Object.freeze(value.map((entry, index) => {
+    assertPayloadKeys(entry, ["id", "inventory"], "RESTORE_PREPARED activeGenerated record");
+    if (entry.id !== GENERATED_IDS[index]) {
+      throw new TypeError("RESTORE_PREPARED activeGenerated IDs are invalid or out of order");
+    }
+    return Object.freeze({
+      id: entry.id,
+      inventory: entry.inventory === null
+        ? null
+        : parseInventorySummary(entry.inventory),
+    });
+  }));
 }
 
 const EVENT_PAYLOAD_PARSERS = Object.freeze({
@@ -299,18 +368,33 @@ const EVENT_PAYLOAD_PARSERS = Object.freeze({
     return Object.freeze({ manifestSha256: parseManifestSha256(payload.manifestSha256) });
   },
   RECOVERY_REQUIRED: (payload) =>
-    parseSortedEntryIds("RECOVERY_REQUIRED", payload, "entryIds"),
+    parseSortedEntryIds("RECOVERY_REQUIRED", payload, "entryIds", { allowEmpty: true }),
   ROLLING_BACK: (payload) => parseEmptyPayload("ROLLING_BACK", payload),
   ROLLBACK_INTENT: (payload) => parseEntryPayload("ROLLBACK_INTENT", payload),
   ROLLED_BACK_ENTRY: (payload) => parseEntryPayload("ROLLED_BACK_ENTRY", payload),
   ROLLED_BACK: (payload) => parseEmptyPayload("ROLLED_BACK", payload),
   INCOMPLETE_CONFLICT: (payload) =>
     parseSortedEntryIds("INCOMPLETE_CONFLICT", payload, "conflictEntryIds"),
-  RESTORE_PREPARED: (payload) => parseEmptyPayload("RESTORE_PREPARED", payload),
+  RESTORE_PREPARED(payload) {
+    assertPayloadKeys(payload, ["restoreId", "activeGenerated"], "RESTORE_PREPARED");
+    return Object.freeze({
+      activeGenerated: parseActiveGenerated(payload.activeGenerated),
+      restoreId: parseRestoreId(payload.restoreId),
+    });
+  },
   RESTORING: (payload) => parseEmptyPayload("RESTORING", payload),
   RESTORE_INTENT: (payload) => parseEntryPayload("RESTORE_INTENT", payload),
   RESTORED_ENTRY: (payload) => parseEntryPayload("RESTORED_ENTRY", payload),
   RESTORED: (payload) => parseEmptyPayload("RESTORED", payload),
+  RESTORE_ROLLING_BACK: (payload) => parseEmptyPayload("RESTORE_ROLLING_BACK", payload),
+  RESTORE_ROLLBACK_INTENT: (payload) =>
+    parseEntryPayload("RESTORE_ROLLBACK_INTENT", payload),
+  RESTORE_ROLLED_BACK_ENTRY: (payload) =>
+    parseEntryPayload("RESTORE_ROLLED_BACK_ENTRY", payload),
+  RESTORE_ABORTED_TO_QUARANTINED: (payload) =>
+    parseEmptyPayload("RESTORE_ABORTED_TO_QUARANTINED", payload),
+  RESTORE_ABORTED_TO_VALIDATED: (payload) =>
+    parseEmptyPayload("RESTORE_ABORTED_TO_VALIDATED", payload),
 });
 
 for (const transitions of TRANSITIONS.values()) {
@@ -354,6 +438,164 @@ export function validateTransition(state, event) {
     throw new Error(`illegal journal transition: ${state ?? "<START>"} -> ${event}`);
   }
   return nextState;
+}
+
+function bytewiseSorted(values) {
+  return [...values].sort((left, right) =>
+    Buffer.compare(Buffer.from(left), Buffer.from(right)));
+}
+
+function assertExactEntryIds(actual, expected, label) {
+  if (
+    actual.length !== expected.length ||
+    actual.some((value, index) => value !== expected[index])
+  ) {
+    throw new Error(`${label} must equal the exact sorted unresolved intent IDs`);
+  }
+}
+
+function firstUnresolved(intents, completed) {
+  return intents.find((id) => !completed.has(id));
+}
+
+function validateJournalSemantics(records) {
+  let state = null;
+  let recoveryContext = null;
+  let preRestoreState = null;
+  const applyIntents = [];
+  const applyCompleted = new Set();
+  let applyRollbackIndex = -1;
+  let applyRollbackPending = null;
+  let restoreIntents = [];
+  let restoreCompleted = new Set();
+  let restoreRollbackIndex = -1;
+  let restoreRollbackPending = null;
+
+  for (const record of records) {
+    const previousState = state;
+    state = validateTransition(previousState, record.event);
+
+    if (record.event === "MOVE_INTENT") {
+      if (applyIntents.includes(record.payload.id)) {
+        throw new Error("duplicate MOVE_INTENT entry ID");
+      }
+      applyIntents.push(record.payload.id);
+    } else if (record.event === "MOVED") {
+      if (firstUnresolved(applyIntents, applyCompleted) !== record.payload.id) {
+        throw new Error("MOVED must complete the next durable MOVE_INTENT");
+      }
+      applyCompleted.add(record.payload.id);
+    } else if (record.event === "RESTORE_PREPARED") {
+      preRestoreState = previousState;
+      restoreIntents = [];
+      restoreCompleted = new Set();
+      restoreRollbackIndex = -1;
+      restoreRollbackPending = null;
+    } else if (record.event === "RESTORE_INTENT") {
+      if (restoreIntents.includes(record.payload.id)) {
+        throw new Error("duplicate RESTORE_INTENT entry ID");
+      }
+      restoreIntents.push(record.payload.id);
+    } else if (record.event === "RESTORED_ENTRY") {
+      if (firstUnresolved(restoreIntents, restoreCompleted) !== record.payload.id) {
+        throw new Error("RESTORED_ENTRY must complete the next durable RESTORE_INTENT");
+      }
+      restoreCompleted.add(record.payload.id);
+    } else if (record.event === "RECOVERY_REQUIRED") {
+      const restoreContext =
+        previousState === "RESTORE_PREPARED" || previousState === "RESTORING";
+      recoveryContext = restoreContext ? "restore" : "apply";
+      const intents = restoreContext ? restoreIntents : applyIntents;
+      const completed = restoreContext ? restoreCompleted : applyCompleted;
+      const unresolved = bytewiseSorted(intents.filter((id) => !completed.has(id)));
+      const noIntentState = restoreContext
+        ? previousState === "RESTORE_PREPARED" || previousState === "RESTORING"
+        : previousState === "PREPARED" || previousState === "MOVING";
+      if (record.payload.entryIds.length === 0) {
+        if (!noIntentState || intents.length !== 0) {
+          throw new Error("empty RECOVERY_REQUIRED is legal only before the first durable intent");
+        }
+      } else {
+        assertExactEntryIds(
+          record.payload.entryIds,
+          unresolved,
+          "RECOVERY_REQUIRED entryIds",
+        );
+      }
+    } else if (previousState === "RECOVERY_REQUIRED") {
+      const applyEvent = record.event === "MOVING" || record.event === "ROLLING_BACK";
+      const restoreEvent =
+        record.event === "RESTORING" || record.event === "RESTORE_ROLLING_BACK";
+      if (
+        (recoveryContext === "apply" && restoreEvent) ||
+        (recoveryContext === "restore" && applyEvent)
+      ) {
+        throw new Error("recovery transition does not match its durable apply/restore context");
+      }
+      if (record.event === "ROLLING_BACK") {
+        applyRollbackIndex = applyIntents.length - 1;
+        applyRollbackPending = null;
+      } else if (record.event === "RESTORE_ROLLING_BACK") {
+        restoreRollbackIndex = restoreIntents.length - 1;
+        restoreRollbackPending = null;
+      }
+    }
+
+    if (record.event === "ROLLBACK_INTENT") {
+      if (
+        applyRollbackPending !== null ||
+        applyRollbackIndex < 0 ||
+        applyIntents[applyRollbackIndex] !== record.payload.id
+      ) {
+        throw new Error("ROLLBACK_INTENT must follow durable MOVE_INTENT IDs in reverse order");
+      }
+      applyRollbackPending = record.payload.id;
+    } else if (record.event === "ROLLED_BACK_ENTRY") {
+      if (applyRollbackPending !== record.payload.id) {
+        throw new Error("ROLLED_BACK_ENTRY must match its durable ROLLBACK_INTENT");
+      }
+      applyRollbackPending = null;
+      applyRollbackIndex -= 1;
+    } else if (record.event === "ROLLED_BACK") {
+      if (applyRollbackPending !== null || applyRollbackIndex !== -1) {
+        throw new Error("ROLLED_BACK requires every durable MOVE_INTENT to be reversed");
+      }
+    } else if (record.event === "RESTORE_ROLLBACK_INTENT") {
+      if (
+        restoreRollbackPending !== null ||
+        restoreRollbackIndex < 0 ||
+        restoreIntents[restoreRollbackIndex] !== record.payload.id
+      ) {
+        throw new Error(
+          "RESTORE_ROLLBACK_INTENT must follow durable RESTORE_INTENT IDs in reverse order",
+        );
+      }
+      restoreRollbackPending = record.payload.id;
+    } else if (record.event === "RESTORE_ROLLED_BACK_ENTRY") {
+      if (restoreRollbackPending !== record.payload.id) {
+        throw new Error(
+          "RESTORE_ROLLED_BACK_ENTRY must match its durable RESTORE_ROLLBACK_INTENT",
+        );
+      }
+      restoreRollbackPending = null;
+      restoreRollbackIndex -= 1;
+    } else if (
+      record.event === "RESTORE_ABORTED_TO_QUARANTINED" ||
+      record.event === "RESTORE_ABORTED_TO_VALIDATED"
+    ) {
+      if (restoreRollbackPending !== null || restoreRollbackIndex !== -1) {
+        throw new Error("restore abort requires every durable RESTORE_INTENT to be reversed");
+      }
+      const expected = preRestoreState === "QUARANTINED"
+        ? "RESTORE_ABORTED_TO_QUARANTINED"
+        : preRestoreState === "VALIDATED"
+          ? "RESTORE_ABORTED_TO_VALIDATED"
+          : null;
+      if (record.event !== expected) {
+        throw new Error("restore abort event does not return to the pre-restore durable state");
+      }
+    }
+  }
 }
 
 function validateFrame(record, rawBody, expectedSequence, expectedPreviousHash, state) {
@@ -429,6 +671,7 @@ function replayJournalBuffer(input) {
     state = validated.state;
     offset = bodyEnd;
   }
+  validateJournalSemantics(records);
   return { records, state, validEndOffset: offset, truncatedTail };
 }
 
@@ -652,6 +895,110 @@ async function invokeFaultHook(faultHook, phase) {
   await faultHook(phase);
 }
 
+function addInventoryRecord(line, observed) {
+  if (line.length === 0) throw new Error("restore-active inventory has an empty JSONL record");
+  let value;
+  try {
+    value = JSON.parse(line.toString("utf8"));
+  } catch (error) {
+    throw new Error("restore-active inventory has malformed JSONL", { cause: error });
+  }
+  const record = parseInventoryRecord(value);
+  if (!line.equals(Buffer.from(JSON.stringify(record)))) {
+    throw new Error("restore-active inventory record is not canonical");
+  }
+  observed.entries += 1;
+  observed.bytes += record.size;
+  if (!Number.isSafeInteger(observed.entries) || !Number.isSafeInteger(observed.bytes)) {
+    throw new Error("restore-active inventory summary exceeds safe integer bounds");
+  }
+}
+
+async function summarizeRestoreInventory(path, fsApi) {
+  const before = await fsApi.lstat(path);
+  assertPrivateRegularFile(before, "restore-active inventory");
+  const stream = fsApi.createReadStream(path, { highWaterMark: 64 * 1024 });
+  const digest = createHash("sha256");
+  const observed = { entries: 0, bytes: 0 };
+  let pending = Buffer.alloc(0);
+  let totalBytes = 0;
+  for await (const value of stream) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    digest.update(chunk);
+    totalBytes += chunk.length;
+    let start = 0;
+    for (let index = 0; index < chunk.length; index += 1) {
+      if (chunk[index] !== 0x0a) continue;
+      const part = chunk.subarray(start, index);
+      if (pending.length + part.length > MAX_INVENTORY_LINE_BYTES) {
+        throw new Error("restore-active inventory record is too large");
+      }
+      const line = pending.length === 0
+        ? part
+        : Buffer.concat([pending, part], pending.length + part.length);
+      addInventoryRecord(line, observed);
+      pending = Buffer.alloc(0);
+      start = index + 1;
+    }
+    const tail = chunk.subarray(start);
+    if (pending.length + tail.length > MAX_INVENTORY_LINE_BYTES) {
+      throw new Error("restore-active inventory record is too large");
+    }
+    if (tail.length > 0) {
+      pending = pending.length === 0
+        ? Buffer.from(tail)
+        : Buffer.concat([pending, tail], pending.length + tail.length);
+    }
+  }
+  if (totalBytes > 0 && pending.length !== 0) {
+    throw new Error("restore-active inventory must end with a JSONL newline");
+  }
+  const after = await fsApi.lstat(path);
+  assertPrivateRegularFile(after, "restore-active inventory");
+  if (!sameIdentity(before, after) || before.size !== after.size) {
+    throw new Error("restore-active inventory changed while being streamed");
+  }
+  return parseInventorySummary({
+    sha256: digest.digest("hex"),
+    entries: observed.entries,
+    bytes: observed.bytes,
+  });
+}
+
+async function validateRestorePreparedBacking(record, capability, fsApi) {
+  if (record.event !== "RESTORE_PREPARED") return;
+  for (const active of record.payload.activeGenerated) {
+    if (active.inventory === null) continue;
+    const path = deriveRunPath(capability, {
+      purpose: "inventory",
+      phase: "restore-active",
+      id: active.id,
+    });
+    let observed;
+    try {
+      observed = await summarizeRestoreInventory(path, fsApi);
+    } catch (error) {
+      throw new Error(
+        `RESTORE_PREPARED inventory backing is invalid for ${active.id}: ${error.message}`,
+        { cause: error },
+      );
+    }
+    if (
+      observed.sha256 !== active.inventory.sha256 ||
+      observed.entries !== active.inventory.entries ||
+      observed.bytes !== active.inventory.bytes
+    ) {
+      throw new Error(`RESTORE_PREPARED inventory backing mismatch for ${active.id}`);
+    }
+  }
+}
+
+async function validateRestorePreparedBackings(records, capability, fsApi) {
+  for (const record of records) {
+    await validateRestorePreparedBacking(record, capability, fsApi);
+  }
+}
+
 async function readJournalSnapshot({ capability, fsApi, maxBytes = MAX_FRAME_BYTES }) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
     throw new TypeError("journal maximum bytes must be a non-negative safe integer");
@@ -681,11 +1028,13 @@ async function readJournalSnapshot({ capability, fsApi, maxBytes = MAX_FRAME_BYT
       throw new Error("journal changed while being inspected");
     }
     const bytes = await readCompleteFile(openedHandle, maxBytes);
+    const replayed = replayJournalBuffer(bytes);
+    await validateRestorePreparedBackings(replayed.records, capability, fsApi);
     return {
       bytes,
       identity: { dev: opened.dev, ino: opened.ino },
       journalPath,
-      replayed: replayJournalBuffer(bytes),
+      replayed,
     };
   });
 }
@@ -952,6 +1301,8 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
     const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
     const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
     candidate = { sequence, previousHash, event, payload: canonicalPayload, recordHash };
+    validateJournalSemantics([...replayed.records, candidate]);
+    await validateRestorePreparedBacking(candidate, capability, fsApi);
     const body = Buffer.from(JSON.stringify(candidate));
     if (body.length > MAX_FRAME_BYTES) throw new Error("journal frame is too large");
     if (replayed.validEndOffset + 4 + body.length > MAX_FRAME_BYTES) {
