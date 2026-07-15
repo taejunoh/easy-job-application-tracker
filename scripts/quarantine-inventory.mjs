@@ -63,10 +63,10 @@ function normalizeLimits(value) {
     if (!Number.isSafeInteger(input[key]) || input[key] <= 0) {
       throw new TypeError(`inventory limit ${key} must be a positive safe integer`);
     }
-    limits[key] = input[key];
+    limits[key] = Math.min(DEFAULT_LIMITS[key], input[key]);
   }
-  if (limits.mergeFanIn > 32 || limits.mergeFanIn < 2) {
-    throw new TypeError("inventory merge fan-in must be between 2 and 32");
+  if (limits.mergeFanIn < 2) {
+    throw new TypeError("inventory merge fan-in must be at least 2");
   }
   return Object.freeze(limits);
 }
@@ -81,10 +81,14 @@ function normalizeMetrics(value, limits) {
     chunkFiles: 0,
     mergePasses: 0,
     frontierSpills: 0,
+    postorderSpills: 0,
+    maxPostorderFrames: 0,
+    maxPostorderBytes: 0,
     sortChunkRecordLimit: limits.sortChunkRecords,
     sortChunkByteLimit: limits.sortChunkBytes,
     frontierRecordLimit: limits.frontierRecords,
     frontierByteLimit: limits.frontierBytes,
+    mergeFanInLimit: limits.mergeFanIn,
     maxWorkFileMode: 0,
     minWorkFileMode: 0o600,
   });
@@ -671,7 +675,7 @@ async function writeSortedChunk(records, work) {
   return work.create(records.map((record) => `${JSON.stringify(record)}\n`));
 }
 
-async function* mergeSortedFiles(files, fsApi, metrics) {
+async function* mergeSortedFiles(files, fsApi, metrics, compareValues = compareRecords) {
   const sources = files.map((file) => {
     const reader = createInterface({
       input: fsApi.createReadStream(file.path, { encoding: "utf8" }),
@@ -685,7 +689,7 @@ async function* mergeSortedFiles(files, fsApi, metrics) {
     for (const source of sources) {
       const next = await source.iterator.next();
       if (!next.done) {
-        source.current = { line: next.value, key: recordSortKey(JSON.parse(next.value)) };
+        source.current = { line: next.value, value: JSON.parse(next.value) };
       }
     }
     while (true) {
@@ -694,7 +698,7 @@ async function* mergeSortedFiles(files, fsApi, metrics) {
         const candidate = sources[index].current;
         if (
           candidate !== null &&
-          (selected === -1 || Buffer.compare(candidate.key, sources[selected].current.key) < 0)
+          (selected === -1 || compareValues(candidate.value, sources[selected].current.value) < 0)
         ) {
           selected = index;
         }
@@ -705,35 +709,75 @@ async function* mergeSortedFiles(files, fsApi, metrics) {
       const next = await source.iterator.next();
       source.current = next.done
         ? null
-        : { line: next.value, key: recordSortKey(JSON.parse(next.value)) };
+        : { line: next.value, value: JSON.parse(next.value) };
     }
   } finally {
     for (const source of sources) source.reader.close();
   }
 }
 
-async function mergeToWork(files, context) {
+async function mergeToWork(files, context, compareValues) {
   async function* framedLines() {
-    for await (const line of mergeSortedFiles(files, context.fsApi, context.metrics)) {
+    for await (const line of mergeSortedFiles(
+      files,
+      context.fsApi,
+      context.metrics,
+      compareValues,
+    )) {
       yield `${line}\n`;
     }
   }
   return context.work.create(framedLines());
 }
 
-async function reduceMergeFiles(files, context) {
+async function reduceMergeFiles(files, context, compareValues = compareRecords) {
   let current = files;
   while (current.length > context.limits.mergeFanIn) {
     const next = [];
     for (let offset = 0; offset < current.length; offset += context.limits.mergeFanIn) {
       const group = current.slice(offset, offset + context.limits.mergeFanIn);
-      next.push(await mergeToWork(group, context));
+      next.push(await mergeToWork(group, context, compareValues));
     }
     for (const file of current) await context.work.remove(file);
     current = next;
     context.metrics.mergePasses += 1;
   }
   return current;
+}
+
+async function removeOwnedInventoryOutput({
+  capability,
+  outputPath,
+  entryId,
+  phase,
+  identity,
+  fsApi,
+}) {
+  await revalidateRunCapability(capability, {
+    purpose: "inventory",
+    id: entryId,
+    phase,
+    boundary: "before-mutation",
+  });
+  let current;
+  try {
+    current = await fsApi.lstat(outputPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  assertRegularFile(current, "partial inventory output");
+  if (identity === undefined || !sameIdentity(identity, current)) {
+    throw new Error("partial inventory output ownership changed; foreign replacement preserved");
+  }
+  await fsApi.unlink(outputPath);
+  await fsyncDirectory(dirname(outputPath), fsApi);
+  await revalidateRunCapability(capability, {
+    purpose: "inventory",
+    id: entryId,
+    phase,
+    boundary: "after-sync",
+  });
 }
 
 async function writeFinalInventory({
@@ -754,9 +798,12 @@ async function writeFinalInventory({
   const handle = await fsApi.open(outputPath, "wx", 0o600);
   let identity;
   let primaryError;
+  const cleanupErrors = [];
   const digest = createHash("sha256");
   let entries = 0;
   try {
+    identity = await handle.stat();
+    assertRegularFile(identity, "inventory output");
     await handle.chmod(0o600);
     identity = await handle.stat();
     assertPrivateRegularFile(identity, "inventory output");
@@ -790,18 +837,47 @@ async function writeFinalInventory({
   } catch (error) {
     primaryError = error;
   }
-  await closeHandle(handle, primaryError, "inventory output write and close both failed");
-  await fsyncDirectory(dirname(outputPath), fsApi);
-  await revalidateRunCapability(capability, {
-    purpose: "inventory",
-    id: entryId,
-    phase,
-    boundary: "after-sync",
-  });
-  const after = await fsApi.lstat(outputPath);
-  assertPrivateRegularFile(after, "inventory output");
-  if (!sameIdentity(identity, after)) {
-    throw new Error("inventory output ownership changed after sync");
+  try {
+    await handle.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (primaryError === undefined && cleanupErrors.length === 0) {
+    try {
+      await fsyncDirectory(dirname(outputPath), fsApi);
+      await revalidateRunCapability(capability, {
+        purpose: "inventory",
+        id: entryId,
+        phase,
+        boundary: "after-sync",
+      });
+      const after = await fsApi.lstat(outputPath);
+      assertPrivateRegularFile(after, "inventory output");
+      if (!sameIdentity(identity, after)) {
+        throw new Error("inventory output ownership changed after sync");
+      }
+    } catch (error) {
+      primaryError = error;
+    }
+  }
+  if (primaryError !== undefined || cleanupErrors.length > 0) {
+    try {
+      await removeOwnedInventoryOutput({
+        capability,
+        outputPath,
+        entryId,
+        phase,
+        identity,
+        fsApi,
+      });
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    throwPrimaryAndCleanup(
+      primaryError,
+      cleanupErrors,
+      "inventory output failure and owned cleanup both failed",
+    );
   }
   return { sha256: digest.digest("hex"), entries };
 }
@@ -896,10 +972,10 @@ export async function writeInventoryJsonl(options) {
   return parseInventorySummary(summary);
 }
 
-async function readWorkChildren(file, fsApi, work) {
-  const children = (await readLines(file, fsApi)).map((line) => JSON.parse(line));
-  await work.remove(file);
-  return children;
+function comparePostorderTasks(left, right) {
+  if (left.depth !== right.depth) return right.depth - left.depth;
+  if (left.type !== right.type) return left.type === "file" ? -1 : 1;
+  return Buffer.compare(Buffer.from(left.path), Buffer.from(right.path));
 }
 
 export async function fsyncTree(options) {
@@ -931,8 +1007,45 @@ export async function fsyncTree(options) {
   ]);
   const handles = createHandleMetrics(metrics);
   const work = createWorkManager({ capability: input.capability, fsApi, metrics });
-  const stack = [{ kind: "visit", path: root, isRoot: true }];
+  const postorderChunks = [];
+  let postorderFrames = [];
+  let postorderBytes = 0;
   let primaryError;
+
+  const flushPostorder = async () => {
+    if (postorderFrames.length === 0) return;
+    postorderFrames.sort(comparePostorderTasks);
+    postorderChunks.push(
+      await work.create(postorderFrames.map((frame) => `${JSON.stringify(frame)}\n`)),
+    );
+    metrics.postorderSpills += 1;
+    postorderFrames = [];
+    postorderBytes = 0;
+  };
+
+  const appendPostorder = async (frame) => {
+    const frameBytes = Buffer.byteLength(JSON.stringify(frame)) + 1;
+    if (
+      postorderFrames.length > 0 &&
+      (postorderFrames.length >= limits.frontierRecords ||
+        postorderBytes + frameBytes > limits.frontierBytes)
+    ) {
+      await flushPostorder();
+    }
+    postorderFrames.push(frame);
+    postorderBytes += frameBytes;
+    metrics.maxPostorderFrames = Math.max(
+      metrics.maxPostorderFrames,
+      postorderFrames.length,
+    );
+    metrics.maxPostorderBytes = Math.max(metrics.maxPostorderBytes, postorderBytes);
+    if (
+      postorderFrames.length >= limits.frontierRecords ||
+      postorderBytes >= limits.frontierBytes
+    ) {
+      await flushPostorder();
+    }
+  };
 
   await revalidateRunCapability(input.capability, {
     purpose: "payload",
@@ -940,74 +1053,54 @@ export async function fsyncTree(options) {
     boundary: "before-mutation",
   });
   try {
-    while (stack.length > 0) {
-      const action = stack.pop();
-      if (action.kind === "load") {
-        const children = await readWorkChildren(action.file, fsApi, work);
-        for (let index = children.length - 1; index >= 0; index -= 1) {
-          stack.push({ kind: "visit", path: children[index].path, isRoot: false });
+    const rootStat = await fsApi.lstat(root);
+    if (rootStat.isSymbolicLink()) throw new Error("fsync tree root must not be a symlink");
+    if (!rootStat.isFile() && !rootStat.isDirectory()) {
+      throw new Error(`unsupported fsync entry type: ${root}`);
+    }
+    await appendPostorder({
+      depth: 0,
+      type: rootStat.isFile() ? "file" : "directory",
+      path: root,
+    });
+    if (rootStat.isDirectory()) {
+      for await (const item of walkTree({ root, fsApi, limits, metrics, handles, work })) {
+        if (item.stat.isSymbolicLink()) continue;
+        if (!item.stat.isFile() && !item.stat.isDirectory()) {
+          throw new Error(`unsupported fsync entry type: ${item.absolutePath}`);
         }
-        continue;
-      }
-      if (action.kind === "sync") {
-        const handle = await fsApi.open(action.path, "r");
-        await withHandle(handle, (opened) => opened.sync(), "tree sync and close both failed");
-        continue;
-      }
-
-      const stat = await fsApi.lstat(action.path);
-      if (stat.isSymbolicLink()) {
-        if (action.isRoot) throw new Error("fsync tree root must not be a symlink");
-        continue;
-      }
-      if (stat.isFile()) {
-        stack.push({ kind: "sync", path: action.path });
-        continue;
-      }
-      if (!stat.isDirectory()) throw new Error(`unsupported fsync entry type: ${action.path}`);
-
-      const children = [];
-      const spills = [];
-      let childBytes = 0;
-      const spill = async () => {
-        if (children.length === 0) return;
-        spills.push(await work.create(children.map((child) => `${JSON.stringify(child)}\n`)));
-        metrics.frontierSpills += 1;
-        children.length = 0;
-        childBytes = 0;
-      };
-      const directory = await fsApi.opendir(action.path);
-      handles.directoryOpened();
-      try {
-        for await (const entry of directory) {
-          const child = { path: join(action.path, entry.name) };
-          const bytes = Buffer.byteLength(JSON.stringify(child)) + 1;
-          if (
-            children.length > 0 &&
-            (children.length >= limits.frontierRecords ||
-              childBytes + bytes > limits.frontierBytes)
-          ) {
-            await spill();
-          }
-          children.push(child);
-          childBytes += bytes;
-          if (
-            children.length >= limits.frontierRecords ||
-            childBytes >= limits.frontierBytes
-          ) {
-            await spill();
-          }
-        }
-      } finally {
-        handles.directoryClosed();
-      }
-
-      stack.push({ kind: "sync", path: action.path });
-      for (const file of spills) stack.push({ kind: "load", file });
-      for (let index = children.length - 1; index >= 0; index -= 1) {
-        stack.push({ kind: "visit", path: children[index].path, isRoot: false });
+        await appendPostorder({
+          depth: item.relativePath.split("/").length,
+          type: item.stat.isFile() ? "file" : "directory",
+          path: item.absolutePath,
+        });
       }
     }
+    await flushPostorder();
+    const finalInputs = await reduceMergeFiles(
+      postorderChunks,
+      { fsApi, limits, metrics, work },
+      comparePostorderTasks,
+    );
+    for await (const line of mergeSortedFiles(
+      finalInputs,
+      fsApi,
+      metrics,
+      comparePostorderTasks,
+    )) {
+      const task = JSON.parse(line);
+      const current = await fsApi.lstat(task.path);
+      if (current.isSymbolicLink()) continue;
+      if (
+        (task.type === "file" && !current.isFile()) ||
+        (task.type === "directory" && !current.isDirectory())
+      ) {
+        throw new Error(`fsync tree entry type changed: ${task.path}`);
+      }
+      const handle = await fsApi.open(task.path, "r");
+      await withHandle(handle, (opened) => opened.sync(), "tree sync and close both failed");
+    }
+    metrics.mergePasses += 1;
     await revalidateRunCapability(input.capability, {
       purpose: "payload",
       id: input.entryId,

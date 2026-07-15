@@ -258,6 +258,75 @@ try {
         ownedBytes: await fsPromises.readFile(firstWorkPath + ".owned", "utf8"),
       };
     }, fsApi);
+  } else if (request.operation === "output-cleanup") {
+    let outputPath;
+    let outputLstatCount = 0;
+    let outputWriteCount = 0;
+    let faultActive = true;
+    const fsApi = {
+      ...baseFsApi,
+      lstat: async (path) => {
+        if (path === outputPath) {
+          outputLstatCount += 1;
+          if (faultActive && request.case === "foreign" && outputLstatCount === 2) {
+            await fsPromises.rename(path, path + ".owned");
+            await fsPromises.writeFile(path, "foreign", { mode: 0o600 });
+            await fsPromises.chmod(path, 0o600);
+          }
+        }
+        return fsPromises.lstat(path);
+      },
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (path !== outputPath || !faultActive) return handle;
+        return {
+          chmod: (...args) => handle.chmod(...args),
+          stat: (...args) => handle.stat(...args),
+          sync: (...args) => handle.sync(...args),
+          write: async (buffer, offset, length, position) => {
+            outputWriteCount += 1;
+            if (request.case === "partial" && outputWriteCount === 1) {
+              return handle.write(buffer, offset, 1, position);
+            }
+            throw new Error("injected output write failure");
+          },
+          close: async () => {
+            await handle.close();
+            if (request.case === "close-primary") throw new Error("injected close failure");
+          },
+        };
+      },
+    };
+    result = await withCapability(async (capability) => {
+      outputPath = deriveRunPath(capability, {
+        purpose: "inventory", id: "generated-next", phase: "pre",
+      });
+      let failure;
+      try {
+        await inventory.writeInventoryJsonl({
+          capability, root: request.root, entryId: "generated-next", phase: "pre",
+          fsApi, metrics: {},
+        });
+      } catch (error) {
+        failure = {
+          message: error.message,
+          errors: error.errors?.map((item) => item.message) ?? [error.message],
+        };
+      }
+      faultActive = false;
+      if (request.case === "foreign") {
+        return {
+          failure,
+          foreignBytes: await fsPromises.readFile(outputPath, "utf8"),
+          ownedBytes: await fsPromises.readFile(outputPath + ".owned", "utf8"),
+        };
+      }
+      const retry = await inventory.writeInventoryJsonl({
+        capability, root: request.root, entryId: "generated-next", phase: "pre",
+        fsApi, metrics: {},
+      });
+      return { failure, retry, outputBytes: await fsPromises.readFile(outputPath, "utf8") };
+    }, fsApi);
   } else if (request.operation === "hash") {
     let handles = 0;
     let maxHandles = 0;
@@ -315,8 +384,11 @@ describe("bounded quarantine inventory", () => {
     privateDirectory(quarantineRoot);
     createRun(quarantineRoot, transactionId);
     mkdirSync(leaf, { recursive: true });
-    for (let index = 0; index < 40_000; index += 1) {
+    for (let index = 0; index < 38_975; index += 1) {
       writeFileSync(join(leaf, `file-${String(index).padStart(5, "0")}.txt`), "x");
+    }
+    for (let index = 0; index < 1_025; index += 1) {
+      mkdirSync(join(leaf, `directory-${String(index).padStart(4, "0")}`));
     }
     chmodSync(join(leaf, "file-00000.txt"), 0o640);
     symlinkSync("../../../outside-must-not-be-followed", join(leaf, "leaf-link"));
@@ -337,7 +409,7 @@ describe("bounded quarantine inventory", () => {
       secondMetrics: Record<string, number>;
     };
     expect(result.second).toEqual(result.first);
-    expect(result.second).toMatchObject({ entries: 40_003, bytes: 40_037 });
+    expect(result.second).toMatchObject({ entries: 40_003, bytes: 39_012 });
     expect(readFileSync(result.secondOutput)).toEqual(readFileSync(result.firstOutput));
     expect(result.second.sha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(twoPasses.peakRssBytes).toBeLessThan(160 * 1024 * 1024);
@@ -348,6 +420,7 @@ describe("bounded quarantine inventory", () => {
     expect(result.firstMetrics.sortChunkByteLimit).toBe(8 * 1024 * 1024);
     expect(result.firstMetrics.frontierRecordLimit).toBe(1024);
     expect(result.firstMetrics.frontierByteLimit).toBe(8 * 1024 * 1024);
+    expect(result.firstMetrics.frontierSpills).toBeGreaterThan(0);
     expect(lstatSync(result.firstOutput).mode & 0o7777).toBe(0o600);
     const records = readFileSync(result.firstOutput, "utf8").trimEnd().split("\n").map(JSON.parse);
     const paths = records.map((record) => record.path);
@@ -415,6 +488,30 @@ describe("bounded quarantine inventory", () => {
     expect(result.metrics.mergePasses).toBeGreaterThan(1);
   }, 120_000);
 
+  it("treats configured limits as lower-only overrides of hard ceilings", () => {
+    const nextTransaction = "inventory-hard-ceilings";
+    createRun(quarantineRoot, nextTransaction);
+    const result = runWorker({
+      operation: "one-pass",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: leaf,
+      limits: {
+        sortChunkRecords: 1_000_000,
+        sortChunkBytes: 64 * 1024 * 1024,
+        frontierRecords: 100_000,
+        frontierBytes: 64 * 1024 * 1024,
+        mergeFanIn: 1_000,
+      },
+    }).result as { metrics: Record<string, number> };
+    expect(result.metrics.sortChunkRecordLimit).toBeLessThanOrEqual(4096);
+    expect(result.metrics.sortChunkByteLimit).toBeLessThanOrEqual(8 * 1024 * 1024);
+    expect(result.metrics.frontierRecordLimit).toBeLessThanOrEqual(1024);
+    expect(result.metrics.frontierByteLimit).toBeLessThanOrEqual(8 * 1024 * 1024);
+    expect(result.metrics.mergeFanInLimit).toBeLessThanOrEqual(32);
+  }, 120_000);
+
   it("hashes file bodies through createReadStream and reports handle counts", () => {
     expect(runWorker({ operation: "hash", root: join(leaf, "file-00001.txt") }).result).toEqual({
       sha256: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
@@ -439,7 +536,9 @@ describe("bounded quarantine inventory", () => {
     }).result as { events: [string, string][]; metrics: Record<string, number> };
     const canonicalPayload = realpathSync(payload);
     const canonicalNested = join(canonicalPayload, "nested");
-    const synced = result.events.filter(([event]) => event === "sync").map(([, path]) => path);
+    const synced = result.events
+      .filter(([event, path]) => event === "sync" && path.startsWith(canonicalPayload))
+      .map(([, path]) => path);
     expect(synced).toEqual([join(canonicalNested, "file"), canonicalNested, canonicalPayload]);
     expect(result.events.some(([, path]) => path === join(canonicalNested, "link"))).toBe(false);
     expect(result.events.some(([, path]) => path === external)).toBe(false);
@@ -455,6 +554,9 @@ describe("bounded quarantine inventory", () => {
     expect(result.openDirectories).toBe(0);
     expect(result.metrics.maxOpenDirectoryHandles).toBeLessThanOrEqual(1);
     expect(result.metrics.maxTraversalAndHashHandles).toBeLessThanOrEqual(2);
+    expect(result.metrics.maxPostorderFrames).toBeLessThanOrEqual(1024);
+    expect(result.metrics.maxPostorderBytes).toBeLessThanOrEqual(8 * 1024 * 1024);
+    expect(result.metrics.postorderSpills).toBeGreaterThan(0);
   }, 120_000);
 
   it("rejects a symlink root and an output-parent symlink without touching external data", () => {
@@ -522,5 +624,62 @@ describe("bounded quarantine inventory", () => {
     ]);
     expect(result.foreignBytes).toBe("foreign");
     expect(result.ownedBytes).toContain('"path":"a"');
+  });
+
+  it.each(["zero-byte", "partial", "close-primary"])(
+    "removes an owned %s output failure so an exact retry succeeds",
+    (failureCase) => {
+      const nextTransaction = `inventory-output-${failureCase}`;
+      createRun(quarantineRoot, nextTransaction);
+      const source = join(repoRoot, `${failureCase}.txt`);
+      writeFileSync(source, "retry-body");
+      const result = runWorker({
+        operation: "output-cleanup",
+        case: failureCase,
+        repoRoot,
+        quarantineRoot,
+        transactionId: nextTransaction,
+        root: source,
+      }).result as {
+        failure: { errors: string[] };
+        retry: { entries: number; bytes: number; sha256: string };
+        outputBytes: string;
+      };
+      expect(result.failure.errors[0]).toBe("injected output write failure");
+      if (failureCase === "close-primary") {
+        expect(result.failure.errors).toEqual([
+          "injected output write failure",
+          "injected close failure",
+        ]);
+      }
+      expect(result.retry).toMatchObject({ entries: 1, bytes: 10 });
+      expect(result.outputBytes.endsWith("\n")).toBe(true);
+    },
+    120_000,
+  );
+
+  it("preserves a foreign partial-output replacement and aggregates cleanup failure", () => {
+    const nextTransaction = "inventory-output-foreign";
+    createRun(quarantineRoot, nextTransaction);
+    const source = join(repoRoot, "foreign-output.txt");
+    writeFileSync(source, "source");
+    const result = runWorker({
+      operation: "output-cleanup",
+      case: "foreign",
+      repoRoot,
+      quarantineRoot,
+      transactionId: nextTransaction,
+      root: source,
+    }).result as {
+      failure: { errors: string[] };
+      foreignBytes: string;
+      ownedBytes: string;
+    };
+    expect(result.failure.errors).toEqual([
+      "injected output write failure",
+      expect.stringMatching(/ownership|foreign replacement/i),
+    ]);
+    expect(result.foreignBytes).toBe("foreign");
+    expect(result.ownedBytes).toBe("");
   });
 });
