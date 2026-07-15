@@ -51,6 +51,8 @@ try {
     result = await inventory.hashFileStream(request.path);
   } else if (request.operation === "compare") {
     result = await inventory.compareInventorySummary(request.expected, request.observed);
+  } else if (request.operation === "parse-summary") {
+    result = inventory.parseInventorySummary(request.value);
   }
   if (global.gc) global.gc();
   peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
@@ -176,5 +178,25 @@ describe("streaming quarantine inventory", () => {
         observed: { ...workerResult.result.second, entries: 1 },
       }),
     ).toThrow(/summary/u);
+  });
+
+  it("parses only an exact closed inventory summary", () => {
+    const valid = {
+      sha256: "a".repeat(64),
+      entries: 0,
+      bytes: Number.MAX_SAFE_INTEGER,
+    };
+    expect(runWorker({ operation: "parse-summary", value: valid }).result).toEqual(valid);
+    for (const value of [
+      { ...valid, attackerPath: "../victim" },
+      { ...valid, sha256: "A".repeat(64) },
+      { ...valid, sha256: "a".repeat(63) },
+      { ...valid, entries: -1 },
+      { ...valid, entries: Number.MAX_SAFE_INTEGER + 1 },
+      { ...valid, bytes: -1 },
+      { ...valid, bytes: 1.5 },
+    ]) {
+      expect(() => runWorker({ operation: "parse-summary", value })).toThrow(/summary/u);
+    }
   });
 });

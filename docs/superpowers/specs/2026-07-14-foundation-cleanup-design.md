@@ -207,8 +207,10 @@ the validated transaction ID and manifest SHA-256; `MOVE_INTENT` accepts only
 the entry ID and expected `InventorySummary`; `MOVED` accepts only the entry ID
 and observed `InventorySummary`. Entry-oriented rollback and restore events
 accept only their validated entry ID plus any inventory summary explicitly
-required by their documented transition. Conflict/recovery events accept only
-sorted unique validated entry-ID arrays. Task 2 may extend an event payload only
+required by their documented transition. `RECOVERY_REQUIRED` accepts exactly
+`{ entryIds: string[] }`, and `INCOMPLETE_CONFLICT` accepts exactly
+`{ conflictEntryIds: string[] }`; both arrays are non-empty, bytewise sorted,
+unique validated entry IDs. Task 2 may extend an event payload only
 after adding a failing exact-schema test and updating this contract; arbitrary
 plain canonical JSON is never an accepted journal payload.
 

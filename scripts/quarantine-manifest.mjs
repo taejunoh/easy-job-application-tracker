@@ -2,6 +2,7 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 
+import { parseInventorySummary } from "./quarantine-inventory.mjs";
 import { parseManifestEntry } from "./quarantine-path-policy.mjs";
 
 const RETENTION_DAYS = 4;
@@ -35,6 +36,23 @@ const STATES = new Set([
   "RESTORING",
   "RESTORED",
 ]);
+const SHA256 = /^[a-f0-9]{64}$/u;
+const GIT_OBJECT_ID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
+const SOURCE_ENTRY_KEYS = [
+  "id",
+  "kind",
+  "relativePath",
+  "canonicalRelativePath",
+  "mode",
+  "size",
+  "sha256",
+  "canonicalSize",
+  "canonicalSha256",
+  "classification",
+  "historyMatch",
+  "preMoveInventory",
+];
+const GENERATED_ENTRY_KEYS = ["id", "kind", "relativePath", "mode", "preMoveInventory"];
 
 function isPlainObject(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -65,6 +83,154 @@ function assertIsoDate(value, label, nullable = false) {
     throw new TypeError(`${label} must be a canonical UTC timestamp`);
   }
   return value;
+}
+
+function assertExactKeys(value, expectedKeys, label) {
+  if (!isPlainObject(value)) throw new TypeError(`${label} must be a plain object`);
+  for (const key of Object.keys(value)) {
+    if (!expectedKeys.includes(key)) throw new TypeError(`unknown field: ${key}`);
+  }
+  for (const key of expectedKeys) {
+    if (!Object.hasOwn(value, key)) throw new TypeError(`missing field: ${key}`);
+  }
+}
+
+function assertMode(value) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0o7777) {
+    throw new TypeError("manifest entry mode is invalid");
+  }
+  return value;
+}
+
+function assertNonnegativeSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${label} is invalid`);
+  }
+  return value;
+}
+
+function assertSha256(value, label) {
+  if (typeof value !== "string" || !SHA256.test(value)) {
+    throw new TypeError(`${label} is invalid`);
+  }
+  return value;
+}
+
+function parseEnrichedManifestEntry(value) {
+  if (value?.kind === "source-copy") {
+    assertExactKeys(value, SOURCE_ENTRY_KEYS, "source-copy manifest entry");
+    const locator = parseManifestEntry({
+      id: value.id,
+      kind: value.kind,
+      relativePath: value.relativePath,
+      canonicalRelativePath: value.canonicalRelativePath,
+    });
+    const mode = assertMode(value.mode);
+    const size = assertNonnegativeSafeInteger(value.size, "source-copy size");
+    const sha256 = assertSha256(value.sha256, "source-copy SHA-256");
+    const canonicalSize = assertNonnegativeSafeInteger(
+      value.canonicalSize,
+      "canonical size",
+    );
+    const canonicalSha256 = assertSha256(value.canonicalSha256, "canonical SHA-256");
+    if (!new Set(["identical", "divergent"]).has(value.classification)) {
+      throw new TypeError("source-copy classification is invalid");
+    }
+    if (
+      value.historyMatch !== null &&
+      (typeof value.historyMatch !== "string" || !GIT_OBJECT_ID.test(value.historyMatch))
+    ) {
+      throw new TypeError("source-copy history match is invalid");
+    }
+    const preMoveInventory = parseInventorySummary(value.preMoveInventory);
+    if (preMoveInventory.entries !== 1 || preMoveInventory.bytes !== size) {
+      throw new TypeError("source-copy inventory summary must describe its one source file");
+    }
+    if (
+      value.classification === "identical" &&
+      (size !== canonicalSize || sha256 !== canonicalSha256)
+    ) {
+      throw new TypeError("identical source-copy metadata does not match canonical metadata");
+    }
+    if (value.classification === "divergent" && sha256 === canonicalSha256) {
+      throw new TypeError("divergent source-copy hashes must differ");
+    }
+    return Object.freeze({
+      ...locator,
+      mode,
+      size,
+      sha256,
+      canonicalSize,
+      canonicalSha256,
+      classification: value.classification,
+      historyMatch: value.historyMatch,
+      preMoveInventory,
+    });
+  }
+
+  if (value?.kind === "generated-root") {
+    assertExactKeys(value, GENERATED_ENTRY_KEYS, "generated-root manifest entry");
+    const locator = parseManifestEntry({
+      id: value.id,
+      kind: value.kind,
+      relativePath: value.relativePath,
+    });
+    const expectedId = locator.relativePath === ".next"
+      ? "generated-next"
+      : "generated-node-modules";
+    if (locator.id !== expectedId) {
+      throw new TypeError("generated manifest entry ID/path pair is invalid");
+    }
+    return Object.freeze({
+      ...locator,
+      mode: assertMode(value.mode),
+      preMoveInventory: parseInventorySummary(value.preMoveInventory),
+    });
+  }
+
+  throw new TypeError("manifest entry kind is invalid");
+}
+
+function parseManifestEntries(value) {
+  if (!Array.isArray(value)) throw new TypeError("manifest entries must be an array");
+  const entries = value.map((entry) => parseEnrichedManifestEntry(entry));
+  const ids = new Set();
+  const relativePaths = new Set();
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (ids.has(entry.id)) throw new TypeError("duplicate manifest entry ID");
+    if (relativePaths.has(entry.relativePath)) {
+      throw new TypeError("duplicate manifest entry relative path");
+    }
+    ids.add(entry.id);
+    relativePaths.add(entry.relativePath);
+    if (
+      index > 0 &&
+      Buffer.compare(
+        Buffer.from(entries[index - 1].relativePath),
+        Buffer.from(entry.relativePath),
+      ) >= 0
+    ) {
+      throw new TypeError("manifest entries must use bytewise relative-path order");
+    }
+  }
+
+  const generated = entries.filter((entry) => entry.kind === "generated-root");
+  if (
+    generated.length !== 2 ||
+    !ids.has("generated-next") ||
+    !ids.has("generated-node-modules")
+  ) {
+    throw new TypeError("manifest must contain both fixed generated roots exactly once");
+  }
+  const sources = entries.filter((entry) => entry.kind === "source-copy");
+  for (let index = 0; index < sources.length; index += 1) {
+    const expectedId = `copy-${String(index + 1).padStart(4, "0")}`;
+    if (sources[index].id !== expectedId) {
+      throw new TypeError("source-copy IDs must follow deterministic bytewise numbering");
+    }
+  }
+  return Object.freeze(entries);
 }
 
 function normalizeManifest(value) {
@@ -104,8 +270,7 @@ function normalizeManifest(value) {
   if (!new Set(["retained", "deleted"]).has(value.deletionStatus)) {
     throw new TypeError("manifest deletion status is invalid");
   }
-  if (!Array.isArray(value.entries)) throw new TypeError("manifest entries must be an array");
-  const entries = value.entries.map((entry) => parseManifestEntry(entry));
+  const entries = parseManifestEntries(value.entries);
 
   if (value.state === "VALIDATED") {
     if (validatedAt === null || value.retentionDays !== RETENTION_DAYS || deleteAfter === null) {

@@ -270,8 +270,13 @@ export async function writeInventoryJsonl({ root, outputPath, fsApi = fsPromises
   }
 }
 
-function validateSummary(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+export function parseInventorySummary(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+  ) {
     throw new TypeError("inventory summary must be an object");
   }
   const keys = Object.keys(value).sort();
@@ -287,15 +292,16 @@ function validateSummary(value) {
   if (!Number.isSafeInteger(value.bytes) || value.bytes < 0) {
     throw new TypeError("inventory summary byte count is invalid");
   }
+  return Object.freeze({ sha256: value.sha256, entries: value.entries, bytes: value.bytes });
 }
 
 export async function compareInventorySummary(expected, observed) {
-  validateSummary(expected);
-  validateSummary(observed);
+  const parsedExpected = parseInventorySummary(expected);
+  const parsedObserved = parseInventorySummary(observed);
   if (
-    expected.sha256 !== observed.sha256 ||
-    expected.entries !== observed.entries ||
-    expected.bytes !== observed.bytes
+    parsedExpected.sha256 !== parsedObserved.sha256 ||
+    parsedExpected.entries !== parsedObserved.entries ||
+    parsedExpected.bytes !== parsedObserved.bytes
   ) {
     throw new Error("inventory summary mismatch");
   }

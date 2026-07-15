@@ -2,10 +2,14 @@ import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { dirname } from "node:path";
 
+import { parseInventorySummary } from "./quarantine-inventory.mjs";
+
 const ZERO_HASH = "0".repeat(64);
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const ENVELOPE_KEYS = ["sequence", "previousHash", "event", "payload", "recordHash"];
+const ENTRY_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
+const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 
 const TRANSITIONS = new Map([
   ["<START>", new Map([["PREPARED", "PREPARED"]])],
@@ -104,6 +108,121 @@ function canonicalHashInput(sequence, previousHash, event, payload) {
   return JSON.stringify({ sequence, previousHash, event, payload });
 }
 
+function assertPayloadKeys(payload, expectedKeys, event) {
+  if (!isPlainObject(payload)) throw new TypeError(`${event} payload must be a plain object`);
+  for (const key of Object.keys(payload)) {
+    if (!expectedKeys.includes(key)) throw new TypeError(`unknown field in ${event} payload: ${key}`);
+  }
+  for (const key of expectedKeys) {
+    if (!Object.hasOwn(payload, key)) throw new TypeError(`missing field in ${event} payload: ${key}`);
+  }
+}
+
+function parseEntryId(value) {
+  if (typeof value !== "string" || value.length > 128 || !ENTRY_ID.test(value)) {
+    throw new TypeError("journal payload entry ID is invalid");
+  }
+  return value;
+}
+
+function parseManifestSha256(value) {
+  if (typeof value !== "string" || !HASH_PATTERN.test(value)) {
+    throw new TypeError("journal payload manifest hash is invalid");
+  }
+  return value;
+}
+
+function parseEmptyPayload(event, payload) {
+  assertPayloadKeys(payload, [], event);
+  return Object.freeze({});
+}
+
+function parseEntryPayload(event, payload) {
+  assertPayloadKeys(payload, ["id"], event);
+  return Object.freeze({ id: parseEntryId(payload.id) });
+}
+
+function parseSortedEntryIds(event, payload, key) {
+  assertPayloadKeys(payload, [key], event);
+  if (!Array.isArray(payload[key]) || payload[key].length === 0) {
+    throw new TypeError(`${event} payload ${key} must be a non-empty array`);
+  }
+  const values = payload[key].map((value) => parseEntryId(value));
+  for (let index = 1; index < values.length; index += 1) {
+    if (Buffer.compare(Buffer.from(values[index - 1]), Buffer.from(values[index])) >= 0) {
+      throw new TypeError(`${event} payload ${key} must be bytewise sorted and unique`);
+    }
+  }
+  return Object.freeze({ [key]: Object.freeze(values) });
+}
+
+const EVENT_PAYLOAD_PARSERS = Object.freeze({
+  PREPARED(payload) {
+    assertPayloadKeys(payload, ["transactionId", "manifestSha256"], "PREPARED");
+    if (
+      typeof payload.transactionId !== "string" ||
+      payload.transactionId === "." ||
+      payload.transactionId === ".." ||
+      payload.transactionId !== payload.transactionId.normalize("NFC") ||
+      !TRANSACTION_ID.test(payload.transactionId)
+    ) {
+      throw new TypeError("PREPARED payload transaction ID is invalid");
+    }
+    return Object.freeze({
+      manifestSha256: parseManifestSha256(payload.manifestSha256),
+      transactionId: payload.transactionId,
+    });
+  },
+  MOVING: (payload) => parseEmptyPayload("MOVING", payload),
+  MOVE_INTENT(payload) {
+    assertPayloadKeys(payload, ["id", "expected"], "MOVE_INTENT");
+    return Object.freeze({
+      expected: parseInventorySummary(payload.expected),
+      id: parseEntryId(payload.id),
+    });
+  },
+  MOVED(payload) {
+    assertPayloadKeys(payload, ["id", "observed"], "MOVED");
+    return Object.freeze({
+      id: parseEntryId(payload.id),
+      observed: parseInventorySummary(payload.observed),
+    });
+  },
+  VERIFYING: (payload) => parseEmptyPayload("VERIFYING", payload),
+  QUARANTINED(payload) {
+    assertPayloadKeys(payload, ["manifestSha256"], "QUARANTINED");
+    return Object.freeze({ manifestSha256: parseManifestSha256(payload.manifestSha256) });
+  },
+  VALIDATED: (payload) => parseEmptyPayload("VALIDATED", payload),
+  RECOVERY_REQUIRED: (payload) =>
+    parseSortedEntryIds("RECOVERY_REQUIRED", payload, "entryIds"),
+  ROLLING_BACK: (payload) => parseEmptyPayload("ROLLING_BACK", payload),
+  ROLLBACK_INTENT: (payload) => parseEntryPayload("ROLLBACK_INTENT", payload),
+  ROLLED_BACK_ENTRY: (payload) => parseEntryPayload("ROLLED_BACK_ENTRY", payload),
+  ROLLED_BACK: (payload) => parseEmptyPayload("ROLLED_BACK", payload),
+  INCOMPLETE_CONFLICT: (payload) =>
+    parseSortedEntryIds("INCOMPLETE_CONFLICT", payload, "conflictEntryIds"),
+  RESTORE_PREPARED: (payload) => parseEmptyPayload("RESTORE_PREPARED", payload),
+  RESTORING: (payload) => parseEmptyPayload("RESTORING", payload),
+  RESTORE_INTENT: (payload) => parseEntryPayload("RESTORE_INTENT", payload),
+  RESTORED_ENTRY: (payload) => parseEntryPayload("RESTORED_ENTRY", payload),
+  RESTORED: (payload) => parseEmptyPayload("RESTORED", payload),
+});
+
+for (const transitions of TRANSITIONS.values()) {
+  for (const event of transitions.keys()) {
+    if (!Object.hasOwn(EVENT_PAYLOAD_PARSERS, event)) {
+      throw new Error(`journal transition has no payload parser: ${event}`);
+    }
+  }
+}
+
+function parseEventPayload(event, payload) {
+  const parser = EVENT_PAYLOAD_PARSERS[event];
+  if (parser === undefined) throw new Error(`journal event has no payload parser: ${event}`);
+  return parser(payload);
+}
+
 function hashRecord(sequence, previousHash, event, payload) {
   return createHash("sha256")
     .update(canonicalHashInput(sequence, previousHash, event, payload))
@@ -147,7 +266,7 @@ function validateFrame(record, rawBody, expectedSequence, expectedPreviousHash, 
     throw new Error("journal record hash is invalid");
   }
 
-  const payload = canonicalize(record.payload);
+  const payload = canonicalize(parseEventPayload(record.event, record.payload));
   const canonicalRecord = {
     sequence: record.sequence,
     previousHash: record.previousHash,
@@ -231,7 +350,7 @@ export async function appendJournalRecord({
   if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
   const replayed = await replayJournal(journalPath, fsApi);
   validateTransition(replayed.state, event);
-  const canonicalPayload = canonicalize(payload);
+  const canonicalPayload = canonicalize(parseEventPayload(event, payload));
   const sequence = replayed.records.length + 1;
   const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
   const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);

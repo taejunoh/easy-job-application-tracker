@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
@@ -76,13 +77,19 @@ try {
   return result;
 }
 
+const validSummary = { sha256: "b".repeat(64), entries: 1, bytes: 1 };
+const manifestSha256 = "a".repeat(64);
+
 const happyRecords = [
-  { event: "PREPARED", payload: { transactionId: "tx-0001" } },
+  {
+    event: "PREPARED",
+    payload: { transactionId: "tx-0001", manifestSha256 },
+  },
   { event: "MOVING", payload: {} },
-  { event: "MOVE_INTENT", payload: { id: "copy-0001" } },
-  { event: "MOVED", payload: { id: "copy-0001" } },
+  { event: "MOVE_INTENT", payload: { id: "copy-0001", expected: validSummary } },
+  { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
   { event: "VERIFYING", payload: {} },
-  { event: "QUARANTINED", payload: {} },
+  { event: "QUARANTINED", payload: { manifestSha256 } },
 ] as const;
 
 function appendMany(journalPath: string, records = happyRecords, trackDurability = false) {
@@ -128,7 +135,7 @@ describe("durable quarantine journal", () => {
       sequence: 1,
       previousHash: "0".repeat(64),
       event: "PREPARED",
-      payload: { transactionId: "tx-0001" },
+      payload: { manifestSha256, transactionId: "tx-0001" },
     });
     expect(replayed.records[1].previousHash).toBe(replayed.records[0].recordHash);
     expect(replayed.records.every((record: { recordHash: string }) =>
@@ -204,7 +211,9 @@ describe("durable quarantine journal", () => {
       expect(boundary).toBeTruthy();
     }
 
-    appendMany(path, [{ event: "MOVED", payload: { id: "copy-0001" } }]);
+    appendMany(path, [
+      { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
+    ]);
     expect(replay(path).records.at(-1)).toMatchObject({ event: "MOVED" });
   });
 
@@ -261,7 +270,155 @@ describe("durable quarantine journal", () => {
     writeFileSync(path, Buffer.concat([length, body]));
     expect(() => replay(path)).toThrow(expected);
   });
+
+  it("enforces an exact closed payload parser for every journal event", () => {
+    const rollbackPath = join(fixture, "payload-all-rollback", "journal.log");
+    appendMany(rollbackPath, [
+      ...happyRecords.slice(0, 2),
+      { event: "RECOVERY_REQUIRED", payload: { entryIds: ["copy-0001"] } },
+      { event: "ROLLING_BACK", payload: {} },
+      { event: "ROLLBACK_INTENT", payload: { id: "copy-0001" } },
+      { event: "ROLLED_BACK_ENTRY", payload: { id: "copy-0001" } },
+      { event: "ROLLED_BACK", payload: {} },
+    ]);
+    expect(replay(rollbackPath).state).toBe("ROLLED_BACK");
+
+    const conflictPath = join(fixture, "payload-all-conflict", "journal.log");
+    appendMany(conflictPath, [
+      ...happyRecords.slice(0, 2),
+      {
+        event: "INCOMPLETE_CONFLICT",
+        payload: { conflictEntryIds: ["copy-0001"] },
+      },
+    ]);
+    expect(replay(conflictPath).state).toBe("INCOMPLETE_CONFLICT");
+
+    const validatedPath = join(fixture, "payload-all-validated", "journal.log");
+    appendMany(validatedPath, [...happyRecords, { event: "VALIDATED", payload: {} }]);
+    expect(replay(validatedPath).state).toBe("VALIDATED");
+
+    const restorePath = join(fixture, "payload-all-restore", "journal.log");
+    appendMany(restorePath, [
+      ...happyRecords,
+      { event: "RESTORE_PREPARED", payload: {} },
+      { event: "RESTORING", payload: {} },
+      { event: "RESTORE_INTENT", payload: { id: "copy-0001" } },
+      { event: "RESTORED_ENTRY", payload: { id: "copy-0001" } },
+      { event: "RESTORED", payload: {} },
+    ]);
+    expect(replay(restorePath).state).toBe("RESTORED");
+  });
+
+  it("rejects unknown keys on empty lifecycle payloads", () => {
+    const path = join(fixture, "payload-empty-unknown", "journal.log");
+    expect(() =>
+      appendMany(path, [
+        happyRecords[0],
+        { event: "MOVING", payload: { attackerPath: "../victim" } },
+      ]),
+    ).toThrow(/payload|unknown field/u);
+  });
+
+  it.each([
+    [{ transactionId: "tx-0001" }, /missing|payload/u],
+    [{ transactionId: "tx-0001", manifestSha256, extra: true }, /unknown field|payload/u],
+    [{ transactionId: "../victim", manifestSha256 }, /transaction ID/u],
+    [{ transactionId: "tx-0001", manifestSha256: "A".repeat(64) }, /hash|payload/u],
+  ])("rejects an invalid PREPARED payload", (payload, expected) => {
+    const path = join(fixture, `payload-prepared-${Math.random()}`, "journal.log");
+    expect(() => appendMany(path, [{ event: "PREPARED", payload }])).toThrow(expected);
+  });
+
+  it.each([
+    ["MOVE_INTENT", { id: "../victim", expected: validSummary }],
+    ["MOVE_INTENT", { id: "copy-0001", expected: { ...validSummary, path: "../victim" } }],
+    ["MOVE_INTENT", { id: "copy-0001", expected: { ...validSummary, sha256: "f" } }],
+    ["MOVE_INTENT", { id: "copy-0001", expected: { ...validSummary, entries: -1 } }],
+    ["MOVED", { id: "copy-0001", observed: { ...validSummary, bytes: -1 } }],
+    ["MOVED", { id: "copy-0001", observed: validSummary, extra: true }],
+  ])("rejects invalid %s payloads", (event, payload) => {
+    const path = join(fixture, `payload-${event}-${Math.random()}`, "journal.log");
+    const prefix = event === "MOVE_INTENT" ? happyRecords.slice(0, 2) : happyRecords.slice(0, 3);
+    expect(() => appendMany(path, [...prefix, { event, payload }])).toThrow(/payload|summary|ID/u);
+  });
+
+  it.each([
+    ["RECOVERY_REQUIRED", { entryIds: [] }],
+    ["RECOVERY_REQUIRED", { entryIds: ["copy-0002", "copy-0001"] }],
+    ["RECOVERY_REQUIRED", { entryIds: ["copy-0001", "copy-0001"] }],
+    ["INCOMPLETE_CONFLICT", { conflictEntryIds: ["../victim"] }],
+    ["INCOMPLETE_CONFLICT", { entryIds: ["copy-0001"] }],
+  ])("rejects invalid sorted recovery/conflict IDs for %s", (event, payload) => {
+    const path = join(fixture, `payload-${event}-${Math.random()}`, "journal.log");
+    expect(() => appendMany(path, [...happyRecords.slice(0, 2), { event, payload }])).toThrow(
+      /payload|ID|sorted|unknown field/u,
+    );
+  });
+
+  it("rejects a correctly re-hashed canonical frame with an invalid event payload", () => {
+    const path = join(fixture, "payload-replay-invalid", "journal.log");
+    appendMany(path, happyRecords.slice(0, 1));
+    const first = replay(path).records[0];
+    const payload = { attackerPath: "../victim" };
+    const hashInput = {
+      sequence: 2,
+      previousHash: first.recordHash,
+      event: "MOVING",
+      payload,
+    };
+    const recordHash = createHash("sha256").update(JSON.stringify(hashInput)).digest("hex");
+    const body = Buffer.from(JSON.stringify({ ...hashInput, recordHash }));
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(body.length);
+    appendFileSync(path, Buffer.concat([length, body]));
+    expect(() => replay(path)).toThrow(/payload|unknown field/u);
+  });
 });
+
+function inventorySummary(overrides: Record<string, unknown> = {}) {
+  return { sha256: "9".repeat(64), entries: 1, bytes: 1, ...overrides };
+}
+
+function sourceManifestEntry(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "copy-0001",
+    kind: "source-copy",
+    relativePath: "src/example 2.ts",
+    canonicalRelativePath: "src/example.ts",
+    mode: 0o640,
+    size: 1,
+    sha256: "1".repeat(64),
+    canonicalSize: 1,
+    canonicalSha256: "1".repeat(64),
+    classification: "identical",
+    historyMatch: null,
+    preMoveInventory: inventorySummary(),
+    ...overrides,
+  };
+}
+
+function generatedManifestEntries() {
+  return [
+    {
+      id: "generated-next",
+      kind: "generated-root",
+      relativePath: ".next",
+      mode: 0o755,
+      preMoveInventory: inventorySummary({ sha256: "7".repeat(64), entries: 2, bytes: 3 }),
+    },
+    {
+      id: "generated-node-modules",
+      kind: "generated-root",
+      relativePath: "node_modules",
+      mode: 0o755,
+      preMoveInventory: inventorySummary({ sha256: "8".repeat(64), entries: 4, bytes: 5 }),
+    },
+  ];
+}
+
+function validManifestEntries() {
+  return [...generatedManifestEntries(), sourceManifestEntry()];
+}
 
 function manifestValue(overrides: Record<string, unknown> = {}) {
   return {
@@ -276,7 +433,7 @@ function manifestValue(overrides: Record<string, unknown> = {}) {
     deletionRequiresConfirmation: true,
     deleteAfter: null,
     deletionStatus: "retained",
-    entries: [],
+    entries: validManifestEntries(),
     ...overrides,
   };
 }
@@ -438,5 +595,142 @@ describe("small quarantine manifest publisher", () => {
         now: "2026-07-14T12:00:00.000Z",
       }),
     ).toThrow(/QUARANTINED/u);
+  });
+
+  it.each(Object.keys(sourceManifestEntry()))(
+    "rejects a source-copy entry missing %s",
+    (missingField) => {
+      const source: Record<string, unknown> = sourceManifestEntry();
+      delete source[missingField];
+      expect(() =>
+        invokeManifest({
+          operation: "publish",
+          quarantineRoot: join(fixture, `missing-${missingField}`),
+          manifest: manifestValue({ entries: [...generatedManifestEntries(), source] }),
+        }),
+      ).toThrow(/missing field|entry/u);
+    },
+  );
+
+  it("rejects free-form inventory and destination paths on entries", () => {
+    for (const field of ["inventoryPath", "payloadPath", "rollbackPath", "destination"]) {
+      expect(() =>
+        invokeManifest({
+          operation: "publish",
+          quarantineRoot: join(fixture, `free-path-${field}`),
+          manifest: manifestValue({
+            entries: [...generatedManifestEntries(), sourceManifestEntry({ [field]: "../victim" })],
+          }),
+        }),
+      ).toThrow(/unknown field/u);
+    }
+  });
+
+  it.each(Object.keys(generatedManifestEntries()[0]))(
+    "rejects a generated-root entry missing %s",
+    (missingField) => {
+      const generated: Record<string, unknown> = { ...generatedManifestEntries()[0] };
+      delete generated[missingField];
+      expect(() =>
+        invokeManifest({
+          operation: "publish",
+          quarantineRoot: join(fixture, `missing-generated-${missingField}`),
+          manifest: manifestValue({
+            entries: [generated, generatedManifestEntries()[1], sourceManifestEntry()],
+          }),
+        }),
+      ).toThrow(/missing field|entry/u);
+    },
+  );
+
+  it("rejects unknown generated-root fields", () => {
+    expect(() =>
+      invokeManifest({
+        operation: "publish",
+        quarantineRoot: join(fixture, "unknown-generated-field"),
+        manifest: manifestValue({
+          entries: [
+            { ...generatedManifestEntries()[0], inventoryPath: "../victim" },
+            generatedManifestEntries()[1],
+            sourceManifestEntry(),
+          ],
+        }),
+      }),
+    ).toThrow(/unknown field/u);
+  });
+
+  it.each([
+    ["hash", sourceManifestEntry({ sha256: "A".repeat(64) })],
+    ["mode", sourceManifestEntry({ mode: 0o10000 })],
+    ["negative size", sourceManifestEntry({ size: -1 })],
+    ["unsafe integer", sourceManifestEntry({ canonicalSize: Number.MAX_SAFE_INTEGER + 1 })],
+    [
+      "identical mismatch",
+      sourceManifestEntry({ canonicalSha256: "2".repeat(64), classification: "identical" }),
+    ],
+    ["divergent equal", sourceManifestEntry({ classification: "divergent" })],
+    ["history match", sourceManifestEntry({ historyMatch: "not-a-git-object" })],
+    ["source summary entries", sourceManifestEntry({ preMoveInventory: inventorySummary({ entries: 2 }) })],
+    ["source summary bytes", sourceManifestEntry({ preMoveInventory: inventorySummary({ bytes: 2 }) })],
+  ])("rejects invalid source-copy metadata: %s", (label, source) => {
+    expect(label).toBeTruthy();
+    expect(() =>
+      invokeManifest({
+        operation: "publish",
+        quarantineRoot: join(fixture, `invalid-source-${String(label).replaceAll(" ", "-")}`),
+        manifest: manifestValue({ entries: [...generatedManifestEntries(), source] }),
+      }),
+    ).toThrow();
+  });
+
+  it("accepts a divergent source with a valid history match", () => {
+    const divergent = sourceManifestEntry({
+      size: 2,
+      sha256: "2".repeat(64),
+      canonicalSize: 3,
+      canonicalSha256: "3".repeat(64),
+      classification: "divergent",
+      historyMatch: "4".repeat(40),
+      preMoveInventory: inventorySummary({ bytes: 2 }),
+    });
+    const quarantineRoot = join(fixture, "valid-divergent");
+    const manifest = manifestValue({ entries: [...generatedManifestEntries(), divergent] });
+    expect(
+      invokeManifest({ operation: "publish", quarantineRoot, manifest }).result.entries.at(-1),
+    ).toEqual(divergent);
+  });
+
+  it.each([
+    [
+      "duplicate ID",
+      [...generatedManifestEntries(), sourceManifestEntry(), sourceManifestEntry({ relativePath: "src/z 2.ts", canonicalRelativePath: "src/z.ts" })],
+    ],
+    [
+      "duplicate relative path",
+      [...generatedManifestEntries(), sourceManifestEntry(), sourceManifestEntry({ id: "copy-0002" })],
+    ],
+    ["unsorted", [sourceManifestEntry(), ...generatedManifestEntries()]],
+    ["copy numbering", [...generatedManifestEntries(), sourceManifestEntry({ id: "copy-0002" })]],
+    ["missing generated", [generatedManifestEntries()[0], sourceManifestEntry()]],
+    [
+      "duplicate generated",
+      [...generatedManifestEntries(), generatedManifestEntries()[0], sourceManifestEntry()],
+    ],
+    [
+      "generated ID/path mismatch",
+      [
+        { ...generatedManifestEntries()[0], id: "generated-node-modules" },
+        generatedManifestEntries()[1],
+        sourceManifestEntry(),
+      ],
+    ],
+  ])("rejects cross-entry invariant violations: %s", (label, entries) => {
+    expect(() =>
+      invokeManifest({
+        operation: "publish",
+        quarantineRoot: join(fixture, `entry-invariant-${String(label).replaceAll(" ", "-")}`),
+        manifest: manifestValue({ entries }),
+      }),
+    ).toThrow(/entry|generated|sorted|order|duplicate|ID/u);
   });
 });

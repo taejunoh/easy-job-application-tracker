@@ -204,8 +204,11 @@ type RequiredJournalPayloads = {
 ```
 
 Lifecycle-only events outside this minimum accept exactly `{}` unless their
-Task 2 transition contract defines a narrower entry-ID, inventory-summary, or
-sorted conflict-ID payload. Tests must prove that an empty-payload event rejects
+Task 2 transition contract defines a narrower entry-ID or inventory-summary
+payload. `RECOVERY_REQUIRED` accepts exactly `{ entryIds: string[] }`, while
+`INCOMPLETE_CONFLICT` accepts exactly `{ conflictEntryIds: string[] }`; both
+arrays must be non-empty, bytewise sorted, unique validated entry IDs. Tests
+must prove that an empty-payload event rejects
 one unknown key; `PREPARED` rejects a missing or extra field, invalid transaction
 ID, and invalid checksum; `MOVE_INTENT` and `MOVED` reject unknown fields, invalid
 entry IDs, invalid nested summary keys, hashes, counts, and byte sizes. Replay
