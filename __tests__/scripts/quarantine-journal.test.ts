@@ -567,6 +567,65 @@ const result = await withQuarantineRunCapability({
       ));
     return { outcome, replayed: await journal.replayJournal({ capability }) };
   }
+  if (request.operation === "journal-close-only") {
+    if (request.mode === "recovery") {
+      await appendAll(capability, [request.prefix]);
+      await seedArtifacts(capability);
+    }
+    const journalPath = deriveRunPath(capability, { purpose: "journal" });
+    let callbackCount = 0;
+    let journalSyncs = 0;
+    const failureFs = {
+      ...fsPromises,
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        const isJournalMutation = String(path) === journalPath && String(flags).includes("+");
+        if (!isJournalMutation) return handle;
+        let synced = false;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === "sync") return async () => {
+              await target.sync();
+              synced = true;
+              journalSyncs += 1;
+            };
+            if (property === "close") return async () => {
+              await target.close();
+              if (synced) throw new Error("injected journal close-only failure");
+            };
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+    const append = (heldLock) => {
+      callbackCount += 1;
+      return journal.appendJournalRecord({
+        capability,
+        heldLock,
+        event: request.record.event,
+        payload: request.record.payload,
+        fsApi: failureFs,
+      });
+    };
+    const outcome = request.mode === "recovery"
+      ? await capture(() => journal.reclaimJournalLock(
+        { capability, writersStopped: true, fsApi: failureFs },
+        append,
+      ))
+      : await capture(() => journal.withJournalLock(
+        { capability, fsApi: failureFs },
+        append,
+      ));
+    return {
+      callbackCount,
+      journalSyncs,
+      names: (await fsPromises.readdir(runRoot)).sort(),
+      outcome,
+      replayed: await journal.replayJournal({ capability }),
+    };
+  }
   if (request.operation === "pre-mutation") {
     const journalPath = deriveRunPath(capability, { purpose: "journal" });
     let created = false;
@@ -1355,6 +1414,40 @@ describe("capability-bound durable quarantine journal", () => {
         expectedSequence: null,
         expectedRecordHash: null,
       });
+    },
+  );
+
+  it.each([
+    ["ordinary", 1, records.prepared, null],
+    ["recovery", 2, records.moving, records.prepared],
+  ] as const)(
+    "classifies a synced %s journal-handle close-only failure as indeterminate",
+    (mode, expectedSequence, record, prefix) => {
+      const result = invoke(join(fixture, `journal-close-only-${mode}`), {
+        operation: "journal-close-only",
+        mode,
+        prefix,
+        record,
+      });
+      expect(result.outcome.ok).toBe(false);
+      expect(result.outcome.error).toMatchObject({
+        name: "IndeterminateJournalAppendError",
+        code: "ERR_INDETERMINATE_JOURNAL_APPEND",
+        expectedSequence,
+        expectedRecordHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      });
+      expect(result.callbackCount).toBe(1);
+      expect(result.journalSyncs).toBe(1);
+      const candidates = result.replayed.records.filter(
+        (candidate: { event: string }) => candidate.event === record.event,
+      );
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0].recordHash).toBe(result.outcome.error.expectedRecordHash);
+      expect(result.names).toContain("journal.lock");
+      const tombstones = result.names.filter(
+        (name: string) => name.startsWith("journal.lock.tombstone."),
+      );
+      expect(tombstones).toHaveLength(mode === "recovery" ? 2 : 0);
     },
   );
 

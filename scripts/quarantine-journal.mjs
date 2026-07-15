@@ -922,7 +922,14 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
   }
   state.appendInProgress = false;
   if (journal !== undefined) {
-    await closePreservingPrimary(journal.handle, primaryError);
+    try {
+      await closePreservingPrimary(journal.handle, primaryError);
+    } catch (error) {
+      if (primaryError === undefined && mutationStarted && candidate !== undefined) {
+        throw indeterminate(candidate, error);
+      }
+      throw error;
+    }
   } else if (primaryError !== undefined) {
     throw primaryError;
   }
