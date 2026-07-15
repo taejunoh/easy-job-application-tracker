@@ -627,6 +627,16 @@ function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+function assertPrivateRegularFile(stat, label) {
+  if (
+    stat.isSymbolicLink() ||
+    !stat.isFile() ||
+    (stat.mode & 0o7777) !== 0o600
+  ) {
+    throw new Error(`${label} must be a non-symlink regular file with exact mode 0600`);
+  }
+}
+
 function indeterminate(candidate, cause) {
   if (cause instanceof IndeterminateJournalAppendError) return cause;
   return new IndeterminateJournalAppendError({
@@ -661,14 +671,13 @@ async function readJournalSnapshot({ capability, fsApi, maxBytes = MAX_FRAME_BYT
     }
     throw error;
   }
-  if (before.isSymbolicLink() || !before.isFile()) {
-    throw new Error("journal must be a non-symlink regular file");
-  }
+  assertPrivateRegularFile(before, "journal");
   if (before.size > maxBytes) throw new Error("journal is too large");
   const handle = await fsApi.open(journalPath, "r");
   return withHandle(handle, async (openedHandle) => {
     const opened = await openedHandle.stat();
-    if (!opened.isFile() || !sameIdentity(before, opened) || opened.size !== before.size) {
+    assertPrivateRegularFile(opened, "opened journal");
+    if (!sameIdentity(before, opened) || opened.size !== before.size) {
       throw new Error("journal changed while being inspected");
     }
     const bytes = await readCompleteFile(openedHandle, maxBytes);
@@ -710,6 +719,13 @@ async function createJournalLock({ capability, fsApi }) {
   }
   try {
     await handle.chmod(0o600);
+    const owned = await handle.stat();
+    assertPrivateRegularFile(owned, "opened journal lock");
+    const pathOwned = await fsApi.lstat(lockPath);
+    assertPrivateRegularFile(pathOwned, "journal lock");
+    if (!sameIdentity(owned, pathOwned)) {
+      throw new Error("journal lock ownership changed during creation");
+    }
     const encoded = encodeLockFrame();
     await writeComplete(handle, encoded.frame);
     await handle.sync();
@@ -719,6 +735,12 @@ async function createJournalLock({ capability, fsApi }) {
       boundary: "after-sync",
     });
     const stat = await handle.stat();
+    assertPrivateRegularFile(stat, "durable journal lock");
+    const durablePath = await fsApi.lstat(lockPath);
+    assertPrivateRegularFile(durablePath, "durable journal lock path");
+    if (!sameIdentity(stat, durablePath)) {
+      throw new Error("journal lock ownership changed after sync");
+    }
     return {
       handle,
       identity: { dev: stat.dev, ino: stat.ino },
@@ -737,20 +759,27 @@ async function assertPathIdentity(path, identity, fsApi, label) {
   } catch (error) {
     throw new Error(`${label} ownership cannot be verified`, { cause: error });
   }
-  if (
-    current.isSymbolicLink() ||
-    !current.isFile() ||
-    current.dev !== identity.dev ||
-    current.ino !== identity.ino
-  ) {
+  assertPrivateRegularFile(current, label);
+  if (current.dev !== identity.dev || current.ino !== identity.ino) {
     throw new Error(`${label} ownership mismatch`);
   }
+}
+
+async function assertPathAbsent(path, fsApi, label) {
+  try {
+    await fsApi.lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(`${label} unexpectedly exists after durable removal`);
 }
 
 async function assertHeldLockOwned(state) {
   if (!state.active) throw new Error("journal held-lock capability is inactive");
   const held = await state.handle.stat();
-  if (!held.isFile() || held.dev !== state.identity.dev || held.ino !== state.identity.ino) {
+  assertPrivateRegularFile(held, "journal held lock");
+  if (held.dev !== state.identity.dev || held.ino !== state.identity.ino) {
     throw new Error("journal held lock identity changed");
   }
   await assertPathIdentity(state.lockPath, state.identity, state.fsApi, "journal held lock");
@@ -812,9 +841,18 @@ async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callba
     !(settledError instanceof IndeterminateJournalAppendError)
   ) {
     try {
+      await revalidateRunCapability(capability, {
+        purpose: "journal-lock",
+        boundary: "before-mutation",
+      });
       await assertPathIdentity(state.lockPath, state.identity, fsApi, "journal held lock");
       await fsApi.rm(state.lockPath);
       await fsyncDirectory(dirname(state.lockPath), fsApi);
+      await revalidateRunCapability(capability, {
+        purpose: "journal-lock",
+        boundary: "after-sync",
+      });
+      await assertPathAbsent(state.lockPath, fsApi, "journal held lock");
     } catch (error) {
       if (settledError !== undefined) throw attachCleanupError(settledError, error);
       throw state.lastCandidate === null ? error : indeterminate(state.lastCandidate, error);
@@ -865,9 +903,10 @@ async function openJournalForMutation(snapshot, fsApi) {
   }
   const handle = await fsApi.open(snapshot.journalPath, flags, 0o600);
   try {
+    if (snapshot.identity === null) await handle.chmod(0o600);
     const opened = await handle.stat();
+    assertPrivateRegularFile(opened, "opened journal");
     if (
-      !opened.isFile() ||
       (snapshot.identity !== null && !sameIdentity(snapshot.identity, opened))
     ) {
       throw new Error("journal changed while being opened for mutation");
@@ -876,7 +915,12 @@ async function openJournalForMutation(snapshot, fsApi) {
     if (!observed.equals(snapshot.bytes)) {
       throw new Error("journal changed before mutation");
     }
-    return handle;
+    const pathOwned = await fsApi.lstat(snapshot.journalPath);
+    assertPrivateRegularFile(pathOwned, "journal path");
+    if (!sameIdentity(opened, pathOwned)) {
+      throw new Error("journal ownership changed while being opened for mutation");
+    }
+    return { handle, identity: { dev: opened.dev, ino: opened.ino } };
   } catch (error) {
     return closePreservingPrimary(handle, error);
   }
@@ -924,15 +968,23 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
     });
     mutationStarted = true;
     state.lastCandidate = candidate;
-    const handle = await openJournalForMutation(snapshot, fsApi);
-    journal = { handle, journalPath: snapshot.journalPath };
+    const openedJournal = await openJournalForMutation(snapshot, fsApi);
+    journal = { ...openedJournal, journalPath: snapshot.journalPath };
     await invokeFaultHook(faultHook, "after-journal-open");
-    await journal.handle.chmod(0o600);
     if (replayed.truncatedTail) {
       await journal.handle.truncate(replayed.validEndOffset);
       await journal.handle.sync();
       await fsyncDirectory(dirname(journal.journalPath), fsApi);
+      await revalidateRunCapability(capability, {
+        purpose: "journal",
+        boundary: "after-sync",
+      });
+      await assertPathIdentity(journal.journalPath, journal.identity, fsApi, "journal");
       await assertHeldLockOwned(state);
+      await revalidateRunCapability(capability, {
+        purpose: "journal",
+        boundary: "before-mutation",
+      });
     }
     await writeCompleteAt(
       journal.handle,
@@ -941,12 +993,18 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
     );
     await journal.handle.sync();
     await invokeFaultHook(faultHook, "after-journal-sync");
-    await assertHeldLockOwned(state);
+    await fsyncDirectory(dirname(journal.journalPath), fsApi);
     await revalidateRunCapability(capability, {
       purpose: "journal",
       boundary: "after-sync",
     });
-    await fsyncDirectory(dirname(journal.journalPath), fsApi);
+    const durableJournal = await journal.handle.stat();
+    assertPrivateRegularFile(durableJournal, "durable journal");
+    if (!sameIdentity(durableJournal, journal.identity)) {
+      throw new Error("journal handle identity changed after sync");
+    }
+    await assertPathIdentity(journal.journalPath, journal.identity, fsApi, "durable journal");
+    await assertHeldLockOwned(state);
     await invokeFaultHook(faultHook, "before-lock-cleanup");
     await assertHeldLockOwned(state);
     state.durableAppends += 1;
@@ -993,14 +1051,13 @@ export async function appendJournalRecord(options) {
 
 async function readStaleLock(path, fsApi) {
   const before = await fsApi.lstat(path);
-  if (before.isSymbolicLink() || !before.isFile()) {
-    throw new Error("journal lock must be a non-symlink regular file");
-  }
+  assertPrivateRegularFile(before, "journal lock");
   if (before.size > 4 + MAX_LOCK_BODY_BYTES) throw new Error("journal lock is too large");
   const handle = await fsApi.open(path, "r");
   return withHandle(handle, async (openedHandle) => {
     const opened = await openedHandle.stat();
-    if (!opened.isFile() || !sameIdentity(opened, before) || opened.size !== before.size) {
+    assertPrivateRegularFile(opened, "opened journal lock");
+    if (!sameIdentity(opened, before) || opened.size !== before.size) {
       throw new Error("journal lock changed while being inspected");
     }
     return {
@@ -1040,15 +1097,68 @@ async function validatedTombstones(capability, fsApi) {
   return artifacts.sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)));
 }
 
-async function removeOwnedArtifacts(artifacts, fsApi) {
+function lockArtifactBoundary(path, boundary) {
+  const name = path.split("/").at(-1);
+  if (name === "journal.lock") return { purpose: "journal-lock", boundary };
+  if (name?.startsWith(TOMBSTONE_PREFIX)) {
+    return {
+      purpose: "journal-tombstone",
+      id: name.slice(TOMBSTONE_PREFIX.length),
+      boundary,
+    };
+  }
+  throw new Error(`unknown journal lock artifact path: ${path}`);
+}
+
+async function removeOwnedArtifacts(capability, artifacts, fsApi) {
   for (const artifact of artifacts) {
     await assertPathIdentity(artifact.path, artifact.identity, fsApi, "journal lock artifact");
   }
   for (const artifact of artifacts) {
+    await revalidateRunCapability(
+      capability,
+      lockArtifactBoundary(artifact.path, "before-mutation"),
+    );
     await assertPathIdentity(artifact.path, artifact.identity, fsApi, "journal lock artifact");
     await fsApi.rm(artifact.path);
     await fsyncDirectory(dirname(artifact.path), fsApi);
+    await revalidateRunCapability(
+      capability,
+      lockArtifactBoundary(artifact.path, "after-sync"),
+    );
+    await assertPathAbsent(artifact.path, fsApi, "journal lock artifact");
   }
+}
+
+async function moveStaleLockToTombstone({
+  capability,
+  fsApi,
+  lockPath,
+  staleLock,
+  tombstoneId,
+  tombstonePath,
+}) {
+  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
+  await revalidateRunCapability(capability, {
+    purpose: "journal-lock",
+    boundary: "before-mutation",
+  });
+  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
+  await fsApi.rename(lockPath, tombstonePath);
+  await fsyncDirectory(dirname(lockPath), fsApi);
+  await revalidateRunCapability(capability, {
+    purpose: "journal-tombstone",
+    id: tombstoneId,
+    boundary: "after-sync",
+  });
+  await assertPathAbsent(lockPath, fsApi, "stale journal lock source");
+  await assertPathIdentity(
+    tombstonePath,
+    staleLock.identity,
+    fsApi,
+    "renamed journal lock tombstone",
+  );
+  return { ...staleLock, path: tombstonePath };
 }
 
 export async function reclaimJournalLock(options, callback) {
@@ -1087,19 +1197,14 @@ export async function reclaimJournalLock(options, callback) {
       purpose: "journal-tombstone",
       id: tombstoneId,
     });
-    await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
-    await revalidateRunCapability(capability, {
-      purpose: "journal-lock",
-      boundary: "before-mutation",
+    moved = await moveStaleLockToTombstone({
+      capability,
+      fsApi,
+      lockPath,
+      staleLock,
+      tombstoneId,
+      tombstonePath,
     });
-    await fsApi.rename(lockPath, tombstonePath);
-    await fsyncDirectory(dirname(lockPath), fsApi);
-    await revalidateRunCapability(capability, {
-      purpose: "journal-tombstone",
-      id: tombstoneId,
-      boundary: "after-sync",
-    });
-    moved = { ...staleLock, path: tombstonePath };
   }
   const staleEvidence = staleLock ?? priorTombstones.at(-1);
   const run = await runWithJournalLock(
@@ -1120,6 +1225,7 @@ export async function reclaimJournalLock(options, callback) {
   }
   try {
     await removeOwnedArtifacts(
+      capability,
       [
         ...priorTombstones,
         ...(moved === null ? [] : [moved]),
@@ -1168,19 +1274,14 @@ async function cleanupTerminalJournalArtifactsCore({ capability, writersStopped,
       purpose: "journal-tombstone",
       id: tombstoneId,
     });
-    await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
-    await revalidateRunCapability(capability, {
-      purpose: "journal-lock",
-      boundary: "before-mutation",
+    moved = await moveStaleLockToTombstone({
+      capability,
+      fsApi,
+      lockPath,
+      staleLock,
+      tombstoneId,
+      tombstonePath,
     });
-    await fsApi.rename(lockPath, tombstonePath);
-    await fsyncDirectory(dirname(lockPath), fsApi);
-    await revalidateRunCapability(capability, {
-      purpose: "journal-tombstone",
-      id: tombstoneId,
-      boundary: "after-sync",
-    });
-    moved = { ...staleLock, path: tombstonePath };
   }
 
   const run = await runWithJournalLock(
@@ -1194,6 +1295,7 @@ async function cleanupTerminalJournalArtifactsCore({ capability, writersStopped,
     },
   );
   await removeOwnedArtifacts(
+    capability,
     [
       ...priorTombstones,
       ...(moved === null ? [] : [moved]),

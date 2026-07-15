@@ -287,6 +287,131 @@ const result = await withQuarantineRunCapability({
       files: await snapshot(),
     };
   }
+  if (request.operation === "mode-boundary") {
+    const mode = request.mode;
+    if (request.artifact === "journal") {
+      await appendAll(capability, [request.record]);
+      const journalPath = deriveRunPath(capability, { purpose: "journal" });
+      await fsPromises.chmod(journalPath, mode);
+      const before = await snapshot();
+      return {
+        outcome: await capture(() => journal.replayJournal({ capability })),
+        before,
+        after: await snapshot(),
+      };
+    }
+    if (request.artifact === "active-lock") {
+      let inside;
+      const outcome = await capture(() => journal.withJournalLock(
+        { capability },
+        async (heldLock) => {
+          const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+          await fsPromises.chmod(lockPath, mode);
+          inside = {
+            append: await capture(() => journal.appendJournalRecord({
+              capability,
+              heldLock,
+              event: request.record.event,
+              payload: request.record.payload,
+            })),
+            beforeReturn: await snapshot(),
+          };
+        },
+      ));
+      return { outcome, inside, after: await snapshot() };
+    }
+    await appendAll(capability, request.records);
+    const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+    const tombstonePath = deriveRunPath(capability, {
+      purpose: "journal-tombstone",
+      id: "11111111-1111-4111-8111-111111111111",
+    });
+    if (request.artifact === "stale-lock") {
+      await fsPromises.writeFile(lockPath, lockBytes(), { mode: 0o600 });
+      await fsPromises.chmod(lockPath, mode);
+    } else {
+      await fsPromises.writeFile(tombstonePath, lockBytes(), { mode: 0o600 });
+      await fsPromises.chmod(tombstonePath, mode);
+    }
+    const before = await snapshot();
+    const outcome = request.artifact === "tombstone"
+      ? await capture(() => journal.cleanupTerminalJournalArtifacts({
+          capability,
+          writersStopped: true,
+        }))
+      : await capture(() => journal.reclaimJournalLock(
+          { capability, writersStopped: true },
+          async () => "unreachable",
+        ));
+    return { outcome, before, after: await snapshot() };
+  }
+  if (request.operation === "private-create-modes") {
+    const priorUmask = process.umask(0o777);
+    try {
+      return journal.withJournalLock({ capability }, async (heldLock) => {
+        const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+        await journal.appendJournalRecord({
+          capability,
+          heldLock,
+          event: request.record.event,
+          payload: request.record.payload,
+        });
+        const journalPath = deriveRunPath(capability, { purpose: "journal" });
+        return {
+          lockMode: (await fsPromises.lstat(lockPath)).mode & 0o7777,
+          journalMode: (await fsPromises.lstat(journalPath)).mode & 0o7777,
+        };
+      });
+    } finally {
+      process.umask(priorUmask);
+    }
+  }
+  if (request.operation === "rename-post-sync-replacement") {
+    await appendAll(capability, request.records);
+    const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+    await fsPromises.writeFile(lockPath, lockBytes(), { mode: 0o600 });
+    let destination;
+    let parentSynced = false;
+    let replaced = false;
+    const replacementFs = {
+      ...fsPromises,
+      rename: async (source, target) => {
+        const value = await fsPromises.rename(source, target);
+        if (source === lockPath) destination = target;
+        return value;
+      },
+      open: async (path, flags, mode) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        if (!String(path).endsWith("/quarantine/tx-0001") || flags !== "r") return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === "sync") return async () => {
+              const value = await target.sync();
+              if (destination !== undefined) parentSynced = true;
+              return value;
+            };
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+      realpath: async (path) => {
+        if (String(path).endsWith("/quarantine/tx-0001") && parentSynced && !replaced) {
+          replaced = true;
+          await fsPromises.rename(destination, destination + ".owned");
+          await fsPromises.writeFile(destination, "foreign", { mode: 0o600 });
+          await fsPromises.chmod(destination, 0o600);
+        }
+        return fsPromises.realpath(path);
+      },
+    };
+    const outcome = await capture(() => journal.cleanupTerminalJournalArtifacts({
+      capability,
+      writersStopped: true,
+      fsApi: useFsApi(replacementFs),
+    }));
+    return { outcome, destination, parentSynced, replaced, entries: await snapshot() };
+  }
   if (request.operation === "terminal-cleanup") {
     await appendAll(capability, request.records);
     await seedArtifacts(capability);
@@ -974,6 +1099,7 @@ const result = await withQuarantineRunCapability({
   if (request.operation === "durability") {
     const events = [];
     let directorySyncs = 0;
+    let journalSynced = false;
     const trackedFs = {
       ...fsPromises,
       open: async (path, flags, mode) => {
@@ -985,6 +1111,7 @@ const result = await withQuarantineRunCapability({
               events.push(isDirectory ? "parent-sync" : String(path).endsWith("journal.log")
                 ? "journal-sync"
                 : "lock-sync");
+              if (String(path).endsWith("journal.log")) journalSynced = true;
               if (isDirectory) {
                 directorySyncs += 1;
                 if (request.failParent && directorySyncs === 2) {
@@ -997,6 +1124,13 @@ const result = await withQuarantineRunCapability({
             return typeof value === "function" ? value.bind(target) : value;
           },
         });
+      },
+      realpath: async (...args) => {
+        if (journalSynced) {
+          events.push("revalidate");
+          journalSynced = false;
+        }
+        return fsPromises.realpath(...args);
       },
     };
     const outcome = await capture(() => journal.withJournalLock(
@@ -1268,6 +1402,60 @@ describe("capability-bound durable quarantine journal", () => {
     }
     expect(Object.values(result.distinctCounts).every((count) => count === 0)).toBe(true);
     expect(result.files).toEqual({});
+  });
+
+  it.each([
+    ["journal", [records.prepared]],
+    ["active-lock", [records.prepared]],
+    ["stale-lock", [records.prepared]],
+    ["tombstone", terminalRecords.ROLLED_BACK],
+  ] as const)("rejects and preserves a non-private %s", (artifact, lifecycle) => {
+    for (const mode of [0o640, 0o666, 0o1600]) {
+      const result = invoke(join(fixture, `mode-${artifact}-${mode.toString(8)}`), {
+        operation: "mode-boundary",
+        artifact,
+        mode,
+        record: records.prepared,
+        records: lifecycle,
+      });
+      if (artifact === "active-lock") {
+        expect(result.inside.append).toMatchObject({
+          ok: false,
+          error: { message: expect.stringMatching(/mode|private|0600|lock/i) },
+        });
+        expect(result.outcome.ok).toBe(false);
+        expect(result.after).toEqual(result.inside.beforeReturn);
+      } else {
+        expect(result.outcome).toMatchObject({
+          ok: false,
+          error: { message: expect.stringMatching(/mode|private|0600|journal|lock/i) },
+        });
+        expect(result.after).toEqual(result.before);
+      }
+    }
+  });
+
+  it("creates journal and lock files at exact 0600 even under umask 0777", () => {
+    expect(invoke(join(fixture, "private-create-modes"), {
+      operation: "private-create-modes",
+      record: records.prepared,
+    })).toEqual({ lockMode: 0o600, journalMode: 0o600 });
+  });
+
+  it("revalidates the renamed tombstone after parent sync and preserves a replacement", () => {
+    const result = invoke(join(fixture, "rename-post-sync-replacement"), {
+      operation: "rename-post-sync-replacement",
+      records: terminalRecords.ROLLED_BACK,
+    });
+    expect(result).toMatchObject({ parentSynced: true, replaced: true });
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/ownership|identity|tombstone/i) },
+    });
+    const name = String(result.destination).split("/").at(-1) as string;
+    expect(result.entries[name]).toMatchObject({ kind: "file" });
+    expect(result.entries[name].bytes).toBe(Buffer.from("foreign").toString("base64"));
+    expect(result.entries[`${name}.owned`]).toMatchObject({ kind: "file" });
   });
 
   it.each(Object.entries(terminalRecords))(
@@ -1821,6 +2009,11 @@ describe("capability-bound durable quarantine journal", () => {
       "parent-sync",
       "journal-sync",
       "parent-sync",
+    ]);
+    expect(result.events.slice(2, 5)).toEqual([
+      "journal-sync",
+      "parent-sync",
+      "revalidate",
     ]);
   });
 
