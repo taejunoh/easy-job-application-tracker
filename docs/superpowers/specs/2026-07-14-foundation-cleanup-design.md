@@ -68,10 +68,10 @@ Create one external directory per cleanup run:
 ```text
 ~/Library/Application Support/easy-job-application-tracker/quarantine/
   current
-  <UTC timestamp>/
+  <transaction-id>/
     journal.log
-    manifest.json
-    manifest.sha256
+    manifests/
+      <manifest-sha256>.json
     inventories/
       pre/<entry-id>.jsonl
       moved-pass-1/<entry-id>.jsonl
@@ -86,15 +86,84 @@ Create one external directory per cleanup run:
     conflicts/
 ```
 
-The quarantine root and run directory must have mode `0700`. The ID-only
-`current` pointer, journal, manifest, checksum, inventory, and diff files must
+The quarantine root, run directory, and every derived quarantine subdirectory
+must be non-symlink directories with mode `0700`. The canonical `current`
+pointer, journal, immutable manifest generation, inventory, and diff files must
 have mode `0600`. Quarantine payload paths are
-derived only from validated entry IDs and the fixed generated-root allowlist;
-untrusted manifest or journal path strings never become filesystem destinations.
-No quarantined content lives under the repository, so Git, Jest, ESLint, and
-Next.js cannot rediscover it.
+derived only from a live run capability, a closed purpose enum, validated entry
+IDs, and the fixed generated-root allowlist; untrusted manifest or journal path
+strings never become filesystem destinations. No quarantined content lives
+under the repository, so Git, Jest, ESLint, and Next.js cannot rediscover it.
 
-The small manifest records:
+### Run capability and writer boundary
+
+Every quarantine writer operates inside a callback-scoped opaque run
+capability. The only creator accepts a validated quarantine root, validated
+transaction ID, and `writersStopped === true`; it does not expose a
+constructible or serializable capability value. Before invoking the callback it
+uses `lstat` and `realpath` to prove that the quarantine root and derived run
+root are non-symlink directories, are mode `0700`, are contained under the
+approved real quarantine root, and records each directory's device and inode.
+It also proves that the repository and quarantine root are on the same device.
+The capability becomes inactive before callback settlement cleanup, whether the
+callback succeeds or throws. A leaked capability and any caller-created
+lookalike are rejected.
+
+Journal, inventory, manifest, payload, rollback, conflict, and temporary-file
+writers accept this capability rather than caller-supplied destination paths.
+They derive every path from the capability, a closed purpose enum, and validated
+transaction, entry, restore, or digest IDs. Immediately before the first
+filesystem mutation and immediately after its last durability sync, each writer
+revalidates `lstat`/`realpath` containment and the recorded root/run device and
+inode. Writers that have multiple externally visible mutation phases repeat the
+identity check at every phase boundary. Each derived journal, inventory,
+manifest, payload, rollback, and conflict parent is separately `lstat`ed as a
+mode-`0700` non-symlink directory and realpath-checked for containment before
+use and after sync. A root/run replacement, parent symlink swap, containment
+change, or device/inode mismatch aborts without following the replacement and
+preserves all evidence needed for explicit recovery.
+
+This is a cooperative safety boundary under the truthful writer-quiescence
+attestation. The design detects identity changes at defined seams; it does not
+claim atomic protection from a hostile process replacing a pathname between a
+check and a Node filesystem call. Apply, restore, recovery, terminal cleanup,
+and manifest activation therefore all require `writersStopped === true`.
+
+### Immutable manifest generations
+
+Manifest publication is split into five APIs with separate responsibilities:
+
+- `buildValidatedManifest` is pure and returns the exact closed-schema manifest
+  value;
+- `writeManifestGeneration` canonicalizes it, hashes the exact bytes, and
+  durably creates `<run>/manifests/<sha256>.json` without overwriting an existing
+  generation;
+- `activateManifestGeneration` atomically publishes the one canonical pointer;
+- `readCurrentManifestPointer` validates and returns only the pointer; and
+- `readManifestGeneration` derives the generation path from the validated
+  digest, verifies filename and content-digest agreement, and validates the
+  closed manifest schema.
+
+The root-level `current` file contains exactly
+`{ schemaVersion, transactionId, manifestSha256 }` in canonical JSON. Its
+transaction ID selects the validated run directory and its lowercase
+64-character digest selects the immutable generation. The combined
+write-and-activate protocol writes and syncs the generation temporary file,
+renames it to its digest name without replacement, and syncs the generation
+directory. Activation then appends and syncs the journal event that makes that
+generation eligible, writes and syncs a pointer temporary file, renames it over
+`current`, and syncs the quarantine root. Readers therefore resolve either the
+previous complete generation or the new complete generation, never a partially
+published manifest. Prior generations remain readable audit evidence.
+
+An existing generation at the requested digest is accepted only when its exact
+canonical bytes are identical; the same digest name with different bytes is a
+fatal integrity error. `VALIDATED` has exactly
+`{ manifestSha256: <lowercase SHA-256> }` as its payload, and the digest must
+name the already durable generation. No API writes `manifest.json`,
+`manifest.sha256`, a run-local current file, or an ID-only pointer.
+
+Each immutable manifest generation records:
 
 - repository root and exact HEAD commit;
 - transaction ID, creation and validation timestamps in UTC;
@@ -208,16 +277,32 @@ The journal is the authoritative transaction record. It is a mode-`0600`,
 append-only sequence of length-framed canonical JSON records. Every record has a
 monotonic sequence, previous-record hash, payload, and record hash. Each append
 is flushed and `fsync`ed before the corresponding destructive transition; new
-files and rename operations also `fsync` their containing directories. A torn
-final frame is ignored during replay. Before touching the journal, the appender
-creates a mode-`0600` lock with `wx`, keeps its handle open, writes the exact
-length-framed canonical metadata
-`{ version: 1, ownerToken, pid, checksum }`, and `fsync`s both lock and parent
-directory. `EEXIST` always fails; normal append never reclaims by TTL or PID
-liveness. While holding the lock, append replays through the same journal
-handle, truncates only a recognized torn final frame to the last valid offset,
-and `fsync`s the file and parent directory before appending. Lock removal is
-also directory-`fsync`ed.
+files and rename operations also `fsync` their containing directories. General
+replay recognizes a torn final frame but never treats it as a complete event.
+Inside a live run capability, the ordinary appender creates a mode-`0600` lock
+with `wx`, keeps its handle open, writes the exact length-framed canonical
+metadata `{ version: 1, ownerToken, pid, checksum }`, and `fsync`s both lock and
+parent directory. `EEXIST` always fails; normal append never reclaims by TTL or
+PID liveness. It then invokes the caller under an opaque held-lock capability
+that is valid only for the callback lifetime. While holding that capability,
+append replays through the same journal handle, truncates only a recognized
+torn final frame to the last valid offset, and `fsync`s the file and parent
+directory before appending. Sequential awaited callback appends are allowed;
+forged or leaked held-lock capabilities are rejected.
+
+Ordinary append and stale-lock recovery use the same ownership and uncertainty
+rules. Both compare the open lock handle's device/inode with a non-symlink
+regular-file `lstat` immediately before journal truncate/write, immediately
+after journal sync, and immediately before lock cleanup. A mismatch before the
+first journal mutation is an ordinary ownership error with unchanged journal
+bytes. Once truncate or frame write begins, every later append or ownership
+error is `IndeterminateJournalAppendError` carrying the candidate's
+`expectedSequence` and `expectedRecordHash`. The candidate may be present zero
+or one time; only explicit attested recovery may determine which and make it
+present exactly once. Cleanup removes a lock only when the same owned
+device/inode is still at the path. A foreign replacement is never deleted, and
+the original lock, foreign lock, tombstones, journal, and candidate metadata are
+preserved as applicable for recovery.
 
 Stale-lock recovery is a separate `reclaimJournalLock` operation that requires
 `writersStopped === true`; false attestation fails before journal, lock, or
@@ -238,26 +323,40 @@ cooperative serialization and intrusion detection under the attestation, not
 an atomic defense against hostile concurrent pathname replacement: built-in
 Node cannot atomically couple that path check to a separate journal write.
 
-A mismatch before journal truncate/write begins is an ordinary ownership error
-with unchanged journal bytes. Once truncate or frame write begins, every later
-error is `IndeterminateJournalAppendError` with the candidate's
-`expectedSequence` and `expectedRecordHash`. The caller stops before any
-destructive seam, preserves the current recovery lock and tombstones, and never
-blindly retries the same event. The next explicit attested recovery replays the
-journal, accepts the candidate zero or one time, appends it only if absent, or
-advances with the next legal event if present. Partial and complete-frame
-`SIGKILL` cases must finish with that candidate exactly once.
-If recovery-lock close also fails, the original indeterminate error retains its
-code and candidate identity while the close error is attached as supplemental
-`AggregateError` cause metadata. Without a primary recovery error, the close
-error is surfaced directly. Cleanup does not remove the lock or tombstones in
-either close-failure case.
+Recovery applies the shared pre/post-mutation ownership and indeterminate rules
+above. The caller stops before any destructive seam, preserves the current lock
+and tombstones, and never blindly retries the same event. The next explicit
+attested recovery replays the journal, accepts the candidate zero or one time,
+appends it only if absent, or advances with the next legal event if present.
+Partial and complete-frame `SIGKILL` cases must finish with that candidate
+exactly once. If held-lock close also fails, the original indeterminate error
+retains its code and candidate identity while the close error is attached as
+supplemental `AggregateError` cause metadata. Without a primary recovery error,
+the close error is surfaced directly. Cleanup does not remove the lock or
+tombstones in either close-failure case.
 
-Sequential awaited callback appends are allowed; leaked capabilities are
-rejected. On success, recovery revalidates and removes the current lock and all
+On success, recovery revalidates and removes the current lock and all
 prior well-formed tombstone residues, then `fsync`s the parent. Malformed names,
 malformed frames, symlinks, and non-regular tombstones are preserved and fatal
 before recovery mutation.
+
+Terminal stale artifacts use a separate cleanup-only API; recovery append is
+not reused. The API accepts only a fully replayed journal whose last durable
+state is exactly `ROLLED_BACK`, `RESTORED`, or `INCOMPLETE_CONFLICT`, requires
+`writersStopped === true`, validates the complete non-torn journal tail and
+every stale lock/tombstone artifact, and records the journal tip sequence and
+hash. Only after all preconditions pass, it atomically renames the validated
+stale lock to a derived tombstone, syncs the parent, and acquires a fresh held
+lock through the same run and lock capability boundaries. It replays the
+journal again and requires the identical tip before removing only the validated
+stale artifacts and its owned lock. It appends no event, never truncates the
+journal, leaves journal bytes unchanged, and `fsync`s the journal directory
+after cleanup. A missing/false attestation, nonterminal state, recognized torn
+tail, changed tip, malformed artifact, symlink, non-regular artifact, or
+identity mismatch fails before any journal, lock, or tombstone mutation.
+`VALIDATED` is deliberately not an eligible cleanup-only state because its
+payload may still be restored.
+
 A current PID with a different owner token is treated as possible PID reuse:
 ordinary append still fails and only explicit attested recovery may proceed.
 Tests use actual child-process `SIGKILL` after `wx` and after metadata `fsync`;
@@ -266,8 +365,10 @@ Any malformed non-final frame, sequence
 gap, hash-chain break, unknown field, or illegal state transition is fatal.
 The envelope schema and event payload schema are separate closed boundaries.
 Every event in the transition table has an exact payload parser on both append
-and replay. Lifecycle-only events accept exactly `{}`; `PREPARED` accepts only
-the validated transaction ID and manifest SHA-256; `MOVE_INTENT` accepts only
+and replay. Lifecycle-only events other than `VALIDATED` accept exactly `{}`;
+`PREPARED` accepts only the validated transaction ID and initial manifest
+SHA-256, while `VALIDATED` accepts exactly `{ manifestSha256 }` naming its
+durable immutable generation; `MOVE_INTENT` accepts only
 the entry ID and expected `InventorySummary`; `MOVED` accepts only the entry ID
 and observed `InventorySummary`. Entry-oriented rollback and restore events
 accept only their validated entry ID plus any inventory summary explicitly
@@ -303,13 +404,40 @@ Before moving anything, the tool:
    the repository, mode-restricted, writable, and on the same device;
 4. streams deterministic pre-move inventories to JSONL, computes their SHA-256,
    entry count, and byte count, and records only those summaries in the manifest;
-5. writes and `fsync`s the manifest, divergent diffs, initial inventories,
-   checksum, run directory, and durable `PREPARED` journal record.
+5. durably writes the initial immutable manifest generation, divergent diffs,
+   initial inventories, run directory, and `PREPARED` journal record; it does
+   not activate `current` until the matching validated generation is durable.
 
-Inventory is always streaming. Regular-file hashes use `createReadStream`; tree
-entries are emitted in deterministic bytewise path order to mode-`0600` JSONL.
-No payload file or full generated-tree inventory is loaded into memory, and the
-manifest never embeds the tens of thousands of generated entries.
+### FD-bounded inventory and durability traversal
+
+Inventory and `fsyncTree` use iterative traversal; recursive function calls and
+one-open-directory-per-depth algorithms are forbidden. The walker keeps no
+more than one directory handle open at a time: it reads one directory, closes
+that handle, stores only its bounded frontier records, and then advances. A
+regular-file hash may add one input stream, so inventory traversal has at most
+two simultaneous traversal/hash handles. Symlinks are emitted as leaf metadata
+and are never opened or followed.
+
+Deterministic bytewise order is produced with bounded sorted chunks and a
+k-way merge rather than retaining the whole tree. Each in-memory sorted chunk
+is flushed at 4,096 records or 8 MiB of encoded record data, whichever comes
+first. The in-memory traversal frontier is limited to 1,024 records or 8 MiB of
+encoded path data, whichever comes first; overflow uses a capability-derived,
+mode-`0600`, disk-backed work file. Merge fan-in is at most 32 open readers, and
+multi-pass merge applies the same limit. The JSONL writer and summary hash
+consume the final merged stream once. A regular-file root hashes with
+`createReadStream`. No payload body or complete generated-tree inventory is
+loaded into memory, and the manifest never embeds the tens of thousands of
+generated entries. Equal trees always produce the same JSONL bytes, digest,
+entry count, and byte count regardless of traversal timing.
+
+`fsyncTree` uses the same iterative, no-follow walker, the same frontier limits
+and disk spill, and durable post-order:
+sync each regular file, then each child directory after all its descendants,
+and finally the moved payload root. It opens and closes each directory at the
+point of sync, so its simultaneous directory-handle bound is also one. The
+destination parent and then source parent are synced only after the payload
+post-order completes.
 
 For each source copy and each complete generated root, the tool:
 
@@ -317,17 +445,19 @@ For each source copy and each complete generated root, the tool:
    expected source inventory summary;
 2. rechecks source identity and the absence of the derived destination;
 3. atomically renames the source inode to the derived quarantine destination;
-4. recursively `fsync`s the moved payload, then the destination parent, then the
-   source parent; persisting the destination name before the source-name removal
-   ensures a crash can produce the old name or both names, but not a deliberate
-   neither-name durability window;
+4. iteratively `fsync`s the moved payload in the bounded post-order above, then
+   the destination parent, then the source parent; persisting the destination
+   name before the source-name removal ensures a crash can produce the old name
+   or both names, but not a deliberate neither-name durability window;
 5. streams and verifies the destination inventory;
 6. appends and `fsync`s `MOVED` with the observed summary.
 
 After all moves, two independent streaming destination-inventory passes must
 match the pre-move summaries. All original sources must remain absent and no
 unexpected numbered-path residue may exist. Only then does the transaction
-append `QUARANTINED` and publish the small manifest checksum/current pointer.
+append `QUARANTINED`, durably write the final immutable manifest generation,
+append `VALIDATED` with that exact generation digest, and atomically activate
+the canonical root-level `current` pointer.
 Selective cleanup within `node_modules` or `.next` is forbidden.
 
 Crash replay reconciles every durable move intent against filesystem reality:
@@ -402,15 +532,15 @@ container with bounded forced removal and a final janitor.
 
 Quarantine content is retained for four full days after the clean-regeneration
 validation timestamp. There is no automatic deletion. After the deadline, the
-operator reviews the manifest, the four divergent diffs, the green local/CI
-evidence, and the absence of requested restoration. Permanent deletion occurs
-only after an explicit final confirmation.
+operator reviews the current immutable manifest generation, the four divergent
+diffs, the green local/CI evidence, and the absence of requested restoration.
+Permanent deletion occurs only after an explicit final confirmation.
 
-The small manifest and checksum remain as the audit record after quarantined
-file contents are deleted. They contain no file bodies, credentials, database
-URLs, or application data. Divergent diff files are part of the quarantined
-content because they reproduce source text, so final deletion removes them as
-well.
+The immutable manifest generations, current pointer, and journal remain as the
+audit record after quarantined file contents are deleted. They contain no file
+bodies, credentials, database URLs, or application data. Divergent diff files
+are part of the quarantined content because they reproduce source text, so final
+deletion removes them as well.
 
 ## Rollback
 
@@ -425,8 +555,9 @@ well.
 - Restore uses the same replay matrix and explicit recovery commands as apply.
   A crash can therefore resume or reverse each atomic move without guessing.
 - A successful restore consumes the quarantined payload but retains the
-  manifest, inventories, checksum, and journal as its audit record. Regenerated
-  rollback content remains quarantined until explicit disposition.
+  manifest generations, inventories, current pointer, and journal as its audit
+  record. Regenerated rollback content remains quarantined until explicit
+  disposition.
 - Runbook and test changes use an ordinary Git revert.
 - If hash verification, installation, tests, build, or real-Docker assertions
   fail, stop with the quarantine intact and report the exact failing gate.
@@ -439,7 +570,7 @@ well.
   as shell code.
 - Treat manifests, inventories, journal frames, current pointers, and restore
   arguments as untrusted. Validate closed schemas and derive payload paths from
-  validated IDs; a checksum is corruption evidence, not authorization.
+  validated IDs; a hash or checksum is corruption evidence, not authorization.
 - Require writer quiescence and same-device identity on apply, recovery, and
   restore. `EXDEV` is fatal and never triggers a copy fallback.
 - Stream payload hashes and JSONL inventories with bounded memory. Never call
@@ -453,6 +584,68 @@ well.
 - A post-merge production-backup workflow dispatch may validate the changed
   default-branch operations path. It must remain a read-only production backup
   and must not restore into or mutate Production.
+
+## Contract precedence and superseded wording
+
+This amendment is authoritative wherever older prose, committed plans, or
+pre-amendment tests conflict with it. In particular, it supersedes all wording
+that permits:
+
+- a mutable `manifest.json`, `manifest.sha256` sidecar, ID-only `current`, or
+  run-local current pointer instead of immutable digest-named generations and
+  the canonical root-level pointer;
+- manifest or checksum validation without a live run capability, generation
+  content-digest verification, and the pure closed-schema builder;
+- caller-supplied writer destinations or independent writer path validation
+  instead of capability-derived paths and pre/post identity checks;
+- ordinary journal append without the held-lock ownership, conditional cleanup,
+  and indeterminate-error rules used by recovery;
+- terminal stale-lock cleanup that appends an event, changes journal bytes,
+  accepts a torn tail, or mutates artifacts before the second same-tip replay;
+  or
+- recursive directory traversal, one open directory per depth, unbounded
+  in-memory sorting, more than 32 merge readers, or following a symlink during
+  inventory or durability sync.
+
+The lock metadata checksum remains only a closed-frame corruption check. A
+manifest generation digest binds exact canonical bytes but is not authorization;
+authorization to write still comes exclusively from the live callback-scoped
+capability and writer-quiescence attestation.
+
+## Required RED acceptance matrix
+
+Implementation begins by proving that the pre-amendment behavior fails these
+tests. The completed implementation must make every row pass without weakening
+the assertions:
+
+1. **Terminal cleanup:** for each of `ROLLED_BACK`, `RESTORED`, and
+   `INCOMPLETE_CONFLICT`, cleanup leaves journal bytes identical, appends no new
+   event, removes only validated stale lock/tombstone artifacts, and syncs their
+   parent. For a nonterminal state, torn final journal frame, or missing/false
+   writer-stopped attestation, the journal, lock, tombstones, and every other
+   artifact remain byte-for-byte identical.
+2. **Capability and symlink attacks:** independently swap the quarantine root,
+   run root, journal parent, inventory parent, and manifest parent for symlinks;
+   attempt capability forgery and callback leakage; and replace a validated
+   root/run with a different device/inode. Each case fails, follows no swapped
+   link, and leaves a sentinel external victim byte-for-byte unchanged.
+3. **Manifest-generation crash matrix:** interrupt immediately after generation
+   temporary-file sync, generation rename, generation-directory sync, pointer
+   temporary-file sync, pointer rename, and quarantine-root sync. After each
+   interruption, a reader returns only the previous or new complete validated
+   generation, and the prior generation remains readable. An existing digest
+   filename containing different bytes is always rejected.
+4. **Ordinary append lock replacement:** replace the lock before journal
+   mutation, after journal mutation/sync, and immediately before cleanup. The
+   pre-mutation case leaves journal bytes unchanged. Each post-mutation case
+   records the candidate zero or one time and explicit recovery makes it present
+   exactly once. No phase deletes the foreign replacement lock.
+5. **Bounded traversal:** a virtual tree 10,000 directories deep completes with
+   at most one simultaneous directory handle. A real 40,000-entry fixture has
+   peak RSS below 160 MiB, uses at most 32 merge readers, and produces identical
+   JSONL bytes and digest across repeated traversals. Durability order is
+   file-before-child-directory-before-parent post-order, and symlink targets are
+   never opened or followed.
 
 ## Success criteria
 
