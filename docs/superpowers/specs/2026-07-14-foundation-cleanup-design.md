@@ -700,6 +700,17 @@ under the repository through non-symlink ancestors and must be regular,
 non-symlink files. `.next` and `node_modules` must each be a non-symlink
 directory; their inner symlinks remain leaf inventory entries in later phases.
 
+Porcelain stdout has no aggregate byte cap: all 9,999 legal path records may
+legitimately total more than 1 MiB. Instead, the incremental NUL parser caps
+each in-progress or complete record, including its exact `?? ` prefix but not
+its terminating NUL, at exactly 1,048,576 bytes. If byte 1,048,577 arrives
+before a NUL, the runtime kills the status child, awaits close and all stream
+settlement, and then fails with the fixed `ERR_PREFLIGHT` error. It retains no
+more than `expectedCount` parsed paths while incrementally hashing all accepted
+raw status bytes; a count overflow fails without building an unbounded path
+array. This per-record limit is above legal filesystem path limits and bounds a
+malicious unterminated frame without rejecting a valid aggregate status body.
+
 A complete pass streams, rather than buffers, source and canonical file bodies
 through SHA-256. It produces this private canonical byte frame, with each field
 encoded as UTF-8 and terminated by one NUL byte; numeric fields use canonical
@@ -733,8 +744,13 @@ For each divergent source, enumerate candidate historical commits with exactly
 `git -c core.fsmonitor=false log --all --format=%H -z -- <canonical-relative-path>`.
 Parse stdout as
 fatal UTF-8, NUL-terminated lowercase 40/64-character object IDs while it is
-streaming; retain at most 4,096 IDs and 1 MiB of control bytes. Close and await
-that process before checking commits sequentially.
+streaming. Each OID body is at most 64 bytes and its required NUL makes its
+maximum complete frame 65 bytes. Retain at most 4,096 IDs, so valid output is
+arithmetically bounded by `4,096 * 65 = 266,240` bytes without a redundant
+aggregate byte cap. A 65th body byte before NUL or a 4,097th frame kills the
+child; every success or failure closes and awaits the child and all streams
+before commits are checked sequentially or the fixed `ERR_PREFLIGHT` error is
+thrown.
 
 For each commit OID, run exactly
 `git -c core.fsmonitor=false ls-tree -z --full-tree <commitOid> -- <canonical-relative-path>`,

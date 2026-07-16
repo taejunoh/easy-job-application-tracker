@@ -948,7 +948,14 @@ fatal UTF-8, required final NUL when nonempty, no empty interior frame, and only
 Reject tracked/staged/rename/copy/malformed records and every unrelated
 untracked path. Assert the exact final-component numbered suffix, strict NFC
 POSIX paths, derived regular canonical path, UTF-8 bytewise ordering, and the
-fixed two generated directories.
+fixed two generated directories. Do not impose an aggregate status stdout cap:
+valid output for 9,999 paths may exceed 1 MiB. Cap each in-progress or complete
+porcelain record, including `?? ` but excluding its NUL, at exactly 1,048,576
+bytes. Exercise the exact boundary and require byte 1,048,577 before NUL to
+kill the child, await close and all streams, and produce `ERR_PREFLIGHT`.
+Retain at most `expectedCount` parsed paths plus a streaming raw-status digest;
+exercise count overflow without an unbounded path array, and accept a legal
+multi-record aggregate status body larger than 1 MiB.
 
 Require two completely independent passes. Each pass reruns Git identity and
 status, streams fresh source/canonical hashes, captures source/canonical
@@ -961,8 +968,15 @@ ancestor with a symlink and prove an external sentinel is unchanged.
 Assert every runtime discovery Git argv begins exactly
 `git -c core.fsmonitor=false` before its subcommand. For divergent history
 assert streamed
-`git -c core.fsmonitor=false log --all --format=%H -z -- <path>` with bounded
-4,096-ID/1-MiB control parsing. For each commit, assert exact
+`git -c core.fsmonitor=false log --all --format=%H -z -- <path>` with incremental
+exact lowercase 40/64-hex OID parsing. Each OID body is at most 64 bytes and its
+NUL-terminated frame at most 65 bytes; 4,096 frames therefore imply the exact
+`4,096 * 65 = 266,240`-byte aggregate invariant without a separate total-byte
+cap. Accept 4,096 frames; reject a 4,097th frame and a 65th body byte before
+NUL, killing the child and awaiting close and all streams on both failures.
+Exercise both an exact 64-byte lowercase OID body plus NUL and the rejected
+65-byte body. Do not require a 1-MiB history-output boundary test. For each
+commit, assert exact
 `git -c core.fsmonitor=false ls-tree -z --full-tree <commitOid> -- <canonicalPath>`
 argument boundaries and strict empty-or-one-record parsing. Include canonical
 names containing a newline and pathspec punctuation. Empty exit-zero output is
@@ -970,7 +984,8 @@ absent. Only exact `100644 blob` and `100755 blob` pairs are body-eligible;
 exactly `040000 tree`, `120000 blob`, and `160000 commit` skip without opening
 an object body. Reject every other mode/type pair or width/value, as well as
 multiple/malformed/mismatched/oversized output, missing NUL, nonzero exit, or
-signal.
+signal. The design's separate 1-MiB stdout cap and boundary tests for
+`ls-tree -z` remain required.
 
 For an eligible record assert exact
 `git -c core.fsmonitor=false cat-file blob <blobOid>` with the blob OID as the
@@ -1020,7 +1035,11 @@ with argument arrays, and apply the same global `-c core.fsmonitor=false`
 prefix to every other Git child.
 Implement the design's fatal decoding, exact status grammar, canonical
 NUL-frame, fresh two-pass identity, bytewise sorting, streamed hashes, and
-bounded child-process lifecycle. Use `ls-tree -z` only to derive a validated
+bounded child-process lifecycle. Status parsing has no aggregate stdout cap;
+enforce its exact per-record bound while retaining at most `expectedCount`
+paths and a streaming digest. History parsing enforces exact OID frame length
+and count bounds whose arithmetic limits valid output to 266,240 bytes; it has
+no redundant 1-MiB aggregate cap. Use `ls-tree -z` only to derive a validated
 regular blob OID, then hash only
 `git -c core.fsmonitor=false cat-file blob <blobOid>` stdout. Every
 read-only Git spawn uses the exact sanitized environment and settles all child
