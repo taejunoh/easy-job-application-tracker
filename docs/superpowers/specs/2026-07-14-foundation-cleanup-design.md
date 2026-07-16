@@ -373,13 +373,28 @@ device/inode/mode is revalidated after that sync. The public fault hook
 `after-divergent-diff:<entry-id>` runs only after this complete durable publish.
 
 A same-transaction precommit retry recomputes the patch with the exact command
-and streams a byte-for-byte comparison plus SHA-256 against an existing complete
-mode-`0600` patch; it adopts only an exact match. It never trusts a name or hash
-alone. A complete mismatch, foreign file, symlink, wrong mode, identity change,
-or extra artifact is preserved and maps to `ERR_INTEGRITY`. An incomplete owned
-temporary may be removed only by the temporary publication primitive's existing
-ownership and identity rules; orchestration never recursively cleans or adopts
-an incomplete file.
+and uses this closed matrix; path, mode, or a previously observed inode alone
+never proves ownership:
+
+- final present, temporary absent: stream-compare exact complete bytes, SHA-256,
+  size, and mode `0600`; adopt only an exact final;
+- final present, temporary present: first require the exact final above. Unlink
+  the temporary only when its current device/inode is exactly the final's
+  current device/inode, after final identity and final-parent durability are
+  proven; otherwise preserve the extra temporary and return `ERR_INTEGRITY`;
+- final absent, temporary present: require a non-symlink regular mode-`0600`
+  temporary, recompute the canonical patch, and stream-compare exact complete
+  bytes, SHA-256, size, and mode. If exact, publish without replacement, sync
+  and revalidate the final and parent, then identity-check and unlink the
+  temporary and sync the parent again;
+- a mismatching, partial, wrong-mode, nonregular, replaced, or otherwise
+  unprovable preexisting temporary is preserved and returns `ERR_INTEGRITY`.
+
+Only a temporary successfully created with `O_EXCL` by the current invocation
+may be identity-checked and unlinked on that invocation's local prepublication
+failure. Primitive-internal owned temporary cleanup remains local to the
+primitive that created and recorded the handle identity; orchestration never
+generalizes that authority to a preexisting pathname.
 
 Slice 2 extends the run capability's closed purpose table without adding a
 module export:
@@ -393,11 +408,11 @@ The purpose requires the exact `copy-NNNN` nonzero entry-ID grammar and forbids
 `phase` or another key. Derivation and both mutation-boundary revalidations
 require the existing `divergent-diffs` parent to be the recorded contained
 mode-`0700` directory and the temporary, when present, to be same-device,
-regular, non-symlink, and exactly mode `0600`. Under literal writer attestation,
-an exact owned temporary in a run with no journal or journal residue may be
-identity-checked, unlinked, its parent synced, and then recreated. A wrong
-name/type/mode/device, symlink, identity replacement, or temporary beside any
-journal evidence is preserved and fails closed.
+regular, non-symlink, and exactly mode `0600`. A preexisting temporary follows
+only the exact recompute/adopt matrix above; it is never unlinked merely because
+its path, mode, or inode looked valid. A wrong name/type/mode/device, symlink,
+identity replacement, or temporary beside journal evidence is preserved and
+fails closed.
 
 Manifest, journal, inventory, and CLI inputs use closed schemas: unknown keys,
 absolute paths, empty or `.`/`..` components, NUL bytes, non-normalized Unicode
@@ -742,9 +757,10 @@ capability and applies this ordered decision table without mutation:
    residue also returns `ERR_RECOVERY_REQUIRED`; it may instead return
    `ERR_INDETERMINATE_JOURNAL_APPEND` only when the existing primitive evidence
    proves the exact attempted candidate and uncertainty boundary;
-3. with no journal or journal residue, an empty exact fixed layout permits
-   ordinary discovery, and the closed precommit artifact set below permits
-   private precommit resume;
+3. with no journal or journal residue, any ancestor-closed prefix of the exact
+   Slice 1 fixed directory layout permits ordinary discovery and strict
+   bootstrap completion, and a complete fixed layout with the closed final
+   precommit artifact set below permits private precommit resume;
 4. any other name, type, mode, symlink, device, containment, identity, or
    artifact combination is preserved and returns `ERR_INTEGRITY`.
 
@@ -753,15 +769,29 @@ on otherwise precommit-looking files. The gate never cleans a lock, settles or
 appends a journal record, reads Git workspace state, adopts a precommit file, or
 invokes a fault hook.
 
-The closed journal-absent precommit set is exactly the fixed-layout directories
-plus: `inventories/pre/<validated-entry-id>.jsonl`; mode-`0600`
-`inventories/work/<lowercase-v4-shaped-uuid>.bin` files admitted only to the
-inventory primitive's owned cleanup/recreation rules; one digest-named manifest
-generation and/or its exact hidden digest temporary under `manifests`; and one
-final `<source-copy-entry-id>.patch` and/or deterministic hidden
-`.<source-copy-entry-id>.tmp` per divergent entry. It contains no journal,
-lock, tombstone, payload, moved/validation/restore inventory, rollback,
-conflict, current pointer, or other file.
+An ancestor-closed layout prefix contains the run directory plus any subset of
+the fixed Slice 1 directories for which every lexical parent is also present.
+Every present path is a contained, realpath-equal, same-device, non-symlink
+mode-`0700` directory; no file, unexpected name, or child whose fixed parent is
+absent is allowed. The strict Slice 1 bootstrap creates missing suffix
+directories in canonical order and repeats the required parent fsync for every
+created or adopted name. Tests cover every possible prefix, including only the
+run root and the complete empty layout.
+
+The closed journal-absent precommit set requires the complete fixed layout and
+adds only complete published finals:
+`inventories/pre/<validated-entry-id>.jsonl`, one digest-named manifest
+generation, and one final `<source-copy-entry-id>.patch` per divergent entry.
+The sole preexisting temporary it admits is the deterministic
+`.<source-copy-entry-id>.tmp`, and that path is usable only through the exact
+divergent matrix above. Preexisting inventory work/publication temporaries and
+manifest temporaries, including syntactically valid random UUID or digest temp
+names, are never allowlisted, adopted, or cleaned by Slice 2; they are preserved
+and return `ERR_INTEGRITY`. Public retry fault seams for inventory and manifest
+occur only after those primitives have published their final artifacts, while
+primitive-internal owned-temp cleanup remains primitive-local. The set contains
+no journal, lock, tombstone, payload, moved/validation/restore inventory,
+rollback, conflict, current pointer, or other file.
 
 Because this gate deliberately precedes discovery, it admits entry-associated
 precommit names only by their closed path/ID grammar and security metadata. The
@@ -775,13 +805,13 @@ implementation calls a non-exported core with mode
 `"apply-precommit-resume"`; direct `prepareQuarantineWorkspace` retains its
 strict Slice 1 behavior and rejects every file or non-allowlisted child. After
 the gate permits private resume, apply repeats fresh discovery and may adopt
-only complete deterministic `pre` inventories, divergent patches, and the
-immutable `PREPARED` generation after recomputing their exact bytes, summaries,
-hashes, modes, and identities. Exact allowlisted owned inventory, manifest, and
-divergent temporaries may be cleaned or recreated only by their owning bounded
-primitive with identity checks and parent fsync. A complete mismatch, foreign
-or unexpected artifact, or any artifact outside the closed set is preserved
-and fails with `ERR_INTEGRITY`.
+only complete deterministic published `pre` inventories, divergent patches,
+and the immutable `PREPARED` generation after recomputing their exact bytes,
+summaries, hashes, modes, and identities. The only preexisting temporary it may
+adopt is an exact complete divergent temporary through the matrix above. A
+complete mismatch, foreign or unexpected artifact, inventory/manifest
+temporary, or any artifact outside the closed set is preserved and fails with
+`ERR_INTEGRITY`.
 
 Once a complete `PREPARED` event is durable, regardless of its later durable
 tip, a fresh apply call performs no filesystem or journal mutation and throws
@@ -1143,10 +1173,14 @@ After Slice 1, `quarantine-workspace-runtime.mjs` exports exactly
 `quarantineWorkspace`, so the runtime module then exports exactly
 `inspectWorkspace`, `prepareQuarantineWorkspace`, and `quarantineWorkspace`.
 The transaction module exports exactly `inspectWorkspace` and
-`quarantineWorkspace` after Slice 2. Runtime exports are importable only by
-transaction orchestration and focused internal tests; only the transaction
-exports are public package/facade names. `prepareQuarantineWorkspace` never
-appears on the compatibility facade.
+`quarantineWorkspace` after Slice 2 and is the authoritative Slice 2 public
+orchestration surface. Runtime exports are importable only by transaction
+orchestration and focused internal tests. Slice 2 does not edit the legacy
+compatibility facade, package exports, CLI, or package scripts; those remain
+unchanged until Slice 6. Any unrelated legacy symbol already named
+`quarantineWorkspace` on that facade is not the Slice 2 implementation or an
+exception to this staging boundary. `prepareQuarantineWorkspace` never appears
+on the compatibility facade.
 
 The Slice 1 runtime-only preparation contract is:
 

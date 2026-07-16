@@ -1109,8 +1109,11 @@ captured filesystem source, and returns only the final `QUARANTINED` result afte
 the complete durable protocol below. After this slice,
 `quarantine-workspace-runtime.mjs` exports exactly `inspectWorkspace`,
 `prepareQuarantineWorkspace`, and `quarantineWorkspace`; the transaction module
-exports exactly `inspectWorkspace` and `quarantineWorkspace`. No runtime helper
-or facade name is added beyond those exact sets. The runtime implementation uses
+exports exactly `inspectWorkspace` and `quarantineWorkspace` and is the
+authoritative Slice 2 interface. Slice 2 makes no edit to the legacy facade,
+package exports, CLI, or package scripts; those change only in Slice 6. An
+unrelated legacy facade export already named `quarantineWorkspace` remains
+untouched and is not the Slice 2 implementation. The runtime implementation uses
 a non-exported core mode named `apply-precommit-resume`; direct
 `prepareQuarantineWorkspace` remains strict and no second prepare API is
 exposed.
@@ -1150,7 +1153,8 @@ git -c core.fsmonitor=false -c core.quotePath=true
 
 Require exit `1`; exit `0` is an integrity mismatch and a signal or any other
 exit is fatal. Stream stdout bytes without decoding or newline rewriting into a
-capability-derived mode-`0600` owned temporary using fixed memory. Extend the
+capability-derived mode-`0600` temporary opened with `O_EXCL` by the current
+invocation using fixed memory. Extend the
 closed capability table with exact request
 `{ purpose: "divergent-diff-temp", id: <source-copy-entry-id> }`, deriving only
 `divergent-diffs/.<entry-id>.tmp`; reject every generated/invalid ID, phase,
@@ -1182,9 +1186,12 @@ validation.
 
 Add retry fixtures for a kill or injected failure at every precommit seam. The
 same `quarantineWorkspace` invocation must rerun fresh discovery and may adopt
-only exact deterministic complete `pre` inventories, divergent patches, and
-the immutable PREPARED generation. Incomplete owned temporaries are removed
-only through their owning primitive's identity checks. Preserve complete
+only exact deterministic complete published `pre` inventories, divergent
+patches, and the immutable PREPARED generation. Preserve every preexisting
+inventory work/publication temporary and manifest temporary; Slice 2 never
+adopts or cleans them because their public fault seams follow final publication.
+Primitive-internal owned-temp cleanup remains local to the primitive and a
+current-invocation `O_EXCL` handle identity. Preserve complete
 mismatches, foreign names/files, symlinks, wrong modes, identity replacements,
 and unresolved lock/tombstone evidence and require `ERR_INTEGRITY` or
 `ERR_INDETERMINATE_JOURNAL_APPEND` as applicable. Assert no source rename before
@@ -1201,17 +1208,34 @@ when the primitive evidence proves one exact attempted candidate; otherwise
 recovery-required wins. Assert that this journal/recovery branch has priority
 over a simultaneous precommit-looking mismatch and launches no Git child.
 
-With no journal or residue, admit exactly the fixed layout plus legal
-`pre` inventories, inventory-owned mode-`0600` UUIDv4 work files, one legal
-manifest digest generation/hidden digest temporary, and legal divergent final
-patches/deterministic hidden temporaries. Reject and preserve any payload,
-moved/validation/restore inventory, current pointer, rollback, conflict,
-foreign name, or malformed artifact. Direct `prepareQuarantineWorkspace`
-retains the Slice 1 strict rejection of every file; only runtime
-`quarantineWorkspace` may enter the non-exported `apply-precommit-resume` core
-mode. Journal-absent, writer-attested retry may unlink/recreate an exact owned
-`divergent-diff-temp` only after identity verification and must fsync its parent;
-a complete final patch is adopted only after exact streamed recomputation.
+With no journal or residue, admit every ancestor-closed subset of the exact
+Slice 1 fixed directories when every present name is a same-device,
+realpath-equal, non-symlink mode-`0700` directory and no file or foreign name
+exists. Strict bootstrap must complete and re-fsync every such prefix. Add a
+table-driven case for every prefix from run-root-only through the complete empty
+layout, plus non-ancestor subsets and files as rejecting controls.
+
+Private precommit resume requires the complete fixed layout and admits only
+published `pre` inventories, one published manifest digest generation, legal
+divergent final patches, and deterministic divergent temporaries. Reject and
+preserve any inventory/work or manifest temporary even when its UUID/digest
+grammar and mode look valid, plus any payload, moved/validation/restore
+inventory, current pointer, rollback, conflict, foreign name, or malformed
+artifact. Direct `prepareQuarantineWorkspace` retains the Slice 1 strict
+rejection of every file; only runtime `quarantineWorkspace` may enter the
+non-exported `apply-precommit-resume` core mode.
+
+Test the exact divergent temporary matrix. A final alone is adopted only after
+exact streamed bytes/hash/size/mode recomputation. With final plus temp, unlink
+temp only when both current paths identify the same exact inode and only after
+final and parent durability; a different temp is preserved with
+`ERR_INTEGRITY`. With temp alone, recompute and stream-compare the complete
+canonical patch and, only if exact, publish no-replace, fsync/revalidate final
+and parent, then identity-check/unlink temp and fsync the parent again. Preserve
+partial, mismatching, nonregular, wrong-mode, and replaced temps. Only a temp
+successfully `O_EXCL`-created by the current invocation may be identity-checked
+and removed on its local prepublication failure; path/mode/inode observations
+alone never authorize deletion of a preexisting temp.
 
 Seed each durable Slice 2 tip `PREPARED`, `MOVING`, `VERIFYING`, and
 `QUARANTINED`, then call `quarantineWorkspace` again. Require no filesystem or
@@ -1275,16 +1299,19 @@ reconciliation in the runtime module's non-exported core mode
 `apply-precommit-resume`, using existing capability-derived inventory, manifest,
 and temporary publication primitives. Export runtime `quarantineWorkspace` and
 have the transaction module export it alongside `inspectWorkspace`; preserve the
-exact runtime and transaction export sets specified above and add no facade name
-beyond public `quarantineWorkspace`. Keep direct `prepareQuarantineWorkspace`
-on the strict Slice 1 core mode.
+exact runtime and transaction export sets specified above. Do not edit the
+legacy facade or package in Slice 2, even if the facade already has an unrelated
+legacy symbol with the same name. Keep direct `prepareQuarantineWorkspace` on
+the strict Slice 1 core mode.
 
 Extend `quarantine-run-capability.mjs` only with the closed
 `divergent-diff-temp` purpose and its deterministic hidden entry-ID path. Under
 an exact run capability, require its existing parent and the optional temporary
 to pass the documented mode/type/device/no-follow/identity checks before and
-after mutation. Permit owned unlink/recreate only with writer attestation and no
-journal evidence, and fsync the parent after unlink and publication.
+after mutation. Implement the exact final/temporary matrix above. Never infer
+deletion authority from a preexisting temp's path/mode/inode alone; unlink on a
+local failure only when the current invocation successfully created it with
+`O_EXCL` and retained its handle identity.
 
 Use a fresh `withJournalLock` boundary for each append. Do not claim or attempt
 to hold one journal lock across discovery, diff, inventory, rename, or tree-sync
