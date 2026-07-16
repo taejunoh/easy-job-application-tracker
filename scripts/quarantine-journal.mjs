@@ -1272,6 +1272,10 @@ async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callba
   if (
     removeOnSuccess &&
     !state.lifecycleFailure &&
+    !(
+      settledError !== undefined &&
+      (state.durableAppends > 0 || state.lastCandidate !== null)
+    ) &&
     !(settledError instanceof IndeterminateJournalAppendError)
   ) {
     try {
@@ -1370,7 +1374,6 @@ async function appendAttemptUnderHeldLock({
   attempt,
 }) {
   if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
-  state.appendInProgress = true;
   let candidate;
   let mutationStarted = false;
   let journal;
@@ -1452,7 +1455,6 @@ async function appendAttemptUnderHeldLock({
         ? indeterminate(candidate, error)
         : error;
   }
-  state.appendInProgress = false;
   if (journal !== undefined) {
     try {
       await closePreservingPrimary(journal.handle, primaryError);
@@ -1479,14 +1481,19 @@ async function appendUnderHeldLock(options) {
   }
   state.appendInvocations += 1;
   const attempt = { candidate: null };
+  let ownsAppendProgress = false;
   try {
     if (state.appendInProgress) throw new Error("journal append is already in progress");
+    state.appendInProgress = true;
+    ownsAppendProgress = true;
     return await appendAttemptUnderHeldLock({ ...options, state, attempt });
   } catch (error) {
     if (state.firstFailedAttempt === null) {
       state.firstFailedAttempt = Object.freeze({ error, candidate: attempt.candidate });
     }
     throw error;
+  } finally {
+    if (ownsAppendProgress) state.appendInProgress = false;
   }
 }
 
@@ -1569,7 +1576,7 @@ function lockArtifactBoundary(path, boundary) {
   throw new Error(`unknown journal lock artifact path: ${path}`);
 }
 
-async function removeOwnedArtifacts(capability, artifacts, fsApi) {
+async function removeOwnedArtifacts(capability, artifacts, fsApi, cleanupState) {
   const uniqueArtifacts = [...new Map(
     artifacts.map((artifact) => [artifact.path, artifact]),
   ).values()];
@@ -1582,6 +1589,7 @@ async function removeOwnedArtifacts(capability, artifacts, fsApi) {
       lockArtifactBoundary(artifact.path, "before-mutation"),
     );
     await assertPathIdentity(artifact.path, artifact.identity, fsApi, "journal lock artifact");
+    if (cleanupState !== undefined) cleanupState.started = true;
     await fsApi.rm(artifact.path);
     await fsyncDirectory(dirname(artifact.path), fsApi);
     await revalidateRunCapability(
@@ -1885,6 +1893,7 @@ export async function reclaimJournalLock(options, callback) {
       throw primary;
     }
   }
+  const cleanupState = { started: false };
   try {
     await removeOwnedArtifacts(
       capability,
@@ -1894,9 +1903,10 @@ export async function reclaimJournalLock(options, callback) {
         { path: run.created.lockPath, identity: run.created.identity },
       ],
       fsApi,
+      cleanupState,
     );
   } catch (error) {
-    if (run.state.durableAppends === 0) {
+    if (run.state.durableAppends === 0 && !cleanupState.started) {
       try {
         await restoreRecoveryArtifacts({
           capability,
