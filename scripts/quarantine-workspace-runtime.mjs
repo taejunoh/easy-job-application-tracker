@@ -1932,12 +1932,18 @@ async function captureSourceAncestors(repoRoot, source, fsApi) {
   const components = sourceRelative.split(sep);
   const ancestors = [];
   let current = repoRoot;
-  ancestors.push({ path: current, identity: await captureWorkspaceDirectory(current, repoRoot, fsApi) });
+  ancestors.push(Object.freeze({
+    path: current,
+    identity: Object.freeze(await captureWorkspaceDirectory(current, repoRoot, fsApi)),
+  }));
   for (const component of components.slice(0, -1)) {
     current = join(current, component);
-    ancestors.push({ path: current, identity: await captureWorkspaceDirectory(current, repoRoot, fsApi) });
+    ancestors.push(Object.freeze({
+      path: current,
+      identity: Object.freeze(await captureWorkspaceDirectory(current, repoRoot, fsApi)),
+    }));
   }
-  return ancestors;
+  return Object.freeze(ancestors);
 }
 
 async function assertSourceAncestors(repoRoot, ancestors, fsApi) {
@@ -1976,6 +1982,7 @@ async function assertPrivateDirectoryIdentity(path, identity, fsApi) {
 
 async function validatePayloadEndpoint({
   capability,
+  purpose = "payload",
   entry,
   destination,
   destinationParent,
@@ -1984,12 +1991,27 @@ async function validatePayloadEndpoint({
   fsApi,
 }) {
   await revalidateRunCapability(capability, {
-    purpose: "payload",
+    purpose,
     id: entry.id,
     boundary,
   });
   await assertPrivateDirectoryIdentity(destinationParent, destinationParentIdentity, fsApi);
   await assertEntrySourceIdentity(destination, entry, fsApi);
+}
+
+async function validateMovedEndpointEvidence(capability, evidence, boundary, fsApi) {
+  await validatePayloadEndpoint({
+    capability,
+    purpose: evidence.purpose,
+    entry: evidence.entry,
+    destination: evidence.destination,
+    destinationParent: evidence.destinationParent,
+    destinationParentIdentity: evidence.destinationParentIdentity,
+    boundary,
+    fsApi,
+  });
+  await assertSourceAncestors(evidence.repoRoot, evidence.sourceAncestors, fsApi);
+  await assertPathMissing(evidence.source, fsApi);
 }
 
 async function movePreparedEntry({
@@ -2005,7 +2027,21 @@ async function movePreparedEntry({
   const destination = deriveRunPath(capability, { purpose: "payload", id: entry.id });
   const destinationParent = dirname(destination);
   const sourceAncestors = await captureSourceAncestors(handoff.repoRoot, source, fsApi);
-  const destinationParentIdentity = await capturePrivateDirectory(destinationParent, fsApi);
+  const destinationParentIdentity = Object.freeze(
+    await capturePrivateDirectory(destinationParent, fsApi),
+  );
+  const endpointEvidence = Object.freeze({
+    purpose: "payload",
+    entry,
+    repoRoot: handoff.repoRoot,
+    source,
+    sourceParent: dirname(source),
+    sourceParentIdentity: sourceAncestors.at(-1).identity,
+    sourceAncestors,
+    destination,
+    destinationParent,
+    destinationParentIdentity,
+  });
   await assertEntrySourceIdentity(source, entry, fsApi);
   await assertPathMissing(destination, fsApi);
   await appendEvent({
@@ -2162,6 +2198,8 @@ async function movePreparedEntry({
     payload: { id: entry.id, observed },
   });
   await invokeApplyHook(options.faultHook, hookState, `after-event:MOVED:${entry.id}`);
+  await validateMovedEndpointEvidence(capability, endpointEvidence, "after-sync", fsApi);
+  return endpointEvidence;
 }
 
 async function prepareDurableApply({ capability, handoff, environment, options, hookState }) {
@@ -2249,33 +2287,41 @@ async function prepareDurableApply({ capability, handoff, environment, options, 
   await invokeApplyHook(options.faultHook, hookState, "after-event:PREPARED");
   await appendEvent({ capability, event: "MOVING", payload: {} });
   await invokeApplyHook(options.faultHook, hookState, "after-event:MOVING");
+  const movedEndpointEvidence = [];
   for (const planned of entries) {
-    await movePreparedEntry({
+    movedEndpointEvidence.push(await movePreparedEntry({
       capability,
       handoff,
       planned,
       options,
       hookState,
       fsApi,
-    });
+    }));
   }
+  Object.freeze(movedEndpointEvidence);
   await appendEvent({ capability, event: "VERIFYING", payload: {} });
   await invokeApplyHook(options.faultHook, hookState, "after-event:VERIFYING");
-  for (const { entry, preMoveInventory } of entries) {
-    const payload = deriveRunPath(capability, { purpose: "payload", id: entry.id });
+  for (const evidence of movedEndpointEvidence) {
+    await validateMovedEndpointEvidence(capability, evidence, "after-sync", fsApi);
+  }
+  for (let index = 0; index < entries.length; index += 1) {
+    const { entry, preMoveInventory } = entries[index];
+    const evidence = movedEndpointEvidence[index];
+    await validateMovedEndpointEvidence(capability, evidence, "after-sync", fsApi);
     const observed = await writeInventoryJsonl({
       capability,
-      root: payload,
+      root: evidence.destination,
       entryId: entry.id,
       phase: "moved-pass-2",
     });
+    await validateMovedEndpointEvidence(capability, evidence, "after-sync", fsApi);
     await compareInventorySummary(preMoveInventory, observed);
     await invokeApplyHook(
       options.faultHook,
       hookState,
       `after-inventory:moved-pass-2:${entry.id}`,
     );
-    await assertPathMissing(workspaceEntryPath(handoff.repoRoot, entry), fsApi);
+    await validateMovedEndpointEvidence(capability, evidence, "after-sync", fsApi);
   }
   let finalWorkspace;
   try {
@@ -2289,6 +2335,9 @@ async function prepareDurableApply({ capability, handoff, environment, options, 
     finalWorkspace.head !== handoff.head ||
     finalWorkspace.statusPaths.length !== 0
   ) fail("ERR_INTEGRITY");
+  for (const evidence of movedEndpointEvidence) {
+    await validateMovedEndpointEvidence(capability, evidence, "after-sync", fsApi);
+  }
   await appendEvent({
     capability,
     event: "QUARANTINED",

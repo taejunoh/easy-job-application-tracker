@@ -2900,6 +2900,66 @@ describe("quarantine transaction Slice 1", () => {
     expect(existsSync(join(externalRoot, "payload-parent-owned/.next"))).toBe(true);
   });
 
+  it.each([
+    ["generated after MOVED", "generated-node-modules", "after-event:MOVED:generated-node-modules", "MOVED"],
+    ["source-copy after MOVED", "copy-0001", "after-event:MOVED:copy-0001", "MOVED"],
+    ["generated after VERIFYING", "generated-node-modules", "after-event:VERIFYING", "VERIFYING"],
+    ["source-copy after VERIFYING", "copy-0001", "after-event:VERIFYING", "VERIFYING"],
+    [
+      "generated after pass-2 inventory",
+      "generated-node-modules",
+      "after-inventory:moved-pass-2:generated-node-modules",
+      "VERIFYING",
+    ],
+    [
+      "source-copy after pass-2 inventory",
+      "copy-0001",
+      "after-inventory:moved-pass-2:copy-0001",
+      "VERIFYING",
+    ],
+  ] as const)(
+    "stops at the carried endpoint boundary %s",
+    (_label, targetId, triggerPhase, expectedLastEvent) => {
+      const f = fixture();
+      bases.push(f.base);
+      const externalRoot = join(
+        f.base,
+        `external-late-${targetId}-${triggerPhase.replaceAll(":", "-")}`,
+      );
+      privateDirectory(externalRoot);
+      writeFileSync(join(externalRoot, "sentinel"), "preserve");
+      const transactionId = `tx-late-${targetId}-${triggerPhase.replaceAll(":", "-")}`;
+      const worker = invoke("apply-endpoint-swap", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+        variant: "destination-after-move",
+        triggerPhase,
+        targetId,
+        externalRoot,
+      }, {}, 30_000);
+      expectWorkerError(
+        worker,
+        "ERR_INTEGRITY",
+        "Quarantine evidence failed integrity validation.",
+      );
+      expect(worker.externalOperations).toEqual([]);
+      expect(worker.replayEvents).not.toContainEqual({
+        event: "QUARANTINED",
+        payload: {},
+      });
+      const last = worker.replayEvents?.at(-1);
+      expect(last?.event).toBe(expectedLastEvent);
+      if (expectedLastEvent === "MOVED") expect(last?.payload.id).toBe(targetId);
+      expect(readFileSync(join(externalRoot, "sentinel"), "utf8")).toBe("preserve");
+    },
+  );
+
   it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])(
     "maps append lock-cleanup failure %i to indeterminate at the exact durable event",
     (failCleanupAt) => {
