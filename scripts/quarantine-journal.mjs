@@ -1230,9 +1230,11 @@ async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callba
     ...created,
     active: true,
     appendInProgress: false,
+    appendInvocations: 0,
     capability,
-    candidateAttempts: 0,
+    completedDurableAttempts: 0,
     durableAppends: 0,
+    firstFailedAttempt: null,
     fsApi,
     lastCandidate: null,
   };
@@ -1349,16 +1351,16 @@ async function openJournalForMutation(snapshot, fsApi) {
   }
 }
 
-async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi, faultHook }) {
+async function appendAttemptUnderHeldLock({
+  capability,
+  event,
+  payload,
+  fsApi,
+  faultHook,
+  state,
+  attempt,
+}) {
   if (!isPlainObject(payload)) throw new TypeError("journal payload must be a plain object");
-  const state = heldLockState.get(heldLock);
-  if (state === undefined || !state.active) {
-    throw new TypeError("journal held-lock capability is forged or inactive");
-  }
-  if (state.capability !== capability || state.fsApi !== fsApi) {
-    throw new TypeError("journal held-lock capability does not match the append boundary");
-  }
-  if (state.appendInProgress) throw new Error("journal append is already in progress");
   state.appendInProgress = true;
   let candidate;
   let mutationStarted = false;
@@ -1385,7 +1387,6 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
     const length = Buffer.alloc(4);
     length.writeUInt32BE(body.length);
 
-    state.candidateAttempts += 1;
     await invokeFaultHook(faultHook, "before-mutation");
     await assertHeldLockOwned(state);
     await revalidateRunCapability(capability, {
@@ -1393,6 +1394,7 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
       boundary: "before-mutation",
     });
     mutationStarted = true;
+    attempt.candidate = candidate;
     state.lastCandidate = candidate;
     const openedJournal = await openJournalForMutation(snapshot, fsApi);
     journal = { ...openedJournal, journalPath: snapshot.journalPath };
@@ -1454,7 +1456,29 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
   } else if (primaryError !== undefined) {
     throw primaryError;
   }
+  state.completedDurableAttempts += 1;
   return result;
+}
+
+async function appendUnderHeldLock(options) {
+  const state = heldLockState.get(options.heldLock);
+  if (state === undefined || !state.active) {
+    throw new TypeError("journal held-lock capability is forged or inactive");
+  }
+  if (state.capability !== options.capability || state.fsApi !== options.fsApi) {
+    throw new TypeError("journal held-lock capability does not match the append boundary");
+  }
+  state.appendInvocations += 1;
+  const attempt = { candidate: null };
+  try {
+    if (state.appendInProgress) throw new Error("journal append is already in progress");
+    return await appendAttemptUnderHeldLock({ ...options, state, attempt });
+  } catch (error) {
+    if (state.firstFailedAttempt === null) {
+      state.firstFailedAttempt = Object.freeze({ error, candidate: attempt.candidate });
+    }
+    throw error;
+  }
 }
 
 export async function appendJournalRecord(options) {
@@ -1810,7 +1834,11 @@ export async function reclaimJournalLock(options, callback) {
       const lockState = heldLockState.get(heldLock);
       if (lockState?.durableAppends === 0) {
         try {
-          if (lockState.lastCandidate !== null || lockState.candidateAttempts !== 0) {
+          if (
+            lockState.firstFailedAttempt !== null ||
+            lockState.appendInvocations !== 0 ||
+            lockState.completedDurableAttempts !== 0
+          ) {
             throw new Error("durable journal tip settlement rejects prior append attempts");
           }
           if (rechecked.replayed.truncatedTail) {
@@ -1828,15 +1856,15 @@ export async function reclaimJournalLock(options, callback) {
       return callbackResult;
     },
   );
+  if (
+    run.state.firstFailedAttempt !== null ||
+    run.state.appendInvocations !== run.state.completedDurableAttempts
+  ) {
+    throw run.state.firstFailedAttempt?.error ?? new Error(
+      "journal lock recovery has an incomplete append invocation",
+    );
+  }
   if (run.state.durableAppends === 0) {
-    if (run.state.lastCandidate !== null || run.state.candidateAttempts !== 0) {
-      const attemptError = zeroAppendFailure ?? new Error(
-        "durable journal tip settlement rejects prior append attempts",
-      );
-      throw run.state.lastCandidate === null
-        ? attemptError
-        : indeterminate(run.state.lastCandidate, attemptError);
-    }
     if (zeroAppendFailure !== undefined || settlementResult === undefined) {
       const primary = zeroAppendFailure ?? new Error(
         "journal lock recovery requires a durable journal append or exact tip settlement",

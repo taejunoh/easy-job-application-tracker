@@ -1059,6 +1059,58 @@ const result = await withQuarantineRunCapability({
     ));
     return { outcome, closes };
   }
+  if (request.operation === "append-attempt-sequence") {
+    await appendAll(capability, request.records);
+    await seedArtifacts(capability);
+    const journalPath = deriveRunPath(capability, { purpose: "journal" });
+    const before = await snapshot();
+    const beforeBytes = await fsPromises.readFile(journalPath);
+    const swallowed = [];
+    const outcome = await capture(() => journal.reclaimJournalLock(
+      { capability, writersStopped: true, fsApi: boundFsApi },
+      async (heldLock) => {
+        const completed = [];
+        for (const action of request.actions) {
+          try {
+            completed.push(await journal.appendJournalRecord({
+              capability,
+              heldLock,
+              event: action.record.event,
+              payload: action.record.payload,
+              fsApi: boundFsApi,
+              faultHook: action.failurePhase === undefined
+                ? undefined
+                : async (phase) => {
+                  if (phase === action.failurePhase) {
+                    throw new Error("injected sequenced append failure");
+                  }
+                },
+            }));
+          } catch (error) {
+            if (!action.swallow) throw error;
+            swallowed.push({
+              name: error.name,
+              code: error.code ?? null,
+              message: error.message,
+              expectedSequence: error.expectedSequence ?? null,
+              expectedRecordHash: error.expectedRecordHash ?? null,
+            });
+          }
+        }
+        return { completed };
+      },
+    ));
+    const after = await snapshot();
+    const afterBytes = await fsPromises.readFile(journalPath);
+    return {
+      outcome,
+      swallowed,
+      before,
+      after,
+      bytesChanged: !beforeBytes.equals(afterBytes),
+      replayed: await journal.replayJournal({ capability }),
+    };
+  }
   if (request.operation === "settle-durable-tip") {
     if (request.setup !== "existing") {
       await appendAll(capability, request.records);
@@ -2947,7 +2999,7 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.outcome.error).toMatchObject({
       name: "Error",
       code: null,
-      message: "durable journal tip settlement rejects prior append attempts",
+      message: "injected swallowed append failure",
       expectedSequence: null,
       expectedRecordHash: null,
     });
@@ -3003,6 +3055,86 @@ describe("capability-bound durable quarantine journal", () => {
     );
     expect(movedTombstones).toHaveLength(1);
     expect(movedTombstones[0][1]).toEqual(result.before["journal.lock"]);
+  });
+
+  it.each([
+    ["success-then-prewrite", [
+      { record: records.moving },
+      { record: records.moveIntent, failurePhase: "before-mutation", swallow: true },
+    ], "Error", ["PREPARED", "MOVING"]],
+    ["success-then-indeterminate", [
+      { record: records.moving },
+      { record: records.moveIntent, failurePhase: "after-journal-sync", swallow: true },
+    ], "IndeterminateJournalAppendError", ["PREPARED", "MOVING", "MOVE_INTENT"]],
+    ["failure-then-success", [
+      { record: records.moving, failurePhase: "before-mutation", swallow: true },
+      { record: records.moving },
+    ], "Error", ["PREPARED", "MOVING"]],
+  ] as const)(
+    "preserves evidence for a mixed append sequence: %s",
+    (caseName, actions, expectedErrorName, expectedEvents) => {
+      const result = invoke(join(fixture, `append-sequence-${caseName}`), {
+        operation: "append-attempt-sequence",
+        records: [records.prepared],
+        actions,
+      });
+      expect(result.swallowed).toHaveLength(1);
+      expect(result.outcome.ok).toBe(false);
+      expect(result.outcome.error.name).toBe(expectedErrorName);
+      expect(result.outcome.error.message).toBe(result.swallowed[0].message);
+      expect(result.outcome.error.expectedSequence).toBe(
+        result.swallowed[0].expectedSequence,
+      );
+      expect(result.outcome.error.expectedRecordHash).toBe(
+        result.swallowed[0].expectedRecordHash,
+      );
+      expect(result.bytesChanged).toBe(true);
+      expect(result.replayed.records.map(
+        (record: { event: string }) => record.event,
+      )).toEqual(expectedEvents);
+      if (expectedErrorName === "IndeterminateJournalAppendError") {
+        expect(result.swallowed[0]).toMatchObject({
+          code: "ERR_INDETERMINATE_JOURNAL_APPEND",
+          expectedSequence: 3,
+          expectedRecordHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        });
+        expect(result.replayed.records.at(-1).recordHash).toBe(
+          result.swallowed[0].expectedRecordHash,
+        );
+      }
+      expect(result.after["journal.lock"]).not.toEqual(result.before["journal.lock"]);
+      expect(result.after["journal.lock.tombstone.11111111-1111-4111-8111-111111111111"])
+        .toEqual(
+          result.before["journal.lock.tombstone.11111111-1111-4111-8111-111111111111"],
+        );
+      const movedTombstones = Object.entries(result.after).filter(
+        ([name]) => name.startsWith("journal.lock.tombstone.") &&
+          name !== "journal.lock.tombstone.11111111-1111-4111-8111-111111111111",
+      );
+      expect(movedTombstones).toHaveLength(1);
+      expect(movedTombstones[0][1]).toEqual(result.before["journal.lock"]);
+    },
+  );
+
+  it("cleans recovery artifacts after multiple successful append invocations", () => {
+    const result = invoke(join(fixture, "append-sequence-all-success"), {
+      operation: "append-attempt-sequence",
+      records: [records.prepared],
+      actions: [
+        { record: records.moving },
+        { record: records.moveIntent },
+      ],
+    });
+    expect(result.outcome.ok).toBe(true);
+    expect(result.outcome.value.completed).toHaveLength(2);
+    expect(result.swallowed).toEqual([]);
+    expect(result.bytesChanged).toBe(true);
+    expect(result.replayed.records.map((record: { event: string }) => record.event)).toEqual([
+      "PREPARED",
+      "MOVING",
+      "MOVE_INTENT",
+    ]);
+    expect(Object.keys(result.after).sort()).toEqual(["journal.log", "sentinel"]);
   });
 
   it.each([
