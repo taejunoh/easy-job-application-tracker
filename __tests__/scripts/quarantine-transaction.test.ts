@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -79,6 +80,16 @@ function git(repoRoot: string, ...args: string[]) {
 function privateDirectory(path: string) {
   mkdirSync(path, { recursive: true, mode: 0o700 });
   chmodSync(path, 0o700);
+}
+
+function listLockResidue(path: string, relative = ""): string[] {
+  const output: string[] = [];
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    const entryRelative = relative === "" ? entry.name : `${relative}/${entry.name}`;
+    if (entry.name.endsWith(".lock")) output.push(entryRelative);
+    if (entry.isDirectory()) output.push(...listLockResidue(join(path, entry.name), entryRelative));
+  }
+  return output.sort();
 }
 
 function installGitOutputOverride(
@@ -188,6 +199,10 @@ type WorkerError = {
   ownKeys: string[];
   descriptors: Record<string, DescriptorShape>;
   leaksSecret: boolean;
+  prototypeIsError: boolean;
+  prototypeParentIsError: boolean;
+  prototypeOwnKeys: string[];
+  codeMutationInert: boolean;
   [key: string]: unknown;
 };
 
@@ -227,6 +242,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { Readable } from "node:stream";
 
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
@@ -258,6 +274,9 @@ function errorShape(error) {
   for (const key of Reflect.ownKeys(error)) {
     if (typeof key === "string") descriptors[key] = Object.getOwnPropertyDescriptor(error, key);
   }
+  const prototype = Object.getPrototypeOf(error);
+  const originalCode = error?.code;
+  const codeSet = Reflect.set(error, "code", "MUTATED");
   return {
     instanceOfError: error instanceof Error,
     name: error?.name,
@@ -276,6 +295,10 @@ function errorShape(error) {
       valueType: typeof value.value,
     }])),
     leaksSecret: String(error?.stack).includes("/do/not/leak"),
+    prototypeIsError: prototype === Error.prototype,
+    prototypeParentIsError: Object.getPrototypeOf(prototype) === Error.prototype,
+    prototypeOwnKeys: Reflect.ownKeys(prototype).map(String),
+    codeMutationInert: codeSet === false && error?.code === originalCode,
   };
 }
 
@@ -290,7 +313,11 @@ try {
     }));
   } else if (operation === "inspect") {
     const result = await transaction.inspectWorkspace(request);
-    process.stdout.write(JSON.stringify({ ok: true, result, shape: shape(result) }));
+    const resultShape = shape(result);
+    const before = JSON.stringify(result);
+    resultShape.mutationStable = Reflect.set(result, "status", "MUTATED") === false &&
+      Reflect.set(result, "sourceCopies", -1) === false && JSON.stringify(result) === before;
+    process.stdout.write(JSON.stringify({ ok: true, result, shape: resultShape }));
   } else if (operation === "getter") {
     let reads = 0;
     const options = { ...request };
@@ -304,16 +331,29 @@ try {
       faultHook(phase) { phases.push(phase); },
     });
     const originalStatus = result.status;
-    const originalEntry = result.entries[0];
-    const originalId = originalEntry.id;
-    const originalDev = originalEntry.sourceIdentity.dev;
+    const originalEntries = result.entries.map((entry) => ({
+      entry,
+      id: entry.id,
+      sourceIdentity: entry.sourceIdentity,
+      sourceDev: entry.sourceIdentity.dev,
+      canonicalIdentity: entry.canonicalIdentity,
+      canonicalDev: entry.canonicalIdentity?.dev,
+    }));
     const mutationResults = [
       Reflect.set(result, "status", "MUTATED"),
       Reflect.set(result.entries, 0, null),
-      Reflect.set(originalEntry, "id", "mutated"),
-      Reflect.set(originalEntry.sourceIdentity, "dev", -1),
+      Reflect.set(result.entries, "length", 0),
       Reflect.set(result.fsSource, "lstat", null),
     ];
+    for (const original of originalEntries) {
+      mutationResults.push(
+        Reflect.set(original.entry, "id", "mutated"),
+        Reflect.set(original.sourceIdentity, "dev", -1),
+      );
+      if (original.canonicalIdentity) {
+        mutationResults.push(Reflect.set(original.canonicalIdentity, "dev", -1));
+      }
+    }
     process.stdout.write(JSON.stringify({
       ok: true,
       result,
@@ -327,8 +367,12 @@ try {
         fsCallable: Object.values(result.fsSource).every((value) => typeof value === "function"),
         fsStable: Object.keys(result.fsSource).every((key) => result.fsSource[key] === result.fsSource[key]),
         mutationStable: mutationResults.every((value) => value === false) &&
-          result.status === originalStatus && result.entries[0] === originalEntry &&
-          originalEntry.id === originalId && originalEntry.sourceIdentity.dev === originalDev,
+          result.status === originalStatus && originalEntries.every((original, index) =>
+            result.entries[index] === original.entry && original.entry.id === original.id &&
+            original.entry.sourceIdentity === original.sourceIdentity &&
+            original.sourceIdentity.dev === original.sourceDev &&
+            original.entry.canonicalIdentity === original.canonicalIdentity &&
+            original.canonicalIdentity?.dev === original.canonicalDev),
       },
     }));
   } else if (operation === "drift") {
@@ -427,6 +471,29 @@ try {
     };
     const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
     process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "file-identity-drift") {
+    const { driftKind, ...runtimeRequest } = request;
+    let quarantineRealpathCalls = 0;
+    const adapter = {
+      ...fsPromises,
+      async realpath(path) {
+        if (path === request.quarantineRoot) {
+          quarantineRealpathCalls += 1;
+          if (quarantineRealpathCalls === 2) {
+            const relative = driftKind === "canonical" ? "notes.txt" : "notes 2.txt";
+            const source = join(request.repoRoot, relative);
+            renameSync(source, request.quarantineRoot + "." + driftKind + "-owned");
+            writeFileSync(source, "canonical\\n");
+          }
+        }
+        return fsPromises.realpath(path);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const result = await transaction.inspectWorkspace({ ...runtimeRequest, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
   } else if (operation === "fs-capture") {
     const implementations = { ...fsPromises, createReadStream, lstatSync, realpathSync };
     const counts = {};
@@ -467,6 +534,38 @@ try {
         return (...args) => Reflect.apply(base.realpathSync, base, args);
       },
     });
+    const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "virtual-files") {
+    const body = Buffer.from("canonical\\n");
+    const repositoryStats = await fsPromises.lstat(request.repoRoot);
+    const virtualPrefix = request.repoRoot + "/virtual-";
+    const virtualStats = {
+      dev: repositoryStats.dev,
+      ino: 777,
+      mode: 0o100600,
+      size: body.length,
+      isSymbolicLink: () => false,
+      isFile: () => true,
+      isDirectory: () => false,
+    };
+    const adapter = {
+      ...fsPromises,
+      async lstat(path) {
+        if (path.startsWith(virtualPrefix)) return virtualStats;
+        return fsPromises.lstat(path);
+      },
+      async realpath(path) {
+        if (path.startsWith(virtualPrefix)) return path;
+        return fsPromises.realpath(path);
+      },
+      createReadStream(path, options) {
+        if (path.startsWith(virtualPrefix)) return Readable.from([body]);
+        return createReadStream(path, options);
+      },
+      lstatSync,
+      realpathSync,
+    };
     const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
     process.stdout.write(JSON.stringify({ ok: true, result }));
   } else if (operation === "symbol") {
@@ -607,6 +706,10 @@ function expectWorkerError(result: WorkerResult, code: string, message: string) 
     json: "{}",
     frozen: true,
     extensible: false,
+    prototypeIsError: false,
+    prototypeParentIsError: true,
+    prototypeOwnKeys: ["constructor"],
+    codeMutationInert: true,
   });
   expect(new Set(result.error!.ownKeys)).toEqual(new Set(["stack", "message", "name", "code"]));
   for (const descriptor of Object.values(result.error!.descriptors)) {
@@ -663,6 +766,7 @@ describe("quarantine transaction Slice 1", () => {
     for (const descriptor of Object.values(worker.shape!.descriptors)) {
       expect(descriptor).toMatchObject({ enumerable: true, configurable: false, writable: false });
     }
+    expect(worker.shape!.mutationStable).toBe(true);
     expect(result).toEqual({
       status: "INSPECTED",
       totalEntries: 3,
@@ -777,6 +881,22 @@ describe("quarantine transaction Slice 1", () => {
         expect(descriptor).toMatchObject({ enumerable: true, writable: false, configurable: false });
       }
     }
+    expect(firstShape.entryShapes!.map((shape) => shape.keys)).toEqual([
+      ["id", "kind", "relativePath", "sourceIdentity"],
+      ["id", "kind", "relativePath", "sourceIdentity"],
+      [
+        "id", "kind", "relativePath", "canonicalRelativePath", "sourceIdentity",
+        "canonicalIdentity", "classification", "historyMatch",
+      ],
+    ]);
+    expect(firstShape.identityShapes!.map((pair) => pair.map((shape) => shape?.keys ?? null))).toEqual([
+      [["dev", "ino", "mode"], null],
+      [["dev", "ino", "mode"], null],
+      [
+        ["dev", "ino", "mode", "size", "sha256"],
+        ["dev", "ino", "mode", "size", "sha256"],
+      ],
+    ]);
     expect(second.entries).toEqual(first.entries);
 
     for (const relativePath of LAYOUT_RELATIVES) {
@@ -1056,6 +1176,62 @@ describe("quarantine transaction Slice 1", () => {
     expect(readFileSync(external, "utf8")).toBe("preserve");
   });
 
+  it("rejects a repository-root symlink without touching its target", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const owned = `${f.repoRoot}-owned`;
+    renameSync(f.repoRoot, owned);
+    writeFileSync(join(owned, "root-symlink-sentinel"), "preserve");
+    symlinkSync(owned, f.repoRoot);
+    expectWorkerError(invoke("inspect", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+    }), "ERR_PREFLIGHT", "Workspace preflight failed.");
+    expect(readFileSync(join(owned, "root-symlink-sentinel"), "utf8")).toBe("preserve");
+  });
+
+  it("rejects a symlinked repository ancestor without touching its target", () => {
+    const f = fixture({ repoName: "nested/repo" });
+    bases.push(f.base);
+    const ancestor = join(f.base, "nested");
+    const owned = join(f.base, "nested-owned");
+    renameSync(ancestor, owned);
+    writeFileSync(join(owned, "ancestor-symlink-sentinel"), "preserve");
+    symlinkSync(owned, ancestor);
+    expectWorkerError(invoke("inspect", {
+      repoRoot: join(ancestor, "repo"),
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+    }), "ERR_PREFLIGHT", "Workspace preflight failed.");
+    expect(readFileSync(join(owned, "ancestor-symlink-sentinel"), "utf8")).toBe("preserve");
+  });
+
+  it.each(["source", "canonical"] as const)(
+    "rejects same-content %s inode drift between complete passes",
+    (kind) => {
+      const f = fixture();
+      bases.push(f.base);
+      expectWorkerError(invoke("file-identity-drift", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        driftKind: kind,
+      }), "ERR_PREFLIGHT", "Workspace preflight failed.");
+      const owned = `${f.quarantineRoot}.${kind}-owned`;
+      expect(existsSync(owned)).toBe(true);
+      expect(readFileSync(owned, "utf8")).toBe("canonical\n");
+      expect(readFileSync(join(f.repoRoot, kind === "canonical" ? "notes.txt" : "notes 2.txt"), "utf8"))
+        .toBe("canonical\n");
+    },
+  );
+
   it("rejects generated-root identity drift between complete passes", () => {
     const f = fixture();
     bases.push(f.base);
@@ -1124,6 +1300,8 @@ describe("quarantine transaction Slice 1", () => {
     );
     chmodSync(join(bin, "git"), 0o700);
     const indexPath = join(f.repoRoot, ".git", "index");
+    const gitDirectory = join(f.repoRoot, ".git");
+    const lockResidueBefore = listLockResidue(gitDirectory);
     const before = statSync(indexPath, { bigint: true });
     const worker = invoke("inspect", {
       repoRoot: f.repoRoot,
@@ -1150,6 +1328,7 @@ describe("quarantine transaction Slice 1", () => {
     }
     expect(calls.some((call) => call.endsWith("status --porcelain=v1 -z --untracked-files=all"))).toBe(true);
     expect(existsSync(join(f.repoRoot, ".git", "index.lock"))).toBe(false);
+    expect(listLockResidue(gitDirectory)).toEqual(lockResidueBefore);
   });
 
   it("passes the exact closed environment and argv prefix to every Git child", () => {
@@ -1282,6 +1461,32 @@ describe("quarantine transaction Slice 1", () => {
     expect(worker.result).toMatchObject({ totalEntries: 2, sourceCopies: 0, generatedRoots: 2 });
   });
 
+  it("streams a valid 9999-record porcelain status larger than one MiB", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const paths = Array.from({ length: 9999 }, (_, index) =>
+      `virtual-${String(index).padStart(4, "0")}-${"x".repeat(100)} 2.txt`);
+    const status = Buffer.from(`${paths.map((path) => `?? ${path}`).join("\0")}\0`, "utf8");
+    expect(status.length).toBeGreaterThan(1024 * 1024);
+    const path = installGitOutputOverride(
+      f,
+      "large-valid-status",
+      "-c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all",
+      status,
+    );
+    const worker = invoke("virtual-files", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: paths.length,
+    }, { PATH: path }, 60_000);
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    expect(worker.result).toMatchObject({
+      status: "INSPECTED", totalEntries: 10_001, sourceCopies: 9999, generatedRoots: 2,
+    });
+  });
+
   it.each(["stdout", "stderr"] as const)(
     "kills and settles a Git child after the %s control limit is exceeded",
     (stream) => {
@@ -1335,7 +1540,6 @@ describe("quarantine transaction Slice 1", () => {
     ["missing-final-nul", Buffer.from("a".repeat(40), "utf8")],
     ["empty-interior", Buffer.from(`${"a".repeat(40)}\0\0`, "utf8")],
     ["fatal-utf8", Buffer.from([0xff, 0x00])],
-    ["duplicate", Buffer.from(`${"a".repeat(40)}\0${"a".repeat(40)}\0`, "utf8")],
     ["over-4096", Buffer.from(`${Array.from({ length: 4097 }, (_, index) =>
       index.toString(16).padStart(40, "0")).join("\0")}\0`, "utf8")],
   ] as Array<[string, Buffer]>)("rejects incremental history log case %s", (label, output) => {
@@ -1354,6 +1558,63 @@ describe("quarantine transaction Slice 1", () => {
       expectedHead: f.head,
       expectedCount: 1,
     }, { PATH: path }), "ERR_PREFLIGHT", "Workspace preflight failed.");
+  });
+
+  it.each([
+    ["exact-one-mib", 1024 * 1024],
+    ["one-byte-over", 1024 * 1024 + 1],
+  ] as Array<[string, number]>)("rejects malformed history control payload at %s", (label, size) => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const path = installGitOutputOverride(
+      f,
+      `history-control-${label}`,
+      "-c core.fsmonitor=false log --all --format=%H -z -- notes.txt",
+      Buffer.alloc(size, 0x61),
+    );
+    expectWorkerError(invoke("inspect", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+    }, { PATH: path }, 3_000), "ERR_PREFLIGHT", "Workspace preflight failed.");
+  });
+
+  it("retains duplicate history OIDs in their emitted order", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const bin = join(f.base, "duplicate-history-order");
+    privateDirectory(bin);
+    const first = "a".repeat(40);
+    const matching = "b".repeat(40);
+    const blobOid = "c".repeat(40);
+    const calls = join(bin, "ls-tree-calls");
+    const logPayload = join(bin, "log.bin");
+    const treePayload = join(bin, "tree.bin");
+    writeFileSync(logPayload, Buffer.from(`${first}\0${first}\0${matching}\0`, "utf8"));
+    writeFileSync(treePayload, Buffer.from(`100644 blob ${blobOid}\tnotes.txt\0`, "utf8"));
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\ncase "$*" in\n  "-c core.fsmonitor=false log --all --format=%H -z -- notes.txt") exec /bin/cat ${JSON.stringify(logPayload)} ;;\n  "-c core.fsmonitor=false ls-tree -z --full-tree ${first} -- notes.txt") printf '%s\\n' ${JSON.stringify(first)} >> ${JSON.stringify(calls)}; exit 0 ;;\n  "-c core.fsmonitor=false ls-tree -z --full-tree ${matching} -- notes.txt") printf '%s\\n' ${JSON.stringify(matching)} >> ${JSON.stringify(calls)}; exec /bin/cat ${JSON.stringify(treePayload)} ;;\n  "-c core.fsmonitor=false cat-file blob ${blobOid}") printf 'canonical\\n'; exit 0 ;;\nesac\nexec ${JSON.stringify(realGit)} "$@"\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(join(bin, "git"), 0o700);
+    const worker = invoke("prepare", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-duplicate-order",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, { PATH: `${bin}:${process.env.PATH ?? ""}` });
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual([
+      first, first, matching, first, first, matching,
+    ]);
   });
 
   it("retains exactly 4096 unique history OIDs in emitted order", () => {
@@ -1416,6 +1677,83 @@ describe("quarantine transaction Slice 1", () => {
       expectedCount: 1,
     }, { PATH: path }), "ERR_PREFLIGHT", "Workspace preflight failed.");
   });
+
+  it.each([
+    ["exact-one-mib", 1024 * 1024],
+    ["one-byte-over", 1024 * 1024 + 1],
+  ] as Array<[string, number]>)("rejects malformed ls-tree control payload at %s", (label, size) => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const commit = git(f.repoRoot, "log", "--all", "--format=%H", "--", "notes.txt").split("\n")[0];
+    const path = installGitOutputOverride(
+      f,
+      `ls-tree-control-${label}`,
+      `-c core.fsmonitor=false ls-tree -z --full-tree ${commit} -- notes.txt`,
+      Buffer.alloc(size, 0x61),
+    );
+    expectWorkerError(invoke("inspect", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+    }, { PATH: path }, 3_000), "ERR_PREFLIGHT", "Workspace preflight failed.");
+  });
+
+  it("treats exact zero-byte ls-tree output as a skipped history candidate", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const bin = join(f.base, "empty-ls-tree");
+    privateDirectory(bin);
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\ncase "$*" in\n  "-c core.fsmonitor=false ls-tree -z --full-tree"*) exit 0 ;;\nesac\nexec ${JSON.stringify(realGit)} "$@"\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(join(bin, "git"), 0o700);
+    const worker = invoke("prepare", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-empty-ls-tree",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, { PATH: `${bin}:${process.env.PATH ?? ""}` });
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    const source = worker.result!.entries!.find((entry) => entry.kind === "source-copy")!;
+    expect(source.historyMatch).toBeNull();
+  });
+
+  it.each(["nonzero", "oversized"] as const)(
+    "settles and rejects an ls-tree child with %s output",
+    (kind) => {
+      const f = fixture({ divergent: true });
+      bases.push(f.base);
+      const bin = join(f.base, `ls-tree-${kind}`);
+      privateDirectory(bin);
+      const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+      const action = kind === "nonzero"
+        ? "printf 'failure' >&2; exit 9"
+        : "while :; do printf '0123456789abcdef0123456789abcdef'; done";
+      writeFileSync(
+        join(bin, "git"),
+        `#!/bin/sh\ncase "$*" in\n  "-c core.fsmonitor=false ls-tree -z --full-tree"*) ${action} ;;\nesac\nexec ${JSON.stringify(realGit)} "$@"\n`,
+        { mode: 0o700 },
+      );
+      chmodSync(join(bin, "git"), 0o700);
+      expectWorkerError(invoke("inspect", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+      }, { PATH: `${bin}:${process.env.PATH ?? ""}` }, 3_000),
+      "ERR_PREFLIGHT", "Workspace preflight failed.");
+    },
+  );
 
   it.each([
     ["040000", "tree"],
@@ -1523,6 +1861,34 @@ describe("quarantine transaction Slice 1", () => {
       expectedCount: 1,
     }, { PATH: `${bin}:${process.env.PATH ?? ""}` }, 3_000),
     "ERR_PREFLIGHT", "Workspace preflight failed.");
+  });
+
+  it("streams a multi-megabyte cat-file blob through the exact 64 KiB child pipe", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const largeBody = Buffer.alloc(2 * 1024 * 1024 + 17, 0x78);
+    writeFileSync(join(f.repoRoot, "notes.txt"), largeBody);
+    git(f.repoRoot, "add", "notes.txt");
+    git(f.repoRoot, "commit", "-m", "large canonical history");
+    const largeCommit = git(f.repoRoot, "rev-parse", "HEAD");
+    writeFileSync(join(f.repoRoot, "notes.txt"), "new canonical\n");
+    git(f.repoRoot, "add", "notes.txt");
+    git(f.repoRoot, "commit", "-m", "replace large canonical");
+    f.head = git(f.repoRoot, "rev-parse", "HEAD");
+    writeFileSync(join(f.repoRoot, "notes 2.txt"), largeBody);
+    const worker = invoke("prepare", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-large-cat-file",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, {}, 30_000);
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    const source = worker.result!.entries!.find((entry) => entry.kind === "source-copy")!;
+    expect(source.historyMatch).toBe(largeCommit);
   });
 
   it("accepts an exact 100755 blob and stores the candidate commit OID", () => {

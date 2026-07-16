@@ -82,6 +82,7 @@ const OID = HEAD;
 const COPY_LIMIT = 9_999;
 const CONTROL_LIMIT = 1024 * 1024;
 const STDERR_LIMIT = 64 * 1024;
+const BLOB_STREAM_HIGH_WATER_MARK = 64 * 1024;
 const PRIVATE_MODE = 0o700;
 
 const LAYOUT = Object.freeze([
@@ -408,50 +409,136 @@ function validateRelativePath(value) {
   ) fail("ERR_PREFLIGHT");
 }
 
-function parseStatus(bytes) {
-  if (bytes.length === 0) return [];
-  if (bytes.at(-1) !== 0) fail("ERR_PREFLIGHT");
-  const body = bytes.subarray(0, -1);
-  if (body.includes(0)) {
-    const records = [];
-    let start = 0;
-    for (let index = 0; index <= body.length; index += 1) {
-      if (index === body.length || body[index] === 0) {
-        if (index === start) fail("ERR_PREFLIGHT");
-        records.push(body.subarray(start, index));
-        start = index + 1;
-      }
-    }
-    return parseStatusRecords(records);
+function parseStatusRecord(recordBytes) {
+  const recordValue = decodeFatal(recordBytes);
+  if (!recordValue.startsWith("?? ") || recordValue.length === 3) fail("ERR_PREFLIGHT");
+  const path = recordValue.slice(3);
+  validateRelativePath(path);
+  try {
+    canonicalPathForNumberedCopy(path);
+  } catch {
+    fail("ERR_PREFLIGHT");
   }
-  return parseStatusRecords([body]);
+  return path;
 }
 
-function parseStatusRecords(records) {
-  const paths = records.map((recordBytes) => {
-    const recordValue = decodeFatal(recordBytes);
-    if (!recordValue.startsWith("?? ") || recordValue.length === 3) fail("ERR_PREFLIGHT");
-    const path = recordValue.slice(3);
-    validateRelativePath(path);
+async function collectStatus(repoRoot, environment, expectedCount) {
+  const child = spawn(
+    "git",
+    ["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    {
+      cwd: repoRoot,
+      env: childGitEnvironment(environment),
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const hash = createHash("sha256");
+  const emittedPaths = [];
+  const seen = new Set();
+  let frameChunks = [];
+  let frameBytes = 0;
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let endedWithNul = false;
+  let invalid = false;
+  let streamError = false;
+  let terminationRequested = false;
+  const terminate = () => {
+    if (terminationRequested) return;
+    terminationRequested = true;
     try {
-      canonicalPathForNumberedCopy(path);
+      child.kill("SIGKILL");
     } catch {
-      fail("ERR_PREFLIGHT");
+      streamError = true;
     }
-    return path;
+  };
+  const reject = () => {
+    invalid = true;
+    terminate();
+  };
+  child.stdout.on("data", (chunk) => {
+    if (invalid) return;
+    stdoutBytes += chunk.length;
+    hash.update(chunk);
+    if (expectedCount === 0 && chunk.length > 0) {
+      reject();
+      return;
+    }
+    let start = 0;
+    while (start < chunk.length) {
+      const end = chunk.indexOf(0, start);
+      if (end === -1) {
+        const tail = chunk.subarray(start);
+        frameChunks.push(Buffer.from(tail));
+        frameBytes += tail.length;
+        endedWithNul = false;
+        break;
+      }
+      const segment = chunk.subarray(start, end);
+      if (segment.length > 0) {
+        frameChunks.push(Buffer.from(segment));
+        frameBytes += segment.length;
+      }
+      if (frameBytes === 0 || emittedPaths.length === expectedCount) {
+        reject();
+        return;
+      }
+      const frame = frameChunks.length === 1
+        ? frameChunks[0]
+        : Buffer.concat(frameChunks, frameBytes);
+      let path;
+      try {
+        path = parseStatusRecord(frame);
+      } catch {
+        reject();
+        return;
+      }
+      if (seen.has(path)) {
+        reject();
+        return;
+      }
+      seen.add(path);
+      emittedPaths.push(path);
+      frameChunks = [];
+      frameBytes = 0;
+      endedWithNul = true;
+      start = end + 1;
+    }
   });
-  const sorted = [...paths].sort(byteCompare);
-  if (new Set(paths).size !== paths.length) fail("ERR_PREFLIGHT");
-  return sorted;
+  child.stderr.on("data", (chunk) => {
+    stderrBytes += chunk.length;
+    if (stderrBytes > STDERR_LIMIT) reject();
+  });
+  child.stdout.on("error", () => { streamError = true; terminate(); });
+  child.stderr.on("error", () => { streamError = true; terminate(); });
+  const outcome = await new Promise((resolve) => {
+    let spawnError;
+    child.once("error", (error) => { spawnError = error; });
+    child.once("close", (code, signal) => resolve({ code, signal, spawnError }));
+  });
+  if (
+    invalid || streamError || outcome.spawnError || outcome.signal || outcome.code !== 0 ||
+    emittedPaths.length !== expectedCount || frameBytes !== 0 ||
+    (stdoutBytes > 0 && !endedWithNul)
+  ) fail("ERR_PREFLIGHT");
+  return {
+    statusPaths: emittedPaths,
+    statusSha256: hash.digest("hex"),
+    paths: [...emittedPaths].sort(byteCompare),
+  };
 }
 
-async function gitSnapshot(repoRoot, environment) {
+function sameStrings(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+async function gitSnapshot(repoRoot, environment, expectedCount) {
   const topLevel = parseTopLevel(await collectChild(repoRoot, environment, ["rev-parse", "--show-toplevel"]));
   const branch = parseIdentityLine(await collectChild(repoRoot, environment, ["symbolic-ref", "--quiet", "--short", "HEAD"]));
   const head = parseIdentityLine(await collectChild(repoRoot, environment, ["rev-parse", "--verify", "HEAD"]));
-  const status = await collectChild(repoRoot, environment, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const status = await collectStatus(repoRoot, environment, expectedCount);
   if (!HEAD.test(head) || branch.length === 0 || branch !== branch.normalize("NFC")) fail("ERR_PREFLIGHT");
-  return { topLevel, branch, head, status, paths: parseStatus(status) };
+  return { topLevel, branch, head, ...status };
 }
 
 async function assertSafeExistingPath(root, relativePath, fsSource, expectedKind) {
@@ -493,7 +580,6 @@ async function collectHistoryOids(repoRoot, environment, canonicalPath) {
     },
   );
   const values = [];
-  const seen = new Set();
   let frame = [];
   let stdoutBytes = 0;
   let stderrBytes = 0;
@@ -541,11 +627,10 @@ async function collectHistoryOids(repoRoot, environment, canonicalPath) {
         return;
       }
       frame = [];
-      if (!OID.test(value) || seen.has(value)) {
+      if (!OID.test(value)) {
         reject();
         return;
       }
-      seen.add(value);
       values.push(value);
     }
   });
@@ -588,6 +673,8 @@ async function hashGitBlob(repoRoot, environment, blobOid) {
   const hash = createHash("sha256");
   let stderrBytes = 0;
   let streamError = false;
+  const invalidStreamConfiguration =
+    child.stdout.readableHighWaterMark !== BLOB_STREAM_HIGH_WATER_MARK;
   let terminationRequested = false;
   const terminate = () => {
     if (terminationRequested) return;
@@ -612,12 +699,16 @@ async function hashGitBlob(repoRoot, environment, blobOid) {
   });
   child.stdout.on("error", () => { streamError = true; terminate(); });
   child.stderr.on("error", () => { streamError = true; terminate(); });
+  if (invalidStreamConfiguration) terminate();
   const outcome = await new Promise((resolve) => {
     let spawnError;
     child.once("error", (error) => { spawnError = error; });
     child.once("close", (code, signal) => resolve({ code, signal, spawnError }));
   });
-  if (stderrBytes > STDERR_LIMIT || streamError || outcome.spawnError || outcome.signal || outcome.code !== 0) {
+  if (
+    invalidStreamConfiguration || stderrBytes > STDERR_LIMIT || streamError ||
+    outcome.spawnError || outcome.signal || outcome.code !== 0
+  ) {
     fail("ERR_PREFLIGHT");
   }
   return hash.digest("hex");
@@ -662,7 +753,7 @@ function frameFields(fields) {
 }
 
 async function discoveryPass(options, fsSource, environment, roots) {
-  const before = await gitSnapshot(roots.repoRoot, environment);
+  const before = await gitSnapshot(roots.repoRoot, environment, options.expectedCount);
   if (
     before.topLevel !== roots.repoRoot ||
     before.branch !== options.expectedBranch ||
@@ -711,12 +802,12 @@ async function discoveryPass(options, fsSource, environment, roots) {
     });
   }
 
-  const after = await gitSnapshot(roots.repoRoot, environment);
+  const after = await gitSnapshot(roots.repoRoot, environment, options.expectedCount);
   if (
     after.topLevel !== before.topLevel ||
     after.branch !== before.branch ||
     after.head !== before.head ||
-    !after.status.equals(before.status)
+    !sameStrings(after.statusPaths, before.statusPaths)
   ) fail("ERR_PREFLIGHT");
 
   const entries = [...sourceEntries, ...generatedEntries].sort((left, right) => byteCompare(left.relativePath, right.relativePath));
@@ -725,7 +816,7 @@ async function discoveryPass(options, fsSource, environment, roots) {
     roots.repoRoot,
     before.branch,
     before.head,
-    createHash("sha256").update(before.status).digest("hex"),
+    before.statusSha256,
   ])];
   for (const entry of entries) {
     if (entry.kind === "source-copy") {
