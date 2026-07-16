@@ -798,6 +798,10 @@ function lockChecksum(version, ownerToken, pid) {
     .digest("hex");
 }
 
+function lockEvidenceSha256(input) {
+  return createHash("sha256").update(input).digest("hex");
+}
+
 function encodeLockFrame() {
   const version = 1;
   const ownerToken = randomUUID();
@@ -1188,6 +1192,7 @@ async function createJournalLock({ capability, fsApi }) {
       identity: { dev: stat.dev, ino: stat.ino },
       lockPath,
       metadata: encoded.metadata,
+      evidenceSha256: lockEvidenceSha256(encoded.frame),
     };
   } catch (error) {
     return closePreservingPrimary(handle, error);
@@ -1303,7 +1308,11 @@ async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callba
         purpose: "journal-lock",
         boundary: "before-mutation",
       });
-      await assertPathIdentity(state.lockPath, state.identity, fsApi, "journal held lock");
+      await assertLockArtifactEvidence(
+        { ...state, path: state.lockPath },
+        fsApi,
+        "journal held lock",
+      );
       await fsApi.rm(state.lockPath);
       await fsyncDirectory(dirname(state.lockPath), fsApi);
       await revalidateRunCapability(capability, {
@@ -1546,12 +1555,29 @@ async function readStaleLock(path, fsApi) {
     if (!sameIdentity(opened, before) || opened.size !== before.size) {
       throw new Error("journal lock changed while being inspected");
     }
+    const bytes = await readCompleteFile(openedHandle, 4 + MAX_LOCK_BODY_BYTES);
     return {
-      ...parseLockFrame(await readCompleteFile(openedHandle, 4 + MAX_LOCK_BODY_BYTES)),
+      ...parseLockFrame(bytes),
       identity: { dev: opened.dev, ino: opened.ino },
+      evidenceSha256: lockEvidenceSha256(bytes),
       path,
     };
   });
+}
+
+async function assertLockArtifactEvidence(artifact, fsApi, label) {
+  let observed;
+  try {
+    observed = await readStaleLock(artifact.path, fsApi);
+  } catch (error) {
+    throw new Error(`${label} exact evidence cannot be verified`, { cause: error });
+  }
+  if (!sameIdentity(observed.identity, artifact.identity)) {
+    throw new Error(`${label} ownership mismatch`);
+  }
+  if (observed.evidenceSha256 !== artifact.evidenceSha256) {
+    throw new Error(`${label} exact evidence mismatch`);
+  }
 }
 
 async function readOptionalStaleLock(path, fsApi) {
@@ -1601,14 +1627,14 @@ async function removeOwnedArtifacts(capability, artifacts, fsApi, cleanupState) 
     artifacts.map((artifact) => [artifact.path, artifact]),
   ).values()];
   for (const artifact of uniqueArtifacts) {
-    await assertPathIdentity(artifact.path, artifact.identity, fsApi, "journal lock artifact");
+    await assertLockArtifactEvidence(artifact, fsApi, "journal lock artifact");
   }
   for (const artifact of uniqueArtifacts) {
     await revalidateRunCapability(
       capability,
       lockArtifactBoundary(artifact.path, "before-mutation"),
     );
-    await assertPathIdentity(artifact.path, artifact.identity, fsApi, "journal lock artifact");
+    await assertLockArtifactEvidence(artifact, fsApi, "journal lock artifact");
     if (cleanupState !== undefined) cleanupState.started = true;
     await fsApi.rm(artifact.path);
     await fsyncDirectory(dirname(artifact.path), fsApi);
@@ -1639,7 +1665,7 @@ async function publishStaleLockTombstone({
   tombstoneId,
   tombstonePath,
 }) {
-  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
+  await assertLockArtifactEvidence(staleLock, fsApi, "stale journal lock");
   let destination = await readOptionalArtifact(
     tombstonePath,
     fsApi,
@@ -1648,12 +1674,19 @@ async function publishStaleLockTombstone({
   if (destination !== null && !sameIdentity(destination, staleLock.identity)) {
     throw new Error("journal lock tombstone destination is a foreign existing file");
   }
+  if (destination !== null) {
+    await assertLockArtifactEvidence(
+      { ...staleLock, path: tombstonePath },
+      fsApi,
+      "journal lock tombstone destination",
+    );
+  }
   await revalidateRunCapability(capability, {
     purpose: "journal-tombstone",
     id: tombstoneId,
     boundary: "before-mutation",
   });
-  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock");
+  await assertLockArtifactEvidence(staleLock, fsApi, "stale journal lock");
   if (destination === null) {
     try {
       await fsApi.link(lockPath, tombstonePath);
@@ -1669,6 +1702,11 @@ async function publishStaleLockTombstone({
           cause: error,
         });
       }
+      await assertLockArtifactEvidence(
+        { ...staleLock, path: tombstonePath },
+        fsApi,
+        "journal lock tombstone destination",
+      );
     }
   }
   await fsyncDirectory(dirname(lockPath), fsApi);
@@ -1677,10 +1715,9 @@ async function publishStaleLockTombstone({
     id: tombstoneId,
     boundary: "after-sync",
   });
-  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock source");
-  await assertPathIdentity(
-    tombstonePath,
-    staleLock.identity,
+  await assertLockArtifactEvidence(staleLock, fsApi, "stale journal lock source");
+  await assertLockArtifactEvidence(
+    { ...staleLock, path: tombstonePath },
     fsApi,
     "published journal lock tombstone",
   );
@@ -1688,10 +1725,9 @@ async function publishStaleLockTombstone({
     purpose: "journal-lock",
     boundary: "before-mutation",
   });
-  await assertPathIdentity(lockPath, staleLock.identity, fsApi, "stale journal lock source");
-  await assertPathIdentity(
-    tombstonePath,
-    staleLock.identity,
+  await assertLockArtifactEvidence(staleLock, fsApi, "stale journal lock source");
+  await assertLockArtifactEvidence(
+    { ...staleLock, path: tombstonePath },
     fsApi,
     "published journal lock tombstone",
   );
@@ -1702,9 +1738,8 @@ async function publishStaleLockTombstone({
     boundary: "after-sync",
   });
   await assertPathAbsent(lockPath, fsApi, "stale journal lock source");
-  await assertPathIdentity(
-    tombstonePath,
-    staleLock.identity,
+  await assertLockArtifactEvidence(
+    { ...staleLock, path: tombstonePath },
     fsApi,
     "durable journal lock tombstone",
   );
@@ -1768,7 +1803,11 @@ async function restoreRecoveryArtifacts({
     purpose: "journal-lock",
     boundary: "before-mutation",
   });
-  await assertPathIdentity(created.lockPath, created.identity, fsApi, "journal held lock");
+  await assertLockArtifactEvidence(
+    { ...created, path: created.lockPath },
+    fsApi,
+    "journal held lock",
+  );
   await fsApi.rm(created.lockPath);
   await fsyncDirectory(dirname(created.lockPath), fsApi);
   await revalidateRunCapability(capability, {
@@ -1778,18 +1817,22 @@ async function restoreRecoveryArtifacts({
   await assertPathAbsent(created.lockPath, fsApi, "journal held lock");
   if (staleLock === null) return;
 
-  await assertPathIdentity(moved.path, staleLock.identity, fsApi, "stale journal lock tombstone");
   await revalidateRunCapability(capability, {
     purpose: "journal-lock",
     boundary: "before-mutation",
   });
+  await assertLockArtifactEvidence(moved, fsApi, "stale journal lock tombstone");
   await fsApi.link(moved.path, created.lockPath);
   await fsyncDirectory(dirname(created.lockPath), fsApi);
   await revalidateRunCapability(capability, {
     purpose: "journal-lock",
     boundary: "after-sync",
   });
-  await assertPathIdentity(created.lockPath, staleLock.identity, fsApi, "restored stale journal lock");
+  await assertLockArtifactEvidence(
+    { ...staleLock, path: created.lockPath },
+    fsApi,
+    "restored stale journal lock",
+  );
   if (movedWasNew) {
     await removeOwnedArtifacts(capability, [moved], fsApi);
   }
@@ -1920,7 +1963,11 @@ export async function reclaimJournalLock(options, callback) {
       [
         ...priorTombstones,
         ...(moved === null ? [] : [moved]),
-        { path: run.created.lockPath, identity: run.created.identity },
+        {
+          path: run.created.lockPath,
+          identity: run.created.identity,
+          evidenceSha256: run.created.evidenceSha256,
+        },
       ],
       fsApi,
       cleanupState,
@@ -2009,7 +2056,11 @@ async function cleanupTerminalJournalArtifactsCore({ capability, writersStopped,
     [
       ...priorTombstones,
       ...(moved === null ? [] : [moved]),
-      { path: run.created.lockPath, identity: run.created.identity },
+      {
+        path: run.created.lockPath,
+        identity: run.created.identity,
+        evidenceSha256: run.created.evidenceSha256,
+      },
     ],
     fsApi,
   );

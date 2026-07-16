@@ -394,6 +394,7 @@ try {
     }, hybrid);
   } else if (request.operation === "cleanup-replacement") {
     let firstWorkPath;
+    let ownedOriginalBytes;
     let readStreamCount = 0;
     const workLstatCounts = new Map();
     const fsApi = {
@@ -412,6 +413,7 @@ try {
           workLstatCounts.set(path, count);
           firstWorkPath ??= path;
           if (path === firstWorkPath && count === 3) {
+            ownedOriginalBytes = await fsPromises.readFile(path, "utf8");
             await fsPromises.rename(path, path + ".owned");
             await fsPromises.writeFile(path, "foreign", { mode: 0o600 });
             await fsPromises.chmod(path, 0o600);
@@ -437,6 +439,7 @@ try {
         failure,
         foreignBytes: await fsPromises.readFile(firstWorkPath, "utf8"),
         ownedBytes: await fsPromises.readFile(firstWorkPath + ".owned", "utf8"),
+        ownedOriginalBytes,
       };
     }, fsApi);
   } else if (request.operation === "output-cleanup") {
@@ -1665,13 +1668,14 @@ describe("bounded quarantine inventory", () => {
       failure: { errors: string[] };
       foreignBytes: string;
       ownedBytes: string;
+      ownedOriginalBytes: string;
     };
     expect(result.failure.errors).toEqual([
       "primary publish failure",
       expect.stringMatching(/ownership|foreign replacement/i),
     ]);
     expect(result.foreignBytes).toBe("foreign");
-    expect(result.ownedBytes).toContain('"path":"a"');
+    expect(result.ownedBytes).toBe(result.ownedOriginalBytes);
   });
 
   it.each(["zero-byte", "partial", "close-primary"])(

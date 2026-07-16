@@ -1488,6 +1488,8 @@ const result = await withQuarantineRunCapability({
     const before = await snapshot();
     const journalBefore = await fsPromises.readFile(journalPath);
     let callbackCalls = 0;
+    let mutatedEvidenceBytes = null;
+    let mutationPreservedIdentity = null;
     let swallowedAppendError = null;
     const getterCounts = { outer: 0, sequence: 0, recordHash: 0, event: 0, state: 0 };
     const outcome = await capture(() => journal.reclaimJournalLock(
@@ -1539,6 +1541,19 @@ const result = await withQuarantineRunCapability({
           await fsPromises.rm(tombstonePath);
           await fsPromises.writeFile(tombstonePath, lockBytes(), { mode: 0o600 });
         }
+        if (request.case === "evidence-mutation") {
+          const tombstonePath = deriveRunPath(capability, {
+            purpose: "journal-tombstone",
+            id: "11111111-1111-4111-8111-111111111111",
+          });
+          const replacement = lockBytes();
+          const beforeMutation = await fsPromises.lstat(tombstonePath);
+          await fsPromises.writeFile(tombstonePath, replacement, { mode: 0o600 });
+          const afterMutation = await fsPromises.lstat(tombstonePath);
+          mutationPreservedIdentity =
+            beforeMutation.dev === afterMutation.dev && beforeMutation.ino === afterMutation.ino;
+          mutatedEvidenceBytes = replacement.toString("base64");
+        }
         if (request.case === "wrong-pair") values.state = "VALIDATED";
         if (request.case === "wrong-sequence") values.sequence += 1;
         if (request.case === "wrong-hash") values.recordHash = "f".repeat(64);
@@ -1585,6 +1600,8 @@ const result = await withQuarantineRunCapability({
     return {
       outcome,
       callbackCalls,
+      mutatedEvidenceBytes,
+      mutationPreservedIdentity,
       swallowedAppendError,
       getterCounts,
       before,
@@ -3864,6 +3881,21 @@ describe("capability-bound durable quarantine journal", () => {
       expect(Object.keys(result.after)).toContain("journal.lock.tombstone.11111111-1111-4111-8111-111111111111");
     },
   );
+
+  it("rejects settlement after same-inode evidence mutation and preserves the foreign bytes", () => {
+    const result = invoke(join(fixture, "settle-evidence-mutation"), {
+      operation: "settle-durable-tip",
+      case: "evidence-mutation",
+      records: quarantinedPrefix,
+    });
+    const tombstone = "journal.lock.tombstone.11111111-1111-4111-8111-111111111111";
+    expect(result.outcome.ok).toBe(false);
+    expect(result.callbackCalls).toBe(1);
+    expect(result.mutationPreservedIdentity).toBe(true);
+    expect(Object.keys(result.after).sort()).toEqual(Object.keys(result.before).sort());
+    expect(result.after[tombstone].bytes).toBe(result.mutatedEvidenceBytes);
+    expect(result.after[tombstone].bytes).not.toBe(result.before[tombstone].bytes);
+  });
 
   it.each(Object.entries(terminalRecords))(
     "keeps terminal %s recovery cleanup-only and bypasses settlement",
