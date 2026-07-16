@@ -905,6 +905,7 @@ describe("callback-scoped quarantine run capability", () => {
 
   it("rejects missing, unknown, extra, and symbol fields for divergent diff temporaries", () => {
     const values = workerValue(invoke(fixture, { operation: "temp-hostile-requests" }));
+    if (!Array.isArray(values)) throw new TypeError("worker value must be an array");
     expect(values).toHaveLength(6);
     for (const value of values) {
       expectCapturedError(value, /purpose|request|field|symbol/u);

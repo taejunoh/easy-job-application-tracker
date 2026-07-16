@@ -942,7 +942,10 @@ describe("bounded quarantine inventory", () => {
     expect(result.firstMetrics.frontierSpills).toBeGreaterThan(0);
     expect(result.firstMetrics.maxCoordinatorReferences).toBeLessThanOrEqual(4096);
     expect(lstatSync(result.firstOutput).mode & 0o7777).toBe(0o600);
-    const records = readFileSync(result.firstOutput, "utf8").trimEnd().split("\n").map(JSON.parse);
+    const records = readFileSync(result.firstOutput, "utf8")
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
     const paths = records.map((record) => record.path);
     expect(paths).toEqual([...paths].sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right))));
     expect(records.find((record) => record.path.endsWith("leaf-link"))).toMatchObject({

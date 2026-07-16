@@ -3406,10 +3406,14 @@ describe("capability-bound durable quarantine journal", () => {
     "settles a durable %s tip after SIGKILL before lock cleanup",
     (name, lifecycle, event, state) => {
       const root = join(fixture, `settle-crash-${name}`);
+      const finalRecord = lifecycle.at(-1);
+      if (finalRecord === undefined) {
+        throw new Error("durable settlement lifecycle must not be empty");
+      }
       const killed = killDurableSettlementTip(
         root,
         lifecycle.slice(0, -1),
-        lifecycle.at(-1),
+        finalRecord,
       );
       expect(killed.signal).toBe("SIGKILL");
       const result = invoke(root, {
