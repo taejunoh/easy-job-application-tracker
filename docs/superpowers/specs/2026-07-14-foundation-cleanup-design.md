@@ -653,6 +653,28 @@ Each discovery pass invokes Git with argument arrays. It resolves identity with
 git status --porcelain=v1 -z --untracked-files=all
 ```
 
+Every read-only Git child receives one newly created null-prototype environment
+record. It copies only non-empty string values for `PATH`, `TMPDIR`, `TMP`,
+`TEMP`, `SystemRoot`, `ComSpec`, `PATHEXT`, `LANG`, `LC_ALL`, and `LC_CTYPE`
+from one process-environment snapshot captured before the first await, omits
+every other inherited variable, then sets exactly these Git-specific overrides:
+
+```text
+GIT_OPTIONAL_LOCKS=0
+GIT_NO_LAZY_FETCH=1
+GIT_LITERAL_PATHSPECS=1
+```
+
+No caller-supplied `GIT_*`, credential, proxy, SSH, pager, editor, or prompt
+variable is inherited. `GIT_OPTIONAL_LOCKS=0` makes discovery observational,
+`GIT_NO_LAZY_FETCH=1` forbids promisor-object network hydration, and
+`GIT_LITERAL_PATHSPECS=1` makes the single post-`--` path argument literal.
+Focused tests record every child's exact environment, compare the repository
+index device/inode/mode/size/mtime/ctime before and after inspection, require no
+`.git/index.lock` or other new lock residue, and use an unavailable promisor
+object plus a remote-helper sentinel to prove that discovery performs no fetch,
+remote-helper, or network access.
+
 An empty status is represented by zero bytes. A non-empty status must end in a
 NUL byte and contain no empty interior record. Every record is decoded with a
 fatal UTF-8 decoder. Any record other than exact `?? <relative-path>` is a
@@ -694,21 +716,35 @@ raw porcelain output, or previously cached metadata is insufficient. Apply
 runs both passes only after validating `writersStopped === true` and does not
 reuse an inspection result as authority.
 
-For each divergent source, enumerate candidate historical objects with exactly
+For each divergent source, enumerate candidate historical commits with exactly
 `git log --all --format=%H -z -- <canonical-relative-path>`. Parse stdout as
 fatal UTF-8, NUL-terminated lowercase 40/64-character object IDs while it is
 streaming; retain at most 4,096 IDs and 1 MiB of control bytes. Close and await
-that process before checking objects sequentially. First run
-`git cat-file -e <object>:<canonical-relative-path>`; exit 1 means the path is
-absent at that object and is skipped, while another nonzero exit fails
-preflight. For a present object, spawn exactly
-`git show <object>:<canonical-relative-path>`, stream stdout directly through a
-SHA-256 accumulator with a 64 KiB read high-water mark, and never retain or
-print its body. Stderr is capped at 64 KiB and is never returned. On a stream,
-decoder, limit, signal, or child-process error, close or kill the child as
-appropriate, await stdout/stderr/process settlement, and fail with the fixed
-sanitized preflight error. The first matching object in Git's emitted order is
-the history match; no match is `null`.
+that process before checking commits sequentially.
+
+For each commit OID, run exactly
+`git ls-tree -z --full-tree <commitOid> -- <canonical-relative-path>`, passing
+the safe canonical path as one literal argument even when it contains a newline.
+Stdout is capped at 1 MiB and parsed as raw NUL-framed bytes. Exit zero plus
+empty stdout means absent and is skipped. Otherwise stdout must contain exactly
+one NUL-terminated record of exact Git form
+`<mode> SP <type> SP <lowerhexBlobOid> TAB <path> NUL`; fatal UTF-8 decoding is
+applied only to the control fields and path, the returned path must equal the
+canonical relative path byte-for-byte, and the OID must be lowercase 40/64-hex.
+Only mode `100644` or `100755` with type `blob` is body-eligible. A well-formed
+tree, symlink, gitlink, or other non-regular record is skipped without reading
+its object body. Multiple records, malformed fields, a mismatched path/type/OID,
+missing final NUL, oversized output, signal, or nonzero exit is fatal.
+
+For an eligible blob, spawn exactly `git cat-file blob <lowerhexBlobOid>` using
+the validated OID only; no `commit:path` expression is passed to a body-reading
+command. Stream stdout directly through a SHA-256 accumulator with a 64 KiB
+read high-water mark and no whole-body or total-body buffer. Every Git child's
+stderr is capped at 64 KiB and never returned. On a stream, decoder, limit,
+signal, or child-process error, close or kill the child as appropriate and await
+stdin/stdout/stderr/process settlement before throwing the fixed sanitized
+preflight error. The first matching eligible blob in Git's emitted commit order
+is the history match; no match is `null`.
 
 ### FD-bounded inventory and durability traversal
 
@@ -896,14 +932,23 @@ Its options are a closed plain object with the same snapshot and validation
 rules as the eventual `quarantineWorkspace`. `createdAt` is canonical UTC,
 `writersStopped` must be literal `true`, and the only phase Slice 1 may pass to
 `faultHook` is `"after-layout-sync"`, after the complete layout is durable.
-The result is a frozen, null-prototype, exact-key internal handoff and does not
-claim a journal state or completed move. `repoRoot`, `quarantineRoot`, and
-`runRoot` are the validated real absolute paths. `fsSource` is the exact frozen
-filesystem source used for bootstrap and later supplied by identity to
-`withQuarantineRunCapability`.
+The result is a deeply frozen, acyclic, null-prototype, exact-key internal
+handoff and does not claim a journal state or completed move. Its own keys are
+exactly the ten displayed keys with no symbol or accessor property. Every
+top-level property is an enumerable, non-writable, non-configurable data
+property, and the object is frozen and non-extensible. `repoRoot`,
+`quarantineRoot`, and `runRoot` are the validated real absolute paths.
+`fsSource` is the exact frozen filesystem source used for bootstrap and later
+supplied by identity to `withQuarantineRunCapability`.
 
-`entries` is a frozen dense array in UTF-8 bytewise `relativePath` order. A
-source element has exactly
+`entries` is a real frozen dense array with `Array.prototype`, no hole, and no
+custom string or symbol key beyond its indices and `length`. Every index is an
+enumerable, non-writable, non-configurable data property; `length` is a
+non-enumerable, non-writable, non-configurable data property. The array uses
+UTF-8 bytewise `relativePath` order. Every entry and nested identity is a frozen,
+non-extensible, null-prototype record with exactly the keys shown below, no
+symbols/accessors, and only enumerable, non-writable, non-configurable data
+properties. A source element has exactly
 `{ id, kind: "source-copy", relativePath, canonicalRelativePath,
 sourceIdentity, canonicalIdentity, classification, historyMatch }`; a generated
 element has exactly `{ id, kind: "generated-root", relativePath,
@@ -915,6 +960,16 @@ source-copy numbering use the existing manifest/path validators. These are
 private runtime plans, not manifest entries: Slice 2 adds `preMoveInventory`
 before building the immutable `PREPARED` manifest and revalidates every identity
 before mutation.
+
+`fsSource` is likewise a frozen, non-extensible, null-prototype record with no
+symbols/accessors and exactly the 14 filesystem method keys listed below. Each
+property is an enumerable, non-writable, non-configurable data property whose
+value is a newly created frozen wrapper function that retains the single
+captured caller receiver and implementation. Deep-freeze tests recursively
+assert prototypes, exact own-key sets, dense-array shape, descriptor flags, and
+`Object.isFrozen`/`Object.isExtensible` for the result, entries, identities,
+filesystem source, and wrappers; mutating any nested record or array must not
+change a later capability handoff.
 
 Every successful result is also a closed plain object with exactly one of these
 shapes:
@@ -958,15 +1013,34 @@ unique.
 For inspection, `generatedRoots` is exactly `2`, `sourceCopies` equals
 `identicalCopies + divergentCopies`, and `totalEntries` equals
 `sourceCopies + generatedRoots`.
+Public results expose no per-entry path, payload/body content, per-entry content
+hash, or undocumented/undisclosed hash. This restriction does not remove the
+documented inspection `head` Git object ID or the documented
+`manifestSha256` fields returned by later durable operations.
 Integrity loss, an illegal action for the replayed state, or indeterminate
 durability throws a typed error rather than inventing another result variant.
 
 Expected orchestration failures throw a non-exported `QuarantineError extends
-Error`. Its observable contract is exact: `name === "QuarantineError"`, one
-read-only string `code` from the closed set below, and the code's fixed
-`message`. It adds no path, body, hash, diff, command output, or other dynamic
-field. A standard non-enumerable stack is not serialized. The CLI preserves
-the code and fixed message rather than copying an underlying exception message.
+Error`. On the required Node.js 22 runtime, its prototype is exactly
+`QuarantineError.prototype`, which inherits `Error.prototype`, and its own-key
+set is exactly `stack`, `message`, `name`, and `code`, with no symbol key,
+`cause`, path, body, content hash, diff, command output, or other
+application-defined dynamic field. Own-key order is not a contract.
+
+All four properties are own non-enumerable data properties. `name`, `message`,
+and `code` contain respectively `"QuarantineError"`, the code's fixed message,
+and one code from the closed set below. Because Node.js initially exposes
+`stack` through an engine-defined own accessor, construction first reads the
+standard string stack and redefines `stack` as a non-enumerable own data
+property, then freezes the instance. Thus every own descriptor has
+`writable: false` and `configurable: false`, the instance is non-extensible,
+and assignment or redefinition cannot change `code`. Consequently
+`Object.keys(error)` is empty and `JSON.stringify(error)` is exactly `{}`; the
+non-enumerable stack is never serialized. The CLI explicitly reads only `code`
+and the fixed `message`, never copies a stack or an underlying exception
+message. Focused tests assert the prototype, exact `Reflect.ownKeys` set, every
+descriptor flag and value category, frozen/non-extensible state, failed code
+mutation, empty enumerable keys, and empty default JSON serialization.
 
 ```text
 ERR_USAGE: "Invalid quarantine request."
@@ -1087,7 +1161,7 @@ to `withQuarantineRunCapability`, and obtains the live normalized adapter from
 the private run filesystem context inside the callback. The private registry is
 never re-exported. After capability creation, transaction and restore rename,
 sync, inventory, manifest, and journal operations use only that bound adapter.
-The complete source has exactly the existing context methods `lstat`,
+The complete source has exactly these 14 existing context methods: `lstat`,
 `realpath`, `mkdir`, `open`, `readdir`, `rm`, `rename`, `unlink`, `link`,
 `opendir`, `readlink`, `createReadStream`, `lstatSync`, and `realpathSync`.
 Runtime reads every method getter once, captures its receiver once, and freezes
@@ -1198,15 +1272,19 @@ claim more than advisory writability. Apply establishes writability with the
 first required run-layout `mkdir`, without creating and deleting a probe.
 
 Bootstrap creates only the validated transaction directory and the exact fixed
-mode-`0700` directory list above. For each absent child it performs
-`mkdir(child, { mode: 0o700 })`, validates the child with `lstat` and `realpath`
-as a same-device, contained, non-symlink mode-`0700` directory, then opens and
-`fsync`s the containing parent before advancing. This parent sync is the
-durability requirement for the new directory entry. A newly created directory
-that later receives children is synced as their parent; an empty leaf needs no
-additional self-sync after its own parent has been synced. After all names are
-created or safely adopted, bootstrap revalidates the full layout and invokes
-`faultHook("after-layout-sync")`.
+mode-`0700` directory list above. For every allowlisted child in order, it first
+creates the child with `mkdir(child, { mode: 0o700 })` when absent. Whether the
+child was newly created or adopted after `EEXIST`, it then validates the child
+with `lstat` and `realpath` as a same-device, contained, non-symlink mode-`0700`
+directory, opens and `fsync`s the containing parent, and does not advance until
+that parent sync settles. This parent sync is the durability requirement for
+the directory entry. A directory that later receives children is synced again
+as each child's parent; an empty leaf needs no additional self-sync after its
+own parent has been synced. A crash after `mkdir` or adoption but before the
+parent sync leaves an adoptable prefix; retry must revalidate that child and
+repeat the containing-parent fsync rather than treating `EEXIST` as durable.
+After every created or adopted name has passed this sequence, bootstrap
+revalidates the full layout and invokes `faultHook("after-layout-sync")`.
 
 Retry with the same transaction ID adopts only directories at exact allowlisted
 locations when each is mode `0700`, non-symlink, same-device, realpath-equal to

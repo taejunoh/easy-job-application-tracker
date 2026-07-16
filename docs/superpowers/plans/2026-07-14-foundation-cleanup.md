@@ -914,6 +914,18 @@ does not return `QUARANTINED`, write a journal/manifest/inventory, or move a
 source. Slice 2 adds the public `quarantineWorkspace` only when that function can
 complete and return the final durable result.
 
+Assert the full internal handoff schema, not only selected values. The top-level
+null-prototype record has exactly the design's ten keys and frozen enumerable
+data descriptors. `entries` is a frozen dense real array with no holes or
+custom keys; its indices are enumerable frozen data descriptors and its length
+is a non-enumerable frozen data descriptor. Every source/generated entry and
+nested identity is a frozen null-prototype exact-key record with non-writable,
+non-configurable enumerable data descriptors. `fsSource` is a frozen
+null-prototype exact 14-key record of newly created frozen wrapper functions.
+Recursively assert prototypes,
+`Reflect.ownKeys`, descriptor flags, frozen/non-extensible state, and mutation
+inertness for every reachable record, array, and wrapper.
+
 - [ ] **Step 1.1: Write discovery and bootstrap RED tests**
 
 Each case creates and commits its own temporary Git repository. Require an
@@ -939,11 +951,27 @@ body, inode, canonical file, generated-root identity, Git branch/HEAD, or status
 between passes and require failure before run creation. Replace a root or
 ancestor with a symlink and prove an external sentinel is unchanged.
 
-For divergent history assert streamed `git log --all --format=%H -z -- <path>`,
-bounded 4,096-ID/1-MiB control parsing, `git cat-file -e`, and sequential
-`git show <object>:<path>` hashing with 64-KiB reads and bounded 64-KiB stderr.
-Assert full child settlement on success, nonzero exit, signal, decoder failure,
-and limit failure; never buffer or print a body.
+For divergent history assert streamed `git log --all --format=%H -z -- <path>`
+with bounded 4,096-ID/1-MiB control parsing. For each commit, assert exact
+`git ls-tree -z --full-tree <commitOid> -- <canonicalPath>` argument boundaries
+and strict empty-or-one-record parsing. Include canonical names containing a
+newline and pathspec punctuation. Empty exit-zero output is absent; only exact
+`100644 blob` or `100755 blob` records with a lowercase 40/64-hex OID and the
+byte-identical canonical path are body-eligible. Skip a well-formed nonregular
+record without opening its body; reject multiple/malformed/mismatched/oversized
+output, missing NUL, nonzero exit, or signal.
+
+For an eligible record assert exact `git cat-file blob <blobOid>` with the OID
+as the only object selector, 64-KiB streaming reads, bounded 64-KiB stderr, no
+whole-body buffer, and full stdin/stdout/stderr/process settlement on every
+success or failure seam. No body command receives a path or `commit:path`.
+
+Every Git child must receive the design's exact new null-prototype environment:
+only the inherited cross-platform execution/locale allowlist plus
+`GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`, and
+`GIT_LITERAL_PATHSPECS=1`. Assert the env for every command, unchanged Git index
+device/inode/mode/size/mtime/ctime, no new lock residue, and an untouched remote
+helper/network sentinel when a required promisor object is unavailable.
 
 Require `inspectWorkspace` to remain read-only and advisory, including no
 writability probe. Require `prepareQuarantineWorkspace` to repeat every gate
@@ -951,6 +979,13 @@ only after literal writer attestation. A false/missing attestation fails before
 Git or filesystem/layout work. Assert the exact `QuarantineError` name, code,
 and fixed sanitized message mapping for `ERR_USAGE`, `ERR_PREFLIGHT`,
 `ERR_EXDEV`, and `ERR_INTEGRITY`; injected hook failures propagate unchanged.
+For each mapped failure, assert a non-exported Node.js 22 `QuarantineError`
+instance whose exact own-key set is `stack`, `message`, `name`, and `code`, with
+no symbols or `cause`. Assert all four are non-enumerable frozen data
+descriptors, `name`/`message`/`code` exact values, a string stack, read-only code,
+non-extensibility, `Object.keys(error) === []`, and
+`JSON.stringify(error) === "{}"`. The CLI remains responsible for explicitly
+serializing only the fixed code and message.
 
 - [ ] **Step 1.2: Verify RED**
 
@@ -965,12 +1000,17 @@ Expected: FAIL because the focused transaction/runtime modules do not exist.
 Use `git status --porcelain=v1 -z --untracked-files=all` with argument arrays.
 Implement the design's fatal decoding, exact status grammar, canonical
 NUL-frame, fresh two-pass identity, bytewise sorting, streamed hashes, and
-bounded child-process lifecycle. No public result, error, or hook receives a
-path list, hash, body, diff, stderr, or dynamic underlying error message; only
-the runtime-only `LAYOUT_READY` handoff carries the validated paths and hashes
-needed by Slice 2.
+bounded child-process lifecycle. Use `ls-tree -z` only to derive a validated
+regular blob OID, then hash only `git cat-file blob <blobOid>` stdout. Every
+read-only Git spawn uses the exact sanitized environment and settles all child
+resources. No public result exposes a per-entry path, payload/body content,
+per-entry content hash, or undocumented hash; the documented inspection `head`
+and later `manifestSha256` outputs remain allowed. No error or hook receives a
+path list, content hash, body, diff, stderr, or dynamic underlying error
+message. Only the runtime-only `LAYOUT_READY` handoff carries validated paths
+and per-entry hashes needed by Slice 2.
 
-The runtime reads each of the existing 15 filesystem methods and its receiver
+The runtime reads each of the existing 14 filesystem methods and its receiver
 once into a frozen source before the first filesystem await. Use that exact
 source for bootstrap and retain it in the private handoff for Slice 2 to supply
 by identity to `withQuarantineRunCapability`; never re-export the private
@@ -980,10 +1020,12 @@ method, and an equal-looking wrong adapter.
 The existing external mode-`0700` quarantine root must already exist. Inspection
 performs no write probe; prepare's first required `mkdir` proves writability.
 Create only the exact design allowlist one component at a time. For every new
-child: `mkdir(0700)`, validate type/mode/device/realpath/containment, then fsync
-its parent. A leaf needs no extra self-sync after its directory entry's parent
-is durable. Revalidate the complete layout, then call only
-`faultHook("after-layout-sync")`.
+or adopted child: run `mkdir(0700)` only when absent, validate
+type/mode/device/realpath/containment, then fsync its containing parent before
+advancing. A leaf needs no extra self-sync after its directory entry's parent
+is durable. Add a fault for every prefix after create/adoption but before parent
+sync; retry must adopt, revalidate, and re-fsync that parent. Revalidate the
+complete layout, then call only `faultHook("after-layout-sync")`.
 
 Retry adopts only exact allowlisted private non-symlink directories. Enumerate
 each expected parent and reject any file, later-stage artifact, foreign name,
