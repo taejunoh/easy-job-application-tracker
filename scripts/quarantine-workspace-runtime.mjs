@@ -382,11 +382,17 @@ function decodeFatal(bytes) {
   }
 }
 
-function parseSingleLine(bytes) {
+function parseIdentityLine(bytes) {
   const value = decodeFatal(bytes);
   if (!value.endsWith("\n") || value.slice(0, -1).includes("\n") || value.includes("\0")) {
     fail("ERR_PREFLIGHT");
   }
+  return value.slice(0, -1);
+}
+
+function parseTopLevel(bytes) {
+  const value = decodeFatal(bytes);
+  if (!value.endsWith("\n") || value.length === 1 || value.includes("\0")) fail("ERR_PREFLIGHT");
   return value.slice(0, -1);
 }
 
@@ -440,9 +446,9 @@ function parseStatusRecords(records) {
 }
 
 async function gitSnapshot(repoRoot, environment) {
-  const topLevel = parseSingleLine(await collectChild(repoRoot, environment, ["rev-parse", "--show-toplevel"]));
-  const branch = parseSingleLine(await collectChild(repoRoot, environment, ["symbolic-ref", "--quiet", "--short", "HEAD"]));
-  const head = parseSingleLine(await collectChild(repoRoot, environment, ["rev-parse", "--verify", "HEAD"]));
+  const topLevel = parseTopLevel(await collectChild(repoRoot, environment, ["rev-parse", "--show-toplevel"]));
+  const branch = parseIdentityLine(await collectChild(repoRoot, environment, ["symbolic-ref", "--quiet", "--short", "HEAD"]));
+  const head = parseIdentityLine(await collectChild(repoRoot, environment, ["rev-parse", "--verify", "HEAD"]));
   const status = await collectChild(repoRoot, environment, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
   if (!HEAD.test(head) || branch.length === 0 || branch !== branch.normalize("NFC")) fail("ERR_PREFLIGHT");
   return { topLevel, branch, head, status, paths: parseStatus(status) };
@@ -476,13 +482,88 @@ async function hashFile(path, fsSource) {
   }
 }
 
-function parseNulOids(bytes) {
-  if (bytes.length === 0) return [];
-  if (bytes.at(-1) !== 0) fail("ERR_PREFLIGHT");
-  const values = decodeFatal(bytes.subarray(0, -1)).split("\0");
-  if (values.some((value) => value.length === 0) || values.length > 4096 || values.some((value) => !OID.test(value))) {
-    fail("ERR_PREFLIGHT");
-  }
+async function collectHistoryOids(repoRoot, environment, canonicalPath) {
+  const child = spawn(
+    "git",
+    ["-c", "core.fsmonitor=false", "log", "--all", "--format=%H", "-z", "--", canonicalPath],
+    {
+      cwd: repoRoot,
+      env: childGitEnvironment(environment),
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const values = [];
+  const seen = new Set();
+  let frame = [];
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let invalid = false;
+  let streamError = false;
+  let terminationRequested = false;
+  const terminate = () => {
+    if (terminationRequested) return;
+    terminationRequested = true;
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      streamError = true;
+    }
+  };
+  const reject = () => {
+    invalid = true;
+    terminate();
+  };
+  child.stdout.on("data", (chunk) => {
+    if (invalid) return;
+    stdoutBytes += chunk.length;
+    if (stdoutBytes > CONTROL_LIMIT) {
+      reject();
+      return;
+    }
+    for (const byte of chunk) {
+      if (byte !== 0) {
+        frame.push(byte);
+        if (frame.length > 64) {
+          reject();
+          return;
+        }
+        continue;
+      }
+      if (frame.length === 0 || values.length === 4096) {
+        reject();
+        return;
+      }
+      let value;
+      try {
+        value = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(frame));
+      } catch {
+        reject();
+        return;
+      }
+      frame = [];
+      if (!OID.test(value) || seen.has(value)) {
+        reject();
+        return;
+      }
+      seen.add(value);
+      values.push(value);
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    stderrBytes += chunk.length;
+    if (stderrBytes > STDERR_LIMIT) reject();
+  });
+  child.stdout.on("error", () => { streamError = true; terminate(); });
+  child.stderr.on("error", () => { streamError = true; terminate(); });
+  const outcome = await new Promise((resolve) => {
+    let spawnError;
+    child.once("error", (error) => { spawnError = error; });
+    child.once("close", (code, signal) => resolve({ code, signal, spawnError }));
+  });
+  if (
+    invalid || streamError || outcome.spawnError || outcome.signal || outcome.code !== 0 ||
+    (stdoutBytes > 0 && frame.length !== 0)
+  ) fail("ERR_PREFLIGHT");
   return values;
 }
 
@@ -543,12 +624,7 @@ async function hashGitBlob(repoRoot, environment, blobOid) {
 }
 
 async function findHistoryMatch(repoRoot, environment, canonicalPath, sourceHash) {
-  const commits = parseNulOids(await collectChild(
-    repoRoot,
-    environment,
-    ["log", "--all", "--format=%H", "-z", "--", canonicalPath],
-    CONTROL_LIMIT,
-  ));
+  const commits = await collectHistoryOids(repoRoot, environment, canonicalPath);
   for (const commitOid of commits) {
     const blobOid = parseLsTree(await collectChild(
       repoRoot,
@@ -723,8 +799,19 @@ async function validateRoots(options, fsSource) {
 }
 
 async function discover(options, fsSource, environment) {
+  const firstRoots = await validateRoots(options, fsSource);
+  const first = await discoveryPass(options, fsSource, environment, firstRoots);
   const roots = await validateRoots(options, fsSource);
-  const first = await discoveryPass(options, fsSource, environment, roots);
+  if (
+    firstRoots.repoRoot !== roots.repoRoot ||
+    firstRoots.quarantineRoot !== roots.quarantineRoot ||
+    firstRoots.repoIdentity.dev !== roots.repoIdentity.dev ||
+    firstRoots.repoIdentity.ino !== roots.repoIdentity.ino ||
+    firstRoots.repoIdentity.mode !== roots.repoIdentity.mode ||
+    firstRoots.quarantineIdentity.dev !== roots.quarantineIdentity.dev ||
+    firstRoots.quarantineIdentity.ino !== roots.quarantineIdentity.ino ||
+    firstRoots.quarantineIdentity.mode !== roots.quarantineIdentity.mode
+  ) fail("ERR_PREFLIGHT");
   const second = await discoveryPass(options, fsSource, environment, roots);
   if (!first.frame.equals(second.frame)) fail("ERR_PREFLIGHT");
   return { roots, ...second, entries: freezeEntries(second.entries) };
