@@ -38,7 +38,7 @@ const MAX_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + String(Number.MAX_SAFE_INTEG
 const ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 const RESTORE_ID =
-  /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+  /^restore-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 const GENERATED_IDS = Object.freeze(["generated-next", "generated-node-modules"]);
 const MAX_INVENTORY_LINE_BYTES = 1024 * 1024;
 const MAX_JOURNAL_ENTRY_IDS = 4096;
@@ -331,13 +331,25 @@ function snapshotDenseArray(value, label, expectedLength) {
   return Object.freeze(snapshot);
 }
 
-function parseSortedEntryIds(event, payload, key, { allowEmpty = false } = {}) {
+function parseRecoveryEntryIds(payload) {
+  const event = "RECOVERY_REQUIRED";
+  const key = "entryIds";
   assertPayloadKeys(payload, [key], event);
   const input = snapshotDenseArray(payload[key], `${event} payload ${key}`);
-  if (!allowEmpty && input.length === 0) {
-    throw new TypeError(
-      `${event} payload ${key} must be ${allowEmpty ? "an array" : "a non-empty array"}`,
-    );
+  const values = input.map((value) => parseEntryId(value));
+  if (new Set(values).size !== values.length) {
+    throw new TypeError(`${event} payload ${key} must contain unique IDs`);
+  }
+  return Object.freeze({ [key]: Object.freeze(values) });
+}
+
+function parseConflictEntryIds(payload) {
+  const event = "INCOMPLETE_CONFLICT";
+  const key = "conflictEntryIds";
+  assertPayloadKeys(payload, [key], event);
+  const input = snapshotDenseArray(payload[key], `${event} payload ${key}`);
+  if (input.length === 0) {
+    throw new TypeError(`${event} payload ${key} must be a non-empty array`);
   }
   const values = input.map((value) => parseEntryId(value));
   for (let index = 1; index < values.length; index += 1) {
@@ -413,14 +425,12 @@ const EVENT_PAYLOAD_PARSERS = Object.freeze({
     assertPayloadKeys(payload, ["manifestSha256"], "VALIDATED");
     return Object.freeze({ manifestSha256: parseManifestSha256(payload.manifestSha256) });
   },
-  RECOVERY_REQUIRED: (payload) =>
-    parseSortedEntryIds("RECOVERY_REQUIRED", payload, "entryIds", { allowEmpty: true }),
+  RECOVERY_REQUIRED: (payload) => parseRecoveryEntryIds(payload),
   ROLLING_BACK: (payload) => parseEmptyPayload("ROLLING_BACK", payload),
   ROLLBACK_INTENT: (payload) => parseEntryPayload("ROLLBACK_INTENT", payload),
   ROLLED_BACK_ENTRY: (payload) => parseEntryPayload("ROLLED_BACK_ENTRY", payload),
   ROLLED_BACK: (payload) => parseEmptyPayload("ROLLED_BACK", payload),
-  INCOMPLETE_CONFLICT: (payload) =>
-    parseSortedEntryIds("INCOMPLETE_CONFLICT", payload, "conflictEntryIds"),
+  INCOMPLETE_CONFLICT: (payload) => parseConflictEntryIds(payload),
   RESTORE_PREPARED(payload) {
     assertPayloadKeys(payload, ["restoreId", "activeGenerated"], "RESTORE_PREPARED");
     return Object.freeze({

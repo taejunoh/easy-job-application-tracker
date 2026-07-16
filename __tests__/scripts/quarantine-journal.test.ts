@@ -14,7 +14,7 @@ const capabilityModuleUrl = pathToFileURL(
 
 const manifestSha256 = "a".repeat(64);
 const validSummary = { sha256: "b".repeat(64), entries: 1, bytes: 1 };
-const restoreId = "22222222-2222-4222-8222-222222222222";
+const restoreId = "restore-22222222-2222-4222-8222-222222222222";
 const inventoryRecord = {
   scope: "root",
   type: "file",
@@ -883,6 +883,7 @@ const result = await withQuarantineRunCapability({
     const moving = { event: "MOVING", payload: {} };
     const intentIds = Array.from({ length: request.count }, (_, index) =>
       "copy-" + String(index + 1).padStart(4, "0"));
+    if (request.order === "reverse") intentIds.reverse();
     const moveIntent = (id) => ({ event: "MOVE_INTENT", payload: { id, expected: summary } });
     const restoreIntent = (id) => ({ event: "RESTORE_INTENT", payload: { id } });
     const values = request.context === "apply"
@@ -897,7 +898,7 @@ const result = await withQuarantineRunCapability({
         {
           event: "RESTORE_PREPARED",
           payload: {
-            restoreId: "22222222-2222-4222-8222-222222222222",
+            restoreId: "restore-22222222-2222-4222-8222-222222222222",
             activeGenerated: [
               { id: "generated-next", inventory: null },
               { id: "generated-node-modules", inventory: null },
@@ -2571,9 +2572,21 @@ describe("capability-bound durable quarantine journal", () => {
       event: "MOVE_INTENT",
       payload: { id: "../victim", expected: validSummary },
     }],
-    ["unsorted recovery IDs", [records.prepared, records.moving], {
+    ["unsorted conflict IDs", [records.prepared, records.moving], {
+      event: "INCOMPLETE_CONFLICT",
+      payload: { conflictEntryIds: ["copy-0002", "copy-0001"] },
+    }],
+    ["empty conflict IDs", [records.prepared, records.moving], {
+      event: "INCOMPLETE_CONFLICT",
+      payload: { conflictEntryIds: [] },
+    }],
+    ["duplicate recovery IDs", [records.prepared, records.moving, records.moveIntent], {
       event: "RECOVERY_REQUIRED",
-      payload: { entryIds: ["copy-0002", "copy-0001"] },
+      payload: { entryIds: ["copy-0001", "copy-0001"] },
+    }],
+    ["duplicate conflict IDs", [records.prepared, records.moving], {
+      event: "INCOMPLETE_CONFLICT",
+      payload: { conflictEntryIds: ["copy-0001", "copy-0001"] },
     }],
   ])("rejects the closed event payload schema: %s", (_label, prefix, record) => {
     const result = invoke(join(fixture, `payload-${_label.replaceAll(" ", "-")}`), {
@@ -2672,13 +2685,14 @@ describe("capability-bound durable quarantine journal", () => {
   });
 
   it.each(["apply", "restore"])(
-    "accepts a 4096-entry %s intent ledger and exact recovery array",
+    "accepts a non-bytewise 4096-entry %s intent ledger in exact forward order",
     (context) => {
       const result = invoke(join(fixture, `intent-ledger-boundary-${context}`), {
         operation: "intent-ledger-cap",
         case: "recovery-boundary",
         context,
         count: 4096,
+        order: "reverse",
       });
       expect(result.outcome.ok).toBe(true);
       expect(result.after.state).toBe("RECOVERY_REQUIRED");
@@ -2811,6 +2825,22 @@ describe("capability-bound durable quarantine journal", () => {
     ["missing restoreId", { activeGenerated: activeGenerated() }],
     ["unknown key", { restoreId, activeGenerated: activeGenerated(), extra: true }],
     ["invalid restoreId", { restoreId: "restore-1", activeGenerated: activeGenerated() }],
+    ["bare restore UUID", {
+      restoreId: "22222222-2222-4222-8222-222222222222",
+      activeGenerated: activeGenerated(),
+    }],
+    ["uppercase restore ID", {
+      restoreId: restoreId.toUpperCase(),
+      activeGenerated: activeGenerated(),
+    }],
+    ["wrong restore UUID version", {
+      restoreId: "restore-22222222-2222-3222-8222-222222222222",
+      activeGenerated: activeGenerated(),
+    }],
+    ["wrong restore UUID variant", {
+      restoreId: "restore-22222222-2222-4222-7222-222222222222",
+      activeGenerated: activeGenerated(),
+    }],
     ["missing generated record", { restoreId, activeGenerated: activeGenerated().slice(0, 1) }],
     ["swapped generated records", { restoreId, activeGenerated: activeGenerated().toReversed() }],
     ["duplicate generated IDs", {
@@ -3949,6 +3979,41 @@ describe("capability-bound durable quarantine journal", () => {
   });
 
   it.each([
+    ["apply", [
+      records.prepared,
+      records.moving,
+      { event: "MOVE_INTENT", payload: { id: "copy-0002", expected: validSummary } },
+      records.moveIntent,
+      {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ["copy-0002", "copy-0001"] },
+      },
+    ], ["copy-0002", "copy-0001"]],
+    ["restore", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-node-modules" } },
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+      {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ["generated-node-modules", "generated-next"] },
+      },
+    ], ["generated-node-modules", "generated-next"]],
+  ])("accepts non-bytewise %s recovery IDs in original forward journal order", (
+    label,
+    lifecycle,
+    expectedEntryIds,
+  ) => {
+    const result = invoke(join(fixture, `recovery-forward-order-${label}`), {
+      operation: "append-valid-lifecycle",
+      records: lifecycle,
+    });
+    expect(result.state).toBe("RECOVERY_REQUIRED");
+    expect(result.records.at(-1).payload.entryIds).toEqual(expectedEntryIds);
+  });
+
+  it.each([
     ["apply includes one completed intent", [
       records.prepared,
       records.moving,
@@ -3956,22 +4021,23 @@ describe("capability-bound durable quarantine journal", () => {
       { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
       records.recoveryCopy1,
     ]],
-    ["apply resume retains completed intent", [
+    ["apply all-completed resume retains every intent", [
       records.prepared,
       records.moving,
       records.moveIntent,
       { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
       { event: "MOVE_INTENT", payload: { id: "copy-0002", expected: validSummary } },
+      { event: "MOVED", payload: { id: "copy-0002", observed: validSummary } },
+      records.verifying,
       {
         event: "RECOVERY_REQUIRED",
         payload: { entryIds: ["copy-0001", "copy-0002"] },
       },
       records.moving,
-      { event: "MOVED", payload: { id: "copy-0002", observed: validSummary } },
       records.verifying,
       records.quarantined,
     ]],
-    ["apply rollback reverses completed intents", [
+    ["apply all-completed rollback reverses every intent", [
       records.prepared,
       records.moving,
       records.moveIntent,
@@ -3997,22 +4063,22 @@ describe("capability-bound durable quarantine journal", () => {
       { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
       { event: "RECOVERY_REQUIRED", payload: { entryIds: ["generated-next"] } },
     ]],
-    ["restore resume retains completed intent", [
+    ["restore all-completed resume retains every intent", [
       ...quarantinedPrefix,
       records.restorePrepared,
       records.restoring,
       { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
       { event: "RESTORED_ENTRY", payload: { id: "generated-next" } },
       { event: "RESTORE_INTENT", payload: { id: "generated-node-modules" } },
+      { event: "RESTORED_ENTRY", payload: { id: "generated-node-modules" } },
       {
         event: "RECOVERY_REQUIRED",
         payload: { entryIds: ["generated-next", "generated-node-modules"] },
       },
       records.restoring,
-      { event: "RESTORED_ENTRY", payload: { id: "generated-node-modules" } },
       records.restored,
     ]],
-    ["restore rollback reverses completed intents", [
+    ["restore all-completed rollback reverses every intent", [
       ...quarantinedPrefix,
       records.restorePrepared,
       records.restoring,
@@ -4055,7 +4121,7 @@ describe("capability-bound durable quarantine journal", () => {
       event: "RECOVERY_REQUIRED",
       payload: { entryIds: [] },
     }],
-    ["apply wrong unresolved IDs", [records.prepared, records.moving, records.moveIntent], {
+    ["apply wrong durable ledger IDs", [records.prepared, records.moving, records.moveIntent], {
       event: "RECOVERY_REQUIRED",
       payload: { entryIds: ["copy-0002"] },
     }],
@@ -4078,6 +4144,15 @@ describe("capability-bound durable quarantine journal", () => {
       { event: "MOVED", payload: { id: "copy-0001", observed: validSummary } },
       { event: "MOVE_INTENT", payload: { id: "copy-0002", expected: validSummary } },
     ], { event: "RECOVERY_REQUIRED", payload: { entryIds: ["copy-0002"] } }],
+    ["apply reorders the durable intent ledger", [
+      records.prepared,
+      records.moving,
+      { event: "MOVE_INTENT", payload: { id: "copy-0002", expected: validSummary } },
+      records.moveIntent,
+    ], {
+      event: "RECOVERY_REQUIRED",
+      payload: { entryIds: ["copy-0001", "copy-0002"] },
+    }],
     ["restore empty after intent", [
       ...quarantinedPrefix,
       records.restorePrepared,
@@ -4089,7 +4164,7 @@ describe("capability-bound durable quarantine journal", () => {
       records.restorePrepared,
       records.restoring,
     ], { event: "RECOVERY_REQUIRED", payload: { entryIds: ["generated-next"] } }],
-    ["restore wrong unresolved IDs", [
+    ["restore wrong durable ledger IDs", [
       ...quarantinedPrefix,
       records.restorePrepared,
       records.restoring,
@@ -4122,6 +4197,16 @@ describe("capability-bound durable quarantine journal", () => {
     ], {
       event: "RECOVERY_REQUIRED",
       payload: { entryIds: ["generated-node-modules"] },
+    }],
+    ["restore reorders the durable intent ledger", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      { event: "RESTORE_INTENT", payload: { id: "generated-node-modules" } },
+      { event: "RESTORE_INTENT", payload: { id: "generated-next" } },
+    ], {
+      event: "RECOVERY_REQUIRED",
+      payload: { entryIds: ["generated-next", "generated-node-modules"] },
     }],
     ["apply recovery cannot enter RESTORING", [
       records.prepared,

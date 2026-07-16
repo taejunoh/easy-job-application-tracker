@@ -1424,7 +1424,7 @@ describe("bounded quarantine inventory", () => {
     expect(result.metrics.maxOpenDirectoryHandles).toBeLessThanOrEqual(1);
   });
 
-  it("fsyncs a capability-derived rollback entry in bounded postorder", () => {
+  it("round-trips the same prefixed restore ID through capability path and inventory fsync", () => {
     const nextTransaction = "inventory-rollback-fsync";
     const nextRun = createRun(quarantineRoot, nextTransaction);
     const rollbackRoot = join(
@@ -1446,6 +1446,7 @@ describe("bounded quarantine inventory", () => {
       entryId: "generated-next",
       root: realpathSync(rollbackRoot),
     }).result as { events: [string, string][]; metrics: Record<string, number> };
+    expect(realpathSync(rollbackRoot).split("/")).toContain(RESTORE_ID);
     const synced = result.events
       .filter(([event, path]) => event === "sync" && path.startsWith(realpathSync(rollbackRoot)))
       .map(([, path]) => path);
