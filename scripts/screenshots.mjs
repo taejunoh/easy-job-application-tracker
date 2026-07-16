@@ -2,11 +2,13 @@ import { chromium } from "playwright";
 import { readFile, mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { installScreenshotNetworkPolicy } from "./screenshot-network-policy.mjs";
 import {
   statsFixture,
   settingsFixture,
   popupFormFixture,
   keywordAnalysisFixture,
+  popupConnectionFixture,
 } from "./screenshot-fixtures.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -14,37 +16,42 @@ const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "..");
 const OUT_DIR = path.join(REPO_ROOT, "docs", "screenshots");
 const POPUP_HTML_PATH = path.join(REPO_ROOT, "extension", "popup.html");
+const CHROME_EXTENSIONS_SETUP_PATH = path.join(
+  REPO_ROOT,
+  "scripts",
+  "chrome-extensions-setup.html"
+);
 const BASE_URL = "http://localhost:3000";
+const SETUP_ONLY = process.argv.includes("--setup-only");
 
 async function assertDevServerUp() {
   let res;
   try {
     res = await fetch(BASE_URL, { signal: AbortSignal.timeout(3000) });
-  } catch {
-    console.error(
+  } catch (cause) {
+    throw new Error(
       "\n✗ Next.js dev server not reachable at " + BASE_URL + "\n" +
-      "  Run `npm run dev` in another terminal first.\n"
+        "  Run `npm run dev` in another terminal first.\n",
+      { cause }
     );
-    process.exit(1);
   }
   if (res.status >= 500) {
-    console.error(
+    throw new Error(
       "\n✗ Next.js dev server at " + BASE_URL + " returned " + res.status + "\n" +
       "  The server is up but failing. Check the dev server logs.\n"
     );
-    process.exit(1);
   }
 }
 
 async function launchBrowser() {
   try {
     return await chromium.launch({ headless: true });
-  } catch {
-    console.error(
+  } catch (cause) {
+    throw new Error(
       "\n✗ Chromium not installed for Playwright.\n" +
-      "  Run `npx playwright install chromium` first.\n"
+        "  Run `npx playwright install chromium` first.\n",
+      { cause }
     );
-    process.exit(1);
   }
 }
 
@@ -54,11 +61,17 @@ function stripPopupScript(html) {
 
 async function loadPopupPage(context) {
   const page = await context.newPage();
-  await page.setViewportSize({ width: 400, height: 800 });
-  const rawHtml = await readFile(POPUP_HTML_PATH, "utf8");
-  const sanitized = stripPopupScript(rawHtml);
-  await page.setContent(sanitized, { waitUntil: "domcontentloaded" });
-  return page;
+
+  try {
+    await page.setViewportSize({ width: 400, height: 800 });
+    const rawHtml = await readFile(POPUP_HTML_PATH, "utf8");
+    const sanitized = stripPopupScript(rawHtml);
+    await page.setContent(sanitized, { waitUntil: "domcontentloaded" });
+    return page;
+  } catch (error) {
+    await page.close();
+    throw error;
+  }
 }
 
 async function loadSettingsPage(context) {
@@ -275,24 +288,143 @@ async function captureSettingsLlm(context) {
   console.log("✓ 05-settings-llm.png");
 }
 
-async function main() {
-  await assertDevServerUp();
-  await mkdir(OUT_DIR, { recursive: true });
-
-  const browser = await launchBrowser();
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
-    deviceScaleFactor: 2,
-  });
+async function captureChromeLoadUnpacked(context) {
+  const page = await context.newPage();
 
   try {
-    await captureDashboard(context);
-    await captureSettingsResume(context);
-    await captureExtensionPopup(context);
-    await captureKeywordAnalysis(context);
-    await captureSettingsLlm(context);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    const setupHtml = await readFile(CHROME_EXTENSIONS_SETUP_PATH, "utf8");
+    await page.setContent(setupHtml, { waitUntil: "domcontentloaded" });
+    await page.screenshot({
+      path: path.join(OUT_DIR, "06-chrome-load-unpacked.png"),
+      fullPage: true,
+      scale: "css",
+    });
   } finally {
-    await context.close();
+    await page.close();
+  }
+  console.log("✓ 06-chrome-load-unpacked.png");
+}
+
+async function preparePopupConnectionPage(context, connected) {
+  const page = await loadPopupPage(context);
+
+  try {
+    await page.evaluate(
+      ({ fixture, isConnected }) => {
+        document.getElementById("extracting").style.display = "none";
+        document.getElementById("form").style.display = "none";
+        document.getElementById("noPage").style.display = "none";
+
+        const serverUrl = document.getElementById("serverUrl");
+        const accessToken = document.getElementById("accessToken");
+        const connectBtn = document.getElementById("connectBtn");
+        const disconnectBtn = document.getElementById("disconnectBtn");
+        const connectionStatus = document.getElementById("connectionStatus");
+
+        serverUrl.value = fixture.serverUrl;
+        accessToken.value = isConnected ? "" : fixture.maskedToken;
+        accessToken.style.caretColor = "transparent";
+        connectBtn.textContent = "Connect";
+        connectBtn.disabled = false;
+        disconnectBtn.textContent = "Disconnect";
+        disconnectBtn.disabled = !isConnected;
+        connectionStatus.textContent = isConnected
+          ? fixture.connectedStatus
+          : fixture.disconnectedStatus;
+        connectionStatus.className = isConnected
+          ? "connection-status success"
+          : "connection-status";
+      },
+      { fixture: popupConnectionFixture, isConnected: connected }
+    );
+    await page.evaluate(async () => {
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
+      await document.fonts.ready;
+      await new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      });
+    });
+
+    return page;
+  } catch (error) {
+    await page.close();
+    throw error;
+  }
+}
+
+async function screenshotPopupBody(page, filename) {
+  const dimensions = await page.evaluate(() => ({
+    width: document.body.scrollWidth,
+    height: document.body.scrollHeight,
+  }));
+  await page.setViewportSize(dimensions);
+  await page.screenshot({
+    path: path.join(OUT_DIR, filename),
+    animations: "disabled",
+    scale: "css",
+  });
+}
+
+async function captureExtensionConnect(context) {
+  const page = await preparePopupConnectionPage(context, false);
+
+  try {
+    await screenshotPopupBody(page, "07-extension-connect.png");
+  } finally {
+    await page.close();
+  }
+  console.log("✓ 07-extension-connect.png");
+}
+
+async function captureExtensionConnected(context) {
+  const page = await preparePopupConnectionPage(context, true);
+
+  try {
+    await screenshotPopupBody(page, "08-extension-connected.png");
+  } finally {
+    await page.close();
+  }
+  console.log("✓ 08-extension-connected.png");
+}
+
+async function main() {
+  await mkdir(OUT_DIR, { recursive: true });
+
+  if (SETUP_ONLY === false) {
+    await assertDevServerUp();
+  }
+
+  const browser = await launchBrowser();
+  let context;
+
+  try {
+    context = await browser.newContext({
+      viewport: { width: 1280, height: 800 },
+      deviceScaleFactor: 2,
+      serviceWorkers: "block",
+    });
+    const setupNetworkPolicy = SETUP_ONLY
+      ? await installScreenshotNetworkPolicy(context)
+      : null;
+
+    if (!SETUP_ONLY) {
+      await captureDashboard(context);
+      await captureSettingsResume(context);
+      await captureExtensionPopup(context);
+      await captureKeywordAnalysis(context);
+      await captureSettingsLlm(context);
+    }
+    await captureChromeLoadUnpacked(context);
+    await captureExtensionConnect(context);
+    await captureExtensionConnected(context);
+    if (setupNetworkPolicy) {
+      setupNetworkPolicy.assertNoNetworkAttempts();
+    }
+  } finally {
+    await context?.close();
     await browser.close();
   }
 
@@ -301,5 +433,5 @@ async function main() {
 
 main().catch((err) => {
   console.error(err);
-  process.exit(1);
+  process.exitCode = 1;
 });

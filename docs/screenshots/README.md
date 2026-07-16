@@ -16,15 +16,27 @@ Then in another terminal run:
 npm run screenshots
 ```
 
-The script writes all five files here:
+The script writes all eight files here:
 
 - `01-dashboard.png` — dashboard with six fixture applications
 - `02-settings-resume.png` — Settings Resume section
 - `03-extension-popup.png` — Chrome extension popup on a job posting
 - `04-keyword-analysis.png` — Chrome extension popup with keyword match results
 - `05-settings-llm.png` — Settings LLM Provider section
+- `06-chrome-load-unpacked.png` — synthetic Chrome Extensions setup view
+- `07-extension-connect.png` — disconnected extension connection form
+- `08-extension-connected.png` — connected extension status
 
 No real database data is used — API calls are intercepted by Playwright and served from `scripts/screenshot-fixtures.mjs`.
+
+To generate only the three extension setup images, run:
+
+```bash
+npm run screenshots:setup
+```
+
+The setup images are synthetic and need no server or database. They contain no
+real extension ID, access token, Chrome profile, or production origin.
 
 ## When to regenerate
 
@@ -34,4 +46,4 @@ Only when the UI visibly changes. These PNGs are deterministic (modulo font anti
 
 - `playwright` devDependency (already in `package.json`)
 - Chromium browser binary (one-time: `npx playwright install chromium`)
-- Next.js dev server running at `http://localhost:3000`
+- Next.js dev server running at `http://localhost:3000` (not required for `screenshots:setup`)

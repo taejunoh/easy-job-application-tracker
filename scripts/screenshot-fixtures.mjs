@@ -50,3 +50,10 @@ export const keywordAnalysisFixture = {
   matched: ["React", "TypeScript", "Node.js", "REST", "Git", "PostgreSQL"],
   missing: ["Kubernetes", "GraphQL", "Rust"],
 };
+
+export const popupConnectionFixture = {
+  serverUrl: "http://localhost:3000",
+  maskedToken: "••••••••••••••••••••••••••••••••",
+  disconnectedStatus: "Disconnected — enter an access token to connect.",
+  connectedStatus: "Connected to http://localhost:3000",
+};

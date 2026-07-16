@@ -19,7 +19,8 @@
     "check:audit": "node scripts/check-audit.mjs",
     "check:production": "node scripts/check-production-stats.mjs",
     "check:startup-env": "node scripts/verify-invalid-startup.mjs",
-    "screenshots": "node scripts/screenshots.mjs"
+    "screenshots": "node scripts/screenshots.mjs",
+    "screenshots:setup": "node scripts/screenshots.mjs --setup-only"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.111.0",
