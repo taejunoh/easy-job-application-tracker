@@ -80,6 +80,10 @@ Create one external directory per cleanup run:
       pre/<entry-id>.jsonl
       moved-pass-1/<entry-id>.jsonl
       moved-pass-2/<entry-id>.jsonl
+      restore-active/<generated-entry-id>.jsonl
+      validation-pass-1/<generated-entry-id>.jsonl
+      validation-pass-2/<generated-entry-id>.jsonl
+      work/
     divergent-diffs/
     payload/
       source-copies/<entry-id>
@@ -89,6 +93,32 @@ Create one external directory per cleanup run:
       regenerated-before-restore/<restore-id>/
     conflicts/
 ```
+
+Fixed-layout bootstrap creates exactly the run root and these directories, one
+path component at a time:
+
+```text
+manifests
+inventories
+inventories/pre
+inventories/moved-pass-1
+inventories/moved-pass-2
+inventories/restore-active
+inventories/validation-pass-1
+inventories/validation-pass-2
+inventories/work
+payload
+payload/source-copies
+payload/generated
+rollback
+rollback/regenerated-before-restore
+conflicts
+divergent-diffs
+```
+
+Bootstrap does not create `current`, `journal.log`, manifest generations,
+inventory or diff files, payload entry roots, generated payload roots, or a
+restore-ID directory. Those artifacts belong to later durable phases.
 
 `<restore-id>` everywhere in this design means exactly
 `restore-<lowercase-v4-shaped-uuid>`; a bare UUID is never a restore ID.
@@ -592,15 +622,93 @@ Before moving anything, the tool:
 
 1. requires the invocation-supplied repository root, expected branch, expected
    HEAD, expected numbered-copy count, and writer-quiescence attestation;
-2. requires no tracked or staged changes and two stable numbered-path discovery
-   passes;
+2. requires no tracked or staged changes and two complete stable discovery
+   passes as defined below;
 3. rejects symlink roots and verifies the external quarantine path is outside
-   the repository, mode-restricted, writable, and on the same device;
+   the repository, mode-restricted, and on the same device; a mutating prepare
+   establishes writability with its first required layout `mkdir`;
 4. streams deterministic pre-move inventories to JSONL, computes their SHA-256,
    entry count, and byte count, and records only those summaries in the manifest;
 5. durably writes the initial immutable manifest generation, divergent diffs,
    initial inventories, run directory, and `PREPARED` journal record; it does
    not activate `current` until the matching validated generation is durable.
+
+### Closed workspace discovery
+
+`repoRoot` and `quarantineRoot` are absolute NFC paths without NUL. Git's
+resolved top level must equal the resolved, non-symlink `repoRoot` exactly.
+`expectedBranch` is a non-empty NFC string without NUL and must equal the
+symbolic branch name returned by Git; detached `HEAD` is rejected even if the
+caller supplies `"HEAD"`. `expectedHead` is exactly a lowercase 40- or
+64-character hexadecimal object ID. `expectedCount` is a safe integer from
+zero through 9,999 inclusive, matching the four-digit nonzero source-copy ID
+space. Every value is snapshotted from the closed option object before the
+first await.
+
+Each discovery pass invokes Git with argument arrays. It resolves identity with
+`git rev-parse --show-toplevel`, `git symbolic-ref --quiet --short HEAD`, and
+`git rev-parse --verify HEAD`, then invokes exactly:
+
+```text
+git status --porcelain=v1 -z --untracked-files=all
+```
+
+An empty status is represented by zero bytes. A non-empty status must end in a
+NUL byte and contain no empty interior record. Every record is decoded with a
+fatal UTF-8 decoder. Any record other than exact `?? <relative-path>` is a
+tracked, staged, malformed, or unsupported rename/copy record and fails. Every
+untracked record must be an approved numbered-copy path; discovery never
+silently ignores unrelated untracked residue. Paths use the existing strict NFC
+POSIX relative-path and numbered-copy suffix validators, and are sorted by
+their UTF-8 bytes. Both the source and its derived canonical path must resolve
+under the repository through non-symlink ancestors and must be regular,
+non-symlink files. `.next` and `node_modules` must each be a non-symlink
+directory; their inner symlinks remain leaf inventory entries in later phases.
+
+A complete pass streams, rather than buffers, source and canonical file bodies
+through SHA-256. It produces this private canonical byte frame, with each field
+encoded as UTF-8 and terminated by one NUL byte; numeric fields use canonical
+unsigned decimal and hashes use lowercase hexadecimal:
+
+```text
+workspace, resolved-repo-root, branch, head, sha256(raw-status-bytes)
+source, relative-path, canonical-relative-path,
+  source-dev, source-ino, source-mode, source-size, source-sha256,
+  canonical-dev, canonical-ino, canonical-mode, canonical-size,
+  canonical-sha256
+generated, relative-path, dev, ino, mode
+```
+
+The `workspace` record is first. All `source` and `generated` records then share
+one UTF-8 bytewise `relative-path` order. Record tags and the fixed field counts
+make the NUL framing unambiguous. Device and inode values must be
+non-negative safe integers; modes are masked to `0o7777`; sizes are
+non-negative safe integers. A pass also rechecks the Git top level, symbolic
+branch, `HEAD`, and porcelain bytes after hashing and fails unless they still
+equal the values framed by that pass.
+
+Inspection and apply each run two new full passes, including new Git commands,
+`lstat`/`realpath` checks, and fresh streamed hashes. Success requires the two
+canonical frame byte sequences to be exactly equal. Comparing only path names,
+raw porcelain output, or previously cached metadata is insufficient. Apply
+runs both passes only after validating `writersStopped === true` and does not
+reuse an inspection result as authority.
+
+For each divergent source, enumerate candidate historical objects with exactly
+`git log --all --format=%H -z -- <canonical-relative-path>`. Parse stdout as
+fatal UTF-8, NUL-terminated lowercase 40/64-character object IDs while it is
+streaming; retain at most 4,096 IDs and 1 MiB of control bytes. Close and await
+that process before checking objects sequentially. First run
+`git cat-file -e <object>:<canonical-relative-path>`; exit 1 means the path is
+absent at that object and is skipped, while another nonzero exit fails
+preflight. For a present object, spawn exactly
+`git show <object>:<canonical-relative-path>`, stream stdout directly through a
+SHA-256 accumulator with a 64 KiB read high-water mark, and never retain or
+print its body. Stderr is capped at 64 KiB and is never returned. On a stream,
+decoder, limit, signal, or child-process error, close or kill the child as
+appropriate, await stdout/stderr/process settlement, and fail with the fixed
+sanitized preflight error. The first matching object in Git's emitted order is
+the history match; no match is `null`.
 
 ### FD-bounded inventory and durability traversal
 
@@ -735,9 +843,12 @@ limits?, metrics? }`; the derived path must equal `root`. Its existing payload
 shape and bounds remain unchanged.
 
 Every public orchestration option is a closed plain object snapshotted before
-its first await. The transaction module exports exactly `inspectWorkspace`,
-`quarantineWorkspace`, `recoverQuarantine`, and
-`markQuarantineValidated`. The restore module exports exactly
+its first await. The completed transaction module exports exactly
+`inspectWorkspace`, `quarantineWorkspace`, `recoverQuarantine`, and
+`markQuarantineValidated`. Slice 1 exports only `inspectWorkspace` from that
+public module; Slice 2 adds `quarantineWorkspace` only when it can produce the
+final durable `QUARANTINED` result, and later slices add the remaining two
+exports. The restore module ultimately exports exactly
 `restoreQuarantine` and `recoverRestore`. Their option contracts are:
 
 ```text
@@ -757,6 +868,53 @@ recoverRestore({ repoRoot, quarantineRoot, transactionId,
                  action: "resume"|"rollback", writersStopped,
                  fsApi?, faultHook? })
 ```
+
+Slice 1 additionally exports one runtime-only helper from
+`quarantine-workspace-runtime.mjs`. It is importable only by transaction
+orchestration and its focused internal tests; it is not a public package export
+and never appears on the compatibility facade:
+
+```text
+prepareQuarantineWorkspace({
+  repoRoot, quarantineRoot, expectedBranch, expectedHead, expectedCount,
+  transactionId, createdAt, writersStopped, fsApi?, faultHook?
+}) -> {
+  status: "LAYOUT_READY",
+  transactionId,
+  createdAt,
+  repoRoot,
+  quarantineRoot,
+  runRoot,
+  branch,
+  head,
+  entries,
+  fsSource
+}
+```
+
+Its options are a closed plain object with the same snapshot and validation
+rules as the eventual `quarantineWorkspace`. `createdAt` is canonical UTC,
+`writersStopped` must be literal `true`, and the only phase Slice 1 may pass to
+`faultHook` is `"after-layout-sync"`, after the complete layout is durable.
+The result is a frozen, null-prototype, exact-key internal handoff and does not
+claim a journal state or completed move. `repoRoot`, `quarantineRoot`, and
+`runRoot` are the validated real absolute paths. `fsSource` is the exact frozen
+filesystem source used for bootstrap and later supplied by identity to
+`withQuarantineRunCapability`.
+
+`entries` is a frozen dense array in UTF-8 bytewise `relativePath` order. A
+source element has exactly
+`{ id, kind: "source-copy", relativePath, canonicalRelativePath,
+sourceIdentity, canonicalIdentity, classification, historyMatch }`; a generated
+element has exactly `{ id, kind: "generated-root", relativePath,
+sourceIdentity }`. Each identity is exactly
+`{ dev, ino, mode, size, sha256 }` for a regular file and
+`{ dev, ino, mode }` for a generated directory. IDs, paths, modes, sizes,
+hashes, classification, history match, generated-root pairing, and deterministic
+source-copy numbering use the existing manifest/path validators. These are
+private runtime plans, not manifest entries: Slice 2 adds `preMoveInventory`
+before building the immutable `PREPARED` manifest and revalidates every identity
+before mutation.
 
 Every successful result is also a closed plain object with exactly one of these
 shapes:
@@ -802,6 +960,37 @@ For inspection, `generatedRoots` is exactly `2`, `sourceCopies` equals
 `sourceCopies + generatedRoots`.
 Integrity loss, an illegal action for the replayed state, or indeterminate
 durability throws a typed error rather than inventing another result variant.
+
+Expected orchestration failures throw a non-exported `QuarantineError extends
+Error`. Its observable contract is exact: `name === "QuarantineError"`, one
+read-only string `code` from the closed set below, and the code's fixed
+`message`. It adds no path, body, hash, diff, command output, or other dynamic
+field. A standard non-enumerable stack is not serialized. The CLI preserves
+the code and fixed message rather than copying an underlying exception message.
+
+```text
+ERR_USAGE: "Invalid quarantine request."
+ERR_PREFLIGHT: "Workspace preflight failed."
+ERR_RECOVERY_REQUIRED: "Explicit quarantine recovery is required."
+ERR_CONFLICT: "Quarantine recovery found preserved conflicts."
+ERR_INTEGRITY: "Quarantine evidence failed integrity validation."
+ERR_EXDEV: "Repository and quarantine must be on the same filesystem."
+ERR_INDETERMINATE_JOURNAL_APPEND:
+  "Journal durability could not be determined."
+ERR_INTERNAL: "Unexpected quarantine failure."
+```
+
+For Slice 1, invalid option shape/value, missing or false writer attestation,
+invalid `fsApi`, and invalid `faultHook` map to `ERR_USAGE`. Git identity,
+detached branch, clean-state, expected-count, path/type, generated-root,
+stable-pass, quarantine mode/externality, or initial `mkdir` permission failures
+map to `ERR_PREFLIGHT`. A device mismatch or filesystem `EXDEV` maps to
+`ERR_EXDEV`. An unexpected existing run-layout name or type, a symlink or mode
+violation inside an existing partial layout, or root/parent identity replacement
+during bootstrap maps to `ERR_INTEGRITY`. Later slices retain the CLI mapping
+below for recovery, conflict, journal, and unexpected failures. A test-only
+`faultHook` rejection is not translated; it propagates unchanged after the
+defined durable seam so crash tests can identify their injected failure.
 
 `faultHook` is called as `(phase) => void | Promise<void>` and accepts only the
 following literals or validated entry-ID templates:
@@ -898,6 +1087,14 @@ to `withQuarantineRunCapability`, and obtains the live normalized adapter from
 the private run filesystem context inside the callback. The private registry is
 never re-exported. After capability creation, transaction and restore rename,
 sync, inventory, manifest, and journal operations use only that bound adapter.
+The complete source has exactly the existing context methods `lstat`,
+`realpath`, `mkdir`, `open`, `readdir`, `rm`, `rename`, `unlink`, `link`,
+`opendir`, `readlink`, `createReadStream`, `lstatSync`, and `realpathSync`.
+Runtime reads every method getter once, captures its receiver once, and freezes
+the resulting source before any filesystem await. A caller adapter must be a
+complete plain object. Later source mutation is ineffective, an equal-looking
+object fails the downstream identity assertion, and bootstrap never calls
+`rm`, recursive or otherwise.
 
 The seven public modules are exactly `quarantine-run-capability.mjs`,
 `quarantine-path-policy.mjs`, `quarantine-journal.mjs`,
@@ -995,11 +1192,31 @@ but the CLI converts it to `ERR_CONFLICT` and exit 3 rather than emitting an
 Inspection is advisory and read-only. Apply repeats branch, HEAD, clean-index,
 same-device, root-identity, and two NUL-safe byte-identical discovery passes
 after the truthful writer attestation. The existing mode-`0700` quarantine root
-must already exist outside the repository. Bootstrap creates only the validated
-transaction directory and its fixed mode-`0700` children, syncing every created
-parent. It never removes a partial layout; retry with the same transaction ID
-adopts only the expected private directories and otherwise preserves evidence
-and fails.
+must already exist outside the repository. Inspection validates its existence,
+type, realpath, mode, externality, and device without a write probe; it does not
+claim more than advisory writability. Apply establishes writability with the
+first required run-layout `mkdir`, without creating and deleting a probe.
+
+Bootstrap creates only the validated transaction directory and the exact fixed
+mode-`0700` directory list above. For each absent child it performs
+`mkdir(child, { mode: 0o700 })`, validates the child with `lstat` and `realpath`
+as a same-device, contained, non-symlink mode-`0700` directory, then opens and
+`fsync`s the containing parent before advancing. This parent sync is the
+durability requirement for the new directory entry. A newly created directory
+that later receives children is synced as their parent; an empty leaf needs no
+additional self-sync after its own parent has been synced. After all names are
+created or safely adopted, bootstrap revalidates the full layout and invokes
+`faultHook("after-layout-sync")`.
+
+Retry with the same transaction ID adopts only directories at exact allowlisted
+locations when each is mode `0700`, non-symlink, same-device, realpath-equal to
+its lexical location, and contained by the recorded roots. Slice 1 permits no
+file and no non-allowlisted child anywhere under the run root. Any later-stage
+artifact, partial journal, foreign name, wrong type/mode, or replacement is
+preserved and fails with `ERR_INTEGRITY`; a later apply implementation routes a
+recognized nonterminal journal to explicit recovery instead of weakening this
+bootstrap rule. Bootstrap never deletes, chmods, replaces, or recursively
+removes a partial layout.
 
 Apply records `MOVE_INTENT`, revalidates the source and absent destination,
 renames, syncs the moved tree, destination parent, and source parent in that

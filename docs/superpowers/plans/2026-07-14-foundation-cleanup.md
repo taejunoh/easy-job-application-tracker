@@ -891,31 +891,66 @@ export async function inspectWorkspace({
   repoRoot, quarantineRoot, expectedBranch, expectedHead, expectedCount, fsApi,
 }) {}
 
-export async function quarantineWorkspace({
+// Runtime-only: imported by transaction orchestration and focused internal tests.
+// It is not a facade or package export.
+export async function prepareQuarantineWorkspace({
   repoRoot, quarantineRoot, expectedBranch, expectedHead, expectedCount,
   transactionId, createdAt, writersStopped, fsApi, faultHook,
 }) {}
 ```
 
-Both are closed plain-object APIs. Optional fields may be omitted but no unknown
-string or symbol key is accepted. `createdAt` is a canonical UTC ISO string.
+Both accept closed plain-object options snapshotted before their first await.
+Optional fields may be omitted but no unknown string or symbol key is accepted.
 `inspectWorkspace` accepts no writer attestation or fault hook and returns
-exactly the `INSPECTED` result from the design. `quarantineWorkspace` accepts
-only `ApplyPhase` hook values and returns exactly its `QUARANTINED` result.
+exactly the public `INSPECTED` result from the design. Slice 1's public
+transaction module exports only `inspectWorkspace`.
+
+`prepareQuarantineWorkspace` requires canonical UTC `createdAt`, a validated
+transaction ID, and literal `writersStopped === true`. Its only reachable hook
+phase is `after-layout-sync`. It returns the exact frozen internal
+`LAYOUT_READY` handoff from the design: validated real roots, Git identity,
+bytewise-sorted runtime entry plans, and the captured filesystem source. It
+does not return `QUARANTINED`, write a journal/manifest/inventory, or move a
+source. Slice 2 adds the public `quarantineWorkspace` only when that function can
+complete and return the final durable result.
 
 - [ ] **Step 1.1: Write discovery and bootstrap RED tests**
 
-Each case creates and commits its own temporary Git repository. Require exact
-top-level, branch, HEAD, count, clean tracked/staged state, no unexpected
-untracked residue, regular source/canonical files, both non-symlink generated
-roots, external private quarantine root, same device, and two byte-identical
-NUL-framed discovery passes. Replace a root or ancestor with a symlink and prove
-an external sentinel is unchanged. Mutate a path between the two passes and
-require failure before run creation.
+Each case creates and commits its own temporary Git repository. Require an
+absolute NFC non-symlink top level, nonempty NFC symbolic branch (detached HEAD
+rejected), lowercase 40/64-hex HEAD, expected count in `0..9999`, clean
+tracked/staged state, no unexpected untracked residue, regular source/canonical
+files, both non-symlink generated roots, external mode-`0700` quarantine root,
+and the same device.
 
-Require `inspectWorkspace` to remain read-only and advisory. Require apply to
-repeat every gate after `writersStopped === true`. A false/missing attestation
-must fail before run/layout mutation.
+Assert the exact argument-array Git commands and strictly parse
+`git status --porcelain=v1 -z --untracked-files=all`: fatal UTF-8, required final
+NUL when nonempty, no empty interior frame, and only `?? <safe numbered path>`.
+Reject tracked/staged/rename/copy/malformed records and every unrelated
+untracked path. Assert the exact final-component numbered suffix, strict NFC
+POSIX paths, derived regular canonical path, UTF-8 bytewise ordering, and the
+fixed two generated directories.
+
+Require two completely independent passes. Each pass reruns Git identity and
+status, streams fresh source/canonical hashes, captures source/canonical
+dev/ino/mode/size/hash plus generated-root dev/ino/mode, and encodes the exact
+canonical NUL frame from the design. Compare the complete bytes. Mutate a path,
+body, inode, canonical file, generated-root identity, Git branch/HEAD, or status
+between passes and require failure before run creation. Replace a root or
+ancestor with a symlink and prove an external sentinel is unchanged.
+
+For divergent history assert streamed `git log --all --format=%H -z -- <path>`,
+bounded 4,096-ID/1-MiB control parsing, `git cat-file -e`, and sequential
+`git show <object>:<path>` hashing with 64-KiB reads and bounded 64-KiB stderr.
+Assert full child settlement on success, nonzero exit, signal, decoder failure,
+and limit failure; never buffer or print a body.
+
+Require `inspectWorkspace` to remain read-only and advisory, including no
+writability probe. Require `prepareQuarantineWorkspace` to repeat every gate
+only after literal writer attestation. A false/missing attestation fails before
+Git or filesystem/layout work. Assert the exact `QuarantineError` name, code,
+and fixed sanitized message mapping for `ERR_USAGE`, `ERR_PREFLIGHT`,
+`ERR_EXDEV`, and `ERR_INTEGRITY`; injected hook failures propagate unchanged.
 
 - [ ] **Step 1.2: Verify RED**
 
@@ -928,19 +963,34 @@ Expected: FAIL because the focused transaction/runtime modules do not exist.
 - [ ] **Step 1.3: Implement discovery, source capture, and bootstrap**
 
 Use `git status --porcelain=v1 -z --untracked-files=all` with argument arrays.
-Decode paths strictly, sort by UTF-8 bytes, stream file hashes, and stream
-`git show <object>:<path>` when checking all-ref history; never buffer or print a
-file body. The transaction runtime captures every filesystem method and its
-receiver once in a frozen source, uses that source during fixed-layout
-bootstrap, supplies the same object to `withQuarantineRunCapability`, and uses
-the private bound adapter after capability creation. Never re-export the private
-filesystem context.
+Implement the design's fatal decoding, exact status grammar, canonical
+NUL-frame, fresh two-pass identity, bytewise sorting, streamed hashes, and
+bounded child-process lifecycle. No public result, error, or hook receives a
+path list, hash, body, diff, stderr, or dynamic underlying error message; only
+the runtime-only `LAYOUT_READY` handoff carries the validated paths and hashes
+needed by Slice 2.
 
-The existing mode-`0700` quarantine root must already exist. Create the
-validated run root and fixed children one level at a time with mode `0700`,
-syncing every created parent. Retry adopts only expected private non-symlink
-directories. Preserve every partial or foreign artifact on error; never call
-recursive removal.
+The runtime reads each of the existing 15 filesystem methods and its receiver
+once into a frozen source before the first filesystem await. Use that exact
+source for bootstrap and retain it in the private handoff for Slice 2 to supply
+by identity to `withQuarantineRunCapability`; never re-export the private
+filesystem context. Test hostile getters, later source mutation, a missing
+method, and an equal-looking wrong adapter.
+
+The existing external mode-`0700` quarantine root must already exist. Inspection
+performs no write probe; prepare's first required `mkdir` proves writability.
+Create only the exact design allowlist one component at a time. For every new
+child: `mkdir(0700)`, validate type/mode/device/realpath/containment, then fsync
+its parent. A leaf needs no extra self-sync after its directory entry's parent
+is durable. Revalidate the complete layout, then call only
+`faultHook("after-layout-sync")`.
+
+Retry adopts only exact allowlisted private non-symlink directories. Enumerate
+each expected parent and reject any file, later-stage artifact, foreign name,
+wrong mode/type, symlink, or replacement with `ERR_INTEGRITY`, preserving every
+byte. Never chmod, delete, replace, or call `rm`. Direct transaction tests may
+import the runtime-only helper but must prove it is absent from the public
+transaction module, package exports, and compatibility facade.
 
 - [ ] **Step 1.4: Verify, commit, and review Slice 1**
 
@@ -958,6 +1008,20 @@ git commit -m "feat: add stable quarantine preflight"
 Require Critical 0 / Important 0 / Minor 0 before Slice 2.
 
 #### Slice 2: Apply atomic journaled moves
+
+**Interface added in this slice:**
+
+```js
+export async function quarantineWorkspace({
+  repoRoot, quarantineRoot, expectedBranch, expectedHead, expectedCount,
+  transactionId, createdAt, writersStopped, fsApi, faultHook,
+}) {}
+```
+
+This is the first slice that publicly exports `quarantineWorkspace`. It consumes
+the internal `LAYOUT_READY` handoff, enters a live run capability with the exact
+captured filesystem source, and returns only the final `QUARANTINED` result after
+the complete durable protocol below.
 
 - [ ] **Step 2.1: Add atomic-apply RED cases**
 
