@@ -330,6 +330,48 @@ Unified diffs and verified Git-history matches for all four divergent files are
 stored in `divergent-diffs/`. No divergent content is automatically merged into
 canonical files.
 
+Each divergent patch is produced by one sanitized, read-only Git child with
+exact argv and working directory:
+
+```text
+cwd: <validated real repository root>
+argv: git -c core.fsmonitor=false -c core.quotePath=true
+      diff --no-index --binary --full-index --no-color --no-ext-diff
+      --src-prefix=a/ --dst-prefix=b/ --
+      <canonical-relative-path> <source-relative-path>
+```
+
+Both path arguments are the already validated repository-relative POSIX paths;
+no absolute or caller-supplied destination is passed. The child receives the
+same closed environment policy as discovery, including
+`GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`, and `GIT_LITERAL_PATHSPECS=1`.
+Exit status `1` is required for an entry already classified as divergent. Exit
+status `0` is an integrity mismatch; a signal, another exit status, spawn or
+stream error, or malformed settlement is fatal. Stderr is drained with the
+existing 64 KiB bound and discarded from every result and error. Stdout bytes
+are the canonical patch without decoding or newline rewriting: Git's exact
+command and configuration above are the sole authority for quoting, prefixes,
+binary framing, and final-newline state.
+
+Patch stdout streams with a fixed-memory buffer into a capability-derived,
+mode-`0600`, writer-owned temporary. Its exact inclusive byte cap is
+`4 * (sourceSize + canonicalSize) + 1,048,576`, and the operation rejects before
+spawn unless that arithmetic is a non-negative safe integer. Byte
+`cap + 1` kills the child, awaits all child and stream settlement, and fails
+closed. A successful temporary is synced, published without replacement at the
+derived `divergent-diff` path, its parent is synced, and the published
+device/inode/mode is revalidated after that sync. The public fault hook
+`after-divergent-diff:<entry-id>` runs only after this complete durable publish.
+
+A same-transaction precommit retry recomputes the patch with the exact command
+and streams a byte-for-byte comparison plus SHA-256 against an existing complete
+mode-`0600` patch; it adopts only an exact match. It never trusts a name or hash
+alone. A complete mismatch, foreign file, symlink, wrong mode, identity change,
+or extra artifact is preserved and maps to `ERR_INTEGRITY`. An incomplete owned
+temporary may be removed only by the temporary publication primitive's existing
+ownership and identity rules; orchestration never recursively cleans or adopts
+an incomplete file.
+
 Manifest, journal, inventory, and CLI inputs use closed schemas: unknown keys,
 absolute paths, empty or `.`/`..` components, NUL bytes, non-normalized Unicode
 or path encodings, and paths outside the repository are rejected. The only
@@ -634,6 +676,49 @@ Before moving anything, the tool:
    initial inventories, run directory, and `PREPARED` journal record; it does
    not activate `current` until the matching validated generation is durable.
 
+The boundary in item 5 is strict: no source copy or generated root may be
+renamed before the complete `PREPARED` frame is durable. The exact Slice 2
+precommit order is:
+
+1. validate and snapshot the closed apply request, including literal
+   `writersStopped === true`, then run two new complete stable discovery passes;
+2. bootstrap or revalidate the exact fixed layout and enter a run capability
+   using the one captured filesystem source;
+3. prove the journal has no complete event and no unresolved append/lock or
+   tombstone evidence;
+4. write or exactly adopt each deterministic `pre` inventory in manifest entry
+   order, then invoke `after-pre-inventories` after every inventory and its
+   parent are durable;
+5. stream-publish or exactly adopt each divergent patch in manifest entry order,
+   invoking `after-divergent-diff:<entry-id>` after each durable publication;
+6. build the one exact closed `PREPARED` manifest from the stable discovery,
+   inventory summaries, patch classification, and history matches, then
+   write or exactly adopt its immutable digest generation;
+7. invoke `after-prepared-generation`, append
+   `PREPARED { transactionId, manifestSha256 }`, and only after that append
+   returns invoke `after-event:PREPARED`;
+8. append `MOVING {}` and only after that append returns invoke
+   `after-event:MOVING`; then begin the first per-entry move protocol.
+
+The same public `quarantineWorkspace` call performs precommit retry; no new
+runtime export, public API, or compatibility-facade name is added. It repeats
+fresh discovery and uses a private apply-precommit mode that may adopt only
+complete deterministic `pre` inventories, divergent patches, and the immutable
+`PREPARED` generation after recomputing their exact bytes, summaries, hashes,
+modes, and identities. Owned incomplete temporaries are handled only by their
+own bounded publication primitives. A complete mismatch, a foreign or
+unexpected artifact, or any artifact outside that closed set is preserved and
+fails with `ERR_INTEGRITY`.
+
+Once a complete `PREPARED` event is durable, regardless of its later durable
+tip, a fresh apply call performs no filesystem or journal mutation and throws
+`ERR_RECOVERY_REQUIRED`; it never continues the move or appends
+`RECOVERY_REQUIRED`. Slice 3's explicit recovery
+path is solely responsible for appending `RECOVERY_REQUIRED`. A torn or
+otherwise uncertain PREPARED append, or any append-attempt uncertainty later in
+the transaction, throws `ERR_INDETERMINATE_JOURNAL_APPEND`, preserves journal,
+lock, tombstone, and precommit evidence, and performs no later mutation.
+
 ### Closed workspace discovery
 
 `repoRoot` and `quarantineRoot` are absolute NFC paths without NUL. Git's
@@ -819,8 +904,10 @@ post-order completes.
 
 For each source copy and each complete generated root, the tool:
 
-1. appends and `fsync`s a `MOVE_INTENT` containing the validated entry ID and
-   expected source inventory summary;
+1. acquires one ordinary journal lock, appends and `fsync`s a `MOVE_INTENT`
+   containing the validated entry ID and expected source inventory summary,
+   completes that append's lock lifecycle, and then invokes the corresponding
+   public `after-event` hook;
 2. rechecks source identity and the absence of the derived destination;
 3. atomically renames the source inode to the derived quarantine destination;
 4. iteratively `fsync`s the moved payload in the bounded post-order above, then
@@ -828,18 +915,48 @@ For each source copy and each complete generated root, the tool:
    name before the source-name removal ensures a crash can produce the old name
    or both names, but not a deliberate neither-name durability window;
 5. streams and verifies the destination inventory;
-6. appends and `fsync`s `MOVED` with the observed summary.
+6. acquires a new ordinary journal lock, appends and `fsync`s `MOVED` with the
+   observed summary, completes that append's lock lifecycle, and then invokes
+   the corresponding public `after-event` hook.
 
 After all moves, two independent streaming destination-inventory passes must
 match the pre-move summaries. All original sources must remain absent and no
 unexpected numbered-path residue may exist. Only then does the transaction
-append `QUARANTINED`. The initial `PREPARED` generation already contains the
+append `QUARANTINED`. Every append from `PREPARED` through `VERIFYING` and each
+entry event uses its own current `withJournalLock` primitive boundary; Slice 2
+does not claim one lock is held across Git, inventory, rename, or fsync-tree
+work. For every non-final append, `after-event:<event>` runs only after the
+append primitive returns and therefore after its successful lock cleanup.
+
+The final `QUARANTINED` append is the sole special case. It supplies a private
+journal-primitive hook that, after the complete frame and journal parent are
+durable but before the primitive cleans its owned lock, invokes
+`after-event:QUARANTINED` and then `before-lock-cleanup`. Once the primitive
+returns, orchestration does not invoke `after-event:QUARANTINED` again. A hook
+failure or kill at either final seam preserves the durable tip and the owned
+lock evidence for explicit reconciliation.
+
+The initial `PREPARED` generation already contains the
 authoritative entries and pre-move summaries, so Task 2 does not publish a
 byte-identical intermediate generation. After clean regeneration, validation
 builds and durably publishes the `VALIDATED` generation, appends `VALIDATED`
 with that exact digest, and atomically activates the canonical root-level
 `current` pointer.
 Selective cleanup within `node_modules` or `.next` is forbidden.
+
+After durable `PREPARED`, any deterministic identity, inventory, destination,
+rename, sync, Git, or integrity failure stops immediately. It preserves the
+current durable journal tip and every existing lock/tombstone artifact; it does
+not append `RECOVERY_REQUIRED`, truncate the journal, remove evidence, attempt
+the next entry, or perform terminal cleanup. A rename that reports `EXDEV`
+triggers fresh no-follow checks proving the source still has its expected
+identity and the destination is still absent. If both facts hold, the operation
+throws the frozen `QuarantineError` for `ERR_EXDEV`; otherwise it throws
+`ERR_INTEGRITY`. It never calls copy or unlink. Any
+`IndeterminateJournalAppendError`, including uncertainty while cleaning the
+append's owned lock after a durable frame, maps to the frozen
+`ERR_INDETERMINATE_JOURNAL_APPEND` error and forbids every subsequent
+filesystem or journal mutation.
 
 Crash replay reconciles every durable move intent against filesystem reality:
 
@@ -1117,12 +1234,27 @@ below for recovery, conflict, journal, and unexpected failures. A test-only
 `faultHook` rejection is not translated; it propagates unchanged after the
 defined durable seam so crash tests can identify their injected failure.
 
+Slice 2 retains those mappings and adds no error type or public export. A fresh
+apply that observes any complete journal beginning with durable `PREPARED`
+throws the exact frozen `ERR_RECOVERY_REQUIRED` instance without mutation,
+including when its current tip is already `QUARANTINED`. A proven
+same-device rename `EXDEV` with unchanged expected source and absent destination
+throws the exact frozen `ERR_EXDEV` instance; a changed source or destination
+instead throws `ERR_INTEGRITY`. Deterministic evidence, schema, summary,
+identity, mode, patch, manifest, or journal mismatches throw
+`ERR_INTEGRITY`. An `IndeterminateJournalAppendError` from any append or its
+lock lifecycle is converted to the exact frozen
+`ERR_INDETERMINATE_JOURNAL_APPEND` instance and stops the operation. These
+orchestration wrappers never expose the primitive's cause, expected sequence,
+expected record hash, path, child output, or dynamic message.
+
 `faultHook` is called as `(phase) => void | Promise<void>` and accepts only the
 following literals or validated entry-ID templates:
 
 ```text
 ApplyPhase =
   "after-layout-sync" | "after-pre-inventories" |
+  `after-divergent-diff:${entryId}` |
   "after-prepared-generation" | "after-event:PREPARED" |
   "after-event:MOVING" | "after-event:VERIFYING" |
   "after-event:QUARANTINED" | "before-lock-cleanup" |

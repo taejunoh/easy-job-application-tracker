@@ -1106,13 +1106,52 @@ export async function quarantineWorkspace({
 This is the first slice that publicly exports `quarantineWorkspace`. It consumes
 the internal `LAYOUT_READY` handoff, enters a live run capability with the exact
 captured filesystem source, and returns only the final `QUARANTINED` result after
-the complete durable protocol below.
+the complete durable protocol below. It adds no other public or runtime export.
+The same function has a private apply-precommit retry mode; it does not expose a
+second prepare API.
 
 - [ ] **Step 2.1: Add atomic-apply RED cases**
 
 The happy fixture contains two source copies, `node_modules`, and `.next`.
-Require deterministic pre inventories, streamed divergent patches, one
-immutable `PREPARED` generation, then this exact durable order per entry:
+Require this exact precommit order before the first source rename:
+
+```text
+closed option snapshot + true writer attestation
+-> two fresh stable discovery passes
+-> fixed-layout bootstrap/revalidation + bound run capability
+-> prove zero complete journal events and no unresolved append evidence
+-> deterministic pre inventories in manifest entry order
+-> after-pre-inventories
+-> divergent patches in manifest entry order
+-> after-divergent-diff:<entryId> after each durable patch
+-> immutable PREPARED manifest generation
+-> after-prepared-generation
+-> PREPARED { transactionId, manifestSha256 }
+-> after-event:PREPARED after append returns
+-> MOVING {}
+-> after-event:MOVING after append returns
+```
+
+The exact divergent command is one sanitized read-only child with `cwd` equal
+to the validated repository root and argv:
+
+```text
+git -c core.fsmonitor=false -c core.quotePath=true
+  diff --no-index --binary --full-index --no-color --no-ext-diff
+  --src-prefix=a/ --dst-prefix=b/ --
+  <canonicalRelative> <sourceRelative>
+```
+
+Require exit `1`; exit `0` is an integrity mismatch and a signal or any other
+exit is fatal. Stream stdout bytes without decoding or newline rewriting into a
+capability-derived mode-`0600` owned temporary using fixed memory. Enforce the
+exact inclusive safe-integer cap
+`4 * (sourceSize + canonicalSize) + 1,048,576`; drain and sanitize bounded
+stderr. Sync the temporary, publish without replacement, sync the parent, and
+revalidate post-sync identity. On retry, recompute and stream-compare exact
+bytes, digest, and mode before adopting an existing complete patch.
+
+Then require this exact durable order per entry:
 
 ```text
 MOVE_INTENT -> source/destination recheck -> rename -> payload fsync
@@ -1123,8 +1162,57 @@ MOVE_INTENT -> source/destination recheck -> rename -> payload fsync
 After all entries require `VERIFYING`, independent `moved-pass-2`, all sources
 absent, no numbered residue, then `QUARANTINED`. Assert no intermediate
 byte-identical manifest generation and no root `current` pointer before
-validation. Inject `EXDEV` and require no copy call, no unlink, preserved
-sources/evidence, and explicit recovery state.
+validation.
+
+Add retry fixtures for a kill or injected failure at every precommit seam. The
+same `quarantineWorkspace` invocation must rerun fresh discovery and may adopt
+only exact deterministic complete `pre` inventories, divergent patches, and
+the immutable PREPARED generation. Incomplete owned temporaries are removed
+only through their owning primitive's identity checks. Preserve complete
+mismatches, foreign names/files, symlinks, wrong modes, identity replacements,
+and unresolved lock/tombstone evidence and require `ERR_INTEGRITY` or
+`ERR_INDETERMINATE_JOURNAL_APPEND` as applicable. Assert no source rename before
+durable PREPARED.
+
+Seed each durable Slice 2 tip `PREPARED`, `MOVING`, `VERIFYING`, and
+`QUARANTINED`, then call `quarantineWorkspace` again. Require no filesystem or
+journal mutation and the exact frozen `QuarantineError` code/message for
+`ERR_RECOVERY_REQUIRED`. The presence of any complete PREPARED frame, not only
+the current nonterminal state, closes fresh apply. Slice 2 must not append
+`RECOVERY_REQUIRED`; that belongs to Slice 3.
+
+Inject rename `EXDEV` and require fresh checks that the source identity is
+unchanged and destination remains absent, then the exact frozen `ERR_EXDEV`
+error, no copy, no unlink, and no later mutation. Change either side after
+`EXDEV` and require `ERR_INTEGRITY`. Inject deterministic failures after durable
+PREPARED and require the current durable tip plus every existing lock/tombstone
+artifact to remain unchanged. Inject append uncertainty at every event and
+require the exact frozen `ERR_INDETERMINATE_JOURNAL_APPEND` error and no later
+mutation.
+
+For every expected error, assert the frozen closed `QuarantineError` prototype,
+the exact non-enumerable own keys `stack`, `message`, `name`, and `code`, the
+fixed code-mapped message, no cause/dynamic evidence, and `{}` JSON. Hook
+rejections remain untranslated and are asserted at their documented durable
+seams.
+
+Record hook order and call count. Require every ordinary
+`after-event:PREPARED`, `after-event:MOVING`, `after-event:MOVE_INTENT:<id>`,
+`after-event:MOVED:<id>`, and `after-event:VERIFYING` callback to occur after
+its append primitive has returned and removed its owned lock. For final
+`QUARANTINED`, require `after-event:QUARANTINED` exactly once followed by
+`before-lock-cleanup`, both after replay can observe the complete durable frame
+and while the owned lock still exists. Kill at either final hook and require the
+durable tip and lock evidence to remain.
+
+Assert exact journal payload schemas (`PREPARED` has only `transactionId` and
+`manifestSha256`; lifecycle events have `{}`; intent/completion events have
+only the documented ID and inventory summary), exact immutable manifest bytes,
+exact inventory summaries, and the exact closed success result. Diff fixtures
+cover text with and without final newline, paths requiring Git quoting, binary
+output, cap and cap-plus-one, exit `0`, exit `1`, signal, bounded stderr, partial
+stream failure, no-replace collision, post-sync identity swap, and exact retry
+adoption. Tests must observe fixed memory rather than buffer complete bodies.
 
 - [ ] **Step 2.2: Verify RED**
 
@@ -1136,8 +1224,24 @@ npm test -- --runInBand __tests__/scripts/quarantine-transaction.test.ts
 
 Use runtime entry plans containing only the validated manifest entry plus
 ephemeral source/destination locations. All persistent references are entry IDs
-and summaries. Hold or recover the journal lock through the durable transition;
-on an indeterminate append, stop before the next destructive seam. Return only:
+and summaries. Implement private precommit reconciliation inside the transaction
+module, using existing capability-derived inventory, manifest, and temporary
+publication primitives; do not add a runtime export or facade name.
+
+Use a fresh `withJournalLock` boundary for each append. Do not claim or attempt
+to hold one journal lock across discovery, diff, inventory, rename, or tree-sync
+work. For every normal non-final event, invoke its public `after-event` hook only
+after the append primitive returns and its successful lock cleanup is complete.
+On an indeterminate append, map to `ERR_INDETERMINATE_JOURNAL_APPEND` and stop
+before the next seam. A deterministic post-PREPARED error preserves the tip and
+all existing lock evidence and does not synthesize a recovery event.
+
+For the final `QUARANTINED` append only, pass a private journal fault hook that
+invokes public `after-event:QUARANTINED` and then `before-lock-cleanup` after the
+frame and journal parent are durable but before owned-lock cleanup. Do not invoke
+`after-event:QUARANTINED` again after append returns.
+
+Return only:
 
 ```js
 { transactionId, status: "QUARANTINED", movedEntries, manifestSha256 }
