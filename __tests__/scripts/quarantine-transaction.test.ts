@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -119,6 +120,33 @@ function installGitOutputOverride(
   return `${bin}:${process.env.PATH ?? ""}`;
 }
 
+function installGitDiffOverride(
+  f: Fixture,
+  label: string,
+  stdout: Buffer,
+  { stderr = Buffer.alloc(0), exit = 1 } = {},
+) {
+  const bin = join(f.base, `git-diff-override-${label}`);
+  privateDirectory(bin);
+  const stdoutPath = join(bin, "stdout.bin");
+  const stderrPath = join(bin, "stderr.bin");
+  writeFileSync(stdoutPath, stdout);
+  writeFileSync(stderrPath, stderr);
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const expected = [
+    "-c", "core.fsmonitor=false", "-c", "core.quotePath=true", "diff", "--no-index",
+    "--binary", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv",
+    "--src-prefix=a/", "--dst-prefix=b/", "--", f.canonicalPath!, f.copyPath!,
+  ].join(" ");
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\nif [ "$*" = ${JSON.stringify(expected)} ]; then /bin/cat ${JSON.stringify(stdoutPath)}; /bin/cat ${JSON.stringify(stderrPath)} >&2; exit ${exit}; fi\nexec ${JSON.stringify(realGit)} "$@"\n`,
+    { mode: 0o700 },
+  );
+  chmodSync(join(bin, "git"), 0o700);
+  return `${bin}:${process.env.PATH ?? ""}`;
+}
+
 function fixture({
   divergent = false,
   repoName = "repo",
@@ -226,6 +254,7 @@ type WorkerResult = {
   firstCode?: string;
   runRootOpenAttempts?: number;
   hookCalls?: number;
+  unlinkCalls?: number;
   thrownUndefined?: boolean;
   codeReads?: number;
   closeGetterReads?: number;
@@ -333,10 +362,14 @@ try {
       Reflect.set(result, "sourceCopies", -1) === false && JSON.stringify(result) === before;
     process.stdout.write(JSON.stringify({ ok: true, result, shape: resultShape }));
   } else if (operation === "apply") {
+    const { stopPhase, ...applyRequest } = request;
     const phases = [];
     const result = await transaction.quarantineWorkspace({
-      ...request,
-      faultHook(phase) { phases.push(phase); },
+      ...applyRequest,
+      faultHook(phase) {
+        phases.push(phase);
+        if (phase === stopPhase) throw new RangeError("stop at requested phase");
+      },
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "apply-stop-after-layout") {
@@ -348,6 +381,26 @@ try {
         faultHook(phase) {
           phases.push(phase);
           if (phase === "after-layout-sync") throw new RangeError("stop after layout");
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      phases,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-stop") {
+    const { stopPhase, ...applyRequest } = request;
+    const phases = [];
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        faultHook(phase) {
+          phases.push(phase);
+          if (phase === stopPhase) throw new RangeError("stop at requested phase");
         },
       });
     } catch (error) {
@@ -380,6 +433,171 @@ try {
       });
     });
     process.stdout.write(JSON.stringify({ ok: true }));
+  } else if (operation === "apply-rename-exdev") {
+    const { variant, ...applyRequest } = request;
+    let injected = false;
+    let unlinkCalls = 0;
+    const adapter = {
+      ...fsPromises,
+      async rename(source, destination) {
+        if (!injected && source === join(request.repoRoot, ".next")) {
+          injected = true;
+          if (variant === "source-changed") {
+            await fsPromises.rename(source, source + ".changed");
+          } else if (variant === "destination-created") {
+            mkdirSync(destination, { mode: 0o700 });
+          }
+          const error = new Error("cross-device");
+          error.code = "EXDEV";
+          throw error;
+        }
+        return fsPromises.rename(source, destination);
+      },
+      async unlink(path) {
+        if (injected) unlinkCalls += 1;
+        return fsPromises.unlink(path);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      unlinkCalls,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-lock-cleanup-failure") {
+    const { failCleanupAt = 1, ...applyRequest } = request;
+    let cleanupCalls = 0;
+    const adapter = {
+      ...fsPromises,
+      async rm(path, ...args) {
+        if (path.endsWith("/journal.lock")) {
+          cleanupCalls += 1;
+        }
+        if (path.endsWith("/journal.lock") && cleanupCalls === failCleanupAt) {
+          throw new Error("injected lock cleanup failure");
+        }
+        return fsPromises.rm(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-mutate-at-hook") {
+    const { mutatePhase, mutation, ...applyRequest } = request;
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        faultHook(phase) {
+          if (phase !== mutatePhase) return;
+          if (mutation === "payload") {
+            writeFileSync(join(request.quarantineRoot, request.transactionId,
+              "payload/generated/.next/build"), "mutated");
+          } else if (mutation === "source") {
+            writeFileSync(join(request.repoRoot, "notes 2.txt"), "recreated");
+          } else if (mutation === "status") {
+            writeFileSync(join(request.repoRoot, "unexpected.txt"), "unexpected");
+          }
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-temp-reappear") {
+    let replaced = false;
+    const adapter = {
+      ...fsPromises,
+      async unlink(path) {
+        await fsPromises.unlink(path);
+        if (!replaced && path.endsWith("/.copy-0001.tmp")) {
+          replaced = true;
+          writeFileSync(path, "foreign-reappeared", { mode: 0o600 });
+          chmodSync(path, 0o600);
+        }
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...request, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-temp-cleanup-seam") {
+    const { variant, ...applyRequest } = request;
+    let tempUnlinked = false;
+    let injected = false;
+    const adapter = {
+      ...fsPromises,
+      async unlink(path) {
+        const result = await fsPromises.unlink(path);
+        if (path.endsWith("/.copy-0001.tmp")) tempUnlinked = true;
+        return result;
+      },
+      async open(path, ...args) {
+        if (tempUnlinked && !injected && path.endsWith("/divergent-diffs")) {
+          injected = true;
+          if (variant === "parent-sync-failure") {
+            throw new Error("injected cleanup parent sync failure");
+          }
+          const realHandle = await fsPromises.open(path, ...args);
+          let wrapper;
+          wrapper = {
+            async sync() {
+              await realHandle.sync();
+              const final = join(path, "copy-0001.patch");
+              renameSync(final, final + ".owned");
+              writeFileSync(final, "foreign-final", { mode: 0o600 });
+              chmodSync(final, 0o600);
+            },
+            async close() { return realHandle.close(); },
+          };
+          return wrapper;
+        }
+        return fsPromises.open(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
   } else if (operation === "getter") {
     let reads = 0;
     const options = { ...request };
@@ -1066,6 +1284,621 @@ describe("quarantine transaction Slice 1", () => {
     expect(apply.phases).toEqual(["after-layout-sync"]);
     expect(apply.error).toMatchObject({ name: "RangeError", message: "stop after layout" });
     expect(readFileSync(preInventory, "utf8")).toBe("preserve");
+    expectWorkerError(
+      invoke("apply", request, {}, 30_000),
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(readFileSync(preInventory, "utf8")).toBe("preserve");
+  });
+
+  it("publishes exact pre inventories and one immutable generation before durable PREPARED", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const transactionId = "tx-prepared-boundary";
+    const worker = invoke("apply-stop", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+      stopPhase: "after-event:PREPARED",
+    }, {}, 30_000);
+    expect(worker.ok).toBe(false);
+    expect(worker.phases).toEqual([
+      "after-layout-sync",
+      "after-pre-inventories",
+      "after-prepared-generation",
+      "after-event:PREPARED",
+    ]);
+    expect(worker.error).toMatchObject({ name: "RangeError", message: "stop at requested phase" });
+    const runRoot = join(f.quarantineRoot, transactionId);
+    for (const id of ["generated-next", "generated-node-modules", "copy-0001"]) {
+      const path = join(runRoot, "inventories/pre", `${id}.jsonl`);
+      expect(statSync(path).mode & 0o7777).toBe(0o600);
+      expect(readFileSync(path).length).toBeGreaterThan(0);
+    }
+    const generations = readdirSync(join(runRoot, "manifests"));
+    expect(generations).toHaveLength(1);
+    expect(generations[0]).toMatch(/^[0-9a-f]{64}\.json$/u);
+    expect(statSync(join(runRoot, "journal.log")).mode & 0o7777).toBe(0o600);
+    expect(existsSync(join(f.repoRoot, ".next"))).toBe(true);
+    expect(existsSync(join(f.repoRoot, "node_modules"))).toBe(true);
+    expect(existsSync(join(f.repoRoot, "notes 2.txt"))).toBe(true);
+  });
+
+  it("streams and durably publishes each divergent patch before PREPARED", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const transactionId = "tx-divergent-patch";
+    const worker = invoke("apply-stop", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+      stopPhase: "after-divergent-diff:copy-0001",
+    }, {}, 30_000);
+    expect(worker.ok).toBe(false);
+    expect(worker.phases).toEqual([
+      "after-layout-sync",
+      "after-pre-inventories",
+      "after-divergent-diff:copy-0001",
+    ]);
+    expect(worker.error).toMatchObject({ name: "RangeError", message: "stop at requested phase" });
+    const diffRoot = join(f.quarantineRoot, transactionId, "divergent-diffs");
+    expect(statSync(join(diffRoot, "copy-0001.patch")).mode & 0o7777).toBe(0o600);
+    expect(readFileSync(join(diffRoot, "copy-0001.patch")).length).toBeGreaterThan(0);
+    expect(existsSync(join(diffRoot, ".copy-0001.tmp"))).toBe(false);
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+  });
+
+  it.each([
+    ["cap", 0, 1, true],
+    ["cap-plus-one", 1, 1, false],
+    ["stderr-limit", -1, 1, true],
+    ["stderr-overflow", -2, 1, false],
+    ["exit-zero", -1, 0, false],
+  ] as const)(
+    "bounds and settles the divergent Git child case %s",
+    (label, capDelta, exit, succeeds) => {
+      const f = fixture({ divergent: true });
+      bases.push(f.base);
+      const cap = 4 * (
+        statSync(join(f.repoRoot, f.canonicalPath!)).size +
+        statSync(join(f.repoRoot, f.copyPath!)).size
+      ) + 1_048_576;
+      const stdout = capDelta >= 0
+        ? Buffer.alloc(cap + capDelta, 0x61)
+        : Buffer.from("canonical patch bytes\n");
+      const stderr = capDelta === -1
+        ? Buffer.alloc(64 * 1024, 0x65)
+        : capDelta === -2
+          ? Buffer.alloc(64 * 1024 + 1, 0x65)
+          : Buffer.alloc(0);
+      const path = installGitDiffOverride(f, label, stdout, { stderr, exit });
+      const worker = invoke("apply", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId: `tx-diff-${label}`,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      }, { PATH: path }, 30_000);
+      if (succeeds) {
+        if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+        expect(worker.result).toMatchObject({ status: "QUARANTINED" });
+      } else {
+        expectWorkerError(
+          worker,
+          "ERR_INTEGRITY",
+          "Quarantine evidence failed integrity validation.",
+        );
+      }
+    },
+  );
+
+  it("keeps hostile external-diff and textconv drivers disabled", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const sentinel = join(f.base, "hostile-diff-ran");
+    const driver = join(f.base, "hostile-diff.sh");
+    writeFileSync(driver, `#!/bin/sh\nprintf invoked > ${JSON.stringify(sentinel)}\nexit 99\n`, {
+      mode: 0o700,
+    });
+    chmodSync(driver, 0o700);
+    writeFileSync(join(f.repoRoot, ".gitattributes"), "*.txt diff=hostile\n");
+    git(f.repoRoot, "add", ".gitattributes");
+    git(f.repoRoot, "commit", "-m", "hostile diff attributes");
+    git(f.repoRoot, "config", "diff.external", driver);
+    git(f.repoRoot, "config", "diff.hostile.textconv", driver);
+    f.head = git(f.repoRoot, "rev-parse", "HEAD");
+    const worker = invoke("apply", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-hostile-diff",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, {}, 30_000);
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    expect(worker.result).toMatchObject({ status: "QUARANTINED" });
+    expect(existsSync(sentinel)).toBe(false);
+  });
+
+  it.each([
+    ["zero-byte", Buffer.alloc(0)],
+    ["binary", Buffer.from([0, 1, 2, 255])],
+    ["no-final-newline", Buffer.from("older content")],
+  ] as const)("publishes an actual Git patch with a %s source side", (label, body) => {
+    const f = fixture();
+    bases.push(f.base);
+    writeFileSync(join(f.repoRoot, f.copyPath!), body);
+    const worker = invoke("apply", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: `tx-patch-${label}`,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, {}, 30_000);
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    const patch = readFileSync(join(
+      f.quarantineRoot,
+      `tx-patch-${label}`,
+      "divergent-diffs/copy-0001.patch",
+    ));
+    expect(patch.length).toBeGreaterThan(0);
+  });
+
+  it("durably records intent, rename syncs, pass-1 inventory, and MOVED per entry", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const transactionId = "tx-first-moved";
+    const worker = invoke("apply-stop", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+      stopPhase: "after-event:MOVED:generated-next",
+    }, {}, 30_000);
+    expect(worker.ok).toBe(false);
+    expect(worker.phases).toEqual([
+      "after-layout-sync",
+      "after-pre-inventories",
+      "after-prepared-generation",
+      "after-event:PREPARED",
+      "after-event:MOVING",
+      "after-event:MOVE_INTENT:generated-next",
+      "after-rename:generated-next",
+      "after-payload-sync:generated-next",
+      "after-destination-parent-sync:generated-next",
+      "after-source-parent-sync:generated-next",
+      "after-inventory:moved-pass-1:generated-next",
+      "after-event:MOVED:generated-next",
+    ]);
+    expect(worker.error).toMatchObject({ name: "RangeError", message: "stop at requested phase" });
+    const runRoot = join(f.quarantineRoot, transactionId);
+    expect(existsSync(join(f.repoRoot, ".next"))).toBe(false);
+    expect(existsSync(join(runRoot, "payload/generated/.next"))).toBe(true);
+    expect(existsSync(join(f.repoRoot, "node_modules"))).toBe(true);
+    expect(existsSync(join(f.repoRoot, "notes 2.txt"))).toBe(true);
+    expect(statSync(join(
+      runRoot,
+      "inventories/moved-pass-1/generated-next.jsonl",
+    )).mode & 0o7777).toBe(0o600);
+  });
+
+  it.each([false, true])(
+    "recomputes and adopts exact precommit finals on retry (divergent=%s)",
+    (divergent) => {
+      const f = fixture({ divergent });
+      bases.push(f.base);
+      const transactionId = divergent ? "tx-retry-divergent" : "tx-retry-generation";
+      const request = {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      };
+      const first = invoke("apply-stop", {
+        ...request,
+        stopPhase: divergent
+          ? "after-divergent-diff:copy-0001"
+          : "after-prepared-generation",
+      }, {}, 30_000);
+      expect(first.ok).toBe(false);
+      expect(first.error).toMatchObject({ name: "RangeError" });
+      const second = invoke("apply", request, {}, 30_000);
+      if (!second.ok) throw new Error(JSON.stringify(second.error));
+      expect(second.result).toMatchObject({
+        transactionId,
+        status: "QUARANTINED",
+        movedEntries: 3,
+      });
+    },
+  );
+
+  it("adopts all exact pre inventories after the inventory publication seam", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const transactionId = "tx-retry-inventories";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const first = invoke("apply-stop", {
+      ...request,
+      stopPhase: "after-pre-inventories",
+    }, {}, 30_000);
+    expect(first.ok).toBe(false);
+    const second = invoke("apply", request, {}, 30_000);
+    if (!second.ok) throw new Error(JSON.stringify(second.error));
+    expect(second.result).toMatchObject({ status: "QUARANTINED", movedEntries: 3 });
+  });
+
+  it.each(["after-event:QUARANTINED", "before-lock-cleanup"])(
+    "maps final in-lock hook rejection at %s to indeterminate and preserves evidence",
+    (stopPhase) => {
+    const f = fixture();
+    bases.push(f.base);
+    const transactionId = "tx-final-hook";
+    const worker = invoke("apply-stop", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+      stopPhase,
+    }, {}, 30_000);
+    expectWorkerError(
+      worker,
+      "ERR_INDETERMINATE_JOURNAL_APPEND",
+      "Journal durability could not be determined.",
+    );
+    expect(worker.phases?.at(-1)).toBe(stopPhase);
+    const runRoot = join(f.quarantineRoot, transactionId);
+    expect(existsSync(join(runRoot, "journal.log"))).toBe(true);
+    expect(existsSync(join(runRoot, "journal.lock"))).toBe(true);
+    },
+  );
+
+  it.each([
+    ["unchanged", "ERR_EXDEV"],
+    ["source-changed", "ERR_INTEGRITY"],
+    ["destination-created", "ERR_INTEGRITY"],
+  ] as const)("classifies rename EXDEV only after fresh evidence checks (%s)", (variant, code) => {
+    const f = fixture();
+    bases.push(f.base);
+    const worker = invoke("apply-rename-exdev", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: `tx-exdev-${variant}`,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+      variant,
+    }, {}, 30_000);
+    expectWorkerError(
+      worker,
+      code,
+      code === "ERR_EXDEV"
+        ? "Repository and quarantine must be on the same filesystem."
+        : "Quarantine evidence failed integrity validation.",
+    );
+    expect(worker.unlinkCalls).toBe(0);
+  });
+
+  it.each([1, 2, 3])(
+    "maps ordinary append lock-cleanup failure %i to indeterminate and stops before rename",
+    (failCleanupAt) => {
+    const f = fixture();
+    bases.push(f.base);
+    const transactionId = `tx-lock-cleanup-${failCleanupAt}`;
+    const worker = invoke("apply-lock-cleanup-failure", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+      failCleanupAt,
+    }, {}, 30_000);
+    expectWorkerError(
+      worker,
+      "ERR_INDETERMINATE_JOURNAL_APPEND",
+      "Journal durability could not be determined.",
+    );
+    expect(existsSync(join(f.repoRoot, ".next"))).toBe(true);
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.lock"))).toBe(true);
+    },
+  );
+
+  it.each([
+    ["after-source-parent-sync:generated-next", "payload"],
+    ["after-event:VERIFYING", "payload"],
+    ["after-inventory:moved-pass-2:copy-0001", "source"],
+    ["after-inventory:moved-pass-2:copy-0001", "status"],
+  ] as const)("fails closed on final verification drift at %s (%s)", (mutatePhase, mutation) => {
+    const f = fixture();
+    bases.push(f.base);
+    const worker = invoke("apply-mutate-at-hook", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: `tx-verify-${mutation}`,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+      mutatePhase,
+      mutation,
+    }, {}, 30_000);
+    expectWorkerError(
+      worker,
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+  });
+
+  it("preserves and rejects a wrong-mode adopted divergent final", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const transactionId = "tx-wrong-mode-patch";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const first = invoke("apply-stop", {
+      ...request,
+      stopPhase: "after-divergent-diff:copy-0001",
+    }, {}, 30_000);
+    expect(first.ok).toBe(false);
+    const final = join(f.quarantineRoot, transactionId, "divergent-diffs/copy-0001.patch");
+    chmodSync(final, 0o644);
+    expectWorkerError(
+      invoke("apply", request, {}, 30_000),
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(readFileSync(final).length).toBeGreaterThan(0);
+    expect(statSync(final).mode & 0o7777).toBe(0o644);
+  });
+
+  it.each(["temp-only", "final-plus-temp"] as const)(
+    "recomputes and adopts an exact preexisting divergent %s artifact set",
+    (variant) => {
+      const f = fixture({ divergent: true });
+      bases.push(f.base);
+      const transactionId = `tx-${variant}`;
+      const request = {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      };
+      const prepared = invoke("prepare-raw", request, {}, 30_000);
+      if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+      const diff = spawnSync("git", [
+        "-c", "core.fsmonitor=false",
+        "-c", "core.quotePath=true",
+        "diff", "--no-index", "--binary", "--full-index", "--no-color",
+        "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--",
+        f.canonicalPath!, f.copyPath!,
+      ], { cwd: f.repoRoot });
+      expect(diff.status).toBe(1);
+      const root = join(f.quarantineRoot, transactionId, "divergent-diffs");
+      const temporary = join(root, ".copy-0001.tmp");
+      const final = join(root, "copy-0001.patch");
+      writeFileSync(temporary, diff.stdout, { mode: 0o600 });
+      chmodSync(temporary, 0o600);
+      if (variant === "final-plus-temp") linkSync(temporary, final);
+      const applied = invoke("apply", request, {}, 30_000);
+      if (!applied.ok) throw new Error(JSON.stringify(applied.error));
+      expect(applied.result).toMatchObject({ status: "QUARANTINED" });
+      expect(readFileSync(final)).toEqual(diff.stdout);
+      expect(existsSync(temporary)).toBe(false);
+    },
+  );
+
+  it("preserves a mismatching preexisting divergent temporary", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const transactionId = "tx-mismatch-temp";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const prepared = invoke("prepare-raw", request, {}, 30_000);
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    const temporary = join(
+      f.quarantineRoot,
+      transactionId,
+      "divergent-diffs/.copy-0001.tmp",
+    );
+    writeFileSync(temporary, "foreign", { mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    expectWorkerError(
+      invoke("apply", request, {}, 30_000),
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(readFileSync(temporary, "utf8")).toBe("foreign");
+  });
+
+  it("fails closed and preserves a divergent temporary that reappears after cleanup", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const transactionId = "tx-temp-reappears";
+    const worker = invoke("apply-temp-reappear", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, {}, 30_000);
+    expectWorkerError(
+      worker,
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    const root = join(f.quarantineRoot, transactionId, "divergent-diffs");
+    expect(readFileSync(join(root, ".copy-0001.tmp"), "utf8")).toBe("foreign-reappeared");
+    expect(existsSync(join(root, "copy-0001.patch"))).toBe(true);
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+  });
+
+  it.each(["parent-sync-failure", "final-swap"] as const)(
+    "does not advance after divergent temporary cleanup seam %s",
+    (variant) => {
+      const f = fixture({ divergent: true });
+      bases.push(f.base);
+      const transactionId = `tx-cleanup-${variant}`;
+      const worker = invoke("apply-temp-cleanup-seam", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+        variant,
+      }, {}, 30_000);
+      expectWorkerError(
+        worker,
+        "ERR_INTEGRITY",
+        "Quarantine evidence failed integrity validation.",
+      );
+      const root = join(f.quarantineRoot, transactionId, "divergent-diffs");
+      expect(existsSync(join(root, "copy-0001.patch"))).toBe(true);
+      expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+      if (variant === "final-swap") {
+        expect(readFileSync(join(root, "copy-0001.patch"), "utf8")).toBe("foreign-final");
+        expect(existsSync(join(root, "copy-0001.patch.owned"))).toBe(true);
+      }
+    },
+  );
+
+  it("preserves and rejects a syntactically valid but wrong manifest generation", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const transactionId = "tx-wrong-generation";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const prepared = invoke("prepare-raw", request, {}, 30_000);
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    const generation = join(
+      f.quarantineRoot,
+      transactionId,
+      "manifests",
+      `${"0".repeat(64)}.json`,
+    );
+    writeFileSync(generation, "{}", { mode: 0o600 });
+    chmodSync(generation, 0o600);
+    expectWorkerError(
+      invoke("apply", request, {}, 30_000),
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(readFileSync(generation, "utf8")).toBe("{}");
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+  });
+
+  it("rejects an undiscovered but syntactically valid precommit entry before publication", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const transactionId = "tx-undiscovered-precommit";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const prepared = invoke("prepare-raw", request, {}, 30_000);
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    const foreign = join(
+      f.quarantineRoot,
+      transactionId,
+      "inventories/pre/copy-9999.jsonl",
+    );
+    writeFileSync(foreign, "foreign", { mode: 0o600 });
+    chmodSync(foreign, 0o600);
+    expectWorkerError(
+      invoke("apply", request, {}, 30_000),
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(readFileSync(foreign, "utf8")).toBe("foreign");
+    expect(existsSync(join(
+      f.quarantineRoot,
+      transactionId,
+      "inventories/pre/copy-0001.jsonl",
+    ))).toBe(false);
   });
 
   it("returns the exact body-free INSPECTED summary without writing quarantine", async () => {

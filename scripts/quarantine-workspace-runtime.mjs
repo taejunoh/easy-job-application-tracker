@@ -28,8 +28,27 @@ import {
 } from "node:path";
 
 import { canonicalPathForNumberedCopy } from "./quarantine-path-policy.mjs";
-import { replayJournal } from "./quarantine-journal.mjs";
-import { withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
+import {
+  appendJournalRecord,
+  IndeterminateJournalAppendError,
+  replayJournal,
+  withJournalLock,
+} from "./quarantine-journal.mjs";
+import {
+  compareInventorySummary,
+  fsyncTree,
+  writeInventoryJsonl,
+} from "./quarantine-inventory.mjs";
+import {
+  buildValidatedManifest,
+  writeManifestGeneration,
+} from "./quarantine-manifest.mjs";
+import {
+  deriveRunPath,
+  revalidateRunCapability,
+  withQuarantineRunCapability,
+} from "./quarantine-run-capability.mjs";
+import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
 
 const FS_METHODS = Object.freeze([
   "lstat",
@@ -1253,7 +1272,7 @@ async function prepareWorkspaceCore(input, mode, hookState) {
       throw error;
     }
   }
-  return record([
+  const handoff = record([
     ["status", "LAYOUT_READY"],
     ["transactionId", options.transactionId],
     ["createdAt", options.createdAt],
@@ -1265,12 +1284,811 @@ async function prepareWorkspaceCore(input, mode, hookState) {
     ["entries", discovery.entries],
     ["fsSource", fsSource],
   ]);
+  return { environment, handoff, options };
+}
+
+async function invokeApplyHook(faultHook, hookState, phase) {
+  if (faultHook === undefined) return;
+  try {
+    await faultHook(phase);
+  } catch (error) {
+    hookState.rejected = true;
+    throw error;
+  }
+}
+
+function workspaceEntryPath(repoRoot, entry) {
+  return resolve(repoRoot, ...entry.relativePath.split("/"));
+}
+
+async function closeFileHandle(handle, primaryError) {
+  let closeError;
+  try {
+    await handle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (primaryError !== undefined) {
+    if (closeError === undefined) throw primaryError;
+    throw new AggregateError([primaryError, closeError], "file operation and close both failed");
+  }
+  if (closeError !== undefined) throw closeError;
+}
+
+async function syncFile(path, fsApi) {
+  const handle = await fsApi.open(path, "r");
+  let primaryError;
+  try {
+    await handle.sync();
+  } catch (error) {
+    primaryError = error;
+  }
+  await closeFileHandle(handle, primaryError);
+}
+
+function sameFileIdentity(left, right) {
+  return Number(left.dev) === Number(right.dev) && Number(left.ino) === Number(right.ino);
+}
+
+function assertPrivateRegularFile(stats) {
+  if (
+    stats.isSymbolicLink() || !stats.isFile() || modeOf(stats) !== PRIVATE_FILE_MODE ||
+    !safeInteger(Number(stats.size))
+  ) fail("ERR_INTEGRITY");
+}
+
+async function comparePrivateFiles(leftPath, rightPath, fsApi) {
+  const left = await fsApi.open(leftPath, "r");
+  const right = await fsApi.open(rightPath, "r");
+  let primaryError;
+  let equal = false;
+  try {
+    const leftStats = await left.stat();
+    const rightStats = await right.stat();
+    assertPrivateRegularFile(leftStats);
+    assertPrivateRegularFile(rightStats);
+    if (Number(leftStats.size) === Number(rightStats.size)) {
+      equal = true;
+      let position = 0;
+      const leftBuffer = Buffer.allocUnsafe(64 * 1024);
+      const rightBuffer = Buffer.allocUnsafe(64 * 1024);
+      while (position < Number(leftStats.size)) {
+        const length = Math.min(leftBuffer.length, Number(leftStats.size) - position);
+        const [leftRead, rightRead] = await Promise.all([
+          left.read(leftBuffer, 0, length, position),
+          right.read(rightBuffer, 0, length, position),
+        ]);
+        if (
+          leftRead.bytesRead !== length || rightRead.bytesRead !== length ||
+          !leftBuffer.subarray(0, length).equals(rightBuffer.subarray(0, length))
+        ) {
+          equal = false;
+          break;
+        }
+        position += length;
+      }
+    }
+  } catch (error) {
+    primaryError = error;
+  }
+  try {
+    await closeFileHandle(left, primaryError);
+    primaryError = undefined;
+  } catch (error) {
+    primaryError = error;
+  }
+  try {
+    await closeFileHandle(right, primaryError);
+    primaryError = undefined;
+  } catch (error) {
+    primaryError = error;
+  }
+  if (primaryError !== undefined) throw primaryError;
+  return equal;
+}
+
+async function removeOwnedDiffTemporary({ capability, path, id, identity, fsApi }) {
+  const current = await fsApi.lstat(path);
+  if (
+    current.isSymbolicLink() || !current.isFile() || modeOf(current) !== PRIVATE_FILE_MODE ||
+    !sameFileIdentity(current, identity)
+  ) fail("ERR_INTEGRITY");
+  await revalidateRunCapability(capability, {
+    purpose: "divergent-diff-temp",
+    id,
+    boundary: "before-mutation",
+  });
+  await fsApi.unlink(path);
+  await syncDirectory(dirname(path), fsApi);
+  await revalidateRunCapability(capability, {
+    purpose: "divergent-diff-temp",
+    id,
+    boundary: "after-sync",
+  });
+  await assertPathMissing(path, fsApi);
+}
+
+function divergentDiffArgs(entry) {
+  return [
+    "-c", "core.fsmonitor=false",
+    "-c", "core.quotePath=true",
+    "diff", "--no-index", "--binary", "--full-index", "--no-color",
+    "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--",
+    entry.canonicalRelativePath,
+    entry.relativePath,
+  ];
+}
+
+async function compareCanonicalPatchToFile({
+  entry,
+  repoRoot,
+  environment,
+  path,
+  identity,
+  cap,
+  fsApi,
+}) {
+  const handle = await fsApi.open(path, "r");
+  let primaryError;
+  let matches = true;
+  try {
+    const opened = await handle.stat();
+    assertPrivateRegularFile(opened);
+    if (!sameFileIdentity(opened, identity) || Number(opened.size) !== Number(identity.size)) {
+      fail("ERR_INTEGRITY");
+    }
+    const child = spawn("git", divergentDiffArgs(entry), {
+      cwd: repoRoot,
+      env: childGitEnvironment(environment),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let invalid = false;
+    let stderrBytes = 0;
+    let spawnError;
+    const terminate = () => {
+      if (child.killed) return;
+      try { child.kill("SIGKILL"); } catch { invalid = true; }
+    };
+    child.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > STDERR_LIMIT) { invalid = true; terminate(); }
+    });
+    child.stderr.on("error", () => { invalid = true; terminate(); });
+    child.once("error", (error) => { spawnError = error; });
+    const closed = new Promise((resolveClose) => {
+      child.once("close", (code, signal) => resolveClose({ code, signal }));
+    });
+    let position = 0;
+    try {
+      for await (const chunk of child.stdout) {
+        position += chunk.length;
+        if (position > cap) { invalid = true; terminate(); continue; }
+        const expected = Buffer.allocUnsafe(chunk.length);
+        const read = await handle.read(expected, 0, chunk.length, position - chunk.length);
+        if (read.bytesRead !== chunk.length || !expected.equals(chunk)) matches = false;
+      }
+    } catch {
+      invalid = true;
+      terminate();
+    }
+    const outcome = await closed;
+    if (
+      invalid || spawnError !== undefined || outcome.signal !== null || outcome.code !== 1 ||
+      position !== Number(opened.size)
+    ) fail("ERR_INTEGRITY");
+  } catch (error) {
+    primaryError = error;
+  }
+  await closeFileHandle(handle, primaryError);
+  const retained = await fsApi.lstat(path);
+  if (
+    !sameFileIdentity(identity, retained) || Number(identity.size) !== Number(retained.size) ||
+    modeOf(retained) !== PRIVATE_FILE_MODE
+  ) fail("ERR_INTEGRITY");
+  if (!matches) fail("ERR_INTEGRITY");
+}
+
+async function adoptPreexistingDivergentTemporary({
+  capability,
+  entry,
+  repoRoot,
+  environment,
+  temporaryPath,
+  finalPath,
+  cap,
+  fsApi,
+}) {
+  const temporary = await fsApi.lstat(temporaryPath);
+  assertPrivateRegularFile(temporary);
+  await compareCanonicalPatchToFile({
+    entry,
+    repoRoot,
+    environment,
+    path: temporaryPath,
+    identity: temporary,
+    cap,
+    fsApi,
+  });
+  const beforeLink = await fsApi.lstat(temporaryPath);
+  if (
+    !sameFileIdentity(temporary, beforeLink) ||
+    Number(temporary.size) !== Number(beforeLink.size) ||
+    modeOf(beforeLink) !== PRIVATE_FILE_MODE
+  ) fail("ERR_INTEGRITY");
+  let final;
+  try {
+    final = await fsApi.lstat(finalPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (final === undefined) {
+    await revalidateRunCapability(capability, {
+      purpose: "divergent-diff",
+      id: entry.id,
+      boundary: "before-mutation",
+    });
+    await fsApi.link(temporaryPath, finalPath);
+    final = await fsApi.lstat(finalPath);
+  }
+  assertPrivateRegularFile(final);
+  if (
+    !sameFileIdentity(temporary, final) || Number(temporary.size) !== Number(final.size)
+  ) fail("ERR_INTEGRITY");
+  await syncFile(finalPath, fsApi);
+  const tempBeforeParent = await fsApi.lstat(temporaryPath);
+  const finalBeforeParent = await fsApi.lstat(finalPath);
+  if (
+    !sameFileIdentity(temporary, tempBeforeParent) ||
+    !sameFileIdentity(temporary, finalBeforeParent)
+  ) fail("ERR_INTEGRITY");
+  await syncDirectory(dirname(finalPath), fsApi);
+  await revalidateRunCapability(capability, {
+    purpose: "divergent-diff",
+    id: entry.id,
+    boundary: "after-sync",
+  });
+  const durableTemporary = await fsApi.lstat(temporaryPath);
+  const durableFinal = await fsApi.lstat(finalPath);
+  if (
+    !sameFileIdentity(temporary, durableTemporary) ||
+    !sameFileIdentity(temporary, durableFinal) ||
+    modeOf(durableTemporary) !== PRIVATE_FILE_MODE ||
+    modeOf(durableFinal) !== PRIVATE_FILE_MODE
+  ) fail("ERR_INTEGRITY");
+  await removeOwnedDiffTemporary({
+    capability,
+    path: temporaryPath,
+    id: entry.id,
+    identity: temporary,
+    fsApi,
+  });
+  const retained = await fsApi.lstat(finalPath);
+  if (!sameFileIdentity(temporary, retained) || modeOf(retained) !== PRIVATE_FILE_MODE) {
+    fail("ERR_INTEGRITY");
+  }
+}
+
+async function publishDivergentPatch({
+  capability,
+  entry,
+  repoRoot,
+  environment,
+  fsApi,
+}) {
+  const combinedSize = entry.sourceIdentity.size + entry.canonicalIdentity.size;
+  const cap = 4 * combinedSize + 1_048_576;
+  if (!Number.isSafeInteger(combinedSize) || combinedSize < 0 || !Number.isSafeInteger(cap)) {
+    fail("ERR_INTEGRITY");
+  }
+  const temporaryPath = deriveRunPath(capability, {
+    purpose: "divergent-diff-temp",
+    id: entry.id,
+  });
+  const finalPath = deriveRunPath(capability, { purpose: "divergent-diff", id: entry.id });
+  await revalidateRunCapability(capability, {
+    purpose: "divergent-diff-temp",
+    id: entry.id,
+    boundary: "before-mutation",
+  });
+  let handle;
+  try {
+    handle = await fsApi.open(temporaryPath, "wx", PRIVATE_FILE_MODE);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      await adoptPreexistingDivergentTemporary({
+        capability,
+        entry,
+        repoRoot,
+        environment,
+        temporaryPath,
+        finalPath,
+        cap,
+        fsApi,
+      });
+      return;
+    }
+    throw error;
+  }
+  let identity;
+  let published = false;
+  let primaryError;
+  try {
+    await handle.chmod(PRIVATE_FILE_MODE);
+    identity = await handle.stat();
+    if (identity.isSymbolicLink() || !identity.isFile() || modeOf(identity) !== PRIVATE_FILE_MODE) {
+      fail("ERR_INTEGRITY");
+    }
+    const pathIdentity = await fsApi.lstat(temporaryPath);
+    if (!sameFileIdentity(identity, pathIdentity)) fail("ERR_INTEGRITY");
+    const child = spawn("git", divergentDiffArgs(entry), {
+      cwd: repoRoot,
+      env: childGitEnvironment(environment),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderrBytes = 0;
+    let invalid = false;
+    let spawnError;
+    const terminate = () => {
+      if (child.killed) return;
+      try { child.kill("SIGKILL"); } catch { invalid = true; }
+    };
+    child.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > STDERR_LIMIT) {
+        invalid = true;
+        terminate();
+      }
+    });
+    child.stderr.on("error", () => { invalid = true; terminate(); });
+    child.once("error", (error) => { spawnError = error; });
+    const closed = new Promise((resolveClose) => {
+      child.once("close", (code, signal) => resolveClose({ code, signal }));
+    });
+    let bytes = 0;
+    try {
+      for await (const chunk of child.stdout) {
+        bytes += chunk.length;
+        if (bytes > cap) {
+          invalid = true;
+          terminate();
+          continue;
+        }
+        let offset = 0;
+        while (offset < chunk.length) {
+          const written = await handle.write(chunk, offset, chunk.length - offset, null);
+          if (!Number.isSafeInteger(written.bytesWritten) || written.bytesWritten <= 0) {
+            throw new Error("divergent patch write made no progress");
+          }
+          offset += written.bytesWritten;
+        }
+      }
+    } catch {
+      invalid = true;
+      terminate();
+    }
+    const outcome = await closed;
+    if (invalid || spawnError !== undefined || outcome.signal !== null || outcome.code !== 1) {
+      fail("ERR_INTEGRITY");
+    }
+    await handle.sync();
+    await closeFileHandle(handle);
+    handle = undefined;
+    await revalidateRunCapability(capability, {
+      purpose: "divergent-diff-temp",
+      id: entry.id,
+      boundary: "after-sync",
+    });
+    const durableTemporary = await fsApi.lstat(temporaryPath);
+    if (
+      durableTemporary.isSymbolicLink() || !durableTemporary.isFile() ||
+      modeOf(durableTemporary) !== PRIVATE_FILE_MODE ||
+      !sameFileIdentity(identity, durableTemporary) || Number(durableTemporary.size) !== bytes
+    ) fail("ERR_INTEGRITY");
+    await revalidateRunCapability(capability, {
+      purpose: "divergent-diff",
+      id: entry.id,
+      boundary: "before-mutation",
+    });
+    try {
+      await fsApi.link(temporaryPath, finalPath);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const existing = await fsApi.lstat(finalPath);
+      assertPrivateRegularFile(existing);
+      if (!(await comparePrivateFiles(temporaryPath, finalPath, fsApi))) {
+        fail("ERR_INTEGRITY");
+      }
+      const afterRead = await fsApi.lstat(finalPath);
+      if (
+        !sameFileIdentity(existing, afterRead) ||
+        Number(existing.size) !== Number(afterRead.size) ||
+        modeOf(afterRead) !== PRIVATE_FILE_MODE
+      ) fail("ERR_INTEGRITY");
+      await syncFile(finalPath, fsApi);
+      await syncDirectory(dirname(finalPath), fsApi);
+      await revalidateRunCapability(capability, {
+        purpose: "divergent-diff",
+        id: entry.id,
+        boundary: "after-sync",
+      });
+      const durableExisting = await fsApi.lstat(finalPath);
+      if (
+        !sameFileIdentity(existing, durableExisting) ||
+        Number(existing.size) !== Number(durableExisting.size) ||
+        modeOf(durableExisting) !== PRIVATE_FILE_MODE
+      ) fail("ERR_INTEGRITY");
+      await removeOwnedDiffTemporary({
+        capability,
+        path: temporaryPath,
+        id: entry.id,
+        identity,
+        fsApi,
+      });
+      const retainedExisting = await fsApi.lstat(finalPath);
+      if (
+        !sameFileIdentity(existing, retainedExisting) ||
+        Number(existing.size) !== Number(retainedExisting.size) ||
+        modeOf(retainedExisting) !== PRIVATE_FILE_MODE
+      ) fail("ERR_INTEGRITY");
+      return;
+    }
+    published = true;
+    const linked = await fsApi.lstat(finalPath);
+    if (!sameFileIdentity(identity, linked) || modeOf(linked) !== PRIVATE_FILE_MODE) {
+      fail("ERR_INTEGRITY");
+    }
+    await syncFile(finalPath, fsApi);
+    await syncDirectory(dirname(finalPath), fsApi);
+    await revalidateRunCapability(capability, {
+      purpose: "divergent-diff",
+      id: entry.id,
+      boundary: "after-sync",
+    });
+    const durableFinal = await fsApi.lstat(finalPath);
+    if (!sameFileIdentity(identity, durableFinal) || modeOf(durableFinal) !== PRIVATE_FILE_MODE) {
+      fail("ERR_INTEGRITY");
+    }
+    await removeOwnedDiffTemporary({
+      capability,
+      path: temporaryPath,
+      id: entry.id,
+      identity,
+      fsApi,
+    });
+    const retainedFinal = await fsApi.lstat(finalPath);
+    if (!sameFileIdentity(identity, retainedFinal) || modeOf(retainedFinal) !== PRIVATE_FILE_MODE) {
+      fail("ERR_INTEGRITY");
+    }
+  } catch (error) {
+    primaryError = error;
+  }
+  if (handle !== undefined) {
+    try {
+      await closeFileHandle(handle, primaryError);
+    } catch (error) {
+      primaryError = error;
+    }
+  }
+  if (primaryError !== undefined) {
+    if (!published && identity !== undefined) {
+      try {
+        await removeOwnedDiffTemporary({
+          capability,
+          path: temporaryPath,
+          id: entry.id,
+          identity,
+          fsApi,
+        });
+      } catch {
+        // Preserve cleanup uncertainty; orchestration reports integrity only.
+      }
+    }
+    throw primaryError;
+  }
+}
+
+function preparedManifest(handoff, entries) {
+  return buildValidatedManifest({
+    schemaVersion: 1,
+    transactionId: handoff.transactionId,
+    state: "PREPARED",
+    repositoryRoot: handoff.repoRoot,
+    head: handoff.head,
+    createdAt: handoff.createdAt,
+    validatedAt: null,
+    retentionDays: 4,
+    deletionRequiresConfirmation: true,
+    deleteAfter: null,
+    deletionStatus: "retained",
+    entries: entries.map(({ entry, preMoveInventory }) => entry.kind === "source-copy" ? {
+      id: entry.id,
+      kind: entry.kind,
+      relativePath: entry.relativePath,
+      canonicalRelativePath: entry.canonicalRelativePath,
+      mode: entry.sourceIdentity.mode,
+      size: entry.sourceIdentity.size,
+      sha256: entry.sourceIdentity.sha256,
+      canonicalSize: entry.canonicalIdentity.size,
+      canonicalSha256: entry.canonicalIdentity.sha256,
+      classification: entry.classification,
+      historyMatch: entry.historyMatch,
+      preMoveInventory,
+    } : {
+      id: entry.id,
+      kind: entry.kind,
+      relativePath: entry.relativePath,
+      mode: entry.sourceIdentity.mode,
+      preMoveInventory,
+    }),
+  });
+}
+
+async function appendEvent({ capability, event, payload, faultHook }) {
+  return withJournalLock({ capability }, async (heldLock) => appendJournalRecord({
+    capability,
+    heldLock,
+    event,
+    payload,
+    faultHook,
+  }));
+}
+
+async function assertEntrySourceIdentity(path, entry, fsApi) {
+  let stats;
+  try {
+    stats = await fsApi.lstat(path);
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  const expected = entry.sourceIdentity;
+  if (
+    stats.isSymbolicLink() ||
+    (entry.kind === "source-copy" ? !stats.isFile() : !stats.isDirectory()) ||
+    Number(stats.dev) !== expected.dev || Number(stats.ino) !== expected.ino ||
+    modeOf(stats) !== expected.mode ||
+    (entry.kind === "source-copy" && Number(stats.size) !== expected.size)
+  ) fail("ERR_INTEGRITY");
+  if (entry.kind === "source-copy") {
+    let sha256;
+    try {
+      sha256 = await hashFile(path, fsApi);
+    } catch {
+      fail("ERR_INTEGRITY");
+    }
+    if (sha256 !== expected.sha256) fail("ERR_INTEGRITY");
+  }
+}
+
+async function assertPathMissing(path, fsApi) {
+  try {
+    await fsApi.lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    fail("ERR_INTEGRITY");
+  }
+  fail("ERR_INTEGRITY");
+}
+
+async function movePreparedEntry({
+  capability,
+  handoff,
+  planned,
+  options,
+  hookState,
+  fsApi,
+}) {
+  const { entry, preMoveInventory } = planned;
+  const source = workspaceEntryPath(handoff.repoRoot, entry);
+  const destination = deriveRunPath(capability, { purpose: "payload", id: entry.id });
+  await appendEvent({
+    capability,
+    event: "MOVE_INTENT",
+    payload: { id: entry.id, expected: preMoveInventory },
+  });
+  await invokeApplyHook(
+    options.faultHook,
+    hookState,
+    `after-event:MOVE_INTENT:${entry.id}`,
+  );
+  await assertEntrySourceIdentity(source, entry, fsApi);
+  await assertPathMissing(destination, fsApi);
+  try {
+    await fsApi.rename(source, destination);
+  } catch (error) {
+    if (error?.code === "EXDEV") {
+      await assertEntrySourceIdentity(source, entry, fsApi);
+      await assertPathMissing(destination, fsApi);
+      fail("ERR_EXDEV");
+    }
+    throw error;
+  }
+  await invokeApplyHook(options.faultHook, hookState, `after-rename:${entry.id}`);
+  await fsyncTree({
+    capability,
+    root: destination,
+    entryId: entry.id,
+    purpose: "payload",
+  });
+  await invokeApplyHook(options.faultHook, hookState, `after-payload-sync:${entry.id}`);
+  await syncDirectory(dirname(destination), fsApi);
+  await invokeApplyHook(
+    options.faultHook,
+    hookState,
+    `after-destination-parent-sync:${entry.id}`,
+  );
+  await syncDirectory(dirname(source), fsApi);
+  await invokeApplyHook(
+    options.faultHook,
+    hookState,
+    `after-source-parent-sync:${entry.id}`,
+  );
+  const observed = await writeInventoryJsonl({
+    capability,
+    root: destination,
+    entryId: entry.id,
+    phase: "moved-pass-1",
+  });
+  await compareInventorySummary(preMoveInventory, observed);
+  await invokeApplyHook(
+    options.faultHook,
+    hookState,
+    `after-inventory:moved-pass-1:${entry.id}`,
+  );
+  await appendEvent({
+    capability,
+    event: "MOVED",
+    payload: { id: entry.id, observed },
+  });
+  await invokeApplyHook(options.faultHook, hookState, `after-event:MOVED:${entry.id}`);
+}
+
+async function prepareDurableApply({ capability, handoff, environment, options, hookState }) {
+  const fsApi = getRunFsContext(capability, handoff.fsSource);
+  const entryIds = new Set(handoff.entries.map((entry) => entry.id));
+  const divergentIds = new Set(handoff.entries
+    .filter((entry) => entry.kind === "source-copy" && entry.classification === "divergent")
+    .map((entry) => entry.id));
+  const preDirectory = dirname(deriveRunPath(capability, {
+    purpose: "inventory",
+    id: handoff.entries[0].id,
+    phase: "pre",
+  }));
+  const preNames = await fsApi.readdir(preDirectory);
+  if (
+    !Array.isArray(preNames) || preNames.some((name) =>
+      !name.endsWith(".jsonl") || !entryIds.has(name.slice(0, -".jsonl".length)))
+  ) fail("ERR_INTEGRITY");
+  const diffDirectory = dirname(deriveRunPath(capability, {
+    purpose: "divergent-diff",
+    id: "copy-0001",
+  }));
+  const diffNames = await fsApi.readdir(diffDirectory);
+  if (!Array.isArray(diffNames) || diffNames.some((name) => {
+    const id = name.endsWith(".patch")
+      ? name.slice(0, -".patch".length)
+      : name.startsWith(".") && name.endsWith(".tmp")
+        ? name.slice(1, -".tmp".length)
+        : null;
+    return id === null || !divergentIds.has(id);
+  })) fail("ERR_INTEGRITY");
+  const entries = [];
+  for (const entry of handoff.entries) {
+    const preMoveInventory = await writeInventoryJsonl({
+      capability,
+      root: workspaceEntryPath(handoff.repoRoot, entry),
+      entryId: entry.id,
+      phase: "pre",
+    });
+    entries.push({ entry, preMoveInventory });
+  }
+  await invokeApplyHook(options.faultHook, hookState, "after-pre-inventories");
+  for (const { entry } of entries) {
+    if (entry.kind !== "source-copy" || entry.classification !== "divergent") continue;
+    await publishDivergentPatch({
+      capability,
+      entry,
+      repoRoot: handoff.repoRoot,
+      environment,
+      fsApi,
+    });
+    await invokeApplyHook(
+      options.faultHook,
+      hookState,
+      `after-divergent-diff:${entry.id}`,
+    );
+  }
+  const manifest = preparedManifest(handoff, entries);
+  const expectedManifestSha256 = createHash("sha256")
+    .update(Buffer.from(`${JSON.stringify(manifest)}\n`))
+    .digest("hex");
+  const manifestDirectory = dirname(deriveRunPath(capability, {
+    purpose: "manifest-generation",
+    id: expectedManifestSha256,
+  }));
+  const existingGenerations = await fsApi.readdir(manifestDirectory);
+  if (
+    !Array.isArray(existingGenerations) ||
+    existingGenerations.some((name) => name !== `${expectedManifestSha256}.json`)
+  ) fail("ERR_INTEGRITY");
+  const generation = await writeManifestGeneration({
+    capability,
+    manifest,
+  });
+  if (generation.manifestSha256 !== expectedManifestSha256) fail("ERR_INTEGRITY");
+  await invokeApplyHook(options.faultHook, hookState, "after-prepared-generation");
+  await appendEvent({
+    capability,
+    event: "PREPARED",
+    payload: {
+      transactionId: handoff.transactionId,
+      manifestSha256: generation.manifestSha256,
+    },
+  });
+  await invokeApplyHook(options.faultHook, hookState, "after-event:PREPARED");
+  await appendEvent({ capability, event: "MOVING", payload: {} });
+  await invokeApplyHook(options.faultHook, hookState, "after-event:MOVING");
+  for (const planned of entries) {
+    await movePreparedEntry({
+      capability,
+      handoff,
+      planned,
+      options,
+      hookState,
+      fsApi,
+    });
+  }
+  await appendEvent({ capability, event: "VERIFYING", payload: {} });
+  await invokeApplyHook(options.faultHook, hookState, "after-event:VERIFYING");
+  for (const { entry, preMoveInventory } of entries) {
+    const payload = deriveRunPath(capability, { purpose: "payload", id: entry.id });
+    const observed = await writeInventoryJsonl({
+      capability,
+      root: payload,
+      entryId: entry.id,
+      phase: "moved-pass-2",
+    });
+    await compareInventorySummary(preMoveInventory, observed);
+    await invokeApplyHook(
+      options.faultHook,
+      hookState,
+      `after-inventory:moved-pass-2:${entry.id}`,
+    );
+    await assertPathMissing(workspaceEntryPath(handoff.repoRoot, entry), fsApi);
+  }
+  let finalWorkspace;
+  try {
+    finalWorkspace = await gitSnapshot(handoff.repoRoot, environment, 0);
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  if (
+    finalWorkspace.topLevel !== handoff.repoRoot ||
+    finalWorkspace.branch !== handoff.branch ||
+    finalWorkspace.head !== handoff.head ||
+    finalWorkspace.statusPaths.length !== 0
+  ) fail("ERR_INTEGRITY");
+  await appendEvent({
+    capability,
+    event: "QUARANTINED",
+    payload: {},
+    faultHook: options.faultHook === undefined ? undefined : async (phase) => {
+      if (phase !== "before-lock-cleanup") return;
+      await options.faultHook("after-event:QUARANTINED");
+      await options.faultHook("before-lock-cleanup");
+    },
+  });
+  return record([
+    ["transactionId", handoff.transactionId],
+    ["status", "QUARANTINED"],
+    ["movedEntries", entries.length],
+    ["manifestSha256", generation.manifestSha256],
+  ]);
 }
 
 export async function prepareQuarantineWorkspace(input) {
   const hookState = { rejected: false };
   try {
-    return await prepareWorkspaceCore(input, "strict", hookState);
+    return (await prepareWorkspaceCore(input, "strict", hookState)).handoff;
   } catch (error) {
     if (hookState.rejected) throw error;
     throw publicError(error, "ERR_PREFLIGHT");
@@ -1278,12 +2096,37 @@ export async function prepareQuarantineWorkspace(input) {
 }
 
 export async function quarantineWorkspace(input) {
-  const hookState = { rejected: false };
+  const hookState = { layoutComplete: false, rejected: false };
   try {
-    await prepareWorkspaceCore(input, "apply-precommit-resume", hookState);
-    fail("ERR_INTERNAL");
+    const prepared = await prepareWorkspaceCore(input, "apply-precommit-resume", hookState);
+    hookState.layoutComplete = true;
+    return await withQuarantineRunCapability({
+      repoRoot: prepared.handoff.repoRoot,
+      quarantineRoot: prepared.handoff.quarantineRoot,
+      transactionId: prepared.handoff.transactionId,
+      writersStopped: true,
+      fsApi: prepared.handoff.fsSource,
+    }, async (capability) => prepareDurableApply({
+      capability,
+      handoff: prepared.handoff,
+      environment: prepared.environment,
+      options: prepared.options,
+      hookState,
+    }));
   } catch (error) {
     if (hookState.rejected) throw error;
+    if (error instanceof IndeterminateJournalAppendError) {
+      throw new QuarantineError("ERR_INDETERMINATE_JOURNAL_APPEND");
+    }
+    if (
+      hookState.layoutComplete && error instanceof ClassifiedFailure &&
+      error.code === "ERR_PREFLIGHT"
+    ) {
+      throw new QuarantineError("ERR_INTEGRITY");
+    }
+    if (!(error instanceof ClassifiedFailure) && !(error instanceof QuarantineError)) {
+      throw new QuarantineError("ERR_INTEGRITY");
+    }
     throw publicError(error, "ERR_INTERNAL");
   }
 }
