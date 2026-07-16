@@ -43,12 +43,17 @@ and the server prerequisites can be described with platform-neutral commands.
    requiring the operations runbook.
 7. Preserve authoritative production, migration, CI, security, and E2E details
    while moving them out of the beginner path.
+8. Add visual guidance for the three setup states that are currently text-only:
+   loading the unpacked extension, entering connection details, and confirming
+   a successful connection.
 
 ## Non-Goals
 
 - Publishing the extension to the Chrome Web Store
 - Providing a shared public access token for the existing production instance
 - Adding an automated installer or changing application behavior
+- Capturing the owner's real Chrome profile, open tabs, production token, or
+  other personal browser state
 - Replacing the production or Chrome smoke runbooks
 - Adding operating-system-specific PostgreSQL installation tutorials
 - Documenting unfinished Slice 3 quarantine recovery work as a user feature
@@ -130,6 +135,23 @@ cleanup. It must not tell users to enable broad access to every site. Job-board
 access is requested or used only where required by the manifest and current
 workflow.
 
+Place three new sanitized images beside this journey:
+
+1. `06-chrome-load-unpacked.png` — an instructional Chrome Extensions view
+   highlighting **Developer mode**, **Load unpacked**, the JobTracker card, and
+   the extension ID location.
+2. `07-extension-connect.png` — the real extension popup layout in its
+   disconnected state, using `http://localhost:3000` and a masked example token.
+3. `08-extension-connected.png` — the popup after successful pairing, showing
+   the connected status and an empty token field.
+
+These are deterministic documentation visuals, not captures of a real user
+profile. The Chrome Extensions image is rendered from a purpose-built static
+HTML fixture because Playwright cannot automate privileged `chrome://` pages.
+The two popup images reuse `extension/popup.html` styles and synthetic state,
+following the existing screenshot pipeline. No real extension ID, access token,
+browser avatar, history, bookmarks, or open tabs may appear.
+
 ### 5. First-use walkthrough
 
 Guide the user through a concrete outcome:
@@ -145,6 +167,20 @@ Guide the user through a concrete outcome:
 8. Optionally configure OpenAI, Gemini, or Anthropic for fallback extraction.
 
 Existing screenshots remain positioned next to the step they explain.
+
+### 5a. Documentation image production
+
+Extend the existing screenshot tooling with documentation-only fixtures rather
+than manual screenshots. The generated assets live under `docs/screenshots/`
+and use a consistent desktop-Chrome/popup visual language. Exact button labels,
+field labels, and statuses must be sourced from the current extension UI where
+possible.
+
+The generated Chrome setup image must be clearly presented as an instructional
+view, not claimed to be a pixel-perfect capture of a particular Chrome release.
+The popup images must remain faithful to the checked-in popup HTML and CSS.
+Regeneration instructions and the expanded image list are added to
+`docs/screenshots/README.md`.
 
 ### 6. Troubleshooting
 
@@ -205,16 +241,22 @@ The README update is complete only when:
 3. Environment variable names match `.env.example` and server validation code.
 4. Extension labels and permission claims match `popup.html`, `popup.js`, and
    `manifest.json`.
-5. Relative Markdown links resolve from `README.md`.
-6. Code fences are syntactically complete and commands contain no real secret.
-7. Existing documentation contract tests pass.
-8. `npm run lint`, `npm run typecheck`, and relevant README/docs tests pass.
-9. The original dirty `main` checkout and its 65 untracked files remain
+5. All eight referenced screenshots exist, contain only synthetic data, and
+   render legibly at the width used by GitHub's README viewer.
+6. Relative Markdown links resolve from `README.md`.
+7. Code fences are syntactically complete and commands contain no real secret.
+8. Existing documentation contract tests pass.
+9. Screenshot generation completes without accessing the configured database.
+10. `npm run lint`, `npm run typecheck`, and relevant README/docs tests pass.
+11. The original dirty `main` checkout and its 65 untracked files remain
    untouched.
 
 ## Deliverables
 
 - Rewritten root `README.md`
+- Three new sanitized setup images under `docs/screenshots/`
+- Updated screenshot generator, synthetic fixtures, and screenshot regeneration
+  notes
 - This design spec
 - An implementation plan under `docs/superpowers/plans/`
 - No application, extension, database schema, or dependency changes
