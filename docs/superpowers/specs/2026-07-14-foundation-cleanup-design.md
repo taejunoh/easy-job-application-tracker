@@ -367,10 +367,16 @@ byte cap is
 `4 * (sourceSize + canonicalSize) + 1,048,576`, and the operation rejects before
 spawn unless that arithmetic is a non-negative safe integer. Byte
 `cap + 1` kills the child, awaits all child and stream settlement, and fails
-closed. A successful temporary is synced, published without replacement at the
-derived `divergent-diff` path, its parent is synced, and the published
-device/inode/mode is revalidated after that sync. The public fault hook
-`after-divergent-diff:<entry-id>` runs only after this complete durable publish.
+closed. A successful temporary is synced and its device/inode/mode/size is
+captured, then it is published without replacement at the derived
+`divergent-diff` path. Its parent is synced and the published final must retain
+that exact captured identity after the sync. Normal
+current-invocation publication then uses the same durable temporary-cleanup
+protocol as retry adoption: identity-check and unlink the temporary, sync
+`divergent-diffs` again, and capability-revalidate temporary `ENOENT` plus the
+final's exact captured identity. The public fault hook
+`after-divergent-diff:<entry-id>` runs only after this complete durable publish
+and cleanup.
 
 A same-transaction precommit retry recomputes the patch with the exact command
 and uses this closed matrix; path, mode, or a previously observed inode alone
@@ -408,6 +414,10 @@ pre-parent-sync, or post-sync seam preserves all available evidence and returns
 A cleanup-parent-sync failure, post-cleanup final replacement, or temporary
 reappearance fails closed with `ERR_INTEGRITY` and never reports successful
 adoption. Cleanup never attempts to remove a reappeared or foreign path.
+Normal current-invocation publication, final-plus-same-inode retry, and
+temp-only retry converge on one private durable cleanup helper implementing
+this exact unlink, parent-sync, temporary-absence, and final-identity protocol;
+none may invoke `after-divergent-diff` or advance toward `PREPARED` earlier.
 
 Only a temporary successfully created with `O_EXCL` by the current invocation
 may be identity-checked and unlinked on that invocation's local prepublication

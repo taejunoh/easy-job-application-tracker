@@ -1163,8 +1163,11 @@ containment change, and identity replacement. Enforce the
 exact inclusive safe-integer cap
 `4 * (sourceSize + canonicalSize) + 1,048,576`; drain and sanitize bounded
 stderr. Sync the temporary, publish without replacement, sync the parent, and
-revalidate post-sync identity. On retry, recompute and stream-compare exact
-bytes, digest, and mode before adopting an existing complete patch.
+revalidate post-sync identity. Then unlink the current-invocation temporary,
+sync the parent again, and capability-revalidate temporary `ENOENT` plus the
+final's captured identity before the durable-publish hook. On retry, recompute
+and stream-compare exact bytes, digest, and mode before adopting an existing
+complete patch.
 `--no-ext-diff --no-textconv` must leave hostile external-diff and textconv
 sentinels untouched. Treat the exact Git executable/version, argv, closed
 environment, and repository built-in attributes/configuration as the canonical
@@ -1254,6 +1257,12 @@ a final swap after cleanup sync, and temporary reappearance before post-sync
 validation. Require no successful adoption, exact `ERR_INTEGRITY`, preservation
 of every remaining or foreign artifact, temporary `ENOENT` plus final captured
 identity on success, and no attempt to unlink a reappeared path.
+
+Make normal current-invocation publication, final-plus-same-inode retry, and
+temp-only retry call one private durable cleanup helper with that exact
+unlink/parent-sync/ENOENT/final-identity protocol. Apply the same cleanup-sync,
+final-swap, and temp-reappearance RED cases to all three branches. None may call
+`after-divergent-diff:<id>` or advance toward PREPARED before the helper returns.
 
 Seed each durable Slice 2 tip `PREPARED`, `MOVING`, `VERIFYING`, and
 `QUARANTINED`, then call `quarantineWorkspace` again. Require no filesystem or
