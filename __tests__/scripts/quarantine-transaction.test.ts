@@ -127,7 +127,12 @@ function installGitDiffOverride(
   f: Fixture,
   label: string,
   stdout: Buffer,
-  { stderr = Buffer.alloc(0), exit = 1, signal }: { stderr?: Buffer; exit?: number; signal?: string } = {},
+  { stderr = Buffer.alloc(0), exit = 1, signal, sentinel }: {
+    stderr?: Buffer;
+    exit?: number;
+    signal?: string;
+    sentinel?: string;
+  } = {},
 ) {
   const bin = join(f.base, `git-diff-override-${label}`);
   privateDirectory(bin);
@@ -143,7 +148,7 @@ function installGitDiffOverride(
   ].join(" ");
   writeFileSync(
     join(bin, "git"),
-    `#!/bin/sh\nif [ "$*" = ${JSON.stringify(expected)} ]; then /bin/cat ${JSON.stringify(stdoutPath)}; /bin/cat ${JSON.stringify(stderrPath)} >&2; ${signal === undefined ? `exit ${exit}` : `kill -${signal} $$; exit 99`}; fi\nexec ${JSON.stringify(realGit)} "$@"\n`,
+    `#!/bin/sh\nif [ "$*" = ${JSON.stringify(expected)} ]; then ${sentinel === undefined ? "" : `printf invoked > ${JSON.stringify(sentinel)}; `}/bin/cat ${JSON.stringify(stdoutPath)}; /bin/cat ${JSON.stringify(stderrPath)} >&2; ${signal === undefined ? `exit ${exit}` : `kill -${signal} $$; exit 99`}; fi\nexec ${JSON.stringify(realGit)} "$@"\n`,
     { mode: 0o700 },
   );
   chmodSync(join(bin, "git"), 0o700);
@@ -292,6 +297,11 @@ type WorkerResult = {
     }>;
     lockCreates: number;
     lockRemovals: number;
+  };
+  maxReadLength?: number;
+  mutationCounters?: {
+    atFailure: Record<string, number>;
+    final: Record<string, number>;
   };
   shape?: ValueShape;
   error?: WorkerError;
@@ -526,13 +536,55 @@ try {
   } else if (operation === "apply-lock-cleanup-failure") {
     const { failCleanupAt = 1, ...applyRequest } = request;
     let cleanupCalls = 0;
+    const counters = {
+      renames: 0,
+      syncs: 0,
+      inventoryPublications: 0,
+      generationPublications: 0,
+      journalMutations: 0,
+    };
+    let atFailure;
     const adapter = {
       ...fsPromises,
+      async rename(...args) {
+        const result = await fsPromises.rename(...args);
+        counters.renames += 1;
+        return result;
+      },
+      async link(source, destination) {
+        const result = await fsPromises.link(source, destination);
+        if (destination.includes("/inventories/") && destination.endsWith(".jsonl")) {
+          counters.inventoryPublications += 1;
+        }
+        if (destination.includes("/manifests/") && destination.endsWith(".json")) {
+          counters.generationPublications += 1;
+        }
+        return result;
+      },
+      async open(path, ...args) {
+        const handle = await fsPromises.open(path, ...args);
+        if (
+          path.endsWith("/journal.log") &&
+          (args[0] === "wx+" || args[0] === "r+")
+        ) counters.journalMutations += 1;
+        return new Proxy(handle, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target);
+            if (key === "sync") return async (...syncArgs) => {
+              const result = await Reflect.apply(value, target, syncArgs);
+              counters.syncs += 1;
+              return result;
+            };
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
       async rm(path, ...args) {
         if (path.endsWith("/journal.lock")) {
           cleanupCalls += 1;
         }
         if (path.endsWith("/journal.lock") && cleanupCalls === failCleanupAt) {
+          atFailure = { ...counters };
           throw new Error("injected lock cleanup failure");
         }
         return fsPromises.rm(path, ...args);
@@ -549,6 +601,7 @@ try {
     }
     process.stdout.write(JSON.stringify({
       ok: captured === undefined,
+      mutationCounters: { atFailure, final: { ...counters } },
       error: captured === undefined ? undefined : errorShape(captured),
     }));
   } else if (operation === "apply-mutate-at-hook") {
@@ -849,6 +902,102 @@ try {
       result,
       phases,
       instrumentation: { renamed, synced, snapshots, lockCreates, lockRemovals },
+    }));
+  } else if (operation === "apply-virtual-cap") {
+    const { virtualSourceSize, virtualCanonicalSize, stopPhase, ...applyRequest } = request;
+    let virtual = true;
+    const adapter = {
+      ...fsPromises,
+      async lstat(path) {
+        const stats = await fsPromises.lstat(path);
+        let size;
+        if (virtual && path === join(request.repoRoot, "notes 2.txt")) size = virtualSourceSize;
+        if (virtual && path === join(request.repoRoot, "notes.txt")) size = virtualCanonicalSize;
+        if (size === undefined) return stats;
+        return new Proxy(stats, {
+          get(target, key) {
+            if (key === "size") return size;
+            const value = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const phases = [];
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        fsApi: adapter,
+        faultHook(phase) {
+          phases.push(phase);
+          if (phase === "after-layout-sync") virtual = false;
+          if (phase === stopPhase) throw new RangeError("stop at requested phase");
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      phases,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-observe-read-bound") {
+    const { stopPhase, ...applyRequest } = request;
+    const temporary = join(
+      request.quarantineRoot,
+      request.transactionId,
+      "divergent-diffs/.copy-0001.tmp",
+    );
+    const final = join(
+      request.quarantineRoot,
+      request.transactionId,
+      "divergent-diffs/copy-0001.patch",
+    );
+    let maxReadLength = 0;
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        const handle = await fsPromises.open(path, ...args);
+        if (path !== temporary && path !== final) return handle;
+        return new Proxy(handle, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target);
+            if (key === "read") return async (buffer, offset, length, position) => {
+              maxReadLength = Math.max(maxReadLength, length);
+              return value.call(target, buffer, offset, length, position);
+            };
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const phases = [];
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        fsApi: adapter,
+        faultHook(phase) {
+          phases.push(phase);
+          if (phase === stopPhase) throw new RangeError("stop at requested phase");
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      phases,
+      maxReadLength,
+      error: captured === undefined ? undefined : errorShape(captured),
     }));
   } else if (operation === "getter") {
     let reads = 0;
@@ -1331,6 +1480,48 @@ try {
     maxBuffer: 8 * 1024 * 1024,
     timeout,
     env: { ...process.env, ...extraEnvironment },
+  });
+  if (child.error) throw child.error;
+  if (child.status !== 0) throw new Error(child.stderr || `worker exited ${child.status}`);
+  return JSON.parse(child.stdout) as WorkerResult;
+}
+
+function invokeWithGitStdoutError(request: Record<string, unknown>): WorkerResult {
+  const source = `
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (...args) {
+  const child = Reflect.apply(originalSpawn, this, args);
+  const childArgs = args[1];
+  if (Array.isArray(childArgs) && childArgs.includes("--no-index")) {
+    child.stdout[Symbol.asyncIterator] = async function* () {
+      throw new Error("injected Git stdout stream failure");
+    };
+  }
+  return child;
+};
+syncBuiltinESMExports();
+const transaction = await import(${JSON.stringify(transactionUrl)});
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const request = JSON.parse(input);
+try {
+  await transaction.quarantineWorkspace(request);
+  process.stdout.write(JSON.stringify({ ok: true }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({
+    ok: false,
+    error: { name: error?.name, code: error?.code, message: error?.message },
+  }));
+}
+`;
+  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    input: JSON.stringify(request),
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+    timeout: 30_000,
   });
   if (child.error) throw child.error;
   if (child.status !== 0) throw new Error(child.stderr || `worker exited ${child.status}`);
@@ -2003,6 +2194,165 @@ describe("quarantine transaction Slice 1", () => {
     expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
   });
 
+  it.each(["safe-boundary", "overflow"] as const)(
+    "checks the divergent cap %s before spawning Git",
+    (variant) => {
+      const f = fixture({ divergent: true });
+      bases.push(f.base);
+      const largestSafeCombined = Math.floor(
+        (Number.MAX_SAFE_INTEGER - 1_048_576) / 4,
+      );
+      const combined = variant === "safe-boundary"
+        ? largestSafeCombined
+        : largestSafeCombined + 1;
+      const virtualSourceSize = Math.floor(combined / 2);
+      const virtualCanonicalSize = combined - virtualSourceSize;
+      const sentinel = join(f.base, `diff-spawn-${variant}`);
+      const path = installGitDiffOverride(
+        f,
+        `virtual-cap-${variant}`,
+        canonicalDiff(f),
+        { sentinel },
+      );
+      const transactionId = `tx-virtual-cap-${variant}`;
+      const worker = invoke("apply-virtual-cap", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+        virtualSourceSize,
+        virtualCanonicalSize,
+        stopPhase: "after-divergent-diff:copy-0001",
+      }, { PATH: path }, 30_000);
+      if (variant === "safe-boundary") {
+        expect(worker.ok).toBe(false);
+        expect(worker.error).toMatchObject({ name: "RangeError", message: "stop at requested phase" });
+        expect(existsSync(sentinel)).toBe(true);
+      } else {
+        expectWorkerError(
+          worker,
+          "ERR_INTEGRITY",
+          "Quarantine evidence failed integrity validation.",
+        );
+        expect(existsSync(sentinel)).toBe(false);
+      }
+      expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+    },
+  );
+
+  it("keeps canonical re-comparison reads bounded to 64 KiB for multi-MiB output", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    writeFileSync(join(f.repoRoot, f.canonicalPath!), Buffer.alloc(1024 * 1024, 0x61));
+    git(f.repoRoot, "add", f.canonicalPath!);
+    git(f.repoRoot, "commit", "-m", "large canonical");
+    writeFileSync(join(f.repoRoot, f.copyPath!), Buffer.alloc(1024 * 1024, 0x62));
+    f.head = git(f.repoRoot, "rev-parse", "HEAD");
+    const transactionId = "tx-bounded-canonical-compare";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const prepared = invoke("prepare-raw", request, {}, 30_000);
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    const output = Buffer.alloc(6 * 1024 * 1024, 0x70);
+    const temporary = join(
+      f.quarantineRoot,
+      transactionId,
+      "divergent-diffs/.copy-0001.tmp",
+    );
+    writeFileSync(temporary, output, { mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    const path = installGitDiffOverride(f, "bounded-canonical-compare", output);
+    const worker = invoke("apply-observe-read-bound", {
+      ...request,
+      stopPhase: "after-divergent-diff:copy-0001",
+    }, { PATH: path }, 30_000);
+    expect(worker.ok).toBe(false);
+    expect(worker.error).toMatchObject({ name: "RangeError", message: "stop at requested phase" });
+    expect(worker.maxReadLength).toBe(64 * 1024);
+    expect(readFileSync(join(
+      f.quarantineRoot,
+      transactionId,
+      "divergent-diffs/copy-0001.patch",
+    )).length).toBe(output.length);
+  });
+
+  it("keeps final-only two-file comparison reads bounded to 64 KiB", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    writeFileSync(join(f.repoRoot, f.canonicalPath!), Buffer.alloc(1024 * 1024, 0x63));
+    git(f.repoRoot, "add", f.canonicalPath!);
+    git(f.repoRoot, "commit", "-m", "large final-only canonical");
+    writeFileSync(join(f.repoRoot, f.copyPath!), Buffer.alloc(1024 * 1024, 0x64));
+    f.head = git(f.repoRoot, "rev-parse", "HEAD");
+    const transactionId = "tx-bounded-final-only-compare";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const output = Buffer.alloc(6 * 1024 * 1024, 0x71);
+    const path = installGitDiffOverride(f, "bounded-final-only-compare", output);
+    const first = invoke("apply-stop", {
+      ...request,
+      stopPhase: "after-divergent-diff:copy-0001",
+    }, { PATH: path }, 30_000);
+    expect(first.ok).toBe(false);
+    const worker = invoke("apply-observe-read-bound", {
+      ...request,
+      stopPhase: "after-divergent-diff:copy-0001",
+    }, { PATH: path }, 30_000);
+    expect(worker.ok).toBe(false);
+    expect(worker.error).toMatchObject({ name: "RangeError", message: "stop at requested phase" });
+    expect(worker.maxReadLength).toBe(64 * 1024);
+    expect(readFileSync(join(
+      f.quarantineRoot,
+      transactionId,
+      "divergent-diffs/copy-0001.patch",
+    )).length).toBe(output.length);
+  });
+
+  it("settles a true Git stdout stream error independently of child signals", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const transactionId = "tx-child-stdout-error";
+    const worker = invokeWithGitStdoutError({
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    });
+    expect(worker).toMatchObject({
+      ok: false,
+      error: {
+        name: "QuarantineError",
+        code: "ERR_INTEGRITY",
+        message: "Quarantine evidence failed integrity validation.",
+      },
+    });
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+  });
+
   it("keeps hostile external-diff and textconv drivers disabled", () => {
     const f = fixture({ divergent: true });
     bases.push(f.base);
@@ -2243,12 +2593,17 @@ describe("quarantine transaction Slice 1", () => {
       "Journal durability could not be determined.",
     );
     expect(existsSync(join(f.quarantineRoot, transactionId, "journal.lock"))).toBe(true);
+    expect(worker.mutationCounters?.atFailure).toEqual(worker.mutationCounters?.final);
+    expect(worker.mutationCounters?.final).toMatchObject({
+      generationPublications: 1,
+      journalMutations: failCleanupAt,
+    });
     const replay = invoke("replay-run", request, {}, 30_000);
     if (!replay.ok) throw new Error(JSON.stringify(replay.error));
     const records = replay.result?.records as Array<{
       sequence: number;
       event: string;
-      payload: { id?: string };
+      payload: { id?: string; manifestSha256?: string; transactionId?: string };
     }>;
     const expected = [
       ["PREPARED", undefined],
@@ -2268,6 +2623,40 @@ describe("quarantine transaction Slice 1", () => {
     expect(records.map((record) => record.sequence)).toEqual(
       Array.from({ length: failCleanupAt }, (_, index) => index + 1),
     );
+    expect(records[0]).toMatchObject({
+      sequence: 1,
+      event: "PREPARED",
+      payload: {
+        transactionId,
+        manifestSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      },
+    });
+    const manifestSha256 = records[0].payload.manifestSha256!;
+    const runRoot = join(f.quarantineRoot, transactionId);
+    expect(readdirSync(join(runRoot, "manifests"))).toEqual([`${manifestSha256}.json`]);
+    const manifestPath = join(runRoot, "manifests", `${manifestSha256}.json`);
+    const beforeReplayBytes = readFileSync(manifestPath);
+    const manifest = JSON.parse(beforeReplayBytes.toString("utf8"));
+    expect(beforeReplayBytes).toEqual(Buffer.from(`${JSON.stringify(manifest)}\n`));
+    expect(createHash("sha256").update(beforeReplayBytes).digest("hex")).toBe(manifestSha256);
+    expect(manifest).toMatchObject({
+      transactionId,
+      state: "PREPARED",
+      retentionDays: 4,
+      deletionRequiresConfirmation: true,
+    });
+    expect(manifest.entries).toHaveLength(3);
+    for (const entry of manifest.entries) {
+      expect(entry.preMoveInventory).toMatchObject({
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        entries: expect.any(Number),
+        bytes: expect.any(Number),
+      });
+    }
+    expect(readFileSync(manifestPath)).toEqual(beforeReplayBytes);
+    expect(existsSync(join(f.quarantineRoot, "current"))).toBe(false);
+    expect(readdirSync(join(runRoot, "manifests")).some((name) =>
+      name === "current" || name.includes("intermediate"))).toBe(false);
     },
   );
 

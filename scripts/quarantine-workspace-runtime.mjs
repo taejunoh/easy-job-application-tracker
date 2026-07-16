@@ -1365,27 +1365,38 @@ async function comparePrivateFiles(leftPath, rightPath, fsApi) {
     const rightStats = await right.stat();
     assertPrivateRegularFile(leftStats);
     assertPrivateRegularFile(rightStats);
-    if (Number(leftStats.size) === Number(rightStats.size)) {
-      equal = true;
-      let position = 0;
-      const leftBuffer = Buffer.allocUnsafe(64 * 1024);
-      const rightBuffer = Buffer.allocUnsafe(64 * 1024);
-      while (position < Number(leftStats.size)) {
-        const length = Math.min(leftBuffer.length, Number(leftStats.size) - position);
-        const [leftRead, rightRead] = await Promise.all([
-          left.read(leftBuffer, 0, length, position),
-          right.read(rightBuffer, 0, length, position),
-        ]);
-        if (
-          leftRead.bytesRead !== length || rightRead.bytesRead !== length ||
-          !leftBuffer.subarray(0, length).equals(rightBuffer.subarray(0, length))
-        ) {
-          equal = false;
-          break;
-        }
-        position += length;
-      }
+    const leftSize = Number(leftStats.size);
+    const rightSize = Number(rightStats.size);
+    const leftHash = createHash("sha256");
+    const rightHash = createHash("sha256");
+    const leftBuffer = Buffer.allocUnsafe(64 * 1024);
+    const rightBuffer = Buffer.allocUnsafe(64 * 1024);
+    let leftPosition = 0;
+    let rightPosition = 0;
+    equal = leftSize === rightSize;
+    while (leftPosition < leftSize || rightPosition < rightSize) {
+      const leftLength = Math.min(leftBuffer.length, leftSize - leftPosition);
+      const rightLength = Math.min(rightBuffer.length, rightSize - rightPosition);
+      const [leftRead, rightRead] = await Promise.all([
+        leftLength === 0
+          ? { bytesRead: 0 }
+          : left.read(leftBuffer, 0, leftLength, leftPosition),
+        rightLength === 0
+          ? { bytesRead: 0 }
+          : right.read(rightBuffer, 0, rightLength, rightPosition),
+      ]);
+      const leftBytes = leftBuffer.subarray(0, leftRead.bytesRead);
+      const rightBytes = rightBuffer.subarray(0, rightRead.bytesRead);
+      leftHash.update(leftBytes);
+      rightHash.update(rightBytes);
+      if (
+        leftRead.bytesRead !== leftLength || rightRead.bytesRead !== rightLength ||
+        leftLength !== rightLength || !leftBytes.equals(rightBytes)
+      ) equal = false;
+      leftPosition += leftLength;
+      rightPosition += rightLength;
     }
+    if (leftHash.digest("hex") !== rightHash.digest("hex")) equal = false;
     assertPrivateFileIdentity(await left.stat(), leftStats);
     assertPrivateFileIdentity(await right.stat(), rightStats);
   } catch (error) {
