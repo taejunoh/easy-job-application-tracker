@@ -1071,11 +1071,38 @@ const result = await withQuarantineRunCapability({
     const before = await snapshot();
     const journalBefore = await fsPromises.readFile(journalPath);
     let callbackCalls = 0;
+    let swallowedAppendError = null;
     const getterCounts = { outer: 0, sequence: 0, recordHash: 0, event: 0, state: 0 };
     const outcome = await capture(() => journal.reclaimJournalLock(
       { capability, writersStopped: true, fsApi: boundFsApi },
-      async () => {
+      async (heldLock) => {
         callbackCalls += 1;
+        if (request.case === "swallow-prewrite" || request.case === "swallow-indeterminate") {
+          try {
+            await journal.appendJournalRecord({
+              capability,
+              heldLock,
+              event: request.attemptRecord.event,
+              payload: request.attemptRecord.payload,
+              fsApi: boundFsApi,
+              faultHook: async (phase) => {
+                if (
+                  (request.case === "swallow-prewrite" && phase === "before-mutation") ||
+                  (request.case === "swallow-indeterminate" && phase === "after-journal-open")
+                ) {
+                  throw new Error("injected swallowed append failure");
+                }
+              },
+            });
+          } catch (error) {
+            swallowedAppendError = {
+              name: error.name,
+              code: error.code ?? null,
+              expectedSequence: error.expectedSequence ?? null,
+              expectedRecordHash: error.expectedRecordHash ?? null,
+            };
+          }
+        }
         const replayed = await journal.replayJournal({ capability });
         const tip = replayed.records.at(-1);
         const values = {
@@ -1141,6 +1168,7 @@ const result = await withQuarantineRunCapability({
     return {
       outcome,
       callbackCalls,
+      swallowedAppendError,
       getterCounts,
       before,
       after,
@@ -2900,6 +2928,81 @@ describe("capability-bound durable quarantine journal", () => {
       state: 1,
     });
     expect(result.journalUnchanged).toBe(true);
+  });
+
+  it("rejects settlement after a swallowed pre-write append attempt", () => {
+    const result = invoke(join(fixture, "settle-swallowed-prewrite"), {
+      operation: "settle-durable-tip",
+      case: "swallow-prewrite",
+      records: quarantinedPrefix,
+      attemptRecord: records.validated,
+    });
+    expect(result.swallowedAppendError).toMatchObject({
+      name: "Error",
+      code: null,
+      expectedSequence: null,
+      expectedRecordHash: null,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.outcome.error).toMatchObject({
+      name: "Error",
+      code: null,
+      message: "durable journal tip settlement rejects prior append attempts",
+      expectedSequence: null,
+      expectedRecordHash: null,
+    });
+    expect(result.callbackCalls).toBe(1);
+    expect(result.journalUnchanged).toBe(true);
+    expect(result.after["journal.lock"]).not.toEqual(result.before["journal.lock"]);
+    expect(result.after["journal.lock.tombstone.11111111-1111-4111-8111-111111111111"]).toEqual(
+      result.before["journal.lock.tombstone.11111111-1111-4111-8111-111111111111"],
+    );
+    const movedTombstones = Object.entries(result.after).filter(
+      ([name]) => name.startsWith("journal.lock.tombstone.") &&
+        name !== "journal.lock.tombstone.11111111-1111-4111-8111-111111111111",
+    );
+    expect(movedTombstones).toHaveLength(1);
+    expect(movedTombstones[0][1]).toEqual(result.before["journal.lock"]);
+  });
+
+  it("rejects settlement after a swallowed indeterminate append candidate", () => {
+    const result = invoke(join(fixture, "settle-swallowed-indeterminate"), {
+      operation: "settle-durable-tip",
+      case: "swallow-indeterminate",
+      records: quarantinedPrefix,
+      attemptRecord: records.validated,
+    });
+    expect(result.swallowedAppendError).toMatchObject({
+      name: "IndeterminateJournalAppendError",
+      code: "ERR_INDETERMINATE_JOURNAL_APPEND",
+      expectedSequence: quarantinedPrefix.length + 1,
+      expectedRecordHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.outcome.error).toMatchObject({
+      name: "IndeterminateJournalAppendError",
+      code: "ERR_INDETERMINATE_JOURNAL_APPEND",
+      message: "journal append is indeterminate after mutation began",
+      expectedSequence: result.swallowedAppendError.expectedSequence,
+      expectedRecordHash: result.swallowedAppendError.expectedRecordHash,
+    });
+    expect(result.callbackCalls).toBe(1);
+    expect(result.journalUnchanged).toBe(true);
+    expect(result.replayed).toMatchObject({
+      ok: true,
+      value: { state: "QUARANTINED", truncatedTail: false },
+    });
+    expect(result.replayed.value.records).toHaveLength(quarantinedPrefix.length);
+    expect(result.after["journal.lock"]).not.toEqual(result.before["journal.lock"]);
+    expect(result.after["journal.lock.tombstone.11111111-1111-4111-8111-111111111111"]).toEqual(
+      result.before["journal.lock.tombstone.11111111-1111-4111-8111-111111111111"],
+    );
+    const movedTombstones = Object.entries(result.after).filter(
+      ([name]) => name.startsWith("journal.lock.tombstone.") &&
+        name !== "journal.lock.tombstone.11111111-1111-4111-8111-111111111111",
+    );
+    expect(movedTombstones).toHaveLength(1);
+    expect(movedTombstones[0][1]).toEqual(result.before["journal.lock"]);
   });
 
   it.each([

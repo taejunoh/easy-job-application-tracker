@@ -1231,6 +1231,7 @@ async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callba
     active: true,
     appendInProgress: false,
     capability,
+    candidateAttempts: 0,
     durableAppends: 0,
     fsApi,
     lastCandidate: null,
@@ -1384,6 +1385,7 @@ async function appendUnderHeldLock({ capability, heldLock, event, payload, fsApi
     const length = Buffer.alloc(4);
     length.writeUInt32BE(body.length);
 
+    state.candidateAttempts += 1;
     await invokeFaultHook(faultHook, "before-mutation");
     await assertHeldLockOwned(state);
     await revalidateRunCapability(capability, {
@@ -1805,8 +1807,12 @@ export async function reclaimJournalLock(options, callback) {
         zeroAppendFailure = error;
         return undefined;
       }
-      if (heldLockState.get(heldLock)?.durableAppends === 0) {
+      const lockState = heldLockState.get(heldLock);
+      if (lockState?.durableAppends === 0) {
         try {
+          if (lockState.lastCandidate !== null || lockState.candidateAttempts !== 0) {
+            throw new Error("durable journal tip settlement rejects prior append attempts");
+          }
           if (rechecked.replayed.truncatedTail) {
             throw new Error("durable journal tip settlement rejects a torn journal tail");
           }
@@ -1823,6 +1829,14 @@ export async function reclaimJournalLock(options, callback) {
     },
   );
   if (run.state.durableAppends === 0) {
+    if (run.state.lastCandidate !== null || run.state.candidateAttempts !== 0) {
+      const attemptError = zeroAppendFailure ?? new Error(
+        "durable journal tip settlement rejects prior append attempts",
+      );
+      throw run.state.lastCandidate === null
+        ? attemptError
+        : indeterminate(run.state.lastCandidate, attemptError);
+    }
     if (zeroAppendFailure !== undefined || settlementResult === undefined) {
       const primary = zeroAppendFailure ?? new Error(
         "journal lock recovery requires a durable journal append or exact tip settlement",
