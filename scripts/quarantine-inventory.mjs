@@ -453,7 +453,8 @@ export function parseInventoryRecord(value) {
   }
   if (value.type === "symlink") {
     assertExactRecordKeys(value, ["scope", "path", "type", "mode", "size", "linkTarget"]);
-    if (typeof value.linkTarget !== "string") {
+    const linkTarget = value.linkTarget;
+    if (typeof linkTarget !== "string") {
       throw new TypeError("inventory record symlink target is invalid");
     }
     return Object.freeze({
@@ -462,7 +463,7 @@ export function parseInventoryRecord(value) {
       type: "symlink",
       mode: parseRecordMode(value.mode),
       size: parseRecordSize(value.size),
-      linkTarget: value.linkTarget,
+      linkTarget,
     });
   }
   throw new TypeError("inventory record type is invalid");

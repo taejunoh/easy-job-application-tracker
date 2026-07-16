@@ -374,34 +374,44 @@ function parseActiveGenerated(value) {
     GENERATED_IDS.length,
   );
   return Object.freeze(input.map((entry, index) => {
-    assertPayloadKeys(entry, ["id", "inventory"], "RESTORE_PREPARED activeGenerated record");
-    if (entry.id !== GENERATED_IDS[index]) {
+    const record = snapshotOptions(
+      entry,
+      ["id", "inventory"],
+      ["id", "inventory"],
+      "RESTORE_PREPARED activeGenerated record",
+    );
+    if (record.id !== GENERATED_IDS[index]) {
       throw new TypeError("RESTORE_PREPARED activeGenerated IDs are invalid or out of order");
     }
     return Object.freeze({
-      id: entry.id,
-      inventory: entry.inventory === null
+      id: record.id,
+      inventory: record.inventory === null
         ? null
-        : parseInventorySummary(entry.inventory),
+        : parseInventorySummary(record.inventory),
     });
   }));
 }
 
 const EVENT_PAYLOAD_PARSERS = Object.freeze({
   PREPARED(payload) {
-    assertPayloadKeys(payload, ["transactionId", "manifestSha256"], "PREPARED");
+    const record = snapshotOptions(
+      payload,
+      ["transactionId", "manifestSha256"],
+      ["transactionId", "manifestSha256"],
+      "PREPARED payload",
+    );
     if (
-      typeof payload.transactionId !== "string" ||
-      payload.transactionId === "." ||
-      payload.transactionId === ".." ||
-      payload.transactionId !== payload.transactionId.normalize("NFC") ||
-      !TRANSACTION_ID.test(payload.transactionId)
+      typeof record.transactionId !== "string" ||
+      record.transactionId === "." ||
+      record.transactionId === ".." ||
+      record.transactionId !== record.transactionId.normalize("NFC") ||
+      !TRANSACTION_ID.test(record.transactionId)
     ) {
       throw new TypeError("PREPARED payload transaction ID is invalid");
     }
     return Object.freeze({
-      manifestSha256: parseManifestSha256(payload.manifestSha256),
-      transactionId: payload.transactionId,
+      manifestSha256: parseManifestSha256(record.manifestSha256),
+      transactionId: record.transactionId,
     });
   },
   MOVING: (payload) => parseEmptyPayload("MOVING", payload),

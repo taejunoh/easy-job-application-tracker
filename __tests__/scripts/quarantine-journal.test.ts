@@ -231,7 +231,7 @@ const result = await withQuarantineRunCapability({
   writersStopped: true,
   fsApi: boundFsApi,
 }, async (capability) => {
-  for (const backing of request.inventoryBackings ?? []) {
+      for (const backing of request.inventoryBackings ?? []) {
     await fsPromises.mkdir(join(runRoot, "inventories", "restore-active"), {
       recursive: true,
       mode: 0o700,
@@ -248,10 +248,85 @@ const result = await withQuarantineRunCapability({
     } else {
       await fsPromises.writeFile(inventoryPath, Buffer.from(backing.base64, "base64"), {
         mode: backing.mode ?? 0o600,
-      });
-    }
-  }
-  if (request.operation === "closed-options") {
+          });
+        }
+      }
+      if (request.operation === "prepared-transaction-accessor") {
+        let getterReads = 0;
+        const payload = { manifestSha256: "a".repeat(64) };
+        Object.defineProperty(payload, "transactionId", {
+          enumerable: true,
+          get() {
+            getterReads += 1;
+            return getterReads <= 6 ? request.transactionId : "../poison";
+          },
+        });
+        const outcome = await capture(() => appendAll(capability, [{
+          event: "PREPARED",
+          payload,
+        }]));
+        const replayed = await capture(() => journal.replayJournal({ capability }));
+        return {
+          outcome,
+          getterReads,
+          replayed: replayed.ok
+            ? {
+              ok: true,
+              state: replayed.value.state,
+              payload: replayed.value.records.at(-1).payload,
+            }
+            : replayed,
+        };
+      }
+      if (request.operation === "active-generated-accessor") {
+        await appendAll(capability, request.prefix);
+        let getterReads = 0;
+        const first = {};
+        Object.defineProperties(first, {
+          id: request.field === "id"
+            ? {
+              enumerable: true,
+              get() {
+                getterReads += 1;
+                return getterReads === 1 ? "generated-next" : "../poison";
+              },
+            }
+            : { enumerable: true, value: "generated-next" },
+          inventory: request.field === "inventory"
+            ? {
+              enumerable: true,
+              get() {
+                getterReads += 1;
+                if (getterReads === 1) return request.inventory;
+                throw new Error("activeGenerated inventory getter read twice");
+              },
+            }
+            : { enumerable: true, value: null },
+        });
+        const outcome = await capture(() => appendAll(capability, [{
+          event: "RESTORE_PREPARED",
+          payload: {
+            restoreId: request.restoreId,
+            activeGenerated: [
+              first,
+              { id: "generated-node-modules", inventory: null },
+            ],
+          },
+        }]));
+        const replayed = await capture(() => journal.replayJournal({ capability }));
+        return {
+          outcome,
+          getterReads,
+          replayed: replayed.ok
+            ? {
+              ok: true,
+              state: replayed.value.state,
+              payload: replayed.value.records.at(-1).payload,
+            }
+            : replayed,
+        };
+      }
+      if (request.operation === "closed-options") {
     const definitions = {
       replay: {
         allowed: ["capability", "fsApi", "maxBytes"],
@@ -2558,6 +2633,21 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.replayed.records[0].recordHash).toMatch(/^[a-f0-9]{64}$/u);
   });
 
+  it("snapshots the PREPARED transactionId accessor once before append", () => {
+    const transactionId = "tx-accessor";
+    const result = invoke(join(fixture, "prepared-transaction-accessor"), {
+      operation: "prepared-transaction-accessor",
+      transactionId,
+    });
+    expect(result.outcome.ok).toBe(true);
+    expect(result.getterReads).toBe(1);
+    expect(result.replayed).toEqual({
+      ok: true,
+      state: "PREPARED",
+      payload: { manifestSha256, transactionId },
+    });
+  });
+
   it.each([
     ["missing PREPARED key", [], { event: "PREPARED", payload: { transactionId: "tx-0001" } }],
     ["unknown PREPARED key", [], {
@@ -2877,6 +2967,36 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.outcome.ok).toBe(false);
     expect(result.bytesUnchanged).toBe(true);
   });
+
+  it.each(["id", "inventory"] as const)(
+    "snapshots a nested activeGenerated %s accessor once before append",
+    (field) => {
+      const inventory = field === "inventory" ? restoreInventorySummary : null;
+      const result = invoke(join(fixture, `restore-prepared-${field}-accessor`), {
+        operation: "active-generated-accessor",
+        field,
+        prefix: quarantinedPrefix,
+        restoreId,
+        inventory,
+        inventoryBackings: field === "inventory"
+          ? [{ id: "generated-next", base64: inventoryBytes.toString("base64") }]
+          : [],
+      });
+      expect(result.outcome.ok).toBe(true);
+      expect(result.getterReads).toBe(1);
+      expect(result.replayed).toEqual({
+        ok: true,
+        state: "RESTORE_PREPARED",
+        payload: {
+          restoreId,
+          activeGenerated: [
+            { id: "generated-next", inventory },
+            { id: "generated-node-modules", inventory: null },
+          ],
+        },
+      });
+    },
+  );
 
   it("accepts exact null inventory records without backing JSONL", () => {
     const result = invoke(join(fixture, "restore-prepared-null-inventories"), {

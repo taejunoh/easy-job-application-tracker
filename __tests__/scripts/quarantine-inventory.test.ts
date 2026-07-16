@@ -823,6 +823,24 @@ try {
     result = { ...result, handles, maxHandles };
   } else if (request.operation === "parse-record") {
     result = inventory.parseInventoryRecord(request.value);
+  } else if (request.operation === "parse-record-link-target-accessor") {
+    let getterReads = 0;
+    const value = {
+      scope: "relative",
+      path: "src/link",
+      type: "symlink",
+      mode: 0o777,
+      size: 1,
+    };
+    Object.defineProperty(value, "linkTarget", {
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        return getterReads === 1 ? request.linkTarget : { poisoned: true };
+      },
+    });
+    const record = inventory.parseInventoryRecord(value);
+    result = { getterReads, record };
   } else if (request.operation === "parse-summary") {
     result = inventory.parseInventorySummary(request.value);
   } else if (request.operation === "compare") {
@@ -983,6 +1001,24 @@ describe("bounded quarantine inventory", () => {
       { ...relative, path: "a//b" },
       { ...relative, path: "cafe\u0301" },
     ]) expect(() => runWorker({ operation: "parse-record", value })).toThrow(/inventory record/u);
+  });
+
+  it("snapshots a symlink inventory record linkTarget accessor once", () => {
+    const linkTarget = "../target";
+    expect(runWorker({
+      operation: "parse-record-link-target-accessor",
+      linkTarget,
+    }).result).toEqual({
+      getterReads: 1,
+      record: {
+        scope: "relative",
+        path: "src/link",
+        type: "symlink",
+        mode: 0o777,
+        size: 1,
+        linkTarget,
+      },
+    });
   });
 
   it("parses and compares only exact inventory summaries", () => {
