@@ -1213,7 +1213,10 @@ Slice 1 fixed directories when every present name is a same-device,
 realpath-equal, non-symlink mode-`0700` directory and no file or foreign name
 exists. Strict bootstrap must complete and re-fsync every such prefix. Add a
 table-driven case for every prefix from run-root-only through the complete empty
-layout, plus non-ancestor subsets and files as rejecting controls.
+layout. Also admit valid branching subsets, such as present `manifests` and
+`payload` while `inventories` is absent when both required parents are present;
+reject an orphan child whose fixed lexical parent is absent, plus files and
+foreign names.
 
 Private precommit resume requires the complete fixed layout and admits only
 published `pre` inventories, one published manifest digest generation, legal
@@ -1226,13 +1229,20 @@ rejection of every file; only runtime `quarantineWorkspace` may enter the
 non-exported `apply-precommit-resume` core mode.
 
 Test the exact divergent temporary matrix. A final alone is adopted only after
-exact streamed bytes/hash/size/mode recomputation. With final plus temp, unlink
-temp only when both current paths identify the same exact inode and only after
-final and parent durability; a different temp is preserved with
-`ERR_INTEGRITY`. With temp alone, recompute and stream-compare the complete
-canonical patch and, only if exact, publish no-replace, fsync/revalidate final
-and parent, then identity-check/unlink temp and fsync the parent again. Preserve
-partial, mismatching, nonregular, wrong-mode, and replaced temps. Only a temp
+capturing device/inode/mode/size before the streamed comparison and proving the
+same identity after read and after final/parent sync. With final plus temp,
+unlink temp only when its current complete identity equals the captured exact
+final after final and parent durability; a different temp is preserved with
+`ERR_INTEGRITY`. With temp alone, capture its complete identity before read,
+recompute and stream-compare the complete canonical patch, and recheck that
+identity after read and immediately before link. Publish no-replace, require the
+final identity to equal the capture, sync final, recheck final and temp before
+parent sync, sync parent, and recheck both afterward. Only then
+identity-check/unlink temp and fsync the parent again. Inject swaps after compare
+but before link, after link but before final sync, after final sync but before
+parent sync, and after parent sync; every mismatch preserves evidence and
+returns `ERR_INTEGRITY`. Preserve partial, mismatching, nonregular, wrong-mode,
+and replaced temps. Only a temp
 successfully `O_EXCL`-created by the current invocation may be identity-checked
 and removed on its local prepublication failure; path/mode/inode observations
 alone never authorize deletion of a preexisting temp.

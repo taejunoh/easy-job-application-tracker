@@ -376,19 +376,30 @@ A same-transaction precommit retry recomputes the patch with the exact command
 and uses this closed matrix; path, mode, or a previously observed inode alone
 never proves ownership:
 
-- final present, temporary absent: stream-compare exact complete bytes, SHA-256,
-  size, and mode `0600`; adopt only an exact final;
-- final present, temporary present: first require the exact final above. Unlink
-  the temporary only when its current device/inode is exactly the final's
-  current device/inode, after final identity and final-parent durability are
+- final present, temporary absent: capture the final's device/inode/mode/size
+  before streaming, compare exact complete bytes and SHA-256, then require the
+  post-read identity to equal that captured identity with exact mode `0600`.
+  Sync the final and then its parent, rechecking after the parent sync that the
+  final still has the captured identity; only then adopt it;
+- final present, temporary present: first require the exact identity-stable
+  final above. Unlink the temporary only when its current device/inode/mode/size
+  equals the captured final identity after final and parent durability are
   proven; otherwise preserve the extra temporary and return `ERR_INTEGRITY`;
 - final absent, temporary present: require a non-symlink regular mode-`0600`
-  temporary, recompute the canonical patch, and stream-compare exact complete
-  bytes, SHA-256, size, and mode. If exact, publish without replacement, sync
-  and revalidate the final and parent, then identity-check and unlink the
-  temporary and sync the parent again;
+  temporary and capture its device/inode/mode/size before streaming. Recompute
+  the canonical patch and compare exact complete bytes and SHA-256; require the
+  post-read and immediate pre-link temporary identity to equal the capture.
+  Link without replacement, require the final's device/inode/mode/size to equal
+  that same capture, sync the final, recheck both paths against the capture
+  immediately before syncing the parent, then sync the parent. Require both
+  final and still-present temporary to retain the captured identity after the
+  parent sync. Only then identity-check and unlink the temporary and sync the
+  parent again;
 - a mismatching, partial, wrong-mode, nonregular, replaced, or otherwise
-  unprovable preexisting temporary is preserved and returns `ERR_INTEGRITY`.
+unprovable preexisting temporary is preserved and returns `ERR_INTEGRITY`.
+Any swap or mismatch at the post-read, immediate pre-link, post-link,
+pre-parent-sync, or post-sync seam preserves all available evidence and returns
+`ERR_INTEGRITY`; no later unlink or adoption occurs.
 
 Only a temporary successfully created with `O_EXCL` by the current invocation
 may be identity-checked and unlinked on that invocation's local prepublication
@@ -776,7 +787,10 @@ mode-`0700` directory; no file, unexpected name, or child whose fixed parent is
 absent is allowed. The strict Slice 1 bootstrap creates missing suffix
 directories in canonical order and repeats the required parent fsync for every
 created or adopted name. Tests cover every possible prefix, including only the
-run root and the complete empty layout.
+run root and the complete empty layout, plus valid branching subsets such as
+`manifests` and `payload` present while `inventories` is absent when their
+parents are present. A fixed child with an absent lexical parent is an invalid
+orphan and returns `ERR_INTEGRITY`.
 
 The closed journal-absent precommit set requires the complete fixed layout and
 adds only complete published finals:
