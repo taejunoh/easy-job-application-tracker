@@ -1111,6 +1111,90 @@ const result = await withQuarantineRunCapability({
       replayed: await journal.replayJournal({ capability }),
     };
   }
+  if (request.operation === "shared-append-lifecycle") {
+    await appendAll(capability, request.records);
+    if (request.mode === "recovery") await seedArtifacts(capability);
+    const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
+    const before = await snapshot();
+    let heldCloseCalls = 0;
+    const lifecycleFs = request.closeFailure
+      ? {
+        ...fsPromises,
+        open: async (path, flags, mode) => {
+          const handle = await fsPromises.open(path, flags, mode);
+          if (String(path) !== lockPath || !String(flags).includes("x")) return handle;
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === "close") return async () => {
+                heldCloseCalls += 1;
+                await target.close();
+                throw new Error("injected lifecycle held-lock close failure");
+              };
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        },
+      }
+      : fsPromises;
+    useFsApi(lifecycleFs);
+    let pendingAppend = null;
+    let swallowed = null;
+    const callback = async (heldLock) => {
+      const append = () => journal.appendJournalRecord({
+        capability,
+        heldLock,
+        event: request.record.event,
+        payload: request.record.payload,
+        fsApi: boundFsApi,
+        faultHook: request.failurePhase === undefined
+          ? undefined
+          : async (phase) => {
+            if (phase === request.failurePhase) {
+              throw new Error("injected shared append failure");
+            }
+          },
+      });
+      if (request.unawaited) {
+        pendingAppend = append();
+        pendingAppend.catch(() => {});
+        return "callback-returned-with-pending-append";
+      }
+      try {
+        await append();
+      } catch (error) {
+        swallowed = {
+          name: error.name,
+          code: error.code ?? null,
+          message: error.message,
+          expectedSequence: error.expectedSequence ?? null,
+          expectedRecordHash: error.expectedRecordHash ?? null,
+        };
+      }
+      return "callback-swallowed-append-failure";
+    };
+    const outcome = request.mode === "recovery"
+      ? await capture(() => journal.reclaimJournalLock(
+        { capability, writersStopped: true, fsApi: boundFsApi },
+        callback,
+      ))
+      : await capture(() => journal.withJournalLock(
+        { capability, fsApi: boundFsApi },
+        callback,
+      ));
+    const pendingOutcome = pendingAppend === null
+      ? null
+      : await capture(() => pendingAppend);
+    return {
+      outcome,
+      pendingOutcome,
+      swallowed,
+      heldCloseCalls,
+      before,
+      after: await snapshot(),
+      replayed: await journal.replayJournal({ capability }),
+    };
+  }
   if (request.operation === "settle-durable-tip") {
     if (request.setup !== "existing") {
       await appendAll(capability, request.records);
@@ -1582,28 +1666,35 @@ const result = await withQuarantineRunCapability({
     }));
   }
   if (request.operation === "overlapping") {
-    const settled = await journal.withJournalLock(
+    let statuses;
+    const outcome = await capture(() => journal.withJournalLock(
       { capability, fsApi: boundFsApi },
-      (heldLock) => Promise.allSettled([
-        journal.appendJournalRecord({
-          capability,
-          heldLock,
-          event: request.record.event,
-          payload: request.record.payload,
-          fsApi: boundFsApi,
-        }),
-        journal.appendJournalRecord({
-          capability,
-          heldLock,
-          event: request.record.event,
-          payload: request.record.payload,
-          fsApi: boundFsApi,
-        }),
-      ]),
-    );
+      async (heldLock) => {
+        const settled = await Promise.allSettled([
+          journal.appendJournalRecord({
+            capability,
+            heldLock,
+            event: request.record.event,
+            payload: request.record.payload,
+            fsApi: boundFsApi,
+          }),
+          journal.appendJournalRecord({
+            capability,
+            heldLock,
+            event: request.record.event,
+            payload: request.record.payload,
+            fsApi: boundFsApi,
+          }),
+        ]);
+        statuses = settled.map((entry) => entry.status).sort();
+        return settled;
+      },
+    ));
     return {
-      statuses: settled.map((entry) => entry.status).sort(),
+      outcome,
+      statuses,
       replayed: await journal.replayJournal({ capability }),
+      names: (await fsPromises.readdir(runRoot)).sort(),
     };
   }
   if (request.operation === "transitions") {
@@ -3138,6 +3229,100 @@ describe("capability-bound durable quarantine journal", () => {
   });
 
   it.each([
+    ["before-mutation", "Error"],
+    ["after-journal-open", "IndeterminateJournalAppendError"],
+  ])(
+    "surfaces an ordinary swallowed %s append failure before lock cleanup",
+    (failurePhase, expectedName) => {
+      const result = invoke(join(fixture, `shared-ordinary-${failurePhase}`), {
+        operation: "shared-append-lifecycle",
+        mode: "ordinary",
+        records: [records.prepared],
+        record: records.moving,
+        failurePhase,
+      });
+      expect(result.swallowed.name).toBe(expectedName);
+      expect(result.outcome.ok).toBe(false);
+      expect(result.outcome.error).toMatchObject({
+        name: result.swallowed.name,
+        code: result.swallowed.code,
+        message: result.swallowed.message,
+        expectedSequence: result.swallowed.expectedSequence,
+        expectedRecordHash: result.swallowed.expectedRecordHash,
+      });
+      expect(result.replayed.records.map(
+        (record: { event: string }) => record.event,
+      )).toEqual(["PREPARED"]);
+      expect(Object.keys(result.after).sort()).toEqual(["journal.lock", "journal.log"]);
+    },
+  );
+
+  it.each([
+    ["ordinary", "before-mutation", "Error"],
+    ["ordinary", "after-journal-open", "IndeterminateJournalAppendError"],
+    ["recovery", "after-journal-open", "IndeterminateJournalAppendError"],
+  ])(
+    "keeps the %s swallowed %s failure primary when held-lock close also fails",
+    (mode, failurePhase, expectedName) => {
+      const result = invoke(join(fixture, `shared-close-${mode}-${failurePhase}`), {
+        operation: "shared-append-lifecycle",
+        mode,
+        closeFailure: true,
+        records: [records.prepared],
+        record: records.moving,
+        failurePhase,
+      });
+      expect(result.swallowed.name).toBe(expectedName);
+      expect(result.outcome.ok).toBe(false);
+      expect(result.outcome.error).toMatchObject({
+        name: result.swallowed.name,
+        code: result.swallowed.code,
+        message: result.swallowed.message,
+        expectedSequence: result.swallowed.expectedSequence,
+        expectedRecordHash: result.swallowed.expectedRecordHash,
+        cleanupError: "injected lifecycle held-lock close failure",
+        causeName: "AggregateError",
+      });
+      expect(result.outcome.error.causeErrors.at(-1)).toBe(
+        "injected lifecycle held-lock close failure",
+      );
+      if (expectedName === "IndeterminateJournalAppendError") {
+        expect(result.outcome.error.causeErrors[0]).toBe("injected shared append failure");
+      }
+      expect(result.heldCloseCalls).toBe(1);
+      expect(Object.keys(result.after)).toContain("journal.lock");
+      if (mode === "recovery") {
+        expect(Object.keys(result.after).filter(
+          (name) => name.startsWith("journal.lock.tombstone."),
+        )).toHaveLength(2);
+      }
+    },
+  );
+
+  it("rejects an unawaited in-flight append before ordinary lock cleanup", () => {
+    const result = invoke(join(fixture, "shared-unawaited-ordinary"), {
+      operation: "shared-append-lifecycle",
+      mode: "ordinary",
+      unawaited: true,
+      records: [records.prepared],
+      record: records.moving,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.outcome.error).toMatchObject({
+      name: "Error",
+      code: null,
+      message: "journal lock callback returned with an incomplete append attempt",
+      expectedSequence: null,
+      expectedRecordHash: null,
+    });
+    expect(result.pendingOutcome.ok).toBe(false);
+    expect(result.replayed.records.map(
+      (record: { event: string }) => record.event,
+    )).toEqual(["PREPARED"]);
+    expect(Object.keys(result.after).sort()).toEqual(["journal.lock", "journal.log"]);
+  });
+
+  it.each([
     "wrong-result",
     "extra-outer",
     "extra-inner",
@@ -3240,8 +3425,16 @@ describe("capability-bound durable quarantine journal", () => {
       record: records.prepared,
     });
     expect(result.statuses).toEqual(["fulfilled", "rejected"]);
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: {
+        name: "Error",
+        message: "journal append is already in progress",
+      },
+    });
     expect(result.replayed.records).toHaveLength(1);
     expect(result.replayed.records[0]).toMatchObject({ sequence: 1, event: "PREPARED" });
+    expect(result.names).toEqual(["journal.lock", "journal.log"]);
   });
 
   const transitionEdges = [

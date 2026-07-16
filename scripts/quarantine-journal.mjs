@@ -1237,6 +1237,7 @@ async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callba
     firstFailedAttempt: null,
     fsApi,
     lastCandidate: null,
+    lifecycleFailure: false,
   };
   heldLockState.set(heldLock, state);
   let result;
@@ -1245,11 +1246,18 @@ async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callba
   try {
     result = await callback(heldLock);
     callbackCompleted = true;
-    if (state.appendInProgress) throw new Error("journal lock callback returned during an append");
+    if (state.firstFailedAttempt !== null) {
+      state.lifecycleFailure = true;
+      throw state.firstFailedAttempt.error;
+    }
+    if (state.appendInvocations !== state.completedDurableAttempts) {
+      state.lifecycleFailure = true;
+      throw new Error("journal lock callback returned with an incomplete append attempt");
+    }
     await assertHeldLockOwned(state);
   } catch (error) {
     primaryError =
-      callbackCompleted && state.lastCandidate !== null
+      callbackCompleted && !state.lifecycleFailure && state.lastCandidate !== null
         ? indeterminate(state.lastCandidate, error)
         : error;
   }
@@ -1263,6 +1271,7 @@ async function runWithJournalLock({ capability, fsApi, removeOnSuccess }, callba
   }
   if (
     removeOnSuccess &&
+    !state.lifecycleFailure &&
     !(settledError instanceof IndeterminateJournalAppendError)
   ) {
     try {
@@ -1856,14 +1865,6 @@ export async function reclaimJournalLock(options, callback) {
       return callbackResult;
     },
   );
-  if (
-    run.state.firstFailedAttempt !== null ||
-    run.state.appendInvocations !== run.state.completedDurableAttempts
-  ) {
-    throw run.state.firstFailedAttempt?.error ?? new Error(
-      "journal lock recovery has an incomplete append invocation",
-    );
-  }
   if (run.state.durableAppends === 0) {
     if (zeroAppendFailure !== undefined || settlementResult === undefined) {
       const primary = zeroAppendFailure ?? new Error(
