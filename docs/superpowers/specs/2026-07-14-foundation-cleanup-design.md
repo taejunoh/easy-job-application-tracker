@@ -296,8 +296,9 @@ type ManifestEntry =
 ```
 
 Every object above has an exact key set. Hashes are lowercase 64-character
-SHA-256 values; `historyMatch` is null or an accepted 40/64-character Git
-object ID; modes are safe integers from `0` through `0o7777`; sizes, entry
+SHA-256 values; `historyMatch` is null or the lowercase 40/64-character
+candidate commit OID whose historical regular blob matched, never a blob OID;
+modes are safe integers from `0` through `0o7777`; sizes, entry
 counts, and byte counts are non-negative safe integers. A source-copy summary
 has exactly one entry and its byte count equals `size`. `identical` requires
 equal source/canonical sizes and hashes, while `divergent` requires unequal
@@ -645,12 +646,15 @@ zero through 9,999 inclusive, matching the four-digit nonzero source-copy ID
 space. Every value is snapshotted from the closed option object before the
 first await.
 
-Each discovery pass invokes Git with argument arrays. It resolves identity with
-`git rev-parse --show-toplevel`, `git symbolic-ref --quiet --short HEAD`, and
-`git rev-parse --verify HEAD`, then invokes exactly:
+Each discovery pass invokes Git with argument arrays. Every invocation inserts
+the exact global arguments `-c core.fsmonitor=false` before the subcommand, so
+the common argv prefix is always `git -c core.fsmonitor=false`. It resolves
+identity with `rev-parse --show-toplevel`,
+`symbolic-ref --quiet --short HEAD`, and `rev-parse --verify HEAD`, then invokes
+exactly:
 
 ```text
-git status --porcelain=v1 -z --untracked-files=all
+git -c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all
 ```
 
 Every read-only Git child receives one newly created null-prototype environment
@@ -674,6 +678,15 @@ index device/inode/mode/size/mtime/ctime before and after inspection, require no
 `.git/index.lock` or other new lock residue, and use an unavailable promisor
 object plus a remote-helper sentinel to prove that discovery performs no fetch,
 remote-helper, or network access.
+
+The fixture also configures a hostile `core.fsmonitor` hook or daemon command
+that writes a sentinel and would omit a newly created untracked path if invoked.
+Every discovery child must retain the global `-c core.fsmonitor=false` prefix;
+the sentinel remains absent and the full porcelain result still contains that
+fresh path. The exact read-only command set does not invoke repository hooks,
+diff drivers, or textconv filters, so no broader hook-disabling mechanism is
+added; the sanitized environment already omits pager, editor, and prompt
+variables.
 
 An empty status is represented by zero bytes. A non-empty status must end in a
 NUL byte and contain no empty interior record. Every record is decoded with a
@@ -717,13 +730,15 @@ runs both passes only after validating `writersStopped === true` and does not
 reuse an inspection result as authority.
 
 For each divergent source, enumerate candidate historical commits with exactly
-`git log --all --format=%H -z -- <canonical-relative-path>`. Parse stdout as
+`git -c core.fsmonitor=false log --all --format=%H -z -- <canonical-relative-path>`.
+Parse stdout as
 fatal UTF-8, NUL-terminated lowercase 40/64-character object IDs while it is
 streaming; retain at most 4,096 IDs and 1 MiB of control bytes. Close and await
 that process before checking commits sequentially.
 
 For each commit OID, run exactly
-`git ls-tree -z --full-tree <commitOid> -- <canonical-relative-path>`, passing
+`git -c core.fsmonitor=false ls-tree -z --full-tree <commitOid> -- <canonical-relative-path>`,
+passing
 the safe canonical path as one literal argument even when it contains a newline.
 Stdout is capped at 1 MiB and parsed as raw NUL-framed bytes. Exit zero plus
 empty stdout means absent and is skipped. Otherwise stdout must contain exactly
@@ -731,20 +746,29 @@ one NUL-terminated record of exact Git form
 `<mode> SP <type> SP <lowerhexBlobOid> TAB <path> NUL`; fatal UTF-8 decoding is
 applied only to the control fields and path, the returned path must equal the
 canonical relative path byte-for-byte, and the OID must be lowercase 40/64-hex.
-Only mode `100644` or `100755` with type `blob` is body-eligible. A well-formed
-tree, symlink, gitlink, or other non-regular record is skipped without reading
-its object body. Multiple records, malformed fields, a mismatched path/type/OID,
-missing final NUL, oversized output, signal, or nonzero exit is fatal.
+Only the exact pairs `100644 blob` and `100755 blob` are body-eligible. The only
+well-formed nonregular pairs that skip without reading an object body are
+exactly `040000 tree`, `120000 blob`, and `160000 commit`. Every other
+mode/type pair, mode width/value, or object type is fatal, including a regular
+mode paired with a non-blob type. Multiple records, malformed fields, a
+mismatched path or OID, missing final NUL, oversized output, signal, or nonzero
+exit is also fatal.
 
-For an eligible blob, spawn exactly `git cat-file blob <lowerhexBlobOid>` using
-the validated OID only; no `commit:path` expression is passed to a body-reading
-command. Stream stdout directly through a SHA-256 accumulator with a 64 KiB
-read high-water mark and no whole-body or total-body buffer. Every Git child's
-stderr is capped at 64 KiB and never returned. On a stream, decoder, limit,
-signal, or child-process error, close or kill the child as appropriate and await
+For an eligible blob, spawn exactly
+`git -c core.fsmonitor=false cat-file blob <lowerhexBlobOid>` using the validated
+blob OID only; no `commit:path` expression is passed to a body-reading command.
+Stream stdout directly through a SHA-256 accumulator with a 64 KiB read
+high-water mark and no whole-body or total-body buffer. Every Git child's stderr
+is capped at 64 KiB and never returned. On a stream, decoder, limit, signal, or
+child-process error, close or kill the child as appropriate and await
 stdin/stdout/stderr/process settlement before throwing the fixed sanitized
-preflight error. The first matching eligible blob in Git's emitted commit order
-is the history match; no match is `null`.
+preflight error.
+
+When a blob hash matches, `historyMatch` is exactly the lowercase 40/64-hex
+candidate commit OID emitted by `git log`, never the blob OID. The blob OID is an
+ephemeral streaming locator only: it is not returned, persisted, added to a
+manifest or runtime entry, or exposed by an error or hook. The first matching
+eligible candidate commit in Git's emitted order wins; no match is `null`.
 
 ### FD-bounded inventory and durability traversal
 
@@ -932,11 +956,12 @@ Its options are a closed plain object with the same snapshot and validation
 rules as the eventual `quarantineWorkspace`. `createdAt` is canonical UTC,
 `writersStopped` must be literal `true`, and the only phase Slice 1 may pass to
 `faultHook` is `"after-layout-sync"`, after the complete layout is durable.
-The result is a deeply frozen, acyclic, null-prototype, exact-key internal
-handoff and does not claim a journal state or completed move. Its own keys are
-exactly the ten displayed keys with no symbol or accessor property. Every
-top-level property is an enumerable, non-writable, non-configurable data
-property, and the object is frozen and non-extensible. `repoRoot`,
+The result is structurally deep-frozen and acyclic: every reachable plain
+record and array is frozen and non-extensible, while callable method leaves use
+the narrower contract below. The top-level handoff has a null prototype, does
+not claim a journal state or completed move, and has exactly the ten displayed
+keys with no symbol or accessor property. Every top-level property is an
+enumerable, non-writable, non-configurable data property. `repoRoot`,
 `quarantineRoot`, and `runRoot` are the validated real absolute paths.
 `fsSource` is the exact frozen filesystem source used for bootstrap and later
 supplied by identity to `withQuarantineRunCapability`.
@@ -963,12 +988,22 @@ before mutation.
 
 `fsSource` is likewise a frozen, non-extensible, null-prototype record with no
 symbols/accessors and exactly the 14 filesystem method keys listed below. Each
-property is an enumerable, non-writable, non-configurable data property whose
-value is a newly created frozen wrapper function that retains the single
-captured caller receiver and implementation. Deep-freeze tests recursively
-assert prototypes, exact own-key sets, dense-array shape, descriptor flags, and
-`Object.isFrozen`/`Object.isExtensible` for the result, entries, identities,
-filesystem source, and wrappers; mutating any nested record or array must not
+property is an enumerable, non-writable, non-configurable data property. Its
+value must be callable, must retain stable identity on repeated property reads,
+and must call the one captured implementation with the one captured caller
+filesystem adapter as its receiver. The exact `Function` prototype, own keys,
+`name`, `length`, property descriptors, extensibility, and frozen state of a
+callable leaf are deliberately not part of the contract: the existing filesystem
+context creates ordinary rest-argument arrow wrappers whose own `length` and
+`name` properties remain implementation details even though the containing
+adapter is frozen. Tests assert only callability, stable wrapper identity, and
+captured-receiver behavior for `fsSource` leaves. The separately created private
+bound-adapter wrappers additionally retain their existing capability-lifetime
+revocation contract. Tests assert the exact `fsSource` object identity at
+capability binding but do not equate source and bound-adapter wrapper identity.
+They recursively assert exact prototypes, own-key sets, dense-array shape,
+descriptors, and frozen/non-extensible state for the result, entries,
+identities, and `fsSource` record itself; mutating any record or array must not
 change a later capability handoff.
 
 Every successful result is also a closed plain object with exactly one of these

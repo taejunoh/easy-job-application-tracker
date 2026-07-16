@@ -921,10 +921,16 @@ custom keys; its indices are enumerable frozen data descriptors and its length
 is a non-enumerable frozen data descriptor. Every source/generated entry and
 nested identity is a frozen null-prototype exact-key record with non-writable,
 non-configurable enumerable data descriptors. `fsSource` is a frozen
-null-prototype exact 14-key record of newly created frozen wrapper functions.
-Recursively assert prototypes,
-`Reflect.ownKeys`, descriptor flags, frozen/non-extensible state, and mutation
-inertness for every reachable record, array, and wrapper.
+null-prototype exact 14-key record whose 14 frozen data properties each hold a
+stable callable wrapper around one captured implementation and receiver.
+Recursively assert prototypes, `Reflect.ownKeys`, descriptor flags,
+frozen/non-extensible state, and mutation inertness for every reachable record
+and array. For callable leaves, assert only `typeof value === "function"`, stable
+identity on repeated reads, captured-receiver behavior, exact source-object
+identity at capability binding, and the separate bound adapter's existing
+revocation behavior. Do not assert a wrapper's `Function` prototype, own keys,
+`name`, `length`, descriptors, extensibility, or frozen state; the current
+rest-argument arrow-wrapper details are deliberately private.
 
 - [ ] **Step 1.1: Write discovery and bootstrap RED tests**
 
@@ -936,8 +942,9 @@ files, both non-symlink generated roots, external mode-`0700` quarantine root,
 and the same device.
 
 Assert the exact argument-array Git commands and strictly parse
-`git status --porcelain=v1 -z --untracked-files=all`: fatal UTF-8, required final
-NUL when nonempty, no empty interior frame, and only `?? <safe numbered path>`.
+`git -c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all`:
+fatal UTF-8, required final NUL when nonempty, no empty interior frame, and only
+`?? <safe numbered path>`.
 Reject tracked/staged/rename/copy/malformed records and every unrelated
 untracked path. Assert the exact final-component numbered suffix, strict NFC
 POSIX paths, derived regular canonical path, UTF-8 bytewise ordering, and the
@@ -951,20 +958,27 @@ body, inode, canonical file, generated-root identity, Git branch/HEAD, or status
 between passes and require failure before run creation. Replace a root or
 ancestor with a symlink and prove an external sentinel is unchanged.
 
-For divergent history assert streamed `git log --all --format=%H -z -- <path>`
-with bounded 4,096-ID/1-MiB control parsing. For each commit, assert exact
-`git ls-tree -z --full-tree <commitOid> -- <canonicalPath>` argument boundaries
-and strict empty-or-one-record parsing. Include canonical names containing a
-newline and pathspec punctuation. Empty exit-zero output is absent; only exact
-`100644 blob` or `100755 blob` records with a lowercase 40/64-hex OID and the
-byte-identical canonical path are body-eligible. Skip a well-formed nonregular
-record without opening its body; reject multiple/malformed/mismatched/oversized
-output, missing NUL, nonzero exit, or signal.
+Assert every runtime discovery Git argv begins exactly
+`git -c core.fsmonitor=false` before its subcommand. For divergent history
+assert streamed
+`git -c core.fsmonitor=false log --all --format=%H -z -- <path>` with bounded
+4,096-ID/1-MiB control parsing. For each commit, assert exact
+`git -c core.fsmonitor=false ls-tree -z --full-tree <commitOid> -- <canonicalPath>`
+argument boundaries and strict empty-or-one-record parsing. Include canonical
+names containing a newline and pathspec punctuation. Empty exit-zero output is
+absent. Only exact `100644 blob` and `100755 blob` pairs are body-eligible;
+exactly `040000 tree`, `120000 blob`, and `160000 commit` skip without opening
+an object body. Reject every other mode/type pair or width/value, as well as
+multiple/malformed/mismatched/oversized output, missing NUL, nonzero exit, or
+signal.
 
-For an eligible record assert exact `git cat-file blob <blobOid>` with the OID
-as the only object selector, 64-KiB streaming reads, bounded 64-KiB stderr, no
+For an eligible record assert exact
+`git -c core.fsmonitor=false cat-file blob <blobOid>` with the blob OID as the
+only object selector, 64-KiB streaming reads, bounded 64-KiB stderr, no
 whole-body buffer, and full stdin/stdout/stderr/process settlement on every
 success or failure seam. No body command receives a path or `commit:path`.
+Assert the stored `historyMatch` is the exact lowercase candidate commit OID,
+not the blob OID; the blob OID never leaves the local streaming lookup.
 
 Every Git child must receive the design's exact new null-prototype environment:
 only the inherited cross-platform execution/locale allowlist plus
@@ -972,6 +986,10 @@ only the inherited cross-platform execution/locale allowlist plus
 `GIT_LITERAL_PATHSPECS=1`. Assert the env for every command, unchanged Git index
 device/inode/mode/size/mtime/ctime, no new lock residue, and an untouched remote
 helper/network sentinel when a required promisor object is unavailable.
+Configure a hostile `core.fsmonitor` hook or daemon sentinel that would omit a
+fresh untracked path if invoked. Assert the sentinel is untouched and status is
+complete. Stay scoped to fsmonitor: these read-only commands invoke no repository
+hook, diff driver, or textconv filter.
 
 Require `inspectWorkspace` to remain read-only and advisory, including no
 writability probe. Require `prepareQuarantineWorkspace` to repeat every gate
@@ -997,13 +1015,19 @@ Expected: FAIL because the focused transaction/runtime modules do not exist.
 
 - [ ] **Step 1.3: Implement discovery, source capture, and bootstrap**
 
-Use `git status --porcelain=v1 -z --untracked-files=all` with argument arrays.
+Use `git -c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all`
+with argument arrays, and apply the same global `-c core.fsmonitor=false`
+prefix to every other Git child.
 Implement the design's fatal decoding, exact status grammar, canonical
 NUL-frame, fresh two-pass identity, bytewise sorting, streamed hashes, and
 bounded child-process lifecycle. Use `ls-tree -z` only to derive a validated
-regular blob OID, then hash only `git cat-file blob <blobOid>` stdout. Every
+regular blob OID, then hash only
+`git -c core.fsmonitor=false cat-file blob <blobOid>` stdout. Every
 read-only Git spawn uses the exact sanitized environment and settles all child
-resources. No public result exposes a per-entry path, payload/body content,
+resources. Enforce the design's exact two eligible and three skippable
+mode/type pairs; every other pair is fatal. Persist only a matching candidate
+commit OID as `historyMatch` and discard the streaming blob OID. No public
+result exposes a per-entry path, payload/body content,
 per-entry content hash, or undocumented hash; the documented inspection `head`
 and later `manifestSha256` outputs remain allowed. No error or hook receives a
 path list, content hash, body, diff, stderr, or dynamic underlying error
