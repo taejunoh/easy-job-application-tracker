@@ -1,8 +1,11 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -124,7 +127,7 @@ function installGitDiffOverride(
   f: Fixture,
   label: string,
   stdout: Buffer,
-  { stderr = Buffer.alloc(0), exit = 1 } = {},
+  { stderr = Buffer.alloc(0), exit = 1, signal }: { stderr?: Buffer; exit?: number; signal?: string } = {},
 ) {
   const bin = join(f.base, `git-diff-override-${label}`);
   privateDirectory(bin);
@@ -140,7 +143,7 @@ function installGitDiffOverride(
   ].join(" ");
   writeFileSync(
     join(bin, "git"),
-    `#!/bin/sh\nif [ "$*" = ${JSON.stringify(expected)} ]; then /bin/cat ${JSON.stringify(stdoutPath)}; /bin/cat ${JSON.stringify(stderrPath)} >&2; exit ${exit}; fi\nexec ${JSON.stringify(realGit)} "$@"\n`,
+    `#!/bin/sh\nif [ "$*" = ${JSON.stringify(expected)} ]; then /bin/cat ${JSON.stringify(stdoutPath)}; /bin/cat ${JSON.stringify(stderrPath)} >&2; ${signal === undefined ? `exit ${exit}` : `kill -${signal} $$; exit 99`}; fi\nexec ${JSON.stringify(realGit)} "$@"\n`,
     { mode: 0o700 },
   );
   chmodSync(join(bin, "git"), 0o700);
@@ -188,6 +191,18 @@ function fixture({
     canonicalPath,
     copyPath,
   };
+}
+
+function canonicalDiff(f: Fixture) {
+  const diff = spawnSync("git", [
+    "-c", "core.fsmonitor=false",
+    "-c", "core.quotePath=true",
+    "diff", "--no-index", "--binary", "--full-index", "--no-color",
+    "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--",
+    f.canonicalPath!, f.copyPath!,
+  ], { cwd: f.repoRoot });
+  expect(diff.status).toBe(1);
+  return diff.stdout;
 }
 
 type DescriptorShape = {
@@ -255,6 +270,7 @@ type WorkerResult = {
   runRootOpenAttempts?: number;
   hookCalls?: number;
   unlinkCalls?: number;
+  injected?: boolean;
   thrownUndefined?: boolean;
   codeReads?: number;
   closeGetterReads?: number;
@@ -263,6 +279,20 @@ type WorkerResult = {
   active?: { callable: boolean; distinctRejected: boolean };
   revoked?: boolean;
   sourceFrozen?: boolean;
+  instrumentation?: {
+    renamed: string[][];
+    synced: string[];
+    snapshots: Array<{
+      phase: string;
+      renamed: string[][];
+      synced: string[];
+      lockCreates: number;
+      lockRemovals: number;
+      lockExists: boolean;
+    }>;
+    lockCreates: number;
+    lockRemovals: number;
+  };
   shape?: ValueShape;
   error?: WorkerError;
 };
@@ -277,12 +307,12 @@ function invoke(
 import * as transaction from ${JSON.stringify(transactionUrl)};
 import * as runtime from ${JSON.stringify(runtimeUrl)};
 import { withQuarantineRunCapability } from ${JSON.stringify(capabilityUrl)};
-import { appendJournalRecord, withJournalLock } from ${JSON.stringify(journalUrl)};
+import { appendJournalRecord, replayJournal, withJournalLock } from ${JSON.stringify(journalUrl)};
 import { getRunFsContext } from ${JSON.stringify(fsContextUrl)};
 import * as fsPromises from "node:fs/promises";
 import {
-  chmodSync, createReadStream, lstatSync, mkdirSync, realpathSync, renameSync,
-  writeFileSync,
+  appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, realpathSync,
+  renameSync, truncateSync, writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
@@ -433,6 +463,27 @@ try {
       });
     });
     process.stdout.write(JSON.stringify({ ok: true }));
+  } else if (operation === "replay-run") {
+    let replayed;
+    await withQuarantineRunCapability({
+      repoRoot: request.repoRoot,
+      quarantineRoot: request.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+    }, async (capability) => {
+      replayed = await replayJournal({ capability });
+    });
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      result: {
+        state: replayed.state,
+        records: replayed.records.map((record) => ({
+          sequence: record.sequence,
+          event: record.event,
+          payload: record.payload,
+        })),
+      },
+    }));
   } else if (operation === "apply-rename-exdev") {
     const { variant, ...applyRequest } = request;
     let injected = false;
@@ -597,6 +648,207 @@ try {
     process.stdout.write(JSON.stringify({
       ok: captured === undefined,
       error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-same-inode-size-drift") {
+    const { driftAtFinalOpen, mutation, ...applyRequest } = request;
+    let finalOpens = 0;
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        if (path.endsWith("/divergent-diffs/copy-0001.patch")) {
+          finalOpens += 1;
+          if (finalOpens === driftAtFinalOpen) {
+            if (mutation === "append") appendFileSync(path, "x");
+            else truncateSync(path, Math.max(0, lstatSync(path).size - 1));
+          }
+        }
+        return fsPromises.open(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-divergent-seam-swap") {
+    const { seam, variant, ...applyRequest } = request;
+    const root = join(request.quarantineRoot, request.transactionId, "divergent-diffs");
+    const temporary = join(root, ".copy-0001.tmp");
+    const final = join(root, "copy-0001.patch");
+    let injected = false;
+    let finalLstats = 0;
+    let parentOpens = 0;
+    let temporaryUnlinked = false;
+    const swap = (path, label) => {
+      if (injected) return;
+      injected = true;
+      if (existsSync(path)) renameSync(path, path + ".owned-" + label);
+      writeFileSync(path, "foreign-" + label, { mode: 0o600 });
+      chmodSync(path, 0o600);
+    };
+    const adapter = {
+      ...fsPromises,
+      async lstat(path) {
+        if (path === final) {
+          finalLstats += 1;
+          if (seam === "before-link" && variant === "final-plus-temp" && finalLstats === 1) {
+            swap(final, seam);
+          }
+          if (seam === "after-link" && variant === "final-plus-temp" && finalLstats === 1) {
+            const stats = await fsPromises.lstat(path);
+            swap(final, seam);
+            return stats;
+          }
+        }
+        return fsPromises.lstat(path);
+      },
+      async link(source, destination) {
+        if (destination === final && seam === "before-link") swap(temporary, seam);
+        const result = await fsPromises.link(source, destination);
+        if (destination === final && seam === "after-link") swap(final, seam);
+        return result;
+      },
+      async unlink(path) {
+        const result = await fsPromises.unlink(path);
+        if (path === temporary) {
+          temporaryUnlinked = true;
+          if (seam === "cleanup-before-parent-sync") swap(final, seam);
+        }
+        return result;
+      },
+      async open(path, ...args) {
+        if (path === final && seam === "after-file-sync" && !injected) {
+          const realHandle = await fsPromises.open(path, ...args);
+          return {
+            async stat() { return realHandle.stat(); },
+            async sync() { await realHandle.sync(); swap(final, seam); },
+            async close() { return realHandle.close(); },
+          };
+        }
+        if (path === root && existsSync(final)) {
+          parentOpens += 1;
+          if (seam === "before-parent-sync" && parentOpens === 1) swap(final, seam);
+          const realHandle = await fsPromises.open(path, ...args);
+          if (
+            (seam === "after-parent-sync" && parentOpens === 1) ||
+            (seam.startsWith("cleanup-after-parent-sync") && temporaryUnlinked)
+          ) {
+            return {
+              async sync() {
+                await realHandle.sync();
+                if (seam === "cleanup-after-parent-sync-temp") swap(temporary, seam);
+                else swap(final, seam);
+              },
+              async close() { return realHandle.close(); },
+            };
+          }
+          return realHandle;
+        }
+        return fsPromises.open(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      injected,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-divergent-spawn-error") {
+    let injected = false;
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...request,
+        faultHook(phase) {
+          if (phase === "after-pre-inventories") {
+            injected = true;
+            renameSync(join(process.env.PATH, "git"), join(process.env.PATH, "git.owned"));
+          }
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      injected,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-instrumented") {
+    const renamed = [];
+    const synced = [];
+    const snapshots = [];
+    let lockCreates = 0;
+    let lockRemovals = 0;
+    const lockPath = join(request.quarantineRoot, request.transactionId, "journal.lock");
+    const adapter = {
+      ...fsPromises,
+      async rename(source, destination) {
+        const result = await fsPromises.rename(source, destination);
+        renamed.push([source, destination]);
+        return result;
+      },
+      async open(path, ...args) {
+        const handle = await fsPromises.open(path, ...args);
+        if (path === lockPath && args[0] === "wx") lockCreates += 1;
+        return new Proxy(handle, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target);
+            if (key === "sync") return async (...syncArgs) => {
+              const result = await Reflect.apply(value, target, syncArgs);
+              synced.push(path);
+              return result;
+            };
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+      async rm(path, ...args) {
+        const result = await fsPromises.rm(path, ...args);
+        if (path === lockPath) lockRemovals += 1;
+        return result;
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const phases = [];
+    const result = await transaction.quarantineWorkspace({
+      ...request,
+      fsApi: adapter,
+      faultHook(phase) {
+        phases.push(phase);
+        snapshots.push({
+          phase,
+          renamed: renamed.map((pair) => [...pair]),
+          synced: [...synced],
+          lockCreates,
+          lockRemovals,
+          lockExists: existsSync(lockPath),
+        });
+      },
+    });
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      result,
+      phases,
+      instrumentation: { renamed, synced, snapshots, lockCreates, lockRemovals },
     }));
   } else if (operation === "getter") {
     let reads = 0;
@@ -1131,7 +1383,7 @@ describe("quarantine transaction Slice 1", () => {
   it("returns QUARANTINED only after the complete durable atomic-move protocol", () => {
     const f = fixture();
     bases.push(f.base);
-    const worker = invoke("apply", {
+    const request = {
       repoRoot: f.repoRoot,
       quarantineRoot: f.quarantineRoot,
       expectedBranch: f.branch,
@@ -1140,7 +1392,8 @@ describe("quarantine transaction Slice 1", () => {
       transactionId: "tx-slice-2-happy",
       createdAt: "2026-07-16T00:00:00.000Z",
       writersStopped: true,
-    }, {}, 30_000);
+    };
+    const worker = invoke("apply", request, {}, 30_000);
     if (!worker.ok) throw new Error(JSON.stringify(worker.error));
     expect(worker.result).toEqual({
       transactionId: "tx-slice-2-happy",
@@ -1186,6 +1439,216 @@ describe("quarantine transaction Slice 1", () => {
     expect(existsSync(join(f.repoRoot, "node_modules"))).toBe(false);
     expect(existsSync(join(f.repoRoot, "notes 2.txt"))).toBe(false);
     expect(existsSync(join(f.quarantineRoot, "current"))).toBe(false);
+    const runRoot = join(f.quarantineRoot, request.transactionId);
+    const manifestSha256 = worker.result?.manifestSha256 as string;
+    const manifestNames = readdirSync(join(runRoot, "manifests"));
+    expect(manifestNames).toEqual([`${manifestSha256}.json`]);
+    const manifestBytes = readFileSync(join(runRoot, "manifests", manifestNames[0]));
+    const manifest = JSON.parse(manifestBytes.toString("utf8"));
+    expect(manifestBytes).toEqual(Buffer.from(`${JSON.stringify(manifest)}\n`));
+    expect(createHash("sha256").update(manifestBytes).digest("hex")).toBe(manifestSha256);
+    expect(manifest).toMatchObject({
+      schemaVersion: 1,
+      transactionId: request.transactionId,
+      state: "PREPARED",
+      retentionDays: 4,
+      deletionRequiresConfirmation: true,
+      deleteAfter: null,
+      deletionStatus: "retained",
+    });
+    expect(manifest.entries.map((entry: { id: string }) => entry.id)).toEqual([
+      "generated-next", "generated-node-modules", "copy-0001",
+    ]);
+    const summaries = new Map(manifest.entries.map(
+      (entry: { id: string; preMoveInventory: unknown }) => [entry.id, entry.preMoveInventory],
+    ));
+    const replay = invoke("replay-run", request, {}, 30_000);
+    if (!replay.ok) throw new Error(JSON.stringify(replay.error));
+    const replayed = replay.result as {
+      state: string;
+      records: Array<{ sequence: number; event: string; payload: Record<string, unknown> }>;
+    };
+    expect(replayed.state).toBe("QUARANTINED");
+    expect(replayed.records).toEqual([
+      { sequence: 1, event: "PREPARED", payload: {
+        transactionId: request.transactionId,
+        manifestSha256,
+      } },
+      { sequence: 2, event: "MOVING", payload: {} },
+      ...["generated-next", "generated-node-modules", "copy-0001"].flatMap((id, index) => [
+        { sequence: 3 + 2 * index, event: "MOVE_INTENT", payload: {
+          id,
+          expected: summaries.get(id),
+        } },
+        { sequence: 4 + 2 * index, event: "MOVED", payload: {
+          id,
+          observed: summaries.get(id),
+        } },
+      ]),
+      { sequence: 9, event: "VERIFYING", payload: {} },
+      { sequence: 10, event: "QUARANTINED", payload: {} },
+    ]);
+    expect(readdirSync(runRoot).filter((name) => name === "journal.lock" ||
+      name.startsWith("journal.lock.tombstone."))).toEqual([]);
+    expect(readdirSync(join(runRoot, "manifests")).some((name) =>
+      name === "current" || name.includes("intermediate"))).toBe(false);
+  });
+
+  it("uses exact global byte order for two source copies and two generated roots", () => {
+    const f = fixture();
+    bases.push(f.base);
+    writeFileSync(join(f.repoRoot, "alpha.txt"), "alpha\n");
+    git(f.repoRoot, "add", "alpha.txt");
+    git(f.repoRoot, "commit", "-m", "add second canonical");
+    writeFileSync(join(f.repoRoot, "alpha 2.txt"), "alpha\n");
+    f.head = git(f.repoRoot, "rev-parse", "HEAD");
+    const worker = invoke("apply", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 2,
+      transactionId: "tx-global-entry-order",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, {}, 30_000);
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    const ids = ["generated-next", "copy-0001", "generated-node-modules", "copy-0002"];
+    const movePhases = ids.flatMap((id) => [
+      `after-event:MOVE_INTENT:${id}`,
+      `after-rename:${id}`,
+      `after-payload-sync:${id}`,
+      `after-destination-parent-sync:${id}`,
+      `after-source-parent-sync:${id}`,
+      `after-inventory:moved-pass-1:${id}`,
+      `after-event:MOVED:${id}`,
+    ]);
+    expect(worker.phases).toEqual([
+      "after-layout-sync",
+      "after-pre-inventories",
+      "after-prepared-generation",
+      "after-event:PREPARED",
+      "after-event:MOVING",
+      ...movePhases,
+      "after-event:VERIFYING",
+      ...ids.map((id) => `after-inventory:moved-pass-2:${id}`),
+      "after-event:QUARANTINED",
+      "before-lock-cleanup",
+    ]);
+    expect(worker.result).toMatchObject({ status: "QUARANTINED", movedEntries: 4 });
+  });
+
+  it("instruments real rename, fsync, and lock state at every public apply hook", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const transactionId = "tx-public-hook-instrumentation";
+    const worker = invoke("apply-instrumented", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, {}, 30_000);
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    const instrumentation = worker.instrumentation!;
+    expect(instrumentation.snapshots.map(({ phase }) => phase)).toEqual(worker.phases);
+    const runRoot = join(f.quarantineRoot, transactionId);
+    const moves = [
+      ["generated-next", join(f.repoRoot, ".next"), join(runRoot, "payload/generated/.next")],
+      ["generated-node-modules", join(f.repoRoot, "node_modules"), join(runRoot, "payload/generated/node_modules")],
+      ["copy-0001", join(f.repoRoot, "notes 2.txt"), join(runRoot, "payload/source-copies/copy-0001")],
+    ] as const;
+    expect(instrumentation.renamed).toEqual(moves.map(([, source, destination]) => [
+      source,
+      destination,
+    ]));
+    for (const [id, source, destination] of moves) {
+      const atRename = instrumentation.snapshots.find(({ phase }) => phase === `after-rename:${id}`)!;
+      expect(atRename.renamed).toContainEqual([source, destination]);
+      const atPayload = instrumentation.snapshots.find(
+        ({ phase }) => phase === `after-payload-sync:${id}`,
+      )!;
+      expect(atPayload.synced).toContain(destination);
+      const atDestinationParent = instrumentation.snapshots.find(
+        ({ phase }) => phase === `after-destination-parent-sync:${id}`,
+      )!;
+      expect(atDestinationParent.synced).toContain(dirname(destination));
+      const atSourceParent = instrumentation.snapshots.find(
+        ({ phase }) => phase === `after-source-parent-sync:${id}`,
+      )!;
+      expect(atSourceParent.synced).toContain(dirname(source));
+      expect(existsSync(join(runRoot, "inventories/moved-pass-1", `${id}.jsonl`))).toBe(true);
+      expect(existsSync(join(runRoot, "inventories/moved-pass-2", `${id}.jsonl`))).toBe(true);
+    }
+    const eventPhases = worker.phases!.filter((phase) => phase.startsWith("after-event:"));
+    for (let index = 0; index < eventPhases.length; index += 1) {
+      const snapshot = instrumentation.snapshots.find(({ phase }) => phase === eventPhases[index])!;
+      const finalEvent = eventPhases[index] === "after-event:QUARANTINED";
+      expect(snapshot.lockCreates).toBe(index + 1);
+      expect(snapshot.lockRemovals).toBe(finalEvent ? index : index + 1);
+      expect(snapshot.lockExists).toBe(finalEvent);
+    }
+    const beforeCleanup = instrumentation.snapshots.find(
+      ({ phase }) => phase === "before-lock-cleanup",
+    )!;
+    expect(beforeCleanup).toMatchObject({ lockCreates: 10, lockRemovals: 9, lockExists: true });
+    expect(instrumentation.lockCreates).toBe(10);
+    expect(instrumentation.lockRemovals).toBe(10);
+    expect(existsSync(join(runRoot, "journal.lock"))).toBe(false);
+  });
+
+  it("handles deterministic hook rejection at every public apply phase", () => {
+    const ids = ["generated-next", "generated-node-modules", "copy-0001"];
+    const phases = [
+      "after-layout-sync",
+      "after-pre-inventories",
+      "after-prepared-generation",
+      "after-event:PREPARED",
+      "after-event:MOVING",
+      ...ids.flatMap((id) => [
+        `after-event:MOVE_INTENT:${id}`,
+        `after-rename:${id}`,
+        `after-payload-sync:${id}`,
+        `after-destination-parent-sync:${id}`,
+        `after-source-parent-sync:${id}`,
+        `after-inventory:moved-pass-1:${id}`,
+        `after-event:MOVED:${id}`,
+      ]),
+      "after-event:VERIFYING",
+      ...ids.map((id) => `after-inventory:moved-pass-2:${id}`),
+      "after-event:QUARANTINED",
+      "before-lock-cleanup",
+    ];
+    for (const [index, stopPhase] of phases.entries()) {
+      const f = fixture();
+      bases.push(f.base);
+      const transactionId = `tx-hook-rejection-${String(index + 1).padStart(2, "0")}`;
+      const worker = invoke("apply-stop", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+        stopPhase,
+      }, {}, 30_000);
+      expect(worker.ok).toBe(false);
+      expect(worker.phases?.at(-1)).toBe(stopPhase);
+      if (stopPhase === "after-event:QUARANTINED" || stopPhase === "before-lock-cleanup") {
+        expect(worker.error).toMatchObject({
+          name: "QuarantineError",
+          code: "ERR_INDETERMINATE_JOURNAL_APPEND",
+        });
+        expect(existsSync(join(f.quarantineRoot, transactionId, "journal.lock"))).toBe(true);
+      } else {
+        expect(worker.error).toMatchObject({ name: "RangeError", message: "stop at requested phase" });
+      }
+    }
   });
 
   it("prioritizes a durable PREPARED journal over precommit mismatch before Git discovery", () => {
@@ -1226,6 +1689,84 @@ describe("quarantine transaction Slice 1", () => {
       "utf8",
     )).toBe("preserve");
   });
+
+  it.each([
+    ["MOVING", "after-event:MOVING", "journal"],
+    ["VERIFYING", "after-event:VERIFYING", "torn-journal"],
+    ["QUARANTINED", "after-event:QUARANTINED", "lock"],
+  ] as const)(
+    "prioritizes %s recovery evidence with %s residue before precommit and Git",
+    (_stage, stopPhase, residue) => {
+      const f = fixture();
+      bases.push(f.base);
+      const transactionId = `tx-gate-${residue}`;
+      const request = {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      };
+      const first = invoke("apply-stop", { ...request, stopPhase }, {}, 30_000);
+      expect(first.ok).toBe(false);
+      const runRoot = join(f.quarantineRoot, transactionId);
+      if (residue === "torn-journal") {
+        appendFileSync(join(runRoot, "journal.log"), Buffer.from([0, 0, 0, 9, 0x7b]));
+      }
+      writeFileSync(join(runRoot, "manifests", "foreign"), "preserve", { mode: 0o600 });
+      chmodSync(join(runRoot, "manifests", "foreign"), 0o600);
+      const sentinel = join(f.base, "git-was-invoked");
+      const bin = join(f.base, `reject-git-${residue}`);
+      privateDirectory(bin);
+      writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf invoked > ${JSON.stringify(sentinel)}\nexit 99\n`, {
+        mode: 0o700,
+      });
+      chmodSync(join(bin, "git"), 0o700);
+      expectWorkerError(
+        invoke("apply", request, { PATH: `${bin}:${process.env.PATH ?? ""}` }),
+        "ERR_RECOVERY_REQUIRED",
+        "Explicit quarantine recovery is required.",
+      );
+      expect(existsSync(sentinel)).toBe(false);
+      expect(readFileSync(join(runRoot, "manifests", "foreign"), "utf8")).toBe("preserve");
+    },
+  );
+
+  it.each(["lock", "tombstone"] as const)(
+    "prioritizes a journal %s residue even without journal.log",
+    (residue) => {
+      const f = fixture();
+      bases.push(f.base);
+      const transactionId = `tx-gate-residue-${residue}`;
+      const request = {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      };
+      const prepared = invoke("prepare-raw", request, {}, 30_000);
+      if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+      const name = residue === "lock"
+        ? "journal.lock"
+        : "journal.lock.tombstone.11111111-1111-4111-8111-111111111111";
+      const artifact = join(f.quarantineRoot, transactionId, name);
+      writeFileSync(artifact, "foreign", { mode: 0o600 });
+      chmodSync(artifact, 0o600);
+      expectWorkerError(
+        invoke("apply", request, {}, 30_000),
+        "ERR_RECOVERY_REQUIRED",
+        "Explicit quarantine recovery is required.",
+      );
+      expect(readFileSync(artifact, "utf8")).toBe("foreign");
+    },
+  );
 
   it("completes an ancestor-closed partial layout before advancing apply", () => {
     const f = fixture();
@@ -1405,6 +1946,62 @@ describe("quarantine transaction Slice 1", () => {
       }
     },
   );
+
+  it.each([
+    ["nonzero", { exit: 2 }],
+    ["partial-signal", { signal: "TERM" }],
+  ] as const)("rejects and settles a divergent Git child %s outcome", (label, outcome) => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const diff = canonicalDiff(f);
+    const path = installGitDiffOverride(
+      f,
+      label,
+      label === "partial-signal" ? diff.subarray(0, Math.max(1, Math.floor(diff.length / 2))) : diff,
+      outcome,
+    );
+    const transactionId = `tx-child-${label}`;
+    expectWorkerError(
+      invoke("apply", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      }, { PATH: path }, 30_000),
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+  });
+
+  it("rejects and settles a divergent Git child spawn error", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const path = installGitDiffOverride(f, "spawn-error", canonicalDiff(f));
+    const isolatedBin = path.slice(0, path.indexOf(":"));
+    const transactionId = "tx-child-spawn-error";
+    const worker = invoke("apply-divergent-spawn-error", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, { PATH: isolatedBin }, 30_000);
+    expect(worker.injected).toBe(true);
+    expectWorkerError(
+      worker,
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+  });
 
   it("keeps hostile external-diff and textconv drivers disabled", () => {
     const f = fixture({ divergent: true });
@@ -1620,13 +2217,13 @@ describe("quarantine transaction Slice 1", () => {
     expect(worker.unlinkCalls).toBe(0);
   });
 
-  it.each([1, 2, 3])(
-    "maps ordinary append lock-cleanup failure %i to indeterminate and stops before rename",
+  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])(
+    "maps append lock-cleanup failure %i to indeterminate at the exact durable event",
     (failCleanupAt) => {
     const f = fixture();
     bases.push(f.base);
     const transactionId = `tx-lock-cleanup-${failCleanupAt}`;
-    const worker = invoke("apply-lock-cleanup-failure", {
+    const request = {
       repoRoot: f.repoRoot,
       quarantineRoot: f.quarantineRoot,
       expectedBranch: f.branch,
@@ -1635,6 +2232,9 @@ describe("quarantine transaction Slice 1", () => {
       transactionId,
       createdAt: "2026-07-16T00:00:00.000Z",
       writersStopped: true,
+    };
+    const worker = invoke("apply-lock-cleanup-failure", {
+      ...request,
       failCleanupAt,
     }, {}, 30_000);
     expectWorkerError(
@@ -1642,8 +2242,32 @@ describe("quarantine transaction Slice 1", () => {
       "ERR_INDETERMINATE_JOURNAL_APPEND",
       "Journal durability could not be determined.",
     );
-    expect(existsSync(join(f.repoRoot, ".next"))).toBe(true);
     expect(existsSync(join(f.quarantineRoot, transactionId, "journal.lock"))).toBe(true);
+    const replay = invoke("replay-run", request, {}, 30_000);
+    if (!replay.ok) throw new Error(JSON.stringify(replay.error));
+    const records = replay.result?.records as Array<{
+      sequence: number;
+      event: string;
+      payload: { id?: string };
+    }>;
+    const expected = [
+      ["PREPARED", undefined],
+      ["MOVING", undefined],
+      ["MOVE_INTENT", "generated-next"],
+      ["MOVED", "generated-next"],
+      ["MOVE_INTENT", "generated-node-modules"],
+      ["MOVED", "generated-node-modules"],
+      ["MOVE_INTENT", "copy-0001"],
+      ["MOVED", "copy-0001"],
+      ["VERIFYING", undefined],
+      ["QUARANTINED", undefined],
+    ] as const;
+    expect(records.map((record) => [record.event, record.payload.id])).toEqual(
+      expected.slice(0, failCleanupAt),
+    );
+    expect(records.map((record) => record.sequence)).toEqual(
+      Array.from({ length: failCleanupAt }, (_, index) => index + 1),
+    );
     },
   );
 
@@ -1744,6 +2368,111 @@ describe("quarantine transaction Slice 1", () => {
     },
   );
 
+  it.each([
+    ["normal", "append", 1],
+    ["normal", "truncate", 1],
+    ["final-only", "append", 1],
+    ["final-only", "truncate", 1],
+    ["temp-only", "append", 1],
+    ["temp-only", "truncate", 1],
+    ["final-plus-temp", "append", 1],
+    ["final-plus-temp", "truncate", 1],
+  ] as const)(
+    "rejects same-inode %s divergent evidence after an in-place %s",
+    (variant, mutation, driftAtFinalOpen) => {
+      const f = fixture({ divergent: true });
+      bases.push(f.base);
+      const transactionId = `tx-size-drift-${variant}-${mutation}`;
+      const request = {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      };
+      const diffRoot = join(f.quarantineRoot, transactionId, "divergent-diffs");
+      const temporary = join(diffRoot, ".copy-0001.tmp");
+      const final = join(diffRoot, "copy-0001.patch");
+      if (variant === "final-only") {
+        const first = invoke("apply-stop", {
+          ...request,
+          stopPhase: "after-divergent-diff:copy-0001",
+        }, {}, 30_000);
+        expect(first.ok).toBe(false);
+        expect(existsSync(final)).toBe(true);
+      } else if (variant !== "normal") {
+        const prepared = invoke("prepare-raw", request, {}, 30_000);
+        if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+        writeFileSync(temporary, canonicalDiff(f), { mode: 0o600 });
+        chmodSync(temporary, 0o600);
+        if (variant === "final-plus-temp") linkSync(temporary, final);
+      }
+      expectWorkerError(
+        invoke("apply-same-inode-size-drift", {
+          ...request,
+          driftAtFinalOpen,
+          mutation,
+        }, {}, 30_000),
+        "ERR_INTEGRITY",
+        "Quarantine evidence failed integrity validation.",
+      );
+    },
+  );
+
+  it.each(
+    (["normal", "temp-only", "final-plus-temp"] as const).flatMap((variant) =>
+      ([
+        "before-link",
+        "after-link",
+        "after-file-sync",
+        "before-parent-sync",
+        "after-parent-sync",
+        "cleanup-before-parent-sync",
+        "cleanup-after-parent-sync-final",
+        "cleanup-after-parent-sync-temp",
+      ] as const).map((seam) => [variant, seam] as const)),
+  )("rejects a %s divergent artifact swap at %s", (variant, seam) => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const transactionId = `tx-seam-${variant}-${seam}`;
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    if (variant !== "normal") {
+      const prepared = invoke("prepare-raw", request, {}, 30_000);
+      if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+      const root = join(f.quarantineRoot, transactionId, "divergent-diffs");
+      const temporary = join(root, ".copy-0001.tmp");
+      writeFileSync(temporary, canonicalDiff(f), { mode: 0o600 });
+      chmodSync(temporary, 0o600);
+      if (variant === "final-plus-temp") {
+        linkSync(temporary, join(root, "copy-0001.patch"));
+      }
+    }
+    const worker = invoke("apply-divergent-seam-swap", {
+      ...request,
+      variant,
+      seam,
+    }, {}, 30_000);
+    expect(worker.injected).toBe(true);
+    expectWorkerError(
+      worker,
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+  });
+
   it("preserves a mismatching preexisting divergent temporary", () => {
     const f = fixture({ divergent: true });
     bases.push(f.base);
@@ -1773,6 +2502,78 @@ describe("quarantine transaction Slice 1", () => {
       "Quarantine evidence failed integrity validation.",
     );
     expect(readFileSync(temporary, "utf8")).toBe("foreign");
+  });
+
+  it.each([
+    ["temporary", "symlink"],
+    ["temporary", "directory"],
+    ["final", "symlink"],
+    ["final", "directory"],
+  ] as const)("preserves and rejects a nonregular divergent %s %s", (artifact, kind) => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const transactionId = `tx-nonregular-${artifact}-${kind}`;
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const prepared = invoke("prepare-raw", request, {}, 30_000);
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    const root = join(f.quarantineRoot, transactionId, "divergent-diffs");
+    const temporary = join(root, ".copy-0001.tmp");
+    const final = join(root, "copy-0001.patch");
+    if (artifact === "final") {
+      writeFileSync(temporary, canonicalDiff(f), { mode: 0o600 });
+      chmodSync(temporary, 0o600);
+    }
+    const target = artifact === "temporary" ? temporary : final;
+    if (kind === "symlink") symlinkSync(f.canonicalPath!, target);
+    else privateDirectory(target);
+    expectWorkerError(
+      invoke("apply", request, {}, 30_000),
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(lstatSync(target).isSymbolicLink()).toBe(kind === "symlink");
+    expect(lstatSync(target).isDirectory()).toBe(kind === "directory");
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
+  });
+
+  it("preserves an EEXIST divergent final collision and removes its owned temporary", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const transactionId = "tx-divergent-eexist-collision";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const prepared = invoke("prepare-raw", request, {}, 30_000);
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    const root = join(f.quarantineRoot, transactionId, "divergent-diffs");
+    const temporary = join(root, ".copy-0001.tmp");
+    const final = join(root, "copy-0001.patch");
+    writeFileSync(final, "foreign-final", { mode: 0o600 });
+    chmodSync(final, 0o600);
+    expectWorkerError(
+      invoke("apply", request, {}, 30_000),
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(readFileSync(final, "utf8")).toBe("foreign-final");
+    expect(existsSync(temporary)).toBe(false);
+    expect(existsSync(join(f.quarantineRoot, transactionId, "journal.log"))).toBe(false);
   });
 
   it("fails closed and preserves a divergent temporary that reappears after cleanup", () => {

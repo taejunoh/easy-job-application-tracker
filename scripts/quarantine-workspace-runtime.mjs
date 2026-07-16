@@ -1315,11 +1315,15 @@ async function closeFileHandle(handle, primaryError) {
   if (closeError !== undefined) throw closeError;
 }
 
-async function syncFile(path, fsApi) {
+async function syncFile(path, identity, fsApi) {
   const handle = await fsApi.open(path, "r");
   let primaryError;
   try {
+    const before = await handle.stat();
+    assertPrivateFileIdentity(before, identity);
     await handle.sync();
+    const after = await handle.stat();
+    assertPrivateFileIdentity(after, identity);
   } catch (error) {
     primaryError = error;
   }
@@ -1327,6 +1331,15 @@ async function syncFile(path, fsApi) {
 }
 
 function sameFileIdentity(left, right) {
+  return (
+    Number(left.dev) === Number(right.dev) &&
+    Number(left.ino) === Number(right.ino) &&
+    modeOf(left) === modeOf(right) &&
+    Number(left.size) === Number(right.size)
+  );
+}
+
+function sameFileObject(left, right) {
   return Number(left.dev) === Number(right.dev) && Number(left.ino) === Number(right.ino);
 }
 
@@ -1335,6 +1348,11 @@ function assertPrivateRegularFile(stats) {
     stats.isSymbolicLink() || !stats.isFile() || modeOf(stats) !== PRIVATE_FILE_MODE ||
     !safeInteger(Number(stats.size))
   ) fail("ERR_INTEGRITY");
+}
+
+function assertPrivateFileIdentity(stats, identity) {
+  assertPrivateRegularFile(stats);
+  if (!sameFileIdentity(stats, identity)) fail("ERR_INTEGRITY");
 }
 
 async function comparePrivateFiles(leftPath, rightPath, fsApi) {
@@ -1368,6 +1386,8 @@ async function comparePrivateFiles(leftPath, rightPath, fsApi) {
         position += length;
       }
     }
+    assertPrivateFileIdentity(await left.stat(), leftStats);
+    assertPrivateFileIdentity(await right.stat(), rightStats);
   } catch (error) {
     primaryError = error;
   }
@@ -1387,12 +1407,20 @@ async function comparePrivateFiles(leftPath, rightPath, fsApi) {
   return equal;
 }
 
-async function removeOwnedDiffTemporary({ capability, path, id, identity, fsApi }) {
+async function removeOwnedDiffTemporary({
+  capability,
+  path,
+  id,
+  identity,
+  retainedPath,
+  retainedIdentity,
+  fsApi,
+}) {
   const current = await fsApi.lstat(path);
-  if (
-    current.isSymbolicLink() || !current.isFile() || modeOf(current) !== PRIVATE_FILE_MODE ||
-    !sameFileIdentity(current, identity)
-  ) fail("ERR_INTEGRITY");
+  assertPrivateFileIdentity(current, identity);
+  if (retainedPath !== undefined) {
+    assertPrivateFileIdentity(await fsApi.lstat(retainedPath), retainedIdentity);
+  }
   await revalidateRunCapability(capability, {
     purpose: "divergent-diff-temp",
     id,
@@ -1406,6 +1434,9 @@ async function removeOwnedDiffTemporary({ capability, path, id, identity, fsApi 
     boundary: "after-sync",
   });
   await assertPathMissing(path, fsApi);
+  if (retainedPath !== undefined) {
+    assertPrivateFileIdentity(await fsApi.lstat(retainedPath), retainedIdentity);
+  }
 }
 
 function divergentDiffArgs(entry) {
@@ -1433,10 +1464,7 @@ async function compareCanonicalPatchToFile({
   let matches = true;
   try {
     const opened = await handle.stat();
-    assertPrivateRegularFile(opened);
-    if (!sameFileIdentity(opened, identity) || Number(opened.size) !== Number(identity.size)) {
-      fail("ERR_INTEGRITY");
-    }
+    assertPrivateFileIdentity(opened, identity);
     const child = spawn("git", divergentDiffArgs(entry), {
       cwd: repoRoot,
       env: childGitEnvironment(environment),
@@ -1459,13 +1487,26 @@ async function compareCanonicalPatchToFile({
       child.once("close", (code, signal) => resolveClose({ code, signal }));
     });
     let position = 0;
+    const childHash = createHash("sha256");
+    const fileHash = createHash("sha256");
+    const expected = Buffer.allocUnsafe(64 * 1024);
     try {
       for await (const chunk of child.stdout) {
-        position += chunk.length;
-        if (position > cap) { invalid = true; terminate(); continue; }
-        const expected = Buffer.allocUnsafe(chunk.length);
-        const read = await handle.read(expected, 0, chunk.length, position - chunk.length);
-        if (read.bytesRead !== chunk.length || !expected.equals(chunk)) matches = false;
+        if (position + chunk.length > cap) { invalid = true; terminate(); continue; }
+        childHash.update(chunk);
+        let offset = 0;
+        while (offset < chunk.length) {
+          const length = Math.min(expected.length, chunk.length - offset);
+          const read = await handle.read(expected, 0, length, position);
+          const fileBytes = expected.subarray(0, read.bytesRead);
+          fileHash.update(fileBytes);
+          if (
+            read.bytesRead !== length ||
+            !fileBytes.equals(chunk.subarray(offset, offset + length))
+          ) matches = false;
+          position += length;
+          offset += length;
+        }
       }
     } catch {
       invalid = true;
@@ -1476,15 +1517,13 @@ async function compareCanonicalPatchToFile({
       invalid || spawnError !== undefined || outcome.signal !== null || outcome.code !== 1 ||
       position !== Number(opened.size)
     ) fail("ERR_INTEGRITY");
+    if (childHash.digest("hex") !== fileHash.digest("hex")) fail("ERR_INTEGRITY");
+    assertPrivateFileIdentity(await handle.stat(), identity);
   } catch (error) {
     primaryError = error;
   }
   await closeFileHandle(handle, primaryError);
-  const retained = await fsApi.lstat(path);
-  if (
-    !sameFileIdentity(identity, retained) || Number(identity.size) !== Number(retained.size) ||
-    modeOf(retained) !== PRIVATE_FILE_MODE
-  ) fail("ERR_INTEGRITY");
+  assertPrivateFileIdentity(await fsApi.lstat(path), identity);
   if (!matches) fail("ERR_INTEGRITY");
 }
 
@@ -1510,11 +1549,7 @@ async function adoptPreexistingDivergentTemporary({
     fsApi,
   });
   const beforeLink = await fsApi.lstat(temporaryPath);
-  if (
-    !sameFileIdentity(temporary, beforeLink) ||
-    Number(temporary.size) !== Number(beforeLink.size) ||
-    modeOf(beforeLink) !== PRIVATE_FILE_MODE
-  ) fail("ERR_INTEGRITY");
+  assertPrivateFileIdentity(beforeLink, temporary);
   let final;
   try {
     final = await fsApi.lstat(finalPath);
@@ -1530,17 +1565,15 @@ async function adoptPreexistingDivergentTemporary({
     await fsApi.link(temporaryPath, finalPath);
     final = await fsApi.lstat(finalPath);
   }
-  assertPrivateRegularFile(final);
-  if (
-    !sameFileIdentity(temporary, final) || Number(temporary.size) !== Number(final.size)
-  ) fail("ERR_INTEGRITY");
-  await syncFile(finalPath, fsApi);
+  assertPrivateFileIdentity(final, temporary);
+  assertPrivateFileIdentity(await fsApi.lstat(temporaryPath), temporary);
+  await syncFile(finalPath, temporary, fsApi);
+  assertPrivateFileIdentity(await fsApi.lstat(temporaryPath), temporary);
+  assertPrivateFileIdentity(await fsApi.lstat(finalPath), temporary);
   const tempBeforeParent = await fsApi.lstat(temporaryPath);
   const finalBeforeParent = await fsApi.lstat(finalPath);
-  if (
-    !sameFileIdentity(temporary, tempBeforeParent) ||
-    !sameFileIdentity(temporary, finalBeforeParent)
-  ) fail("ERR_INTEGRITY");
+  assertPrivateFileIdentity(tempBeforeParent, temporary);
+  assertPrivateFileIdentity(finalBeforeParent, temporary);
   await syncDirectory(dirname(finalPath), fsApi);
   await revalidateRunCapability(capability, {
     purpose: "divergent-diff",
@@ -1549,23 +1582,18 @@ async function adoptPreexistingDivergentTemporary({
   });
   const durableTemporary = await fsApi.lstat(temporaryPath);
   const durableFinal = await fsApi.lstat(finalPath);
-  if (
-    !sameFileIdentity(temporary, durableTemporary) ||
-    !sameFileIdentity(temporary, durableFinal) ||
-    modeOf(durableTemporary) !== PRIVATE_FILE_MODE ||
-    modeOf(durableFinal) !== PRIVATE_FILE_MODE
-  ) fail("ERR_INTEGRITY");
+  assertPrivateFileIdentity(durableTemporary, temporary);
+  assertPrivateFileIdentity(durableFinal, temporary);
   await removeOwnedDiffTemporary({
     capability,
     path: temporaryPath,
     id: entry.id,
     identity: temporary,
+    retainedPath: finalPath,
+    retainedIdentity: temporary,
     fsApi,
   });
-  const retained = await fsApi.lstat(finalPath);
-  if (!sameFileIdentity(temporary, retained) || modeOf(retained) !== PRIVATE_FILE_MODE) {
-    fail("ERR_INTEGRITY");
-  }
+  assertPrivateFileIdentity(await fsApi.lstat(finalPath), temporary);
 }
 
 async function publishDivergentPatch({
@@ -1615,9 +1643,7 @@ async function publishDivergentPatch({
   try {
     await handle.chmod(PRIVATE_FILE_MODE);
     identity = await handle.stat();
-    if (identity.isSymbolicLink() || !identity.isFile() || modeOf(identity) !== PRIVATE_FILE_MODE) {
-      fail("ERR_INTEGRITY");
-    }
+    assertPrivateRegularFile(identity);
     const pathIdentity = await fsApi.lstat(temporaryPath);
     if (!sameFileIdentity(identity, pathIdentity)) fail("ERR_INTEGRITY");
     const child = spawn("git", divergentDiffArgs(entry), {
@@ -1671,6 +1697,12 @@ async function publishDivergentPatch({
       fail("ERR_INTEGRITY");
     }
     await handle.sync();
+    const completedIdentity = await handle.stat();
+    assertPrivateRegularFile(completedIdentity);
+    if (!sameFileObject(identity, completedIdentity) || Number(completedIdentity.size) !== bytes) {
+      fail("ERR_INTEGRITY");
+    }
+    identity = completedIdentity;
     await closeFileHandle(handle);
     handle = undefined;
     await revalidateRunCapability(capability, {
@@ -1679,11 +1711,7 @@ async function publishDivergentPatch({
       boundary: "after-sync",
     });
     const durableTemporary = await fsApi.lstat(temporaryPath);
-    if (
-      durableTemporary.isSymbolicLink() || !durableTemporary.isFile() ||
-      modeOf(durableTemporary) !== PRIVATE_FILE_MODE ||
-      !sameFileIdentity(identity, durableTemporary) || Number(durableTemporary.size) !== bytes
-    ) fail("ERR_INTEGRITY");
+    assertPrivateFileIdentity(durableTemporary, identity);
     await revalidateRunCapability(capability, {
       purpose: "divergent-diff",
       id: entry.id,
@@ -1699,12 +1727,11 @@ async function publishDivergentPatch({
         fail("ERR_INTEGRITY");
       }
       const afterRead = await fsApi.lstat(finalPath);
-      if (
-        !sameFileIdentity(existing, afterRead) ||
-        Number(existing.size) !== Number(afterRead.size) ||
-        modeOf(afterRead) !== PRIVATE_FILE_MODE
-      ) fail("ERR_INTEGRITY");
-      await syncFile(finalPath, fsApi);
+      assertPrivateFileIdentity(afterRead, existing);
+      assertPrivateFileIdentity(await fsApi.lstat(temporaryPath), identity);
+      await syncFile(finalPath, existing, fsApi);
+      assertPrivateFileIdentity(await fsApi.lstat(temporaryPath), identity);
+      assertPrivateFileIdentity(await fsApi.lstat(finalPath), existing);
       await syncDirectory(dirname(finalPath), fsApi);
       await revalidateRunCapability(capability, {
         purpose: "divergent-diff",
@@ -1712,32 +1739,28 @@ async function publishDivergentPatch({
         boundary: "after-sync",
       });
       const durableExisting = await fsApi.lstat(finalPath);
-      if (
-        !sameFileIdentity(existing, durableExisting) ||
-        Number(existing.size) !== Number(durableExisting.size) ||
-        modeOf(durableExisting) !== PRIVATE_FILE_MODE
-      ) fail("ERR_INTEGRITY");
+      assertPrivateFileIdentity(durableExisting, existing);
+      assertPrivateFileIdentity(await fsApi.lstat(temporaryPath), identity);
       await removeOwnedDiffTemporary({
         capability,
         path: temporaryPath,
         id: entry.id,
         identity,
+        retainedPath: finalPath,
+        retainedIdentity: existing,
         fsApi,
       });
       const retainedExisting = await fsApi.lstat(finalPath);
-      if (
-        !sameFileIdentity(existing, retainedExisting) ||
-        Number(existing.size) !== Number(retainedExisting.size) ||
-        modeOf(retainedExisting) !== PRIVATE_FILE_MODE
-      ) fail("ERR_INTEGRITY");
+      assertPrivateFileIdentity(retainedExisting, existing);
       return;
     }
     published = true;
     const linked = await fsApi.lstat(finalPath);
-    if (!sameFileIdentity(identity, linked) || modeOf(linked) !== PRIVATE_FILE_MODE) {
-      fail("ERR_INTEGRITY");
-    }
-    await syncFile(finalPath, fsApi);
+    assertPrivateFileIdentity(linked, identity);
+    assertPrivateFileIdentity(await fsApi.lstat(temporaryPath), identity);
+    await syncFile(finalPath, identity, fsApi);
+    assertPrivateFileIdentity(await fsApi.lstat(temporaryPath), identity);
+    assertPrivateFileIdentity(await fsApi.lstat(finalPath), identity);
     await syncDirectory(dirname(finalPath), fsApi);
     await revalidateRunCapability(capability, {
       purpose: "divergent-diff",
@@ -1745,20 +1768,19 @@ async function publishDivergentPatch({
       boundary: "after-sync",
     });
     const durableFinal = await fsApi.lstat(finalPath);
-    if (!sameFileIdentity(identity, durableFinal) || modeOf(durableFinal) !== PRIVATE_FILE_MODE) {
-      fail("ERR_INTEGRITY");
-    }
+    assertPrivateFileIdentity(durableFinal, identity);
+    assertPrivateFileIdentity(await fsApi.lstat(temporaryPath), identity);
     await removeOwnedDiffTemporary({
       capability,
       path: temporaryPath,
       id: entry.id,
       identity,
+      retainedPath: finalPath,
+      retainedIdentity: identity,
       fsApi,
     });
     const retainedFinal = await fsApi.lstat(finalPath);
-    if (!sameFileIdentity(identity, retainedFinal) || modeOf(retainedFinal) !== PRIVATE_FILE_MODE) {
-      fail("ERR_INTEGRITY");
-    }
+    assertPrivateFileIdentity(retainedFinal, identity);
   } catch (error) {
     primaryError = error;
   }
