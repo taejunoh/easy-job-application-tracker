@@ -29,6 +29,62 @@ const setupCaptureFunctions = [
   "captureExtensionConnected",
 ];
 
+const documentedPlaceholderTokens = new Set([
+  "<second-generated-secret>",
+  "<access-token>",
+  "REPLACE_WITH_GENERATED_TOKEN",
+  "YOUR_ACCESS_TOKEN",
+  "TEST_ONLY_ACCESS_TOKEN",
+  "ci-access-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+]);
+
+function isAllowedDocumentedTokenLiteral(value: string) {
+  return (
+    value.length === 0 ||
+    documentedPlaceholderTokens.has(value) ||
+    /^<[a-z0-9]+(?:-[a-z0-9]+)*>$/iu.test(value) ||
+    /^(?:test-only|test_only)(?:[-_][a-z0-9]+)*[-_]token(?:[-_][a-z0-9]+)*$/iu.test(
+      value,
+    )
+  );
+}
+
+function isSafeDocumentedTokenExpression(expression: string) {
+  const normalizedExpression = expression.trim();
+
+  if (normalizedExpression.length === 0) {
+    return true;
+  }
+
+  const literal = normalizedExpression.match(
+    /^(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s`#;$()\r\n]+))$/u,
+  );
+  const literalValue =
+    literal?.[1] ?? literal?.[2] ?? literal?.[3];
+
+  return (
+    literalValue !== undefined &&
+    isAllowedDocumentedTokenLiteral(literalValue)
+  );
+}
+
+function readDocumentedTokenAssignments(markdown: string) {
+  return markdown.split(/\r?\n/u).flatMap((line) => {
+    const assignment = line.match(/\bAPP_ACCESS_TOKEN\s*=\s*(.*)$/u);
+
+    if (!assignment) {
+      return [];
+    }
+
+    return [
+      {
+        assignment: assignment[0],
+        expression: (assignment[1] ?? "").trim(),
+      },
+    ];
+  });
+}
+
 function readRequiredSetupSource(relativePath: string) {
   const sourcePath = join(root, relativePath);
 
@@ -89,12 +145,11 @@ describe("task-first README user guide", () => {
     expect(generator).toContain("setupNetworkPolicy.assertNoNetworkAttempts()");
 
     const normalCaptureGate = generator.match(
-      /if\s*\(\s*!SETUP_ONLY\s*\)\s*\{(?<normalCaptures>[\s\S]*?)\}/u,
+      /if\s*\(\s*!SETUP_ONLY\s*\)\s*\{([\s\S]*?)\}/u,
     );
     expect(normalCaptureGate).not.toBeNull();
 
-    const normalCaptureSource =
-      normalCaptureGate?.groups?.normalCaptures ?? "";
+    const normalCaptureSource = normalCaptureGate?.[1] ?? "";
     for (const captureFunction of normalCaptureFunctions) {
       expect(normalCaptureSource).toContain(
         `await ${captureFunction}(context);`,
@@ -206,6 +261,135 @@ describe("task-first README user guide", () => {
     expect(screenshotDocs).toContain("synthetic");
     expect(generator).not.toContain(
       "easy-job-application-tracker.vercel.app",
+    );
+  });
+
+  test("allows only synthetic access-token assignments", () => {
+    const cases = [
+      { expression: '"<second-generated-secret>"', safe: true },
+      { expression: '"<access-token>"', safe: true },
+      { expression: "REPLACE_WITH_GENERATED_TOKEN", safe: true },
+      { expression: '"YOUR_ACCESS_TOKEN"', safe: true },
+      { expression: "TEST_ONLY_ACCESS_TOKEN", safe: true },
+      { expression: '"test-only-access-token-fixture"', safe: true },
+      { expression: '"test_only_access_token_fixture"', safe: true },
+      {
+        expression:
+          '"ci-access-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
+        safe: true,
+      },
+      { expression: '""', safe: true },
+      {
+        expression:
+          '"$(node -e \'process.stdout.write(require("node:crypto").randomBytes(32).toString("base64url"))\')"',
+        safe: false,
+      },
+      {
+        expression:
+          '"generated-prod-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
+        safe: false,
+      },
+      { expression: '"prod-secret-test-only-abc123"', safe: false },
+      { expression: '"prod_secret_test_only_abc123"', safe: false },
+      { expression: '"fixed-test-only-access-token"', safe: false },
+      {
+        expression: '"GENERATE_WITH_OPENSSL_RAND_BASE64_32"',
+        safe: false,
+      },
+      { expression: '"$(openssl rand -base64 32)"', safe: false },
+      { expression: '"$(curl https://example.com/token)"', safe: false },
+    ];
+
+    for (const { expression, safe } of cases) {
+      expect({
+        expression,
+        safe: isSafeDocumentedTokenExpression(expression),
+      }).toEqual({ expression, safe });
+    }
+  });
+
+  test("guides a new user from local server setup to the first saved job", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const expectedH2Headings = [
+      "## What You Can Do",
+      "## How JobTracker Works",
+      "## Prerequisites",
+      "## Local Quick Start",
+      "## Install the Chrome Extension",
+      "## Connect the Extension",
+      "## Save Your First Job",
+      "## Set Up Resume Matching",
+      "## Optional Features",
+      "## Troubleshooting",
+      "## Production Deployment",
+      "## Database Migration Notes",
+      "## Development and Verification",
+      "## Documentation",
+      "## License",
+    ];
+    const requiredText = [
+      "Chrome extension → JobTracker server → PostgreSQL",
+      "The extension is not standalone",
+      "Node.js 22.22.2",
+      "npm ci",
+      "node:crypto",
+      "APP_ACCESS_TOKEN",
+      "chrome-extension://<extension-id>",
+      "CORS_ALLOWED_ORIGINS",
+      "chrome://extensions",
+      "Load unpacked",
+      "The token field is cleared after a successful connection",
+      "docs/operations/production-runbook.md",
+    ];
+    const requiredSetupImageReferences = setupImages.map(
+      (setupImage) => `docs/screenshots/${setupImage}`,
+    );
+
+    expect(readme).not.toContain("GENERATE_WITH_OPENSSL_RAND_BASE64_32");
+
+    const unsafeTokenAssignments = readDocumentedTokenAssignments(
+      readme,
+    ).filter(
+      ({ expression }) => !isSafeDocumentedTokenExpression(expression),
+    );
+
+    expect(unsafeTokenAssignments).toEqual([]);
+
+    const actualH2Headings = readme.match(/^## [^\r\n]+$/gmu) ?? [];
+
+    expect({
+      actualH2Headings,
+      missingSetupImageReferences: requiredSetupImageReferences.filter(
+        (imageReference) => !readme.includes(imageReference),
+      ),
+      missingText: requiredText.filter((text) => !readme.includes(text)),
+    }).toEqual({
+      actualH2Headings: expectedH2Headings,
+      missingSetupImageReferences: [],
+      missingText: [],
+    });
+
+    expect(readme).toContain(
+      "Chrome asks for access to the configured JobTracker server origin",
+    );
+    expect(readme).not.toContain(
+      "Site Access permission request for the current job site",
+    );
+    expect(readme).toContain(
+      "placeholder values copied from `.env.example` are intentionally rejected",
+    );
+    expect(readme).toContain("fs.constants.COPYFILE_EXCL");
+    expect(readme).toContain(
+      "preserves it and does not overwrite your credentials",
+    );
+    expect(readme).toContain(
+      "npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code",
+    );
+    expect(readme).toContain("createdb jobtracker");
+    expect(readme).not.toContain("createdb <db-name>");
+    expect(readme).toContain("| Symptom | Likely cause | Action |");
+    expect(readme).toMatch(
+      /\| Resume upload fails \|[^\r\n]+\|[^\r\n]+\|/u,
     );
   });
 });

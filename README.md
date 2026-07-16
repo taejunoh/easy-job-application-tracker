@@ -1,126 +1,243 @@
 # JobTracker
 
-A job application tracker that auto-extracts job details from URLs. Use the Chrome extension to capture job title, company, location, and description from LinkedIn, Indeed, Glassdoor, Lever, and any career page.
+JobTracker is a self-hosted job application tracker with a Chrome extension. The extension reads a job posting from the tab you are viewing, while the JobTracker web server stores the application and provides search, status tracking, resume matching, and settings.
 
-![Dashboard](docs/screenshots/01-dashboard.png)
+This guide starts with a local setup so you can verify the complete workflow before deploying it.
 
-## Features
+## What You Can Do
 
-- **Chrome extension** -- save jobs directly from LinkedIn, Indeed, Glassdoor, Lever, and any career site
-- **Keyword match analysis** -- compare job descriptions against your resume to see matched and missing keywords
-- **Resume upload** -- upload PDF or text resume in Settings for keyword matching
-- **Auto-extract from URLs** -- paste any job posting URL and get title + company extracted automatically
-- **Auto-fill profiles** -- fill LinkedIn and GitHub profile URLs on application forms (Greenhouse, Lever, Workday)
-- **Text paste mode** -- copy/paste job description text for AI-powered extraction
-- **Multi-LLM support** -- choose OpenAI, Google Gemini, or Anthropic Claude for AI extraction
-- **Dashboard** -- stats, status breakdown chart, and recent applications
-- **Full CRUD** -- search, filter, sort, edit, and delete applications
+- Save jobs from LinkedIn, Indeed, Glassdoor, Lever, Greenhouse, Workday, and other career pages.
+- Review, search, filter, edit, and delete applications from one dashboard.
+- Compare a job description with a saved resume and review matched and missing keywords.
+- Fill saved LinkedIn and GitHub profile URLs into supported application forms.
+- Use standard page metadata or optional AI-assisted extraction.
 
-## Quick Start
+![JobTracker dashboard](docs/screenshots/01-dashboard.png)
 
-### 1. Install the Chrome Extension
+## How JobTracker Works
 
-1. Download or clone this project:
-   ```bash
-   git clone https://github.com/taejunoh/easy-job-application-tracker.git
-   ```
-2. Open Google Chrome and go to `chrome://extensions`
-3. Turn on **Developer mode** (top-right toggle)
-4. Click **Load unpacked**
-5. Select the `extension/` folder inside the project
+The data flow is:
 
-### 2. Set Up Your Resume
+**Chrome extension → JobTracker server → PostgreSQL**
 
-1. Open the app and go to **Settings**
-2. Upload your resume (PDF or text) under **Resume**
-3. Click **Save Settings**
+**The extension is not standalone.** It extracts data from the current tab, but it needs a running JobTracker server to authenticate requests, save applications, load settings, and analyze keywords. The server stores application data in the PostgreSQL database configured by `DATABASE_URL`.
 
-Now keyword analysis works automatically in both the extension and the app.
+JobTracker has two interfaces:
 
-![Settings — Resume upload](docs/screenshots/02-settings-resume.png)
+- The web app at your configured `APP_BASE_URL`, where you manage applications, your resume, profiles, and optional AI providers.
+- The unpacked Chrome extension in [`extension/`](extension/), which connects to that server and works on supported job pages.
 
-### 3. Save and Analyze Jobs
+There are no separate native macOS, Windows, or Linux applications. Use Google Chrome for the extension and run the Node.js server with access to PostgreSQL.
 
-1. Go to any job posting (LinkedIn, Indeed, Glassdoor, Lever, etc.)
-2. Click the JobTracker extension icon
-3. Click **Save Application** to track it
-4. Click **Analyze Keywords** to see your resume match
+## Prerequisites
 
-![Extension popup on a job posting](docs/screenshots/03-extension-popup.png)
+Install these before you begin:
 
-![Keyword match analysis](docs/screenshots/04-keyword-analysis.png)
+- **Google Chrome 140 or newer** for the extension.
+- **Node.js 22.22.2**. The repository also pins this version in [`.nvmrc`](.nvmrc) and [`.node-version`](.node-version).
+- **npm**, included with Node.js.
+- **PostgreSQL** and an empty database that your local account can access. Install it from the [official PostgreSQL downloads](https://www.postgresql.org/download/), or use pgAdmin or a managed PostgreSQL service.
+- **Git** to clone the repository.
 
-### 4. Auto-Fill Application Forms (Optional)
+You will also need the PostgreSQL username, password, host, port, and database name for `DATABASE_URL`.
 
-1. Add your LinkedIn and GitHub URLs in **Settings > Profile URLs**
-2. On any application form, click the extension and press **Fill Profiles**
+## Local Quick Start
 
-### 5. Configure AI Extraction (Optional)
-
-AI extraction helps when job postings don't have standard meta tags. Not required -- basic extraction works without it.
-
-1. Go to **Settings**, select your LLM provider, enter your API key
-2. Click **Save Settings**
-
-![Settings — LLM provider](docs/screenshots/05-settings-llm.png)
-
-## Run Locally
-
-JobTracker supports both local self-hosting and hosted production operation. A
-local instance stores data in the PostgreSQL database you configure. A hosted
-Vercel instance stores application data in its configured PostgreSQL service,
-such as Neon; provider credentials are encrypted before they are persisted.
+### 1. Download and install
 
 ```bash
 git clone https://github.com/taejunoh/easy-job-application-tracker.git
 cd easy-job-application-tracker
 npm ci
-cp .env.example .env
 ```
 
-`npm ci` installs the exact dependency versions in `package-lock.json` and is
-recommended for fresh checkouts and deployments.
+`npm ci` installs the exact dependency versions recorded in `package-lock.json`.
 
-Generate separate secrets for encryption and application access. Run this
-command twice and keep each output private:
+### 2. Create your environment file
+
+Use this Node.js command instead of an operating-system-specific copy command:
 
 ```bash
-openssl rand -base64 32
+node -e "const fs=require('node:fs');if(fs.existsSync('.env')){console.log('.env already exists; leaving it unchanged')}else{fs.copyFileSync('.env.example','.env',fs.constants.COPYFILE_EXCL)}"
 ```
 
-Edit `.env` and replace every placeholder. The values in `.env.example` are
-intentionally rejected if copied unchanged:
+If `.env` already exists, this command preserves it and does not overwrite your credentials.
 
+Generate two different secrets. Run this command twice and keep both outputs private:
+
+```bash
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
 ```
-DATABASE_URL="postgresql://<db-user>:<db-password>@<db-host>:5432/<db-name>?sslmode=require"
-ENCRYPTION_SECRET="<first-openssl-output>"
-APP_ACCESS_TOKEN="<second-openssl-output>"
+
+Use the first output for encryption and the second output for application access. Edit `.env` so the five core variables follow this local template:
+
+```dotenv
+DATABASE_URL="postgresql://<db-user>:<db-password>@127.0.0.1:5432/<db-name>"
+ENCRYPTION_SECRET="<first-generated-secret>"
+APP_ACCESS_TOKEN="<second-generated-secret>"
 APP_BASE_URL="http://localhost:3000"
 CORS_ALLOWED_ORIGINS="http://localhost:3000,chrome-extension://<extension-id>"
 ```
 
-For a hosted production deployment, `APP_BASE_URL` must be the root HTTPS
-origin (for example, `https://jobs.example.com`) and that exact origin must
-also appear in `CORS_ALLOWED_ORIGINS`. Add only the Chrome extension origins
-that should be allowed to connect. Production rejects plain HTTP, wildcard
-origins, URL paths, and copied placeholder values.
+The `<extension-id>` value is not known until you load the extension. You can first leave that placeholder in `.env`, complete [Install the Chrome Extension](#install-the-chrome-extension), then replace it before starting the server.
+
+The placeholder values copied from `.env.example` are intentionally rejected by startup validation. Replace every placeholder before running `npm run dev` or `npm start`.
+
+The variables serve these purposes:
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL connection string used by Prisma and the server. |
+| `ENCRYPTION_SECRET` | Separate secret used to encrypt stored provider credentials. |
+| `APP_ACCESS_TOKEN` | Private pairing credential used by the web `/connect` page and Chrome extension. It is not a provider API key. |
+| `APP_BASE_URL` | Exact public origin of the JobTracker server, with no path. Use `http://localhost:3000` locally. |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated origins allowed to call the server. Include the app origin and the exact `chrome-extension://<extension-id>` origin. |
+
+Do not commit `.env`, reuse one generated value for both secrets, or paste either secret into screenshots or issue reports.
+
+### 3. Prepare the database
+
+If you installed PostgreSQL locally and its command-line tools are available, create the empty database with:
 
 ```bash
+createdb jobtracker
+```
+
+Replace `jobtracker` with your chosen database name if needed. Creating it in pgAdmin or with a managed PostgreSQL provider is also fine. In every case, the database name, user, password, host, and port in `DATABASE_URL` must match the database you created. Then run:
+
+```bash
+npx prisma validate
 npx prisma generate
 npx prisma migrate deploy
+```
+
+These commands validate the Prisma schema, generate the client, and safely apply the checked-in migration history.
+
+### 4. Start JobTracker
+
+After replacing `<extension-id>` with the ID from the next section, start the local server:
+
+```bash
 npm run dev
 ```
 
-Use `npm run dev` for local development. Its startup preloader loads Next.js
-dotenv files and validates the complete server environment before Next.js opens
-a listener.
+Open [http://localhost:3000](http://localhost:3000). The supported development command loads `.env` and validates the complete server configuration before opening a listener.
 
-Open [http://localhost:3000](http://localhost:3000). Update the extension's server URL to `http://localhost:3000`.
+The web app also requires authentication. Open [http://localhost:3000/connect](http://localhost:3000/connect) and enter the value you generated for `APP_ACCESS_TOKEN` to create the browser session.
 
-### Database Deployment
+## Install the Chrome Extension
 
-For a new hosted instance, create an empty PostgreSQL database, set
-`DATABASE_URL` to that database, and apply the checked-in migration history:
+1. Open `chrome://extensions` in Google Chrome.
+2. Turn on **Developer mode** in the upper-right corner.
+3. Click **Load unpacked**.
+4. Select the repository's [`extension/`](extension/) folder. Select the folder itself, not an individual file.
+5. On the JobTracker details card, copy the 32-character extension **ID**.
+6. Replace `<extension-id>` in `CORS_ALLOWED_ORIGINS` with that exact ID. The resulting origin should look like `chrome-extension://<extension-id>`.
+7. If the server is already running, stop it and run `npm run dev` again so it reads the updated environment.
+8. Use Chrome's extensions menu to pin JobTracker to the toolbar.
+
+![Load the unpacked JobTracker extension in Chrome](docs/screenshots/06-chrome-load-unpacked.png)
+
+Chrome may show the extension's declared job-site patterns under **Site access** on the extension details page. The permission requested during **Connect** is different: it is access to the configured JobTracker server origin.
+
+## Connect the Extension
+
+1. Open a supported job posting, then click the pinned JobTracker icon.
+2. Enter `http://localhost:3000` in **JobTracker URL**.
+3. Paste the value of `APP_ACCESS_TOKEN` into **Access Token**.
+4. Click **Connect**.
+5. Approve the Site Access request if Chrome shows it. Chrome asks for access to the configured JobTracker server origin, not the current job site.
+
+![Enter the local server URL and access token](docs/screenshots/07-extension-connect.png)
+
+When pairing succeeds, the popup shows **Connected** and enables actions supported by the current page.
+
+![Connected JobTracker extension](docs/screenshots/08-extension-connected.png)
+
+The token field is cleared after a successful connection. An empty token field while the popup says **Connected** is expected: the extension stores its authenticated connection state rather than displaying the credential again.
+
+Use **Disconnect** to remove the stored connection and revoke the runtime-requested server permission. Chrome can continue to list a previously requested server origin on the extension details page; an off toggle means access is no longer granted, and mere list presence does not mean the extension remains connected.
+
+## Save Your First Job
+
+1. Open a job posting on LinkedIn, Indeed, Glassdoor, Lever, Greenhouse, Workday, or another career page.
+2. Click the JobTracker toolbar icon. The popup extracts the title, company, location, description, and page URL when available.
+3. Check the extracted title, company, and location. Edit those fields if the source page is ambiguous.
+4. Click **Save Application**.
+5. Open the JobTracker dashboard and confirm that the application appears. From there you can change its status, add notes, edit details, search, filter, or delete it.
+
+![JobTracker extension on a job posting](docs/screenshots/03-extension-popup.png)
+
+If the page changes after the popup opens, use **Re-extract** before saving. A saved job is written by the server to PostgreSQL; closing Chrome does not remove it.
+
+## Set Up Resume Matching
+
+1. Open **Settings** in the JobTracker web app.
+2. Under **Resume**, upload a PDF resume or paste a text resume.
+3. Save the settings.
+4. Return to a job in the dashboard or extension and select **Analyze Keywords**.
+
+![Upload a PDF or text resume in Settings](docs/screenshots/02-settings-resume.png)
+
+JobTracker compares the saved resume text with the job description and reports matched and missing keywords. Review the result as a writing aid; it is not a hiring prediction.
+
+![Resume keyword match analysis](docs/screenshots/04-keyword-analysis.png)
+
+To fill profile links on supported application forms, add your LinkedIn and GitHub URLs under **Settings > Profile URLs**, save them, then click **Fill Profiles** in the extension.
+
+## Optional Features
+
+Basic extraction does not require an AI provider. When a site lacks useful structured metadata, optional AI extraction can interpret pasted or extracted job text.
+
+JobTracker supports these providers:
+
+- OpenAI
+- Gemini (Google)
+- Anthropic
+
+Choose a provider in **Settings**, enter that provider's API key and model settings, then save. Provider credentials are encrypted with `ENCRYPTION_SECRET` before storage. Do not put provider API keys in `APP_ACCESS_TOKEN` or commit them to the repository.
+
+![Configure an optional LLM provider](docs/screenshots/05-settings-llm.png)
+
+## Troubleshooting
+
+| Symptom | Likely cause | Action |
+| --- | --- | --- |
+| Chrome does not show a permission prompt | Access to that server origin was already granted, or Chrome did not open a new prompt. | Click **Connect** with the exact server origin. In `chrome://extensions`, confirm JobTracker is enabled and check the configured server origin under Site access; the request is not for the current job site. |
+| The popup says **Disconnected** | The extension has not paired with this server, its saved state was cleared, or the unpacked extension was reloaded. | Confirm the server is running, enter its exact origin without a trailing path, paste `APP_ACCESS_TOKEN`, and click **Connect** again. |
+| A request returns HTTP `401` | The saved connection is not accepted because the server and extension tokens differ or the server token changed. | Disconnect, verify that both use the same `APP_ACCESS_TOKEN`, then reconnect. Never send the token as part of a URL. |
+| The server origin remains in Chrome's Site access list after **Disconnect** | Chrome can retain an origin in its list after its permission has been removed. | Confirm the origin's toggle is off. Mere list presence does not mean access remains granted or the extension remains connected. |
+| Extracted fields are missing or inaccurate | The page is still loading, uses an unusual layout, or exposes incomplete metadata. | Wait for the job page to finish loading, reopen the popup, and click **Re-extract**. Edit fields before saving; for unusual layouts, use text paste mode and optionally configure an AI provider. |
+| **Save Application** fails | The connection, job URL, server, or PostgreSQL database is unavailable or invalid. | Confirm the popup is **Connected**, the server is reachable, the job URL is valid, and PostgreSQL is running. Check the server terminal for the specific error. |
+| **Analyze Keywords** fails or shows no result | No resume is saved, or the application has no job description. | Save a PDF or text resume in Settings. Re-extract or edit the application if its description is empty. |
+| Resume upload fails | The file is not PDF or TXT, exceeds 5 MB, is unreadable, or is a PDF with more than 100 pages. | Choose a readable `.pdf` or `.txt` file no larger than 5 MB and, for PDF, no more than 100 pages. You can paste the resume text instead. |
+| `prisma migrate deploy` fails | `DATABASE_URL`, database availability, credentials, TLS requirements, or migration state is incorrect. | Recheck the connection, then run `npx prisma migrate status`. Do not reset a database that contains data you need. |
+| Startup reports `.env` validation errors | A placeholder remains, a secret is invalid, or an origin is missing or includes a path. | Replace every placeholder, use two separately generated secrets, and ensure `APP_BASE_URL` plus the exact extension origin appear in `CORS_ALLOWED_ORIGINS`. Restart after editing `.env`. |
+
+For production-only connection, deployment, backup, and recovery problems, use the [production operations runbook](docs/operations/production-runbook.md).
+
+## Production Deployment
+
+The supported hosted topology is Vercel for the Next.js application and Neon, or another managed PostgreSQL provider, for the database. Start with an empty PostgreSQL database and configure the same five core server variables in the Production environment. Use a canonical HTTPS origin for `APP_BASE_URL` and include that origin plus only approved Chrome extension origins in `CORS_ALLOWED_ORIGINS`.
+
+The **Vercel Next.js preset** runs `npm run build`; Vercel does not run `npm start`. When the build loads `next.config.ts`, JobTracker validates the complete server environment at **build time**. At **request-serving runtime**, `src/instrumentation.ts` validates it again before a new Node.js server instance handles requests. `npm start` pre-listen validation applies to **self-hosted Node only**.
+
+For a self-hosted Node production server, build and start with:
+
+```bash
+npm run build
+npm start
+```
+
+For self-hosted Node, `npm start` and `npm run dev` are the supported launch contracts. Direct `next start` and `npx next` commands are unsupported because they bypass the preloaders in `scripts/validate-startup-env-production.mjs` and `scripts/validate-startup-env-development.mjs`. The `src/instrumentation.ts` check remains request-blocking defense in depth.
+
+Do not give Vercel Preview deployments Production database credentials. Preview builds also validate environment variables, so use Preview-only credentials, a stable Preview HTTPS alias, and a disposable PostgreSQL database if Preview routes need database access.
+
+After deployment, open `/connect` on the canonical HTTPS origin and enter `APP_ACCESS_TOKEN`. Pair the extension with the same origin and credential, and ensure its exact extension origin is allowed. Follow the [production operations runbook](docs/operations/production-runbook.md) for deployment verification, Chrome pairing, logs, Neon connectivity, backups, restore tests, incident response, and rollback.
+
+## Database Migration Notes
+
+For a new empty PostgreSQL database, apply only the checked-in migration history:
 
 ```bash
 npx prisma validate
@@ -129,189 +246,64 @@ npx prisma migrate deploy
 npx prisma migrate status
 ```
 
-Confirm that the `Application`, `Settings`, and `_prisma_migrations` tables are
-present before starting the application. The Settings row is created lazily on
-the first authenticated Settings request, so no database seed is required.
+Confirm the `Application`, `Settings`, and `_prisma_migrations` tables exist before serving traffic. No seed is required; the Settings row is created on the first authenticated Settings request.
 
-Start a self-hosted Node production deployment with:
+If an existing database was previously created with `prisma db push`, first take a verified backup and compare it with the current Prisma schema:
 
 ```bash
-npm start
+npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
 ```
 
-For self-hosted Node, `npm start` and `npm run dev` are the only supported
-application launch contracts. Direct `next start` and `npx next` invocations
-are unsupported because they bypass the pre-listen environment preloaders.
-Those contracts use `scripts/validate-startup-env-production.mjs` and
-`scripts/validate-startup-env-development.mjs`, respectively.
-`src/instrumentation.ts` remains request-blocking defense in depth across
-supported deployments. Hosted platforms use their own lifecycle hooks; the
-Vercel contract is documented below.
-
-If an existing PostgreSQL database was previously created with
-`prisma db push`, do not apply the initial migration directly. Back up the
-database and verify that its Prisma-managed schema exactly matches the current
-schema first:
-
-```bash
-npx prisma migrate diff \
-  --from-config-datasource \
-  --to-schema prisma/schema.prisma \
-  --exit-code
-```
-
-An empty diff exits with status `0`. Stop and resolve every reported difference
-before continuing. Once the backup is complete and the diff is empty, record
-the initial migration as already applied, then verify migration state again:
+Continue only when the diff is empty. Record the initial migration as applied, deploy later migrations, and verify status:
 
 ```bash
 npx prisma migrate resolve --applied 20260713000000_init
 npx prisma migrate deploy
 npx prisma migrate status
-npx prisma migrate diff \
-  --from-config-datasource \
-  --to-schema prisma/schema.prisma \
-  --exit-code
 ```
 
-These migration commands operate only on PostgreSQL and do not import another
-database automatically. Any legacy data import requires a separate, reviewed
-export/import process.
+Never use a destructive reset, `db push` data-loss acceptance, or an unreviewed down migration on a database containing records you need. A safe rollback restores a tested backup. Legacy data imports require a separately reviewed export/import process. See the [production operations runbook](docs/operations/production-runbook.md) and the [sanitized production cutover record](docs/operations/production-cutover-2026-07-14.md) before changing a production database.
 
-Use `prisma db push` only for disposable development databases. Never run a
-destructive reset or accept data loss on a database containing records you need
-to keep. Rollback for the initial baseline is a tested database restore, not a
-destructive down migration.
+## Development and Verification
 
-### Hosted Production
+Run the normal repository checks before opening a pull request:
 
-The supported hosted topology is Vercel for the application and Neon (or
-another managed PostgreSQL provider) for the database. Production requires all
-five server variables shown above, and Vercel Production must use Node 22. The
-Vercel Next.js preset runs `npm run build`; Vercel does not run `npm start`.
-When the build loads `next.config.ts`, the complete server environment is
-validated at build time. At request-serving runtime, `src/instrumentation.ts`
-validates it again before a new Node.js server instance handles requests.
-`npm start` pre-listen validation applies to self-hosted Node only. Preview must
-never receive Production database credentials. Because Preview also runs the
-build-time validation, configure the same five variable names with an inert
-loopback database URL, Preview-only credentials, and the stable Preview HTTPS
-alias for both URL/origin fields. Use a separately provisioned disposable
-database if database-backed Preview routes are required.
+```bash
+npm run check:extension
+npm run test:ci
+npm run lint
+npm run typecheck
+npm run build
+npm run check:startup-env
+```
 
-Open `/connect` on the canonical HTTPS origin and enter the application access
-credential to create a secure browser session. For Chrome extension pairing,
-enter the same canonical server origin and access credential in the extension
-popup, then select **Connect**. The extension origin must appear exactly in
-`CORS_ALLOWED_ORIGINS`; wildcard origins are rejected.
+The CI workflow uses Node.js 22.22.2 and a disposable PostgreSQL service. It validates and deploys migrations, checks schema parity and extension assets, runs tests, lints, typechecks, builds, and verifies invalid startup configuration is rejected.
 
-Deployment, verification, backup, restore, incident response, and rollback
-procedures are maintained in the
-[production operations runbook](docs/operations/production-runbook.md). The
-[2026-07-14 cutover record](docs/operations/production-cutover-2026-07-14.md)
-contains sanitized release evidence.
+### Chrome extension E2E
 
-### Chrome Extension E2E
-
-Run the isolated extension journey locally with:
+For the guarded local wrapper, run:
 
 ```bash
 npm run test:extension:e2e:local
 ```
 
-The wrapper requires a local PostgreSQL 17 server listening on the explicit
-loopback address `127.0.0.1:5432`. It connects to the `postgres` maintenance
-database as the `postgres` role by default; set
-`EXTENSION_E2E_POSTGRES_ADMIN_URL` only when credentials or the explicit port
-must differ. The hostname must remain canonical `127.0.0.1`, and the wrapper
-requires PostgreSQL to report that exact server address before it creates the
-database. The wrapper refuses to proceed if the exact disposable database
-`jobtracker_extension_e2e_test` already exists. Otherwise, it creates that
-database, builds the app with fixed non-production values, runs the E2E suite,
-and force-drops the disposable database in its cleanup path. `SIGINT` and
-`SIGTERM` stop the complete child process group before database cleanup.
+It requires a local **PostgreSQL 17** server on `127.0.0.1:5432` and refuses to reuse the disposable database named `jobtracker_extension_e2e_test`. It creates that database, builds the app with fixed test-only values, starts Playwright's **bundled Chromium** with a temporary profile, runs the real extension journey, and removes the database during cleanup.
 
-The suite uses Playwright's bundled Chromium and a temporary browser profile;
-it never launches or modifies system Chrome. It drives the actual extension
-action popup through invalid and valid pairing, extraction, save, database
-verification, popup reopen, disconnect, and server-`401` cleanup journeys.
-The lower-level CI command is `npm run test:extension:e2e`; do not run it
-directly unless its destructive-test sentinels, exact disposable database,
-server identity, migration, build, and browser prerequisites are already in
-place.
+The lower-level CI command is `npm run test:extension:e2e`. Do not run it directly unless all destructive-test sentinels, database identity checks, migrations, build outputs, and browser prerequisites are already in place. The test never launches or modifies your system Chrome profile.
 
-The automated scope and the required manual production verification are
-documented in the
-[Chrome extension smoke runbook](docs/operations/chrome-extension-smoke.md).
+For automated coverage, production smoke steps, cleanup expectations, and privacy rules, follow the [Chrome extension smoke runbook](docs/operations/chrome-extension-smoke.md).
 
-### Continuous Integration
+### Screenshot maintenance
 
-The primary GitHub Actions verification job runs on Node.js 22.22.2 with a
-disposable PostgreSQL 16 service. It installs the checked-in dependency graph,
-validates and applies the Prisma migration history, verifies schema parity,
-checks the extension's static assets, runs the full unit and database
-integration suite, lints, typechecks with `next typegen`, and creates a
-production build. A separate extension E2E job uses a digest-pinned PostgreSQL
-17 service, installs Playwright's bundled Chromium, builds the app, and runs
-`npm run test:extension:e2e`. All credentials in both jobs are fixed test-only
-values; neither job requires repository secrets or contacts external
-application services.
+Regenerate all documentation screenshots with `npm run screenshots`, or only the synthetic connection setup images with `npm run screenshots:setup`. The setup generator is deterministic and blocks network access so documentation does not capture real origins, extension IDs, credentials, or profile data. See the [screenshot guide](docs/screenshots/README.md).
 
-The database integration suite runs only when every destructive-test guard is
-satisfied: `RUN_DATABASE_INTEGRATION=1`,
-`ALLOW_DESTRUCTIVE_DATABASE_TESTS=jobtracker-ci-delete-all`, an explicit numeric
-port on `localhost`, `127.0.0.1`, or `[::1]`, and exactly one decoded database
-path segment matching `[A-Za-z0-9_]+_(ci|test)`. Query parameters, fragments,
-connection-service options, socket targets, ambiguous user information, and
-additional path segments are rejected. The suite also queries the connected
-PostgreSQL server for its database, address, port, and current schema before
-every bulk cleanup. The address must exactly match
-`EXPECTED_DATABASE_SERVER_ADDRESS` (the inspected service-container bridge
-address in CI), and the other identity fields plus the `public` schema must
-match before any row is deleted. An integration run fails before
-Prisma is imported if the URL guard is missing, and before mutation if the live
-identity differs. Never point the suite at a development, staging, or
-production database because it deletes every application and settings row
-before and after the run.
+## Documentation
 
-The following reproduces the CI database gate with a uniquely named temporary
-local database. It does not read or modify the database configured in `.env`:
-
-```bash
-DB="jobtracker_$(date +%s)_ci"
-createdb -h 127.0.0.1 -U postgres "$DB"
-trap 'dropdb -h 127.0.0.1 -U postgres --if-exists "$DB"' EXIT
-
-export DATABASE_URL="postgresql://postgres@127.0.0.1:5432/$DB"
-export ENCRYPTION_SECRET="ci-encryption-secret-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-export APP_ACCESS_TOKEN="ci-access-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-export APP_BASE_URL="https://jobtracker.test"
-export CORS_ALLOWED_ORIGINS="https://jobtracker.test,chrome-extension://abcdefghijklmnopabcdefghijklmnop"
-export RUN_DATABASE_INTEGRATION=1
-export ALLOW_DESTRUCTIVE_DATABASE_TESTS=jobtracker-ci-delete-all
-export EXPECTED_DATABASE_SERVER_ADDRESS="127.0.0.1"
-
-npx prisma migrate deploy
-npm run test:ci
-```
-
-`EXPECTED_DATABASE_SERVER_ADDRESS` must equal the address reported by
-PostgreSQL for the connection. It is `127.0.0.1` for the local reproduction
-above. CI derives the exact PostgreSQL service-container address with
-`docker inspect`; the integration guard does not accept an arbitrary private
-network range.
-
-The fixed credentials above are disposable test values. The application origin
-must remain `https://jobtracker.test` and appear exactly in the CORS list when
-reproducing the integration contract.
-
-## Troubleshooting
-
-**Extension says "Could not extract":** Try **Re-extract** -- some pages load content dynamically.
-
-**Keyword analysis shows no results:** Upload your resume in Settings and click Save first.
-
-**Extension can't connect:** Check the server URL in the extension popup matches your app URL.
+- [Production operations runbook](docs/operations/production-runbook.md)
+- [Chrome extension smoke runbook](docs/operations/chrome-extension-smoke.md)
+- [Sanitized production cutover record](docs/operations/production-cutover-2026-07-14.md)
+- [Screenshot generation guide](docs/screenshots/README.md)
+- [Dependency audit report](docs/security/dependency-audit-2026-07-14.md)
 
 ## License
 
