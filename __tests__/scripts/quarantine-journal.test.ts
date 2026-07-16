@@ -1059,6 +1059,95 @@ const result = await withQuarantineRunCapability({
     ));
     return { outcome, closes };
   }
+  if (request.operation === "settle-durable-tip") {
+    if (request.setup !== "existing") {
+      await appendAll(capability, request.records);
+      await seedArtifacts(capability);
+    }
+    const journalPath = deriveRunPath(capability, { purpose: "journal" });
+    if (request.case === "torn") {
+      await fsPromises.appendFile(journalPath, Buffer.from([0, 1]));
+    }
+    const before = await snapshot();
+    const journalBefore = await fsPromises.readFile(journalPath);
+    let callbackCalls = 0;
+    const getterCounts = { outer: 0, sequence: 0, recordHash: 0, event: 0, state: 0 };
+    const outcome = await capture(() => journal.reclaimJournalLock(
+      { capability, writersStopped: true, fsApi: boundFsApi },
+      async () => {
+        callbackCalls += 1;
+        const replayed = await journal.replayJournal({ capability });
+        const tip = replayed.records.at(-1);
+        const values = {
+          sequence: tip?.sequence,
+          recordHash: tip?.recordHash,
+          event: tip?.event,
+          state: replayed.state,
+        };
+        if (request.case === "tip-race") {
+          await fsPromises.appendFile(journalPath, Buffer.from([0, 1]));
+        }
+        if (request.case === "evidence-replacement") {
+          const tombstonePath = deriveRunPath(capability, {
+            purpose: "journal-tombstone",
+            id: "11111111-1111-4111-8111-111111111111",
+          });
+          await fsPromises.rm(tombstonePath);
+          await fsPromises.writeFile(tombstonePath, lockBytes(), { mode: 0o600 });
+        }
+        if (request.case === "wrong-pair") values.state = "VALIDATED";
+        if (request.case === "wrong-sequence") values.sequence += 1;
+        if (request.case === "wrong-hash") values.recordHash = "f".repeat(64);
+        if (request.case === "wrong-event") values.event = "VALIDATED";
+        if (request.case === "missing-tip") values.sequence = undefined;
+        let inner;
+        if (request.case === "getter-once") {
+          inner = {};
+          for (const key of ["sequence", "recordHash", "event", "state"]) {
+            Object.defineProperty(inner, key, {
+              enumerable: true,
+              get() {
+                getterCounts[key] += 1;
+                return values[key];
+              },
+            });
+          }
+        } else {
+          inner = { ...values };
+        }
+        if (request.case === "extra-inner") inner.extra = true;
+        if (request.case === "symbol-inner") inner[Symbol("extra")] = true;
+        if (request.case === "prototype-inner") Object.setPrototypeOf(inner, { polluted: true });
+        let outer = { settleDurableTip: inner };
+        if (request.case === "extra-outer") outer.extra = true;
+        if (request.case === "symbol-outer") outer[Symbol("extra")] = true;
+        if (request.case === "prototype-outer") Object.setPrototypeOf(outer, { polluted: true });
+        if (request.case === "wrong-result") outer = {};
+        if (request.case === "getter-once") {
+          outer = {};
+          Object.defineProperty(outer, "settleDurableTip", {
+            enumerable: true,
+            get() {
+              getterCounts.outer += 1;
+              return inner;
+            },
+          });
+        }
+        return outer;
+      },
+    ));
+    const after = await snapshot();
+    const journalAfter = await fsPromises.readFile(journalPath);
+    return {
+      outcome,
+      callbackCalls,
+      getterCounts,
+      before,
+      after,
+      journalUnchanged: journalBefore.equals(journalAfter),
+      replayed: await capture(() => journal.replayJournal({ capability })),
+    };
+  }
   if (request.operation === "recover-moving") {
     const before = await journal.replayJournal({ capability });
     await journal.reclaimJournalLock(
@@ -1706,6 +1795,63 @@ await withQuarantineRunCapability({
         }
       },
     })));
+`;
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", source, root], {
+    encoding: "utf8",
+  });
+}
+
+function killDurableSettlementTip(
+  root: string,
+  prefix: readonly { event: string; payload: unknown }[],
+  finalRecord: { event: string; payload: unknown },
+) {
+  const source = `
+import { createReadStream, lstatSync, realpathSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import { join } from "node:path";
+import * as journal from ${JSON.stringify(journalModuleUrl)};
+import { withQuarantineRunCapability } from ${JSON.stringify(capabilityModuleUrl)};
+const root = process.argv[1];
+const repoRoot = join(root, "repo");
+const quarantineRoot = join(root, "quarantine");
+const prefix = ${JSON.stringify(prefix)};
+const finalRecord = ${JSON.stringify(finalRecord)};
+const fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+await fsPromises.mkdir(repoRoot, { recursive: true, mode: 0o700 });
+await fsPromises.mkdir(join(quarantineRoot, "tx-0001"), { recursive: true, mode: 0o700 });
+await fsPromises.chmod(quarantineRoot, 0o700);
+await fsPromises.chmod(join(quarantineRoot, "tx-0001"), 0o700);
+await withQuarantineRunCapability({
+  repoRoot,
+  quarantineRoot,
+  transactionId: "tx-0001",
+  writersStopped: true,
+  fsApi,
+}, async (capability) => {
+  await journal.withJournalLock({ capability, fsApi }, async (heldLock) => {
+    for (const record of prefix) {
+      await journal.appendJournalRecord({
+        capability,
+        heldLock,
+        event: record.event,
+        payload: record.payload,
+        fsApi,
+      });
+    }
+  });
+  await journal.withJournalLock({ capability, fsApi }, (heldLock) =>
+    journal.appendJournalRecord({
+      capability,
+      heldLock,
+      event: finalRecord.event,
+      payload: finalRecord.payload,
+      fsApi,
+      faultHook: async (phase) => {
+        if (phase === "before-lock-cleanup") process.kill(process.pid, "SIGKILL");
+      },
+    }));
+});
 `;
   return spawnSync(process.execPath, ["--input-type=module", "--eval", source, root], {
     encoding: "utf8",
@@ -2663,6 +2809,178 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.replayed.records).toHaveLength(terminalRecords.ROLLED_BACK.length);
     expect(result.names).toEqual(["journal.log", "sentinel"]);
   });
+
+  const durableSettlementCases = [
+    ["quarantined", quarantinedPrefix, "QUARANTINED", "QUARANTINED"],
+    ["validated", [...quarantinedPrefix, records.validated], "VALIDATED", "VALIDATED"],
+    ["restore-aborted-quarantined", [
+      ...quarantinedPrefix,
+      records.restorePrepared,
+      records.restoring,
+      records.recoveryRequired,
+      records.restoreRollingBack,
+      records.restoreAbortedToQuarantined,
+    ], "RESTORE_ABORTED_TO_QUARANTINED", "QUARANTINED"],
+    ["restore-aborted-validated", [
+      ...quarantinedPrefix,
+      records.validated,
+      records.restorePrepared,
+      records.restoring,
+      records.recoveryRequired,
+      records.restoreRollingBack,
+      records.restoreAbortedToValidated,
+    ], "RESTORE_ABORTED_TO_VALIDATED", "VALIDATED"],
+  ] as const;
+
+  it.each(durableSettlementCases)(
+    "settles the durable %s tip without appending journal bytes",
+    (name, lifecycle, event, state) => {
+      const result = invoke(join(fixture, `settle-${name}`), {
+        operation: "settle-durable-tip",
+        case: "exact",
+        records: lifecycle,
+      });
+      expect(result.outcome.ok).toBe(true);
+      expect(result.callbackCalls).toBe(1);
+      expect(result.outcome.value).toEqual({
+        settleDurableTip: {
+          sequence: lifecycle.length,
+          recordHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          event,
+          state,
+        },
+      });
+      expect(result.journalUnchanged).toBe(true);
+      expect(Object.keys(result.after).sort()).toEqual(["journal.log", "sentinel"]);
+    },
+  );
+
+  it.each(durableSettlementCases)(
+    "settles a durable %s tip after SIGKILL before lock cleanup",
+    (name, lifecycle, event, state) => {
+      const root = join(fixture, `settle-crash-${name}`);
+      const killed = killDurableSettlementTip(
+        root,
+        lifecycle.slice(0, -1),
+        lifecycle.at(-1),
+      );
+      expect(killed.signal).toBe("SIGKILL");
+      const result = invoke(root, {
+        operation: "settle-durable-tip",
+        setup: "existing",
+        case: "exact",
+      });
+      expect(result.outcome.ok).toBe(true);
+      expect(result.outcome.value).toEqual({
+        settleDurableTip: {
+          sequence: lifecycle.length,
+          recordHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          event,
+          state,
+        },
+      });
+      expect(result.callbackCalls).toBe(1);
+      expect(result.journalUnchanged).toBe(true);
+      expect(Object.keys(result.after)).toEqual(["journal.log"]);
+    },
+  );
+
+  it("snapshots settlement accessors exactly once", () => {
+    const result = invoke(join(fixture, "settle-getter-once"), {
+      operation: "settle-durable-tip",
+      case: "getter-once",
+      records: quarantinedPrefix,
+    });
+    expect(result.outcome.ok).toBe(true);
+    expect(result.getterCounts).toEqual({
+      outer: 1,
+      sequence: 1,
+      recordHash: 1,
+      event: 1,
+      state: 1,
+    });
+    expect(result.journalUnchanged).toBe(true);
+  });
+
+  it.each([
+    "wrong-result",
+    "extra-outer",
+    "extra-inner",
+    "symbol-outer",
+    "symbol-inner",
+    "prototype-outer",
+    "prototype-inner",
+    "wrong-pair",
+    "wrong-sequence",
+    "wrong-hash",
+    "wrong-event",
+    "missing-tip",
+  ])("rejects settlement result mutation %s and restores stale evidence", (caseName) => {
+    const result = invoke(join(fixture, `settle-reject-${caseName}`), {
+      operation: "settle-durable-tip",
+      case: caseName,
+      records: quarantinedPrefix,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.callbackCalls).toBe(1);
+    expect(result.journalUnchanged).toBe(true);
+    expect(result.after).toEqual(result.before);
+  });
+
+  it("rejects a non-settleable nonterminal tip and restores stale evidence", () => {
+    const result = invoke(join(fixture, "settle-nonterminal"), {
+      operation: "settle-durable-tip",
+      case: "exact",
+      records: [records.prepared],
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.callbackCalls).toBe(1);
+    expect(result.journalUnchanged).toBe(true);
+    expect(result.after).toEqual(result.before);
+  });
+
+  it("rejects a zero-append settlement of a torn durable tip", () => {
+    const result = invoke(join(fixture, "settle-torn"), {
+      operation: "settle-durable-tip",
+      case: "torn",
+      records: quarantinedPrefix,
+    });
+    expect(result.outcome.ok).toBe(false);
+    expect(result.callbackCalls).toBe(1);
+    expect(result.journalUnchanged).toBe(true);
+    expect(result.after).toEqual(result.before);
+  });
+
+  it.each(["tip-race", "evidence-replacement"])(
+    "rejects settlement %s without consuming recovery evidence",
+    (caseName) => {
+      const result = invoke(join(fixture, `settle-${caseName}`), {
+        operation: "settle-durable-tip",
+        case: caseName,
+        records: quarantinedPrefix,
+      });
+      expect(result.outcome.ok).toBe(false);
+      expect(result.callbackCalls).toBe(1);
+      expect(Object.keys(result.after).sort()).toEqual(Object.keys(result.before).sort());
+      expect(Object.keys(result.after)).toContain("journal.lock");
+      expect(Object.keys(result.after)).toContain("journal.lock.tombstone.11111111-1111-4111-8111-111111111111");
+    },
+  );
+
+  it.each(Object.entries(terminalRecords))(
+    "keeps terminal %s recovery cleanup-only and bypasses settlement",
+    (state, lifecycle) => {
+      const result = invoke(join(fixture, `settle-terminal-${state}`), {
+        operation: "settle-durable-tip",
+        case: "wrong-result",
+        records: lifecycle,
+      });
+      expect(result.outcome.ok).toBe(true);
+      expect(result.callbackCalls).toBe(0);
+      expect(result.outcome.value.state).toBe(state);
+      expect(Object.keys(result.after).sort()).toEqual(["journal.log", "sentinel"]);
+    },
+  );
 
   it.each([
     ["malformed", /malformed journal/u],

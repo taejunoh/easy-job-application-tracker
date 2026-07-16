@@ -931,6 +931,12 @@ const TERMINAL_CLEANUP_STATES = new Set([
   "RESTORED",
   "INCOMPLETE_CONFLICT",
 ]);
+const DURABLE_TIP_SETTLEMENTS = new Map([
+  ["QUARANTINED", "QUARANTINED"],
+  ["VALIDATED", "VALIDATED"],
+  ["RESTORE_ABORTED_TO_QUARANTINED", "QUARANTINED"],
+  ["RESTORE_ABORTED_TO_VALIDATED", "VALIDATED"],
+]);
 const TOMBSTONE_PREFIX = "journal.lock.tombstone.";
 
 function sameIdentity(left, right) {
@@ -1642,6 +1648,90 @@ async function publishStaleLockTombstone({
   return { ...staleLock, path: tombstonePath };
 }
 
+function parseDurableTipSettlement(value, replayed) {
+  const outer = snapshotOptions(
+    value,
+    ["settleDurableTip"],
+    ["settleDurableTip"],
+    "journal lock recovery result",
+  );
+  const settlement = snapshotOptions(
+    outer.settleDurableTip,
+    ["sequence", "recordHash", "event", "state"],
+    ["sequence", "recordHash", "event", "state"],
+    "durable journal tip settlement",
+  );
+  if (!Number.isSafeInteger(settlement.sequence) || settlement.sequence < 1) {
+    throw new TypeError("durable journal tip settlement sequence must be a positive safe integer");
+  }
+  if (typeof settlement.recordHash !== "string" || !HASH_PATTERN.test(settlement.recordHash)) {
+    throw new TypeError("durable journal tip settlement recordHash must be a lowercase SHA-256 hash");
+  }
+  if (typeof settlement.event !== "string" || typeof settlement.state !== "string") {
+    throw new TypeError("durable journal tip settlement event and state must be strings");
+  }
+  if (DURABLE_TIP_SETTLEMENTS.get(settlement.event) !== settlement.state) {
+    throw new Error("durable journal tip settlement event/state pair is not allowed");
+  }
+  const tip = replayed.records.at(-1);
+  if (
+    tip === undefined ||
+    settlement.sequence !== tip.sequence ||
+    settlement.recordHash !== tip.recordHash ||
+    settlement.event !== tip.event ||
+    settlement.state !== replayed.state
+  ) {
+    throw new Error("durable journal tip settlement does not match the replayed tip");
+  }
+  return Object.freeze({
+    settleDurableTip: Object.freeze({
+      sequence: settlement.sequence,
+      recordHash: settlement.recordHash,
+      event: settlement.event,
+      state: settlement.state,
+    }),
+  });
+}
+
+async function restoreRecoveryArtifacts({
+  capability,
+  fsApi,
+  staleLock,
+  moved,
+  movedWasNew,
+  created,
+}) {
+  await revalidateRunCapability(capability, {
+    purpose: "journal-lock",
+    boundary: "before-mutation",
+  });
+  await assertPathIdentity(created.lockPath, created.identity, fsApi, "journal held lock");
+  await fsApi.rm(created.lockPath);
+  await fsyncDirectory(dirname(created.lockPath), fsApi);
+  await revalidateRunCapability(capability, {
+    purpose: "journal-lock",
+    boundary: "after-sync",
+  });
+  await assertPathAbsent(created.lockPath, fsApi, "journal held lock");
+  if (staleLock === null) return;
+
+  await assertPathIdentity(moved.path, staleLock.identity, fsApi, "stale journal lock tombstone");
+  await revalidateRunCapability(capability, {
+    purpose: "journal-lock",
+    boundary: "before-mutation",
+  });
+  await fsApi.link(moved.path, created.lockPath);
+  await fsyncDirectory(dirname(created.lockPath), fsApi);
+  await revalidateRunCapability(capability, {
+    purpose: "journal-lock",
+    boundary: "after-sync",
+  });
+  await assertPathIdentity(created.lockPath, staleLock.identity, fsApi, "restored stale journal lock");
+  if (movedWasNew) {
+    await removeOwnedArtifacts(capability, [moved], fsApi);
+  }
+}
+
 export async function reclaimJournalLock(options, callback) {
   const input = snapshotOptions(
     options,
@@ -1672,9 +1762,11 @@ export async function reclaimJournalLock(options, callback) {
     throw new Error("journal lock recovery requires a stale lock or tombstone");
   }
   let moved = null;
+  let movedWasNew = false;
   if (staleLock !== null) {
     const residue = priorTombstones.find((artifact) =>
       sameIdentity(artifact.identity, staleLock.identity));
+    movedWasNew = residue === undefined;
     const tombstoneId = residue === undefined
       ? randomUUID()
       : residue.path.split("/").at(-1).slice(TOMBSTONE_PREFIX.length);
@@ -1692,6 +1784,8 @@ export async function reclaimJournalLock(options, callback) {
     });
   }
   const staleEvidence = staleLock ?? priorTombstones.at(-1);
+  let zeroAppendFailure;
+  let settlementResult;
   const run = await runWithJournalLock(
     { capability, fsApi, removeOnSuccess: false },
     async (heldLock) => {
@@ -1699,14 +1793,54 @@ export async function reclaimJournalLock(options, callback) {
       if (!sameTerminalSnapshot(before, rechecked)) {
         throw new Error("journal tip changed during lock recovery");
       }
-      return callback(heldLock, Object.freeze({
-        staleLock: staleEvidence.metadata,
-        staleLockTorn: staleEvidence.torn,
-      }));
+      let callbackResult;
+      try {
+        callbackResult = await callback(heldLock, Object.freeze({
+          staleLock: staleEvidence.metadata,
+          staleLockTorn: staleEvidence.torn,
+        }));
+      } catch (error) {
+        const lockState = heldLockState.get(heldLock);
+        if (lockState?.durableAppends !== 0 || lockState.lastCandidate !== null) throw error;
+        zeroAppendFailure = error;
+        return undefined;
+      }
+      if (heldLockState.get(heldLock)?.durableAppends === 0) {
+        try {
+          if (rechecked.replayed.truncatedTail) {
+            throw new Error("durable journal tip settlement rejects a torn journal tail");
+          }
+          settlementResult = parseDurableTipSettlement(callbackResult, rechecked.replayed);
+          const settled = await readJournalSnapshot({ capability, fsApi });
+          if (settled.replayed.truncatedTail || !sameTerminalSnapshot(rechecked, settled)) {
+            throw new Error("journal tip changed during durable-tip settlement");
+          }
+        } catch (error) {
+          zeroAppendFailure = error;
+        }
+      }
+      return callbackResult;
     },
   );
   if (run.state.durableAppends === 0) {
-    throw new Error("journal lock recovery requires a durable journal append");
+    if (zeroAppendFailure !== undefined || settlementResult === undefined) {
+      const primary = zeroAppendFailure ?? new Error(
+        "journal lock recovery requires a durable journal append or exact tip settlement",
+      );
+      try {
+        await restoreRecoveryArtifacts({
+          capability,
+          fsApi,
+          staleLock,
+          moved,
+          movedWasNew,
+          created: run.created,
+        });
+      } catch (error) {
+        throw attachCleanupError(primary, error);
+      }
+      throw primary;
+    }
   }
   try {
     await removeOwnedArtifacts(
@@ -1719,9 +1853,23 @@ export async function reclaimJournalLock(options, callback) {
       fsApi,
     );
   } catch (error) {
+    if (run.state.durableAppends === 0) {
+      try {
+        await restoreRecoveryArtifacts({
+          capability,
+          fsApi,
+          staleLock,
+          moved,
+          movedWasNew,
+          created: run.created,
+        });
+      } catch (restoreError) {
+        throw attachCleanupError(error, restoreError);
+      }
+    }
     throw run.state.lastCandidate === null ? error : indeterminate(run.state.lastCandidate, error);
   }
-  return run.result;
+  return run.state.durableAppends === 0 ? settlementResult : run.result;
 }
 
 function sameTerminalSnapshot(before, after) {
