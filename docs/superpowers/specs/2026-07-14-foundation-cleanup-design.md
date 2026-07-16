@@ -384,7 +384,10 @@ never proves ownership:
 - final present, temporary present: first require the exact identity-stable
   final above. Unlink the temporary only when its current device/inode/mode/size
   equals the captured final identity after final and parent durability are
-  proven; otherwise preserve the extra temporary and return `ERR_INTEGRITY`;
+  proven. After the proven unlink, sync `divergent-diffs` again, perform
+  capability-bound post-sync validation that the temporary is `ENOENT`, and
+  require the final to retain the exact captured device/inode/mode/size;
+  otherwise preserve all remaining evidence and return `ERR_INTEGRITY`;
 - final absent, temporary present: require a non-symlink regular mode-`0600`
   temporary and capture its device/inode/mode/size before streaming. Recompute
   the canonical patch and compare exact complete bytes and SHA-256; require the
@@ -394,12 +397,17 @@ never proves ownership:
   immediately before syncing the parent, then sync the parent. Require both
   final and still-present temporary to retain the captured identity after the
   parent sync. Only then identity-check and unlink the temporary and sync the
-  parent again;
+  `divergent-diffs` parent again. After that cleanup sync, capability-bound
+  validation must prove temporary `ENOENT` and the final's exact captured
+  device/inode/mode/size before adoption succeeds;
 - a mismatching, partial, wrong-mode, nonregular, replaced, or otherwise
 unprovable preexisting temporary is preserved and returns `ERR_INTEGRITY`.
 Any swap or mismatch at the post-read, immediate pre-link, post-link,
 pre-parent-sync, or post-sync seam preserves all available evidence and returns
 `ERR_INTEGRITY`; no later unlink or adoption occurs.
+A cleanup-parent-sync failure, post-cleanup final replacement, or temporary
+reappearance fails closed with `ERR_INTEGRITY` and never reports successful
+adoption. Cleanup never attempts to remove a reappeared or foreign path.
 
 Only a temporary successfully created with `O_EXCL` by the current invocation
 may be identity-checked and unlinked on that invocation's local prepublication

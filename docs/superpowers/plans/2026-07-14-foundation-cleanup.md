@@ -1232,8 +1232,10 @@ Test the exact divergent temporary matrix. A final alone is adopted only after
 capturing device/inode/mode/size before the streamed comparison and proving the
 same identity after read and after final/parent sync. With final plus temp,
 unlink temp only when its current complete identity equals the captured exact
-final after final and parent durability; a different temp is preserved with
-`ERR_INTEGRITY`. With temp alone, capture its complete identity before read,
+final after final and parent durability. After unlink, fsync the
+`divergent-diffs` parent again and capability-revalidate temporary `ENOENT` plus
+the final's exact captured identity; a different/reappeared temp or changed
+final is preserved with `ERR_INTEGRITY`. With temp alone, capture its complete identity before read,
 recompute and stream-compare the complete canonical patch, and recheck that
 identity after read and immediately before link. Publish no-replace, require the
 final identity to equal the capture, sync final, recheck final and temp before
@@ -1246,6 +1248,12 @@ and replaced temps. Only a temp
 successfully `O_EXCL`-created by the current invocation may be identity-checked
 and removed on its local prepublication failure; path/mode/inode observations
 alone never authorize deletion of a preexisting temp.
+
+For both cleanup branches, inject failure of the parent fsync after temp unlink,
+a final swap after cleanup sync, and temporary reappearance before post-sync
+validation. Require no successful adoption, exact `ERR_INTEGRITY`, preservation
+of every remaining or foreign artifact, temporary `ENOENT` plus final captured
+identity on success, and no attempt to unlink a reappeared path.
 
 Seed each durable Slice 2 tip `PREPARED`, `MOVING`, `VERIFYING`, and
 `QUARANTINED`, then call `quarantineWorkspace` again. Require no filesystem or
