@@ -769,14 +769,20 @@ Minor 0; every finding returns to that slice's RED/GREEN cycle.
 - Add `validation-pass-1` and `validation-pass-2` for those same IDs.
 - Add run purpose `{ purpose: "rollback-entry", id: restoreId,
   phase: generatedEntryId }`, deriving only `.next` or `node_modules` under
-  `rollback/regenerated-before-restore/<restore-id>/`.
+  `rollback/regenerated-before-restore/<restore-id>/`. `restoreId` is exactly
+  `restore-<lowercase-v4-shaped-uuid>` and matches
+  `/^restore-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u`;
+  a bare UUID is rejected.
 - Extend `fsyncTree` with the exact rollback-entry shape from the design.
 - Add the exact restore-rollback events and `settleDurableTip` result from the
   design; all unknown keys and illegal transitions remain fatal.
 - Permit `RECOVERY_REQUIRED { entryIds: [] }` only for an apply or restore with
   no durable relevant entry intent; add the exact first-intent rollback/abort
   transitions from the design. Every post-intent recovery array remains
-  non-empty and equals the sorted unresolved IDs.
+  non-empty and equals all durable intent IDs in their original forward journal
+  order, including IDs with durable completion events. The array is unique,
+  dense, capped at 4,096, and has no independent bytewise-sort requirement;
+  conflict IDs alone retain bytewise-sorted order.
 - Change `RESTORE_PREPARED` from `{}` to the design's exact
   `{ restoreId, activeGenerated }` payload, with fixed generated IDs and each
   durable pre-restore inventory summary or exact null absence. Both IDs are
@@ -791,6 +797,12 @@ purpose/ID/phase combination, and prove symlink, mode, containment, adapter,
 10,000-depth, handle, and RSS bounds remain unchanged. In the journal suite,
 require exact restore rollback/abort transitions and require zero-append stale
 recovery to succeed only for an exact non-torn current tip:
+
+Use one shared canonical example
+`restore-123e4567-e89b-42d3-a456-426614174000` across journal, capability,
+rollback-path, and fsync tests. Require `RESTORE_PREPARED` to accept it and
+reject the bare suffix, uppercase, wrong version/variant, double prefix, and
+arbitrary restore strings before append.
 
 ```js
 return {
@@ -812,6 +824,11 @@ the existing cleanup-only API and explicitly reject every settlement variant.
 Also test PREPARED/MOVING and RESTORE_PREPARED/RESTORING crashes before the
 first entry intent: empty recovery IDs may resume, roll back, or abort without
 inventing an entry event. The same empty array after one durable intent is fatal.
+For apply and restore, append intents in a valid non-bytewise ID order and
+require `RECOVERY_REQUIRED.entryIds` to repeat that exact forward journal order;
+reject the same IDs reordered bytewise. Include durable completed-entry IDs,
+exercise all-completed resume and rollback lifecycles, accept exactly 4,096
+intent IDs, and reject a 4,097th intent or recovery ID without changing the tip.
 Require `RESTORE_PREPARED` to reject swapped IDs, sparse/custom arrays, unknown
 keys, a value other than exact null or a closed `InventorySummary`, a non-null
 summary without its matching already-durable restore-active inventory, and any
@@ -830,17 +847,23 @@ npm test -- --runInBand \
   __tests__/scripts/quarantine-journal.test.ts
 ```
 
-Expected: FAIL only on the new purpose, phase, transition, and settlement cases.
+Expected: FAIL only on the new purpose, phase, restore-ID grammar,
+full-intent-ledger ordering, transition, and settlement cases.
 
 - [ ] **Step 0.3: Implement the closed extensions and verify GREEN**
 
 Keep the existing capability and bound-adapter lookups. `rollback-entry`
-validates a restore ID plus a fixed generated ID before derivation. The selected
-restore parent must already be a mode-`0700` non-symlink directory. The journal
-accepts zero durable appends only after the callback's exact `settleDurableTip`
-matches one allowed unchanged replayed tip under the fresh held lock and all
-owned stale evidence remains proven. Implement direct no-intent recovery paths
-without weakening the non-empty unresolved-ID contract after the first intent.
+validates the exact prefixed `RestoreId` plus a fixed generated ID before
+derivation. Change the journal restore-ID parser to the same prefixed grammar;
+do not accept both forms. Split `RECOVERY_REQUIRED` parsing from conflict-array
+parsing: recovery IDs are dense, unique, capped at 4,096, and semantically equal
+the full forward intent ledger, while conflict IDs remain bytewise sorted. The
+selected restore parent must already be a mode-`0700` non-symlink directory.
+The journal accepts zero durable appends only after the callback's exact
+`settleDurableTip` matches one allowed unchanged replayed tip under the fresh
+held lock and all owned stale evidence remains proven. Implement direct
+no-intent recovery paths without weakening the non-empty full-intent-ledger
+contract after the first intent.
 
 ```bash
 npm test -- --runInBand \
@@ -1030,6 +1053,12 @@ individual journal frames are structurally valid. A new apply or restore must
 refuse every nonterminal run. Kill at PREPARED and MOVING before the first
 `MOVE_INTENT`; require `RECOVERY_REQUIRED { entryIds: [] }` to resume or enter
 `ROLLING_BACK` and reach `ROLLED_BACK` without an entry rollback event.
+Kill after the final `MOVED` and after `VERIFYING`. In both cases require the
+recovery payload to repeat every durable `MOVE_INTENT` ID in original forward
+journal order, including every completed ID. Resume must still reach
+`QUARANTINED`; rollback must reverse the complete ledger and reach
+`ROLLED_BACK`. Add a valid non-bytewise intent-order fixture so neither runtime
+nor crash recovery sorts the payload.
 
 - [ ] **Step 3.2: Implement semantic replay and reverse rollback**
 
@@ -1037,7 +1066,11 @@ Replay before filesystem action. Reconcile an indeterminate append from the
 durable ledger plus the matrix and append the next required event only when the
 state transition proves it absent. Use `settleDurableTip` only for an owned
 stale artifact and one exact stable-tip allowlist pair; make no claim about an
-unrecorded candidate. Roll back entries in reverse durable-intent order.
+unrecorded candidate. Construct `RECOVERY_REQUIRED.entryIds` from the complete
+durable intent ledger in forward journal order, never by subtracting IDs with
+durable completion events. Resume derives unfinished work separately from
+completion events and filesystem state; rollback processes the authoritative
+complete ledger in reverse order.
 `QUARANTINED` resume is idempotent;
 `recoverQuarantine(... action: "rollback")` rejects `QUARANTINED` and directs
 the operator to restore.
@@ -1161,7 +1194,35 @@ export async function recoverRestore({
 
 - [ ] **Step 5.1: Write restore and actual-SIGKILL RED matrices**
 
-Derive one deterministic version-4-shaped restore ID from the transaction ID.
+Derive one deterministic prefixed `RestoreId` from the already validated NFC
+transaction ID using exactly this private algorithm in
+`scripts/quarantine-restore.mjs`:
+
+```js
+function deriveRestoreId(transactionId) {
+  const digest = createHash("sha256")
+    .update(Buffer.from(
+      `easy-job-application-tracker\0restore-id\0${transactionId}`,
+      "utf8",
+    ))
+    .digest();
+  const bytes = Buffer.from(digest.subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return [
+    "restore-",
+    hex.slice(0, 8), "-", hex.slice(8, 12), "-", hex.slice(12, 16), "-",
+    hex.slice(16, 20), "-", hex.slice(20),
+  ].join("");
+}
+```
+
+Require the fixed vector
+`tx-0001 -> restore-c3624475-87d7-4886-b0bf-68a5061663d2`, repeated calls to
+return the same ID, and every public result, `RESTORE_PREPARED`, capability
+request, rollback path, and fsync option to carry that exact prefixed string.
+Reject a bare UUID everywhere.
 For each existing generated root, write and `fsync` its fixed `restore-active`
 inventory; for an absent root, write no inventory JSONL and independently
 recheck absence immediately before the event. Then append `RESTORE_PREPARED`
@@ -1205,6 +1266,12 @@ the abort event matching the durable state immediately before
 evidence, and both-side mutation must never be overwritten or deleted. A
 completed `RESTORED` run cannot be silently undone.
 
+Kill after the final `RESTORED_ENTRY` before `RESTORED`. Recovery must append
+the full non-empty forward `RESTORE_INTENT` ledger, including completed IDs.
+Resume reaches `RESTORED`; rollback reverses the complete ledger and returns to
+the exact pre-restore state. A valid non-bytewise restore-intent order remains
+in that journal order in `RECOVERY_REQUIRED.entryIds`.
+
 For every generated entry, parameterize the design's complete `A/R/P` matrix
 using canonical original summary `O`, regenerated summary/presence `G`, absence,
 byte-equal `O == G`, distinct concurrent inodes, and mismatching content. Assert
@@ -1222,9 +1289,10 @@ an entry rollback event.
 - [ ] **Step 5.2: Implement restore and reverse replay**
 
 Create the restore parent as a mode-`0700` capability-validated directory, use
-only rollback-entry paths, and preserve regenerated rollback content after a
-successful restore. On conflict append sorted unique IDs to
-`INCOMPLETE_CONFLICT` and keep every observed location. Resume processes durable
+only rollback-entry paths named by the deterministic prefixed `RestoreId`, and
+preserve regenerated rollback content after a successful restore. On conflict,
+append bytewise-sorted unique IDs to `INCOMPLETE_CONFLICT` and keep every
+observed location. Resume processes durable
 `RESTORE_INTENT` records forward; rollback processes them in reverse durable
 intent order and reverses a generated entry as active original to payload, then
 rollback regenerated to active. `restoreQuarantine` accepts only `RestorePhase`
@@ -1340,6 +1408,10 @@ journal ledger. Reject duplicate/unknown flags, unknown commands, relative
 roots, and malformed values. Reject missing attestation for apply, recovery,
 mark-validation, and restore; `inspect` accepts no attestation flag and remains
 advisory.
+
+For restore and restore-recovery success records, require `restoreId` to match
+the exact prefixed grammar and the deterministic transaction vector from Slice
+5. The CLI must never emit or accept the bare UUID suffix as a restore ID.
 
 API conflict variants are durable results, but the CLI must convert them to the
 closed `ERR_CONFLICT` stderr record and exit 3; it must not label a conflict

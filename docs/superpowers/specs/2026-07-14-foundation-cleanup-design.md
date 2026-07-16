@@ -90,6 +90,9 @@ Create one external directory per cleanup run:
     conflicts/
 ```
 
+`<restore-id>` everywhere in this design means exactly
+`restore-<lowercase-v4-shaped-uuid>`; a bare UUID is never a restore ID.
+
 The quarantine root, run directory, and every derived quarantine subdirectory
 must be non-symlink directories with mode `0700`. The canonical `current`
 pointer, journal, immutable manifest generation, inventory, and diff files must
@@ -464,18 +467,43 @@ and observed `InventorySummary`. Entry-oriented rollback and restore events
 accept only their validated entry ID plus any inventory summary explicitly
 required by their documented transition. `RECOVERY_REQUIRED` accepts exactly
 `{ entryIds: string[] }`, and `INCOMPLETE_CONFLICT` accepts exactly
-`{ conflictEntryIds: string[] }`. Both arrays are bytewise sorted and contain
-unique validated entry IDs. A recovery-required array may be empty only when
-replay proves that the interrupted apply or restore contains zero durable
-`MOVE_INTENT` or `RESTORE_INTENT` records respectively; once any relevant
-intent is durable, the array must be non-empty and contain exactly the unresolved
-entry IDs. A conflict array is always non-empty. Task 2 may extend an event payload only
-after adding a failing exact-schema test and updating this contract; arbitrary
-plain canonical JSON is never an accepted journal payload.
+`{ conflictEntryIds: string[] }`. A recovery-required array is dense, contains
+unique validated entry IDs, has at most 4,096 elements, and equals every durable
+`MOVE_INTENT` or `RESTORE_INTENT` ID in its original forward journal order. It
+is empty if and only if that apply or restore context has zero durable intents;
+completed entry events never remove IDs from this array. It has no independent
+bytewise-sort rule: forward journal order wins even when it is non-bytewise. A
+conflict array is always non-empty, bytewise sorted, unique, and limited to
+4,096 validated entry IDs. Task 2 may extend an event payload
+only after adding a failing exact-schema test and updating this contract;
+arbitrary plain canonical JSON is never an accepted journal payload.
+
+The restore ID type is closed and has one grammar:
+
+```text
+RestoreId = "restore-" + LowercaseV4ShapedUuid
+LowercaseV4ShapedUuid =
+  [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}
+```
+
+The deterministic derivation validates the NFC transaction ID, hashes the UTF-8
+bytes of `"easy-job-application-tracker\0restore-id\0" + transactionId` with
+SHA-256, takes the first 16 digest bytes, sets byte 6 to
+`(byte & 0x0f) | 0x40` and byte 8 to `(byte & 0x3f) | 0x80`, formats those bytes
+as a lowercase UUID, and prepends `restore-`. The fixed vector is:
+
+```text
+transactionId: tx-0001
+restoreId: restore-c3624475-87d7-4886-b0bf-68a5061663d2
+```
+
+No public result, event, capability request, rollback path, or fsync option
+accepts a bare UUID or another restore-ID grammar.
 
 `RESTORE_PREPARED` accepts exactly
 `{ restoreId, activeGenerated }`. `restoreId` is the deterministic validated
-restore ID derived from the transaction. `activeGenerated` is a dense array of
+`RestoreId` derived from the transaction by the algorithm above.
+`activeGenerated` is a dense array of
 exactly these two records in this bytewise-sorted order:
 
 ```text
@@ -508,10 +536,12 @@ PREPARED -> MOVING -> VERIFYING -> QUARANTINED -> VALIDATED
                  \-> INCOMPLETE_CONFLICT
 PREPARED -> RECOVERY_REQUIRED([]) -> MOVING|ROLLING_BACK
 MOVING(no MOVE_INTENT) -> RECOVERY_REQUIRED([]) -> MOVING|ROLLING_BACK
+MOVING|VERIFYING(with MOVE_INTENT) -> RECOVERY_REQUIRED([all intents forward])
 QUARANTINED|VALIDATED -> RESTORE_PREPARED -> RESTORING -> RESTORED
                                              \-> RECOVERY_REQUIRED
 RESTORE_PREPARED -> RECOVERY_REQUIRED([])
 RESTORING(no RESTORE_INTENT) -> RECOVERY_REQUIRED([])
+RESTORING(with RESTORE_INTENT) -> RECOVERY_REQUIRED([all intents forward])
 RECOVERY_REQUIRED(apply context) -> MOVING|ROLLING_BACK
 RECOVERY_REQUIRED(restore context) -> RESTORING|RESTORE_ROLLING_BACK
 RESTORE_ROLLING_BACK -> RESTORE_ABORTED_TO_QUARANTINED -> QUARANTINED
@@ -532,14 +562,25 @@ active-tree archival move followed by its original-payload restore move, whose
 filesystem locations make either partial state unambiguous during replay.
 
 The transition validator therefore accepts `RECOVERY_REQUIRED` directly from
-`PREPARED`, `MOVING`, `RESTORE_PREPARED`, and `RESTORING`. An empty array is
-legal only at the two no-intent apply states or the two no-intent restore
-states. Apply rollback then enters `ROLLING_BACK` and may append `ROLLED_BACK`
-without entry events. Restore rollback enters `RESTORE_ROLLING_BACK` and may
-append the abort event matching the state immediately before
-`RESTORE_PREPARED`, also without entry events. The transaction semantic replay
-layer rejects an empty array after the first durable relevant intent and rejects
-a non-empty array that is not the exact sorted unresolved set.
+`PREPARED`, `MOVING`, `VERIFYING`, `RESTORE_PREPARED`, and `RESTORING`. An empty
+array is legal only at the two no-intent apply states or the two no-intent
+restore states. Apply rollback then enters `ROLLING_BACK` and may append
+`ROLLED_BACK` without entry events. Restore rollback enters
+`RESTORE_ROLLING_BACK` and may append the abort event matching the state
+immediately before `RESTORE_PREPARED`, also without entry events. After the
+first durable relevant intent, semantic replay requires the exact complete
+intent ledger in original forward journal order, including IDs whose `MOVED` or
+`RESTORED_ENTRY` is already durable.
+
+`RECOVERY_REQUIRED.entryIds` is a ledger confirmation, not a resume-only work
+queue. Resume uses the durable completion events plus the filesystem matrix to
+reconcile only unfinished intents in forward journal order. Rollback uses the
+authoritative complete durable intent ledger in reverse order, including
+completed entries. If every intent was completed before the crash, the full
+non-empty array still permits resume to advance through `VERIFYING` to
+`QUARANTINED` or directly to `RESTORED`, and still permits complete reverse
+rollback. The 4,096-intent ledger is recoverable; a 4,097th intent or recovery
+ID is rejected before mutation.
 
 `INCOMPLETE_CONFLICT` is terminal until an operator resolves the preserved
 source and destination evidence. A new `apply` or `restore` is refused whenever
@@ -677,8 +718,9 @@ inventories/validation-pass-2/<generated-entry-id>.jsonl
 Source-copy IDs and restore IDs are rejected for all three phases. The original
 `pre`, `moved-pass-1`, and `moved-pass-2` phase contracts remain unchanged.
 
-A new `rollback-entry` run-path purpose accepts exactly a validated restore ID
-as `id` and one of the two generated entry IDs as `phase`. It derives only:
+A new `rollback-entry` run-path purpose accepts exactly a validated prefixed
+`RestoreId` as `id` and one of the two generated entry IDs as `phase`. It
+derives only:
 
 ```text
 rollback/regenerated-before-restore/<restore-id>/.next
@@ -752,7 +794,9 @@ recoverRestore ->
 ```
 
 All counts are non-negative safe integers; hashes and IDs use their existing
-closed validators; conflict IDs are non-empty, bytewise sorted, and unique.
+closed validators; every returned `restoreId` uses the exact prefixed
+`RestoreId` grammar, and conflict IDs are non-empty, bytewise sorted, and
+unique.
 For inspection, `generatedRoots` is exactly `2`, `sourceCopies` equals
 `identicalCopies + divergentCopies`, and `totalEntries` equals
 `sourceCopies + generatedRoots`.
@@ -965,9 +1009,12 @@ selects a copy fallback. Explicit recovery uses the source/payload matrix above;
 rollback is reverse journal order, never overwrites a recreated source, and
 ends at `ROLLED_BACK` or `INCOMPLETE_CONFLICT`.
 
-The restore ID is deterministically derived from the transaction ID as a
-version-4-shaped UUID, so every retry selects the same validated rollback
-paths without persisting a free-form destination. For a generated entry,
+The restore ID is deterministically derived from the transaction ID by the
+domain-separated SHA-256 algorithm above as a prefixed `RestoreId`, so every
+retry selects the same validated rollback paths without persisting a free-form
+destination. The same exact string appears in public results,
+`RESTORE_PREPARED`, rollback capability requests, rollback paths, and fsync
+options. For a generated entry,
 restore writes and `fsync`s `restore-active` inventory only for each existing
 generated root, independently rechecks every absent root immediately before the
 event, and captures both fixed IDs as summary-or-null records in one durable
@@ -1226,7 +1273,10 @@ the assertions:
    `INCOMPLETE_CONFLICT` with no lost or overwritten path. `EXDEV` never invokes
    copy or unlink. PREPARED/MOVING crashes before the first intent use an empty
    exact recovery ID array and can resume or roll back without an entry event;
-   the same empty array after an intent is fatal.
+   the same empty array after an intent is fatal. Every post-intent recovery
+   array exactly repeats all durable intent IDs in forward journal order,
+   including completed IDs; exercise non-bytewise intent order, an all-completed
+   crash, both recovery actions, the 4,096 boundary, and 4,097 rejection.
 9. **Durable-tip settlement:** an exact allowlisted non-torn tip may be settled
    without a new event only through the closed `settleDurableTip` result while
    the owned stale lock/tombstone evidence remains proven. A changed
@@ -1244,7 +1294,9 @@ the assertions:
     `RESTORED` transaction is not silently undone. Exercise every practical
     matching/missing/mismatching `A/R/P` row including `O == G`, classify roles
     by ledger phase and authorized location, reverse durable intent order, and
-    exercise the empty-ID no-intent abort path.
+    exercise the empty-ID no-intent abort path. The fixed derivation vector and
+    every result, event, capability request, path, and fsync option use the same
+    prefixed `RestoreId`; bare UUIDs are rejected.
 11. **Validation and retention:** two independent inventories for each
     regenerated root match and contain no numbered basename before the
     `VALIDATED` generation and canonical pointer become current. Recovery from
