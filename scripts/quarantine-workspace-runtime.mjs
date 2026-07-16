@@ -1357,7 +1357,12 @@ function assertPrivateFileIdentity(stats, identity) {
 
 async function comparePrivateFiles(leftPath, rightPath, fsApi) {
   const left = await fsApi.open(leftPath, "r");
-  const right = await fsApi.open(rightPath, "r");
+  let right;
+  try {
+    right = await fsApi.open(rightPath, "r");
+  } catch (error) {
+    await closeFileHandle(left, error);
+  }
   let primaryError;
   let equal = false;
   try {
@@ -1902,6 +1907,91 @@ async function assertPathMissing(path, fsApi) {
   fail("ERR_INTEGRITY");
 }
 
+async function captureWorkspaceDirectory(path, repoRoot, fsApi) {
+  let stats;
+  let resolved;
+  try {
+    stats = await fsApi.lstat(path);
+    resolved = await fsApi.realpath(path);
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  if (
+    stats.isSymbolicLink() || !stats.isDirectory() || resolved !== path ||
+    (path !== repoRoot && !isInside(repoRoot, resolved))
+  ) fail("ERR_INTEGRITY");
+  return statsIdentity(stats, false);
+}
+
+async function captureSourceAncestors(repoRoot, source, fsApi) {
+  const sourceRelative = relative(repoRoot, source);
+  if (
+    sourceRelative === "" || sourceRelative === ".." ||
+    sourceRelative.startsWith(`..${sep}`) || isAbsolute(sourceRelative)
+  ) fail("ERR_INTEGRITY");
+  const components = sourceRelative.split(sep);
+  const ancestors = [];
+  let current = repoRoot;
+  ancestors.push({ path: current, identity: await captureWorkspaceDirectory(current, repoRoot, fsApi) });
+  for (const component of components.slice(0, -1)) {
+    current = join(current, component);
+    ancestors.push({ path: current, identity: await captureWorkspaceDirectory(current, repoRoot, fsApi) });
+  }
+  return ancestors;
+}
+
+async function assertSourceAncestors(repoRoot, ancestors, fsApi) {
+  for (const expected of ancestors) {
+    const observed = await captureWorkspaceDirectory(expected.path, repoRoot, fsApi);
+    if (
+      observed.dev !== expected.identity.dev || observed.ino !== expected.identity.ino ||
+      observed.mode !== expected.identity.mode
+    ) fail("ERR_INTEGRITY");
+  }
+}
+
+async function capturePrivateDirectory(path, fsApi) {
+  let stats;
+  let resolved;
+  try {
+    stats = await fsApi.lstat(path);
+    resolved = await fsApi.realpath(path);
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  if (
+    stats.isSymbolicLink() || !stats.isDirectory() ||
+    modeOf(stats) !== PRIVATE_MODE || resolved !== path
+  ) fail("ERR_INTEGRITY");
+  return statsIdentity(stats, false);
+}
+
+async function assertPrivateDirectoryIdentity(path, identity, fsApi) {
+  const observed = await capturePrivateDirectory(path, fsApi);
+  if (
+    observed.dev !== identity.dev || observed.ino !== identity.ino ||
+    observed.mode !== identity.mode
+  ) fail("ERR_INTEGRITY");
+}
+
+async function validatePayloadEndpoint({
+  capability,
+  entry,
+  destination,
+  destinationParent,
+  destinationParentIdentity,
+  boundary,
+  fsApi,
+}) {
+  await revalidateRunCapability(capability, {
+    purpose: "payload",
+    id: entry.id,
+    boundary,
+  });
+  await assertPrivateDirectoryIdentity(destinationParent, destinationParentIdentity, fsApi);
+  await assertEntrySourceIdentity(destination, entry, fsApi);
+}
+
 async function movePreparedEntry({
   capability,
   handoff,
@@ -1913,6 +2003,11 @@ async function movePreparedEntry({
   const { entry, preMoveInventory } = planned;
   const source = workspaceEntryPath(handoff.repoRoot, entry);
   const destination = deriveRunPath(capability, { purpose: "payload", id: entry.id });
+  const destinationParent = dirname(destination);
+  const sourceAncestors = await captureSourceAncestors(handoff.repoRoot, source, fsApi);
+  const destinationParentIdentity = await capturePrivateDirectory(destinationParent, fsApi);
+  await assertEntrySourceIdentity(source, entry, fsApi);
+  await assertPathMissing(destination, fsApi);
   await appendEvent({
     capability,
     event: "MOVE_INTENT",
@@ -1923,12 +2018,26 @@ async function movePreparedEntry({
     hookState,
     `after-event:MOVE_INTENT:${entry.id}`,
   );
+  await revalidateRunCapability(capability, {
+    purpose: "payload",
+    id: entry.id,
+    boundary: "before-mutation",
+  });
+  await assertPrivateDirectoryIdentity(destinationParent, destinationParentIdentity, fsApi);
+  await assertSourceAncestors(handoff.repoRoot, sourceAncestors, fsApi);
   await assertEntrySourceIdentity(source, entry, fsApi);
   await assertPathMissing(destination, fsApi);
   try {
     await fsApi.rename(source, destination);
   } catch (error) {
     if (error?.code === "EXDEV") {
+      await revalidateRunCapability(capability, {
+        purpose: "payload",
+        id: entry.id,
+        boundary: "before-mutation",
+      });
+      await assertPrivateDirectoryIdentity(destinationParent, destinationParentIdentity, fsApi);
+      await assertSourceAncestors(handoff.repoRoot, sourceAncestors, fsApi);
       await assertEntrySourceIdentity(source, entry, fsApi);
       await assertPathMissing(destination, fsApi);
       fail("ERR_EXDEV");
@@ -1936,25 +2045,94 @@ async function movePreparedEntry({
     throw error;
   }
   await invokeApplyHook(options.faultHook, hookState, `after-rename:${entry.id}`);
+  await validatePayloadEndpoint({
+    capability,
+    entry,
+    destination,
+    destinationParent,
+    destinationParentIdentity,
+    boundary: "after-sync",
+    fsApi,
+  });
+  await assertSourceAncestors(handoff.repoRoot, sourceAncestors, fsApi);
+  await assertPathMissing(source, fsApi);
   await fsyncTree({
     capability,
     root: destination,
     entryId: entry.id,
     purpose: "payload",
   });
+  await validatePayloadEndpoint({
+    capability,
+    entry,
+    destination,
+    destinationParent,
+    destinationParentIdentity,
+    boundary: "after-sync",
+    fsApi,
+  });
   await invokeApplyHook(options.faultHook, hookState, `after-payload-sync:${entry.id}`);
-  await syncDirectory(dirname(destination), fsApi);
+  await validatePayloadEndpoint({
+    capability,
+    entry,
+    destination,
+    destinationParent,
+    destinationParentIdentity,
+    boundary: "after-sync",
+    fsApi,
+  });
+  await revalidateRunCapability(capability, {
+    purpose: "payload",
+    id: entry.id,
+    boundary: "before-mutation",
+  });
+  await assertPrivateDirectoryIdentity(destinationParent, destinationParentIdentity, fsApi);
+  await syncDirectory(destinationParent, fsApi);
+  await validatePayloadEndpoint({
+    capability,
+    entry,
+    destination,
+    destinationParent,
+    destinationParentIdentity,
+    boundary: "after-sync",
+    fsApi,
+  });
   await invokeApplyHook(
     options.faultHook,
     hookState,
     `after-destination-parent-sync:${entry.id}`,
   );
-  await syncDirectory(dirname(source), fsApi);
+  await validatePayloadEndpoint({
+    capability,
+    entry,
+    destination,
+    destinationParent,
+    destinationParentIdentity,
+    boundary: "after-sync",
+    fsApi,
+  });
+  await assertSourceAncestors(handoff.repoRoot, sourceAncestors, fsApi);
+  await assertPathMissing(source, fsApi);
+  const sourceParent = dirname(source);
+  await syncDirectory(sourceParent, fsApi);
+  await assertSourceAncestors(handoff.repoRoot, sourceAncestors, fsApi);
+  await assertPathMissing(source, fsApi);
   await invokeApplyHook(
     options.faultHook,
     hookState,
     `after-source-parent-sync:${entry.id}`,
   );
+  await validatePayloadEndpoint({
+    capability,
+    entry,
+    destination,
+    destinationParent,
+    destinationParentIdentity,
+    boundary: "after-sync",
+    fsApi,
+  });
+  await assertSourceAncestors(handoff.repoRoot, sourceAncestors, fsApi);
+  await assertPathMissing(source, fsApi);
   const observed = await writeInventoryJsonl({
     capability,
     root: destination,
@@ -1967,6 +2145,17 @@ async function movePreparedEntry({
     hookState,
     `after-inventory:moved-pass-1:${entry.id}`,
   );
+  await validatePayloadEndpoint({
+    capability,
+    entry,
+    destination,
+    destinationParent,
+    destinationParentIdentity,
+    boundary: "after-sync",
+    fsApi,
+  });
+  await assertSourceAncestors(handoff.repoRoot, sourceAncestors, fsApi);
+  await assertPathMissing(source, fsApi);
   await appendEvent({
     capability,
     event: "MOVED",

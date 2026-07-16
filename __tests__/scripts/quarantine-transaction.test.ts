@@ -303,6 +303,8 @@ type WorkerResult = {
     atFailure: Record<string, number>;
     final: Record<string, number>;
   };
+  externalOperations?: string[];
+  replayEvents?: Array<{ event: string; payload: { id?: string } }>;
   shape?: ValueShape;
   error?: WorkerError;
 };
@@ -322,7 +324,7 @@ import { getRunFsContext } from ${JSON.stringify(fsContextUrl)};
 import * as fsPromises from "node:fs/promises";
 import {
   appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, realpathSync,
-  renameSync, truncateSync, writeFileSync,
+  renameSync, symlinkSync, truncateSync, writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
@@ -997,6 +999,172 @@ try {
       ok: captured === undefined,
       phases,
       maxReadLength,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-endpoint-swap") {
+    const { variant, triggerPhase, targetId, sourceAncestor, externalRoot, ...applyRequest } = request;
+    const runRoot = join(request.quarantineRoot, request.transactionId);
+    const destinationParent = targetId.startsWith("generated-")
+      ? join(runRoot, "payload/generated")
+      : join(runRoot, "payload/source-copies");
+    let injected = false;
+    const externalOperations = [];
+    const resolvesExternal = (path) => {
+      if (!injected || typeof path !== "string") return false;
+      let resolved;
+      try {
+        resolved = realpathSync(path);
+      } catch {
+        try { resolved = realpathSync(dirname(path)); } catch { return false; }
+      }
+      return resolved === externalRoot || resolved.startsWith(externalRoot + "/");
+    };
+    const note = (method, ...paths) => {
+      if (paths.some(resolvesExternal)) externalOperations.push(method);
+    };
+    const adapter = {
+      ...fsPromises,
+      async rename(source, destination) {
+        note("rename", source, destination);
+        return fsPromises.rename(source, destination);
+      },
+      async link(source, destination) {
+        note("link", source, destination);
+        return fsPromises.link(source, destination);
+      },
+      async mkdir(path, ...args) {
+        note("mkdir", path);
+        return fsPromises.mkdir(path, ...args);
+      },
+      async unlink(path, ...args) {
+        note("unlink", path);
+        return fsPromises.unlink(path, ...args);
+      },
+      async rm(path, ...args) {
+        note("rm", path);
+        return fsPromises.rm(path, ...args);
+      },
+      async open(path, ...args) {
+        note("open", path);
+        return fsPromises.open(path, ...args);
+      },
+      async opendir(path, ...args) {
+        note("opendir", path);
+        return fsPromises.opendir(path, ...args);
+      },
+      async readdir(path, ...args) {
+        note("readdir", path);
+        return fsPromises.readdir(path, ...args);
+      },
+      createReadStream(path, ...args) {
+        note("createReadStream", path);
+        return createReadStream(path, ...args);
+      },
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        fsApi: adapter,
+        faultHook(phase) {
+          if (phase !== triggerPhase || injected) return;
+          if (variant === "source-ancestor") {
+            const moved = join(externalRoot, "source-ancestor-owned");
+            renameSync(sourceAncestor, moved);
+            symlinkSync(moved, sourceAncestor);
+          } else if (variant === "destination-before-rename") {
+            renameSync(destinationParent, destinationParent + ".owned");
+            symlinkSync(externalRoot, destinationParent);
+          } else {
+            const moved = join(externalRoot, "payload-parent-owned");
+            renameSync(destinationParent, moved);
+            symlinkSync(moved, destinationParent);
+          }
+          injected = true;
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    let replayed;
+    await withQuarantineRunCapability({
+      repoRoot: request.repoRoot,
+      quarantineRoot: request.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+      fsApi: adapter,
+    }, async (capability) => {
+      replayed = await replayJournal({ capability });
+    });
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      injected,
+      externalOperations,
+      replayEvents: replayed.records.map(({ event, payload }) => ({ event, payload })),
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-final-only-right-open-failure") {
+    const { closeFailure, ...applyRequest } = request;
+    const temporary = join(
+      request.quarantineRoot,
+      request.transactionId,
+      "divergent-diffs/.copy-0001.tmp",
+    );
+    const final = join(
+      request.quarantineRoot,
+      request.transactionId,
+      "divergent-diffs/copy-0001.patch",
+    );
+    let leftWrapped = false;
+    let closeGetterReads = 0;
+    let closeCalls = 0;
+    let closeWrongReceiver = 0;
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        if (path === final && leftWrapped) {
+          const error = new Error("injected right open failure");
+          error.code = "EACCES";
+          throw error;
+        }
+        const handle = await fsPromises.open(path, ...args);
+        if (path !== temporary || args[0] !== "r" || leftWrapped) return handle;
+        leftWrapped = true;
+        let wrapper;
+        wrapper = new Proxy(handle, {
+          get(target, key) {
+            if (key === "close") {
+              closeGetterReads += 1;
+              return async function () {
+                closeCalls += 1;
+                if (this !== wrapper) closeWrongReceiver += 1;
+                await target.close();
+                if (closeFailure) throw new Error("injected left close failure");
+              };
+            }
+            const value = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        return wrapper;
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      closeGetterReads,
+      closeCalls,
+      closeWrongReceiver,
       error: captured === undefined ? undefined : errorShape(captured),
     }));
   } else if (operation === "getter") {
@@ -2328,6 +2496,42 @@ describe("quarantine transaction Slice 1", () => {
     )).length).toBe(output.length);
   });
 
+  it.each([false, true])(
+    "settles the left compare handle exactly once when right open fails (closeFailure=%s)",
+    (closeFailure) => {
+      const f = fixture({ divergent: true });
+      bases.push(f.base);
+      const transactionId = `tx-right-open-failure-${closeFailure}`;
+      const request = {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      };
+      const first = invoke("apply-stop", {
+        ...request,
+        stopPhase: "after-divergent-diff:copy-0001",
+      }, {}, 30_000);
+      expect(first.ok).toBe(false);
+      const worker = invoke("apply-final-only-right-open-failure", {
+        ...request,
+        closeFailure,
+      }, {}, 30_000);
+      expectWorkerError(
+        worker,
+        "ERR_INTEGRITY",
+        "Quarantine evidence failed integrity validation.",
+      );
+      expect(worker.closeGetterReads).toBe(1);
+      expect(worker.closeCalls).toBe(1);
+      expect(worker.closeWrongReceiver).toBe(0);
+    },
+  );
+
   it("settles a true Git stdout stream error independently of child signals", () => {
     const f = fixture({ divergent: true });
     bases.push(f.base);
@@ -2565,6 +2769,135 @@ describe("quarantine transaction Slice 1", () => {
         : "Quarantine evidence failed integrity validation.",
     );
     expect(worker.unlinkCalls).toBe(0);
+  });
+
+  it.each([
+    ["generated parent after intent", "generated-next", "after-event:MOVE_INTENT:generated-next"],
+    ["source-copies parent after intent", "copy-0001", "after-event:MOVE_INTENT:copy-0001"],
+  ] as const)(
+    "does not follow an external %s symlink before rename",
+    (_label, targetId, triggerPhase) => {
+      const f = fixture();
+      bases.push(f.base);
+      const externalRoot = join(f.base, `external-${targetId}`);
+      privateDirectory(externalRoot);
+      writeFileSync(join(externalRoot, "sentinel"), "preserve");
+      const transactionId = `tx-endpoint-intent-${targetId}`;
+      const worker = invoke("apply-endpoint-swap", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+        variant: "destination-before-rename",
+        triggerPhase,
+        targetId,
+        externalRoot,
+      }, {}, 30_000);
+      expectWorkerError(
+        worker,
+        "ERR_INTEGRITY",
+        "Quarantine evidence failed integrity validation.",
+      );
+      expect(worker.externalOperations).toEqual([]);
+      expect(worker.replayEvents).not.toContainEqual({
+        event: "MOVED",
+        payload: expect.objectContaining({ id: targetId }),
+      });
+      expect(readFileSync(join(externalRoot, "sentinel"), "utf8")).toBe("preserve");
+      expect(existsSync(join(
+        externalRoot,
+        targetId === "generated-next" ? ".next" : "copy-0001",
+      ))).toBe(false);
+      expect(existsSync(join(
+        f.repoRoot,
+        targetId === "generated-next" ? ".next" : "notes 2.txt",
+      ))).toBe(true);
+    },
+  );
+
+  it("does not follow a nested source ancestor moved outside and replaced by a symlink", () => {
+    const f = fixture({
+      canonicalPath: "nested/deeper/notes.txt",
+      copyPath: "nested/deeper/notes 2.txt",
+    });
+    bases.push(f.base);
+    const externalRoot = join(f.base, "external-source-ancestor");
+    privateDirectory(externalRoot);
+    writeFileSync(join(externalRoot, "sentinel"), "preserve");
+    const sourceAncestor = join(f.repoRoot, "nested");
+    const transactionId = "tx-endpoint-source-ancestor";
+    const worker = invoke("apply-endpoint-swap", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+      variant: "source-ancestor",
+      triggerPhase: "after-event:MOVE_INTENT:copy-0001",
+      targetId: "copy-0001",
+      sourceAncestor,
+      externalRoot,
+    }, {}, 30_000);
+    expectWorkerError(
+      worker,
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(worker.externalOperations).toEqual([]);
+    expect(worker.replayEvents).not.toContainEqual({
+      event: "MOVED",
+      payload: expect.objectContaining({ id: "copy-0001" }),
+    });
+    expect(readFileSync(join(externalRoot, "sentinel"), "utf8")).toBe("preserve");
+    expect(existsSync(join(
+      externalRoot,
+      "source-ancestor-owned/deeper/notes 2.txt",
+    ))).toBe(true);
+  });
+
+  it.each([
+    ["after payload fsync", "after-payload-sync:generated-next"],
+    ["before inventory", "after-destination-parent-sync:generated-next"],
+  ] as const)("does not open an external payload parent %s", (_label, triggerPhase) => {
+    const f = fixture();
+    bases.push(f.base);
+    const externalRoot = join(f.base, `external-${triggerPhase.replaceAll(":", "-")}`);
+    privateDirectory(externalRoot);
+    writeFileSync(join(externalRoot, "sentinel"), "preserve");
+    const transactionId = `tx-endpoint-${triggerPhase.replaceAll(":", "-")}`;
+    const worker = invoke("apply-endpoint-swap", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+      variant: "destination-after-move",
+      triggerPhase,
+      targetId: "generated-next",
+      externalRoot,
+    }, {}, 30_000);
+    expectWorkerError(
+      worker,
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    expect(worker.externalOperations).toEqual([]);
+    expect(worker.replayEvents).not.toContainEqual({
+      event: "MOVED",
+      payload: expect.objectContaining({ id: "generated-next" }),
+    });
+    expect(readFileSync(join(externalRoot, "sentinel"), "utf8")).toBe("preserve");
+    expect(existsSync(join(externalRoot, "payload-parent-owned/.next"))).toBe(true);
   });
 
   it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])(
