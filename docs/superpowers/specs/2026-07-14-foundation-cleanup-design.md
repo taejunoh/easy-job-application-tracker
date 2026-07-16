@@ -337,6 +337,7 @@ exact argv and working directory:
 cwd: <validated real repository root>
 argv: git -c core.fsmonitor=false -c core.quotePath=true
       diff --no-index --binary --full-index --no-color --no-ext-diff
+      --no-textconv
       --src-prefix=a/ --dst-prefix=b/ --
       <canonical-relative-path> <source-relative-path>
 ```
@@ -349,12 +350,20 @@ Exit status `1` is required for an entry already classified as divergent. Exit
 status `0` is an integrity mismatch; a signal, another exit status, spawn or
 stream error, or malformed settlement is fatal. Stderr is drained with the
 existing 64 KiB bound and discarded from every result and error. Stdout bytes
-are the canonical patch without decoding or newline rewriting: Git's exact
-command and configuration above are the sole authority for quoting, prefixes,
-binary framing, and final-newline state.
+are the canonical patch without decoding or newline rewriting. External diff
+drivers and textconv are prohibited by `--no-ext-diff --no-textconv`; tests
+install hostile external-diff and textconv sentinels and require both to remain
+untouched. The exact Git executable/version, argv, closed environment, and the
+repository's built-in Git attributes and configuration together determine
+quoting, prefixes, binary framing, algorithms, and final-newline state. Retry
+re-evaluates those inputs by rerunning the exact child and therefore accepts a
+published patch only when its recomputed bytes still agree.
 
-Patch stdout streams with a fixed-memory buffer into a capability-derived,
-mode-`0600`, writer-owned temporary. Its exact inclusive byte cap is
+Patch stdout streams with a fixed-memory buffer into a capability-derived
+`divergent-diff-temp`, a same-device, non-symlink, regular mode-`0600` file at
+the one deterministic path
+`divergent-diffs/.<validated-source-copy-entry-id>.tmp`. Its exact inclusive
+byte cap is
 `4 * (sourceSize + canonicalSize) + 1,048,576`, and the operation rejects before
 spawn unless that arithmetic is a non-negative safe integer. Byte
 `cap + 1` kills the child, awaits all child and stream settlement, and fails
@@ -371,6 +380,24 @@ or extra artifact is preserved and maps to `ERR_INTEGRITY`. An incomplete owned
 temporary may be removed only by the temporary publication primitive's existing
 ownership and identity rules; orchestration never recursively cleans or adopts
 an incomplete file.
+
+Slice 2 extends the run capability's closed purpose table without adding a
+module export:
+
+```text
+{ purpose: "divergent-diff-temp", id: <validated-source-copy-entry-id> }
+  -> <run>/divergent-diffs/.<entry-id>.tmp
+```
+
+The purpose requires the exact `copy-NNNN` nonzero entry-ID grammar and forbids
+`phase` or another key. Derivation and both mutation-boundary revalidations
+require the existing `divergent-diffs` parent to be the recorded contained
+mode-`0700` directory and the temporary, when present, to be same-device,
+regular, non-symlink, and exactly mode `0600`. Under literal writer attestation,
+an exact owned temporary in a run with no journal or journal residue may be
+identity-checked, unlinked, its parent synced, and then recreated. A wrong
+name/type/mode/device, symlink, identity replacement, or temporary beside any
+journal evidence is preserved and fails closed.
 
 Manifest, journal, inventory, and CLI inputs use closed schemas: unknown keys,
 absolute paths, empty or `.`/`..` components, NUL bytes, non-normalized Unicode
@@ -681,11 +708,13 @@ renamed before the complete `PREPARED` frame is durable. The exact Slice 2
 precommit order is:
 
 1. validate and snapshot the closed apply request, including literal
-   `writersStopped === true`, then run two new complete stable discovery passes;
-2. bootstrap or revalidate the exact fixed layout and enter a run capability
-   using the one captured filesystem source;
-3. prove the journal has no complete event and no unresolved append/lock or
-   tombstone evidence;
+   `writersStopped === true`, and capture/freeze the filesystem source;
+2. before ordinary Git discovery, perform the nonmutating existing-run gate
+   below; an absent exact run path proceeds, while an existing exact run is
+   inspected only inside its run capability;
+3. only after that gate permits apply, run two new complete stable discovery
+   passes, then bootstrap a missing layout or revalidate the permitted existing
+   layout with the already captured filesystem source;
 4. write or exactly adopt each deterministic `pre` inventory in manifest entry
    order, then invoke `after-pre-inventories` after every inventory and its
    parent are durable;
@@ -700,15 +729,59 @@ precommit order is:
 8. append `MOVING {}` and only after that append returns invoke
    `after-event:MOVING`; then begin the first per-entry move protocol.
 
-The same public `quarantineWorkspace` call performs precommit retry; no new
-runtime export, public API, or compatibility-facade name is added. It repeats
-fresh discovery and uses a private apply-precommit mode that may adopt only
-complete deterministic `pre` inventories, divergent patches, and the immutable
-`PREPARED` generation after recomputing their exact bytes, summaries, hashes,
-modes, and identities. Owned incomplete temporaries are handled only by their
-own bounded publication primitives. A complete mismatch, a foreign or
-unexpected artifact, or any artifact outside that closed set is preserved and
-fails with `ERR_INTEGRITY`.
+The nonmutating existing-run gate resolves the validated transaction ID to its
+one lexical run path without creating it. `ENOENT` means there is no run and
+ordinary discovery may begin. Any existing path must first be a same-device,
+contained, realpath-equal, non-symlink mode-`0700` directory; otherwise
+`ERR_INTEGRITY` wins before discovery. The gate then enters that exact run
+capability and applies this ordered decision table without mutation:
+
+1. any complete journal beginning with `PREPARED`, at any later tip including
+   `QUARANTINED`, returns `ERR_RECOVERY_REQUIRED`;
+2. any journal lock, tombstone, partial/torn journal, or other journal append
+   residue also returns `ERR_RECOVERY_REQUIRED`; it may instead return
+   `ERR_INDETERMINATE_JOURNAL_APPEND` only when the existing primitive evidence
+   proves the exact attempted candidate and uncertainty boundary;
+3. with no journal or journal residue, an empty exact fixed layout permits
+   ordinary discovery, and the closed precommit artifact set below permits
+   private precommit resume;
+4. any other name, type, mode, symlink, device, containment, identity, or
+   artifact combination is preserved and returns `ERR_INTEGRITY`.
+
+Thus recovery/indeterminate journal evidence has priority over mismatch checks
+on otherwise precommit-looking files. The gate never cleans a lock, settles or
+appends a journal record, reads Git workspace state, adopts a precommit file, or
+invokes a fault hook.
+
+The closed journal-absent precommit set is exactly the fixed-layout directories
+plus: `inventories/pre/<validated-entry-id>.jsonl`; mode-`0600`
+`inventories/work/<lowercase-v4-shaped-uuid>.bin` files admitted only to the
+inventory primitive's owned cleanup/recreation rules; one digest-named manifest
+generation and/or its exact hidden digest temporary under `manifests`; and one
+final `<source-copy-entry-id>.patch` and/or deterministic hidden
+`.<source-copy-entry-id>.tmp` per divergent entry. It contains no journal,
+lock, tombstone, payload, moved/validation/restore inventory, rollback,
+conflict, current pointer, or other file.
+
+Because this gate deliberately precedes discovery, it admits entry-associated
+precommit names only by their closed path/ID grammar and security metadata. The
+subsequent fresh discovery must prove the exact entry set and divergent
+classifications, then each owning primitive must recompute and validate exact
+content before adoption; a syntactically legal but undiscovered or wrongly
+classified entry artifact is preserved and returns `ERR_INTEGRITY`.
+
+The same public `quarantineWorkspace` call performs precommit retry. The runtime
+implementation calls a non-exported core with mode
+`"apply-precommit-resume"`; direct `prepareQuarantineWorkspace` retains its
+strict Slice 1 behavior and rejects every file or non-allowlisted child. After
+the gate permits private resume, apply repeats fresh discovery and may adopt
+only complete deterministic `pre` inventories, divergent patches, and the
+immutable `PREPARED` generation after recomputing their exact bytes, summaries,
+hashes, modes, and identities. Exact allowlisted owned inventory, manifest, and
+divergent temporaries may be cleaned or recreated only by their owning bounded
+primitive with identity checks and parent fsync. A complete mismatch, foreign
+or unexpected artifact, or any artifact outside the closed set is preserved
+and fails with `ERR_INTEGRITY`.
 
 Once a complete `PREPARED` event is durable, regardless of its later durable
 tip, a fresh apply call performs no filesystem or journal mutation and throws
@@ -934,7 +1007,10 @@ durable but before the primitive cleans its owned lock, invokes
 `after-event:QUARANTINED` and then `before-lock-cleanup`. Once the primitive
 returns, orchestration does not invoke `after-event:QUARANTINED` again. A hook
 failure or kill at either final seam preserves the durable tip and the owned
-lock evidence for explicit reconciliation.
+lock evidence for explicit reconciliation. Because the journal primitive sees
+either hook rejection after append mutation began, it wraps that rejection as
+`IndeterminateJournalAppendError`; orchestration returns the frozen
+`ERR_INDETERMINATE_JOURNAL_APPEND` error rather than the original hook error.
 
 The initial `PREPARED` generation already contains the
 authoritative entries and pre-move summaries, so Task 2 does not publish a
@@ -1062,10 +1138,17 @@ recoverRestore({ repoRoot, quarantineRoot, transactionId,
                  fsApi?, faultHook? })
 ```
 
-Slice 1 additionally exports one runtime-only helper from
-`quarantine-workspace-runtime.mjs`. It is importable only by transaction
-orchestration and its focused internal tests; it is not a public package export
-and never appears on the compatibility facade:
+After Slice 1, `quarantine-workspace-runtime.mjs` exports exactly
+`inspectWorkspace` and `prepareQuarantineWorkspace`. Slice 2 adds
+`quarantineWorkspace`, so the runtime module then exports exactly
+`inspectWorkspace`, `prepareQuarantineWorkspace`, and `quarantineWorkspace`.
+The transaction module exports exactly `inspectWorkspace` and
+`quarantineWorkspace` after Slice 2. Runtime exports are importable only by
+transaction orchestration and focused internal tests; only the transaction
+exports are public package/facade names. `prepareQuarantineWorkspace` never
+appears on the compatibility facade.
+
+The Slice 1 runtime-only preparation contract is:
 
 ```text
 prepareQuarantineWorkspace({
@@ -1230,9 +1313,13 @@ map to `ERR_PREFLIGHT`. A device mismatch or filesystem `EXDEV` maps to
 `ERR_EXDEV`. An unexpected existing run-layout name or type, a symlink or mode
 violation inside an existing partial layout, or root/parent identity replacement
 during bootstrap maps to `ERR_INTEGRITY`. Later slices retain the CLI mapping
-below for recovery, conflict, journal, and unexpected failures. A test-only
-`faultHook` rejection is not translated; it propagates unchanged after the
-defined durable seam so crash tests can identify their injected failure.
+below for recovery, conflict, journal, and unexpected failures. An
+orchestration-level test-only `faultHook` rejection is not translated; it
+propagates unchanged after the defined durable seam so crash tests can identify
+their injected failure. The final `after-event:QUARANTINED` and
+`before-lock-cleanup` hooks are the deliberate exception: they execute inside
+the journal primitive after append mutation began and therefore map to
+`ERR_INDETERMINATE_JOURNAL_APPEND` as specified above.
 
 Slice 2 retains those mappings and adds no error type or public export. A fresh
 apply that observes any complete journal beginning with durable `PREPARED`

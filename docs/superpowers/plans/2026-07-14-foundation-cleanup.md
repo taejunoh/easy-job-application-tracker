@@ -1106,9 +1106,14 @@ export async function quarantineWorkspace({
 This is the first slice that publicly exports `quarantineWorkspace`. It consumes
 the internal `LAYOUT_READY` handoff, enters a live run capability with the exact
 captured filesystem source, and returns only the final `QUARANTINED` result after
-the complete durable protocol below. It adds no other public or runtime export.
-The same function has a private apply-precommit retry mode; it does not expose a
-second prepare API.
+the complete durable protocol below. After this slice,
+`quarantine-workspace-runtime.mjs` exports exactly `inspectWorkspace`,
+`prepareQuarantineWorkspace`, and `quarantineWorkspace`; the transaction module
+exports exactly `inspectWorkspace` and `quarantineWorkspace`. No runtime helper
+or facade name is added beyond those exact sets. The runtime implementation uses
+a non-exported core mode named `apply-precommit-resume`; direct
+`prepareQuarantineWorkspace` remains strict and no second prepare API is
+exposed.
 
 - [ ] **Step 2.1: Add atomic-apply RED cases**
 
@@ -1117,9 +1122,10 @@ Require this exact precommit order before the first source rename:
 
 ```text
 closed option snapshot + true writer attestation
--> two fresh stable discovery passes
+-> capture/freeze the one filesystem source
+-> nonmutating exact existing-run gate before Git discovery
+-> if permitted, two fresh stable discovery passes
 -> fixed-layout bootstrap/revalidation + bound run capability
--> prove zero complete journal events and no unresolved append evidence
 -> deterministic pre inventories in manifest entry order
 -> after-pre-inventories
 -> divergent patches in manifest entry order
@@ -1137,19 +1143,29 @@ to the validated repository root and argv:
 
 ```text
 git -c core.fsmonitor=false -c core.quotePath=true
-  diff --no-index --binary --full-index --no-color --no-ext-diff
+  diff --no-index --binary --full-index --no-color --no-ext-diff --no-textconv
   --src-prefix=a/ --dst-prefix=b/ --
   <canonicalRelative> <sourceRelative>
 ```
 
 Require exit `1`; exit `0` is an integrity mismatch and a signal or any other
 exit is fatal. Stream stdout bytes without decoding or newline rewriting into a
-capability-derived mode-`0600` owned temporary using fixed memory. Enforce the
+capability-derived mode-`0600` owned temporary using fixed memory. Extend the
+closed capability table with exact request
+`{ purpose: "divergent-diff-temp", id: <source-copy-entry-id> }`, deriving only
+`divergent-diffs/.<entry-id>.tmp`; reject every generated/invalid ID, phase,
+wrong hidden name, symlink, nonregular type, non-`0600` mode, device mismatch,
+containment change, and identity replacement. Enforce the
 exact inclusive safe-integer cap
 `4 * (sourceSize + canonicalSize) + 1,048,576`; drain and sanitize bounded
 stderr. Sync the temporary, publish without replacement, sync the parent, and
 revalidate post-sync identity. On retry, recompute and stream-compare exact
 bytes, digest, and mode before adopting an existing complete patch.
+`--no-ext-diff --no-textconv` must leave hostile external-diff and textconv
+sentinels untouched. Treat the exact Git executable/version, argv, closed
+environment, and repository built-in attributes/configuration as the canonical
+byte inputs; retry reruns the command instead of trusting the previous process
+context.
 
 Then require this exact durable order per entry:
 
@@ -1174,6 +1190,29 @@ and unresolved lock/tombstone evidence and require `ERR_INTEGRITY` or
 `ERR_INDETERMINATE_JOURNAL_APPEND` as applicable. Assert no source rename before
 durable PREPARED.
 
+Before allowing the fixture's first Git child, assert the exact existing-run
+decision priority. After option and filesystem-source snapshot, an absent exact
+run path may continue. An existing wrong type/mode/symlink/device/containment
+fails `ERR_INTEGRITY`. An exact run is inspected under its capability: any
+complete journal beginning at PREPARED, including a QUARANTINED tip, or any
+lock, tombstone, torn journal, or append residue causes zero mutation and
+`ERR_RECOVERY_REQUIRED`. Permit `ERR_INDETERMINATE_JOURNAL_APPEND` instead only
+when the primitive evidence proves one exact attempted candidate; otherwise
+recovery-required wins. Assert that this journal/recovery branch has priority
+over a simultaneous precommit-looking mismatch and launches no Git child.
+
+With no journal or residue, admit exactly the fixed layout plus legal
+`pre` inventories, inventory-owned mode-`0600` UUIDv4 work files, one legal
+manifest digest generation/hidden digest temporary, and legal divergent final
+patches/deterministic hidden temporaries. Reject and preserve any payload,
+moved/validation/restore inventory, current pointer, rollback, conflict,
+foreign name, or malformed artifact. Direct `prepareQuarantineWorkspace`
+retains the Slice 1 strict rejection of every file; only runtime
+`quarantineWorkspace` may enter the non-exported `apply-precommit-resume` core
+mode. Journal-absent, writer-attested retry may unlink/recreate an exact owned
+`divergent-diff-temp` only after identity verification and must fsync its parent;
+a complete final patch is adopted only after exact streamed recomputation.
+
 Seed each durable Slice 2 tip `PREPARED`, `MOVING`, `VERIFYING`, and
 `QUARANTINED`, then call `quarantineWorkspace` again. Require no filesystem or
 journal mutation and the exact frozen `QuarantineError` code/message for
@@ -1192,9 +1231,11 @@ mutation.
 
 For every expected error, assert the frozen closed `QuarantineError` prototype,
 the exact non-enumerable own keys `stack`, `message`, `name`, and `code`, the
-fixed code-mapped message, no cause/dynamic evidence, and `{}` JSON. Hook
-rejections remain untranslated and are asserted at their documented durable
-seams.
+fixed code-mapped message, no cause/dynamic evidence, and `{}` JSON. Ordinary
+orchestration-hook rejections remain untranslated and are asserted at their
+documented durable seams. Rejection from final
+`after-event:QUARANTINED` or `before-lock-cleanup` is instead wrapped by the
+journal primitive and must produce `ERR_INDETERMINATE_JOURNAL_APPEND`.
 
 Record hook order and call count. Require every ordinary
 `after-event:PREPARED`, `after-event:MOVING`, `after-event:MOVE_INTENT:<id>`,
@@ -1210,23 +1251,40 @@ Assert exact journal payload schemas (`PREPARED` has only `transactionId` and
 only the documented ID and inventory summary), exact immutable manifest bytes,
 exact inventory summaries, and the exact closed success result. Diff fixtures
 cover text with and without final newline, paths requiring Git quoting, binary
-output, cap and cap-plus-one, exit `0`, exit `1`, signal, bounded stderr, partial
-stream failure, no-replace collision, post-sync identity swap, and exact retry
-adoption. Tests must observe fixed memory rather than buffer complete bodies.
+output, a divergent fixture with one zero-byte side, cap and cap-plus-one,
+safe-integer boundary and overflow rejection before spawn, exit `0`, exit `1`,
+signal, stderr of exactly 64 KiB and 64 KiB plus one with full child/stream
+settlement, partial stream failure, no-replace collision, post-sync identity
+swap, hostile external-diff/textconv sentinels, and exact retry adoption. Tests
+must observe fixed memory rather than buffer complete bodies.
 
 - [ ] **Step 2.2: Verify RED**
 
 ```bash
-npm test -- --runInBand __tests__/scripts/quarantine-transaction.test.ts
+npm test -- --runInBand \
+  __tests__/scripts/quarantine-run-capability.test.ts \
+  __tests__/scripts/quarantine-transaction.test.ts
 ```
 
 - [ ] **Step 2.3: Implement minimal apply**
 
 Use runtime entry plans containing only the validated manifest entry plus
 ephemeral source/destination locations. All persistent references are entry IDs
-and summaries. Implement private precommit reconciliation inside the transaction
-module, using existing capability-derived inventory, manifest, and temporary
-publication primitives; do not add a runtime export or facade name.
+and summaries. Implement the existing-run gate and private precommit
+reconciliation in the runtime module's non-exported core mode
+`apply-precommit-resume`, using existing capability-derived inventory, manifest,
+and temporary publication primitives. Export runtime `quarantineWorkspace` and
+have the transaction module export it alongside `inspectWorkspace`; preserve the
+exact runtime and transaction export sets specified above and add no facade name
+beyond public `quarantineWorkspace`. Keep direct `prepareQuarantineWorkspace`
+on the strict Slice 1 core mode.
+
+Extend `quarantine-run-capability.mjs` only with the closed
+`divergent-diff-temp` purpose and its deterministic hidden entry-ID path. Under
+an exact run capability, require its existing parent and the optional temporary
+to pass the documented mode/type/device/no-follow/identity checks before and
+after mutation. Permit owned unlink/recreate only with writer attestation and no
+journal evidence, and fsync the parent after unlink and publication.
 
 Use a fresh `withJournalLock` boundary for each append. Do not claim or attempt
 to hold one journal lock across discovery, diff, inventory, rename, or tree-sync
@@ -1251,12 +1309,15 @@ Return only:
 
 ```bash
 npm test -- --runInBand \
+  __tests__/scripts/quarantine-run-capability.test.ts \
   __tests__/scripts/quarantine-transaction.test.ts \
   __tests__/scripts/quarantine-inventory.test.ts \
   __tests__/scripts/quarantine-journal.test.ts \
   __tests__/scripts/quarantine-manifest.test.ts
 git diff --check
-git add scripts/quarantine-workspace-runtime.mjs scripts/quarantine-transaction.mjs \
+git add scripts/quarantine-run-capability.mjs scripts/quarantine-workspace-runtime.mjs \
+  scripts/quarantine-transaction.mjs \
+  __tests__/scripts/quarantine-run-capability.test.ts \
   __tests__/scripts/quarantine-transaction.test.ts
 git commit -m "feat: apply atomic quarantine moves"
 ```
