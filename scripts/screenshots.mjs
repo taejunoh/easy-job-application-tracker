@@ -3,6 +3,15 @@ import { readFile, mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { installScreenshotNetworkPolicy } from "./screenshot-network-policy.mjs";
+import { loadAndValidateStartupEnv } from "./load-and-validate-startup-env.mjs";
+import {
+  APP_SCREENSHOT_CONTEXT_OPTIONS,
+  SETUP_SCREENSHOT_CONTEXT_OPTIONS,
+  authenticateScreenshotContext,
+  openStableScreenshotPage,
+  runScreenshotWorkflow,
+  waitForScreenshotReady,
+} from "./screenshot-workflow.mjs";
 import {
   statsFixture,
   settingsFixture,
@@ -116,7 +125,7 @@ async function captureDashboard(context) {
   });
 
   try {
-    await page.goto(BASE_URL + "/");
+    await openStableScreenshotPage(page, BASE_URL + "/");
     await page.waitForSelector("h1:has-text('Dashboard')");
     await page.waitForSelector("text=Total Applied");
 
@@ -126,9 +135,11 @@ async function captureDashboard(context) {
       );
     }
 
+    await waitForScreenshotReady(page);
     await page.screenshot({
       path: path.join(OUT_DIR, "01-dashboard.png"),
       fullPage: true,
+      animations: "disabled",
     });
   } finally {
     await page.close();
@@ -394,39 +405,35 @@ async function main() {
   await mkdir(OUT_DIR, { recursive: true });
 
   if (SETUP_ONLY === false) {
+    loadAndValidateStartupEnv(true);
     await assertDevServerUp();
   }
 
   const browser = await launchBrowser();
-  let context;
-
-  try {
-    context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
-      deviceScaleFactor: 2,
-      serviceWorkers: "block",
-    });
-    const setupNetworkPolicy = SETUP_ONLY
-      ? await installScreenshotNetworkPolicy(context)
-      : null;
-
-    if (!SETUP_ONLY) {
+  await runScreenshotWorkflow({
+    browser,
+    setupOnly: SETUP_ONLY,
+    appContextOptions: APP_SCREENSHOT_CONTEXT_OPTIONS,
+    setupContextOptions: SETUP_SCREENSHOT_CONTEXT_OPTIONS,
+    authenticateAppContext: (context) =>
+      authenticateScreenshotContext(context, {
+        baseUrl: BASE_URL,
+        accessToken: process.env.APP_ACCESS_TOKEN,
+      }),
+    captureAppScreenshots: async (context) => {
       await captureDashboard(context);
       await captureSettingsResume(context);
       await captureExtensionPopup(context);
       await captureKeywordAnalysis(context);
       await captureSettingsLlm(context);
-    }
-    await captureChromeLoadUnpacked(context);
-    await captureExtensionConnect(context);
-    await captureExtensionConnected(context);
-    if (setupNetworkPolicy) {
-      setupNetworkPolicy.assertNoNetworkAttempts();
-    }
-  } finally {
-    await context?.close();
-    await browser.close();
-  }
+    },
+    installSetupNetworkPolicy: installScreenshotNetworkPolicy,
+    captureSetupScreenshots: async (context) => {
+      await captureChromeLoadUnpacked(context);
+      await captureExtensionConnect(context);
+      await captureExtensionConnected(context);
+    },
+  });
 
   console.log("\n✓ Done.");
 }

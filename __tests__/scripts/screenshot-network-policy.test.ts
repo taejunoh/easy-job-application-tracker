@@ -132,7 +132,7 @@ describe("setup screenshot network policy", () => {
     expect(result.attemptedUrls).toEqual(urls);
     expect(result.attemptedUrlsAfterMutation).toEqual(urls);
     expect(result.assertionError).toBe(
-      "Setup-only screenshots must use static HTML and synthetic fixtures only.\n" +
+      "Setup screenshots must use static HTML and synthetic fixtures only.\n" +
         "Blocked network attempts:\n" +
         urls.map((url) => `- ${url}`).join("\n"),
     );

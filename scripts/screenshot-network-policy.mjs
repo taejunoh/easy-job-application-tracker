@@ -31,7 +31,7 @@ export async function installScreenshotNetworkPolicy(context) {
       if (attemptedUrls.length === 0) return;
 
       throw new Error(
-        "Setup-only screenshots must use static HTML and synthetic fixtures only.\n" +
+        "Setup screenshots must use static HTML and synthetic fixtures only.\n" +
           "Blocked network attempts:\n" +
           attemptedUrls.map((url) => `- ${url}`).join("\n")
       );

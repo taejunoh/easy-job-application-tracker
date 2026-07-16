@@ -79,6 +79,8 @@ APP_BASE_URL="http://localhost:3000"
 CORS_ALLOWED_ORIGINS="http://localhost:3000,chrome-extension://<extension-id>"
 ```
 
+Reserved URL characters in the database username, password, or database name must be percent-encoded before you place those components in `DATABASE_URL`. For example, encode `@` as `%40`.
+
 The `<extension-id>` value is not known until you load the extension. You can first leave that placeholder in `.env`, complete [Install the Chrome Extension](#install-the-chrome-extension), then replace it before starting the server.
 
 The placeholder values copied from `.env.example` are intentionally rejected by startup validation. Replace every placeholder before running `npm run dev` or `npm start`.
@@ -156,7 +158,7 @@ When pairing succeeds, the popup shows **Connected** and enables actions support
 
 The token field is cleared after a successful connection. An empty token field while the popup says **Connected** is expected: the extension stores its authenticated connection state rather than displaying the credential again.
 
-Use **Disconnect** to remove the stored connection and revoke the runtime-requested server permission. Chrome can continue to list a previously requested server origin on the extension details page; an off toggle means access is no longer granted, and mere list presence does not mean the extension remains connected.
+Use **Disconnect** to remove the stored connection and revoke the runtime-requested server permission. Some Chrome versions may retain a previously requested server origin on the extension details page. The popup cleanup warning and the server-origin permission toggle are authoritative: if the popup reports that cleanup remains pending, follow that warning; if the toggle is off, host access is no longer granted. Mere list presence does not mean the extension remains connected.
 
 ## Save Your First Job
 
@@ -195,7 +197,7 @@ JobTracker supports these providers:
 - Gemini (Google)
 - Anthropic
 
-Choose a provider in **Settings**, enter that provider's API key and model settings, then save. Provider credentials are encrypted with `ENCRYPTION_SECRET` before storage. Do not put provider API keys in `APP_ACCESS_TOKEN` or commit them to the repository.
+Choose a provider in **Settings**, enter that provider's API key, then save. Provider models are selected internally; this version does not expose a user-editable model setting. Provider credentials are encrypted with `ENCRYPTION_SECRET` before storage. Do not put provider API keys in `APP_ACCESS_TOKEN` or commit them to the repository.
 
 ![Configure an optional LLM provider](docs/screenshots/05-settings-llm.png)
 
@@ -206,7 +208,7 @@ Choose a provider in **Settings**, enter that provider's API key and model setti
 | Chrome does not show a permission prompt | Access to that server origin was already granted, or Chrome did not open a new prompt. | Click **Connect** with the exact server origin. In `chrome://extensions`, confirm JobTracker is enabled and check the configured server origin under Site access; the request is not for the current job site. |
 | The popup says **Disconnected** | The extension has not paired with this server, its saved state was cleared, or the unpacked extension was reloaded. | Confirm the server is running, enter its exact origin without a trailing path, paste `APP_ACCESS_TOKEN`, and click **Connect** again. |
 | A request returns HTTP `401` | The saved connection is not accepted because the server and extension tokens differ or the server token changed. | Disconnect, verify that both use the same `APP_ACCESS_TOKEN`, then reconnect. Never send the token as part of a URL. |
-| The server origin remains in Chrome's Site access list after **Disconnect** | Chrome can retain an origin in its list after its permission has been removed. | Confirm the origin's toggle is off. Mere list presence does not mean access remains granted or the extension remains connected. |
+| The server origin remains in Chrome's Site access list after **Disconnect** | Some Chrome versions may retain the entry after its permission has been removed. | Check the popup for a cleanup warning and confirm the server-origin permission toggle is off. The warning and toggle, rather than mere list presence, show whether cleanup is pending or access remains granted. |
 | Extracted fields are missing or inaccurate | The page is still loading, uses an unusual layout, or exposes incomplete metadata. | Wait for the job page to finish loading, reopen the popup, and click **Re-extract**. Edit fields before saving; for unusual layouts, use text paste mode and optionally configure an AI provider. |
 | **Save Application** fails | The connection, job URL, server, or PostgreSQL database is unavailable or invalid. | Confirm the popup is **Connected**, the server is reachable, the job URL is valid, and PostgreSQL is running. Check the server terminal for the specific error. |
 | **Analyze Keywords** fails or shows no result | No resume is saved, or the application has no job description. | Save a PDF or text resume in Settings. Re-extract or edit the application if its description is empty. |
@@ -269,6 +271,7 @@ Never use a destructive reset, `db push` data-loss acceptance, or an unreviewed 
 Run the normal repository checks before opening a pull request:
 
 ```bash
+npm run check:audit
 npm run check:extension
 npm run test:ci
 npm run lint
@@ -277,7 +280,7 @@ npm run build
 npm run check:startup-env
 ```
 
-The CI workflow uses Node.js 22.22.2 and a disposable PostgreSQL service. It validates and deploys migrations, checks schema parity and extension assets, runs tests, lints, typechecks, builds, and verifies invalid startup configuration is rejected.
+CI enforces the dependency-audit policy with `npm run check:audit`. The workflow uses Node.js 22.22.2 and a disposable PostgreSQL service. It validates and deploys migrations, checks schema parity and extension assets, runs tests, lints, typechecks, builds, and verifies invalid startup configuration is rejected.
 
 ### Chrome extension E2E
 

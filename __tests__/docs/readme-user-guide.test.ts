@@ -15,14 +15,6 @@ const setupImageDimensions = new Map([
   ["08-extension-connected.png", { width: 320, height: 210 }],
 ]);
 
-const normalCaptureFunctions = [
-  "captureDashboard",
-  "captureSettingsResume",
-  "captureExtensionPopup",
-  "captureKeywordAnalysis",
-  "captureSettingsLlm",
-];
-
 const setupCaptureFunctions = [
   "captureChromeLoadUnpacked",
   "captureExtensionConnect",
@@ -122,6 +114,10 @@ describe("task-first README user guide", () => {
       join(root, "scripts/screenshots.mjs"),
       "utf8",
     );
+    const workflow = readFileSync(
+      join(root, "scripts/screenshot-workflow.mjs"),
+      "utf8",
+    );
     const screenshotDocs = readFileSync(
       join(root, "docs/screenshots/README.md"),
       "utf8",
@@ -138,31 +134,8 @@ describe("task-first README user guide", () => {
     expect(generator).toMatch(
       /const\s+SETUP_ONLY\s*=\s*process\.argv\.includes\("--setup-only"\);?/u,
     );
-    expect(generator).toMatch(
-      /import\s+\{\s*installScreenshotNetworkPolicy\s*\}\s+from\s+"\.\/screenshot-network-policy\.mjs";/u,
-    );
-    expect(generator).toContain("installScreenshotNetworkPolicy(context)");
-    expect(generator).toContain("setupNetworkPolicy.assertNoNetworkAttempts()");
-
-    const normalCaptureGate = generator.match(
-      /if\s*\(\s*!SETUP_ONLY\s*\)\s*\{([\s\S]*?)\}/u,
-    );
-    expect(normalCaptureGate).not.toBeNull();
-
-    const normalCaptureSource = normalCaptureGate?.[1] ?? "";
-    for (const captureFunction of normalCaptureFunctions) {
-      expect(normalCaptureSource).toContain(
-        `await ${captureFunction}(context);`,
-      );
-    }
-
-    const setupCaptureSource = normalCaptureGate
-      ? generator.replace(normalCaptureGate[0], "")
-      : generator;
     for (const captureFunction of setupCaptureFunctions) {
-      expect(setupCaptureSource).toContain(
-        `await ${captureFunction}(context);`,
-      );
+      expect(generator).toContain(`await ${captureFunction}(context);`);
     }
 
     const chromeExtensionsSetup = readRequiredSetupSource(
@@ -198,6 +171,7 @@ describe("task-first README user guide", () => {
     ].join("\n");
     const broaderSources = [
       generator,
+      workflow,
       chromeExtensionsSetup,
       fixtureSource,
       popupSource,
@@ -259,6 +233,8 @@ describe("task-first README user guide", () => {
 
     expect(screenshotDocs).toContain("npm run screenshots:setup");
     expect(screenshotDocs).toContain("synthetic");
+    expect(screenshotDocs).toContain("authenticated local browser session");
+    expect(screenshotDocs).toContain("separate network-blocked browser context");
     expect(generator).not.toContain(
       "easy-job-application-tracker.vercel.app",
     );
@@ -390,6 +366,26 @@ describe("task-first README user guide", () => {
     expect(readme).toContain("| Symptom | Likely cause | Action |");
     expect(readme).toMatch(
       /\| Resume upload fails \|[^\r\n]+\|[^\r\n]+\|/u,
+    );
+  });
+
+  test("documents final-review operational accuracy corrections", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+
+    expect(readme).not.toContain("API key and model settings");
+    expect(readme).toContain("Provider models are selected internally");
+    expect(readme).toContain(
+      "Reserved URL characters in the database username, password, or database name must be percent-encoded",
+    );
+    expect(readme).toContain(
+      "Some Chrome versions may retain a previously requested server origin",
+    );
+    expect(readme).toContain(
+      "The popup cleanup warning and the server-origin permission toggle are authoritative",
+    );
+    expect(readme).toContain("npm run check:audit");
+    expect(readme).toContain(
+      "CI enforces the dependency-audit policy",
     );
   });
 });

@@ -27,7 +27,9 @@ The script writes all eight files here:
 - `07-extension-connect.png` — disconnected extension connection form
 - `08-extension-connected.png` — connected extension status
 
-No real database data is used — API calls are intercepted by Playwright and served from `scripts/screenshot-fixtures.mjs`.
+The full command creates an authenticated local browser session for protected app pages. App captures use the fixed `en-US` locale and `UTC` timezone so date rendering does not depend on the host machine. No real database data is used — API calls are intercepted by Playwright and served from `scripts/screenshot-fixtures.mjs`.
+
+Images 06–08 always run in a separate network-blocked browser context, including during the full command. Any attempted HTTP(S) or WebSocket request fails the generation instead of reaching a real service.
 
 To generate only the three extension setup images, run:
 
