@@ -81,6 +81,9 @@ const HEAD = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const OID = HEAD;
 const COPY_LIMIT = 9_999;
 const CONTROL_LIMIT = 1024 * 1024;
+const STATUS_RECORD_LIMIT = 1024 * 1024;
+const HISTORY_FRAME_LIMIT = 4096;
+const HISTORY_OID_BODY_LIMIT = 64;
 const STDERR_LIMIT = 64 * 1024;
 const BLOB_STREAM_HIGH_WATER_MARK = 64 * 1024;
 const PRIVATE_MODE = 0o700;
@@ -456,6 +459,17 @@ async function collectStatus(repoRoot, environment, expectedCount) {
     invalid = true;
     terminate();
   };
+  const appendFrame = (segment) => {
+    if (segment.length > STATUS_RECORD_LIMIT - frameBytes) {
+      reject();
+      return false;
+    }
+    if (segment.length > 0) {
+      frameChunks.push(Buffer.from(segment));
+      frameBytes += segment.length;
+    }
+    return true;
+  };
   child.stdout.on("data", (chunk) => {
     if (invalid) return;
     stdoutBytes += chunk.length;
@@ -469,16 +483,12 @@ async function collectStatus(repoRoot, environment, expectedCount) {
       const end = chunk.indexOf(0, start);
       if (end === -1) {
         const tail = chunk.subarray(start);
-        frameChunks.push(Buffer.from(tail));
-        frameBytes += tail.length;
+        if (!appendFrame(tail)) return;
         endedWithNul = false;
         break;
       }
       const segment = chunk.subarray(start, end);
-      if (segment.length > 0) {
-        frameChunks.push(Buffer.from(segment));
-        frameBytes += segment.length;
-      }
+      if (!appendFrame(segment)) return;
       if (frameBytes === 0 || emittedPaths.length === expectedCount) {
         reject();
         return;
@@ -581,7 +591,6 @@ async function collectHistoryOids(repoRoot, environment, canonicalPath) {
   );
   const values = [];
   let frame = [];
-  let stdoutBytes = 0;
   let stderrBytes = 0;
   let invalid = false;
   let streamError = false;
@@ -601,21 +610,16 @@ async function collectHistoryOids(repoRoot, environment, canonicalPath) {
   };
   child.stdout.on("data", (chunk) => {
     if (invalid) return;
-    stdoutBytes += chunk.length;
-    if (stdoutBytes > CONTROL_LIMIT) {
-      reject();
-      return;
-    }
     for (const byte of chunk) {
       if (byte !== 0) {
-        frame.push(byte);
-        if (frame.length > 64) {
+        if (frame.length === HISTORY_OID_BODY_LIMIT) {
           reject();
           return;
         }
+        frame.push(byte);
         continue;
       }
-      if (frame.length === 0 || values.length === 4096) {
+      if (frame.length === 0 || values.length === HISTORY_FRAME_LIMIT) {
         reject();
         return;
       }
@@ -647,7 +651,7 @@ async function collectHistoryOids(repoRoot, environment, canonicalPath) {
   });
   if (
     invalid || streamError || outcome.spawnError || outcome.signal || outcome.code !== 0 ||
-    (stdoutBytes > 0 && frame.length !== 0)
+    frame.length !== 0
   ) fail("ERR_PREFLIGHT");
   return values;
 }

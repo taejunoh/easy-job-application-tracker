@@ -58,6 +58,10 @@ const LAYOUT_RELATIVES = [
   "rollback", "rollback/regenerated-before-restore", "conflicts", "divergent-diffs",
 ] as const;
 
+const STATUS_RECORD_LIMIT = 1024 * 1024;
+const HISTORY_FRAME_LIMIT = 4096;
+const HISTORY_OID_BODY_LIMIT = 64;
+
 type Fixture = {
   base: string;
   repoRoot: string;
@@ -1487,6 +1491,59 @@ describe("quarantine transaction Slice 1", () => {
     });
   });
 
+  it("accepts a status record whose body including the prefix is exactly one MiB", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const fixed = "virtual-" + " 2.txt";
+    const pathRecord = `virtual-${"x".repeat(STATUS_RECORD_LIMIT - 3 - fixed.length)} 2.txt`;
+    const record = Buffer.from(`?? ${pathRecord}`, "utf8");
+    expect(record.length).toBe(STATUS_RECORD_LIMIT);
+    const path = installGitOutputOverride(
+      f,
+      "status-record-exact-boundary",
+      "-c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all",
+      Buffer.concat([record, Buffer.from([0])]),
+    );
+    const worker = invoke("virtual-files", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+    }, { PATH: path }, 30_000);
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    expect(worker.result).toMatchObject({ status: "INSPECTED", sourceCopies: 1 });
+  });
+
+  it("kills and settles status on byte 1,048,577 before a record NUL", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const bin = join(f.base, "status-record-overflow");
+    privateDirectory(bin);
+    const payload = join(bin, "payload.bin");
+    const body = Buffer.concat([
+      Buffer.from("?? ", "utf8"),
+      Buffer.alloc(STATUS_RECORD_LIMIT - 2, 0x61),
+    ]);
+    expect(body.length).toBe(STATUS_RECORD_LIMIT + 1);
+    writeFileSync(payload, body);
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\nif [ "$*" = "-c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all" ]; then\n  /bin/cat ${JSON.stringify(payload)}\n  parent=$PPID\n  while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done\n  exit 0\nfi\nexec ${JSON.stringify(realGit)} "$@"\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(join(bin, "git"), 0o700);
+    expectWorkerError(invoke("inspect", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+    }, { PATH: `${bin}:${process.env.PATH ?? ""}` }, 3_000),
+    "ERR_PREFLIGHT", "Workspace preflight failed.");
+  });
+
   it.each(["stdout", "stderr"] as const)(
     "kills and settles a Git child after the %s control limit is exceeded",
     (stream) => {
@@ -1540,8 +1597,6 @@ describe("quarantine transaction Slice 1", () => {
     ["missing-final-nul", Buffer.from("a".repeat(40), "utf8")],
     ["empty-interior", Buffer.from(`${"a".repeat(40)}\0\0`, "utf8")],
     ["fatal-utf8", Buffer.from([0xff, 0x00])],
-    ["over-4096", Buffer.from(`${Array.from({ length: 4097 }, (_, index) =>
-      index.toString(16).padStart(40, "0")).join("\0")}\0`, "utf8")],
   ] as Array<[string, Buffer]>)("rejects incremental history log case %s", (label, output) => {
     const f = fixture({ divergent: true });
     bases.push(f.base);
@@ -1560,25 +1615,61 @@ describe("quarantine transaction Slice 1", () => {
     }, { PATH: path }), "ERR_PREFLIGHT", "Workspace preflight failed.");
   });
 
-  it.each([
-    ["exact-one-mib", 1024 * 1024],
-    ["one-byte-over", 1024 * 1024 + 1],
-  ] as Array<[string, number]>)("rejects malformed history control payload at %s", (label, size) => {
+  it("accepts an exact 64-byte lowercase history OID body plus NUL", () => {
     const f = fixture({ divergent: true });
     bases.push(f.base);
-    const path = installGitOutputOverride(
-      f,
-      `history-control-${label}`,
-      "-c core.fsmonitor=false log --all --format=%H -z -- notes.txt",
-      Buffer.alloc(size, 0x61),
+    const bin = join(f.base, "history-64-byte-body");
+    privateDirectory(bin);
+    const commitOid = "a".repeat(HISTORY_OID_BODY_LIMIT);
+    const blobOid = "b".repeat(HISTORY_OID_BODY_LIMIT);
+    const logPayload = join(bin, "log.bin");
+    const treePayload = join(bin, "tree.bin");
+    writeFileSync(logPayload, Buffer.from(`${commitOid}\0`, "utf8"));
+    writeFileSync(treePayload, Buffer.from(`100644 blob ${blobOid}\tnotes.txt\0`, "utf8"));
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\ncase "$*" in\n  "-c core.fsmonitor=false log --all --format=%H -z -- notes.txt") exec /bin/cat ${JSON.stringify(logPayload)} ;;\n  "-c core.fsmonitor=false ls-tree -z --full-tree ${commitOid} -- notes.txt") exec /bin/cat ${JSON.stringify(treePayload)} ;;\n  "-c core.fsmonitor=false cat-file blob ${blobOid}") printf 'canonical\\n'; exit 0 ;;\nesac\nexec ${JSON.stringify(realGit)} "$@"\n`,
+      { mode: 0o700 },
     );
+    chmodSync(join(bin, "git"), 0o700);
+    const worker = invoke("prepare", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-history-64-byte-body",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, { PATH: `${bin}:${process.env.PATH ?? ""}` });
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    const source = worker.result!.entries!.find((entry) => entry.kind === "source-copy")!;
+    expect(source.historyMatch).toBe(commitOid);
+  });
+
+  it("kills and settles history on a 65th OID body byte before NUL", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const bin = join(f.base, "history-65-byte-body");
+    privateDirectory(bin);
+    const payload = join(bin, "payload.bin");
+    writeFileSync(payload, Buffer.alloc(HISTORY_OID_BODY_LIMIT + 1, 0x61));
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\nif [ "$*" = "-c core.fsmonitor=false log --all --format=%H -z -- notes.txt" ]; then\n  /bin/cat ${JSON.stringify(payload)}\n  parent=$PPID\n  while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done\n  exit 0\nfi\nexec ${JSON.stringify(realGit)} "$@"\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(join(bin, "git"), 0o700);
     expectWorkerError(invoke("inspect", {
       repoRoot: f.repoRoot,
       quarantineRoot: f.quarantineRoot,
       expectedBranch: f.branch,
       expectedHead: f.head,
       expectedCount: 1,
-    }, { PATH: path }, 3_000), "ERR_PREFLIGHT", "Workspace preflight failed.");
+    }, { PATH: `${bin}:${process.env.PATH ?? ""}` }, 3_000),
+    "ERR_PREFLIGHT", "Workspace preflight failed.");
   });
 
   it("retains duplicate history OIDs in their emitted order", () => {
@@ -1622,11 +1713,14 @@ describe("quarantine transaction Slice 1", () => {
     bases.push(f.base);
     const bin = join(f.base, "history-boundary");
     privateDirectory(bin);
-    const commits = Array.from({ length: 4096 }, (_, index) => index.toString(16).padStart(40, "0"));
+    const commits = Array.from({ length: HISTORY_FRAME_LIMIT }, (_, index) =>
+      index.toString(16).padStart(HISTORY_OID_BODY_LIMIT, "0"));
     const logPayload = join(bin, "log.bin");
     const treePayload = join(bin, "tree.bin");
-    const blobOid = "b".repeat(40);
-    writeFileSync(logPayload, Buffer.from(`${commits.join("\0")}\0`, "utf8"));
+    const blobOid = "b".repeat(HISTORY_OID_BODY_LIMIT);
+    const historyBody = Buffer.from(`${commits.join("\0")}\0`, "utf8");
+    expect(historyBody.length).toBe(HISTORY_FRAME_LIMIT * (HISTORY_OID_BODY_LIMIT + 1));
+    writeFileSync(logPayload, historyBody);
     writeFileSync(treePayload, Buffer.from(`100644 blob ${blobOid}\tnotes.txt\0`, "utf8"));
     const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
     writeFileSync(
@@ -1648,6 +1742,33 @@ describe("quarantine transaction Slice 1", () => {
     if (!worker.ok) throw new Error(JSON.stringify(worker.error));
     const source = worker.result!.entries!.find((entry) => entry.kind === "source-copy")!;
     expect(source.historyMatch).toBe(commits[0]);
+  });
+
+  it("kills and settles history on a 4,097th complete OID frame", () => {
+    const f = fixture({ divergent: true });
+    bases.push(f.base);
+    const bin = join(f.base, "history-frame-overflow");
+    privateDirectory(bin);
+    const payload = join(bin, "payload.bin");
+    const oid = "a".repeat(HISTORY_OID_BODY_LIMIT);
+    const historyBody = Buffer.from(`${Array(HISTORY_FRAME_LIMIT + 1).fill(oid).join("\0")}\0`, "utf8");
+    expect(historyBody.length).toBe((HISTORY_FRAME_LIMIT + 1) * (HISTORY_OID_BODY_LIMIT + 1));
+    writeFileSync(payload, historyBody);
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\nif [ "$*" = "-c core.fsmonitor=false log --all --format=%H -z -- notes.txt" ]; then\n  /bin/cat ${JSON.stringify(payload)}\n  parent=$PPID\n  while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done\n  exit 0\nfi\nexec ${JSON.stringify(realGit)} "$@"\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(join(bin, "git"), 0o700);
+    expectWorkerError(invoke("inspect", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+    }, { PATH: `${bin}:${process.env.PATH ?? ""}` }, 3_000),
+    "ERR_PREFLIGHT", "Workspace preflight failed.");
   });
 
   it.each([
