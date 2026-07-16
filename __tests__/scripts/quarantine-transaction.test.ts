@@ -26,6 +26,9 @@ const runtimeUrl = pathToFileURL(
 const capabilityUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-run-capability.mjs"),
 ).href;
+const journalUrl = pathToFileURL(
+  join(__dirname, "../../scripts/quarantine-journal.mjs"),
+).href;
 const fsContextUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-run-fs-context.mjs"),
 ).href;
@@ -245,6 +248,7 @@ function invoke(
 import * as transaction from ${JSON.stringify(transactionUrl)};
 import * as runtime from ${JSON.stringify(runtimeUrl)};
 import { withQuarantineRunCapability } from ${JSON.stringify(capabilityUrl)};
+import { appendJournalRecord, withJournalLock } from ${JSON.stringify(journalUrl)};
 import { getRunFsContext } from ${JSON.stringify(fsContextUrl)};
 import * as fsPromises from "node:fs/promises";
 import {
@@ -328,6 +332,54 @@ try {
     resultShape.mutationStable = Reflect.set(result, "status", "MUTATED") === false &&
       Reflect.set(result, "sourceCopies", -1) === false && JSON.stringify(result) === before;
     process.stdout.write(JSON.stringify({ ok: true, result, shape: resultShape }));
+  } else if (operation === "apply") {
+    const phases = [];
+    const result = await transaction.quarantineWorkspace({
+      ...request,
+      faultHook(phase) { phases.push(phase); },
+    });
+    process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+  } else if (operation === "apply-stop-after-layout") {
+    const phases = [];
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...request,
+        faultHook(phase) {
+          phases.push(phase);
+          if (phase === "after-layout-sync") throw new RangeError("stop after layout");
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      phases,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "seed-prepared") {
+    const handoff = await runtime.prepareQuarantineWorkspace(request);
+    await withQuarantineRunCapability({
+      repoRoot: request.repoRoot,
+      quarantineRoot: request.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+      fsApi: handoff.fsSource,
+    }, async (capability) => {
+      await withJournalLock({ capability }, async (heldLock) => {
+        await appendJournalRecord({
+          capability,
+          heldLock,
+          event: "PREPARED",
+          payload: {
+            transactionId: request.transactionId,
+            manifestSha256: "a".repeat(64),
+          },
+        });
+      });
+    });
+    process.stdout.write(JSON.stringify({ ok: true }));
   } else if (operation === "getter") {
     let reads = 0;
     const options = { ...request };
@@ -845,13 +897,175 @@ describe("quarantine transaction Slice 1", () => {
     for (const base of bases.splice(0)) rmSync(base, { recursive: true, force: true });
   });
 
-  it("exposes only the advisory inspection API", async () => {
+  it("exposes the completed atomic apply API only at the Slice 2 surfaces", async () => {
     const exports = invoke("exports", {});
-    expect(exports.exports).toEqual(["inspectWorkspace"]);
-    expect(exports.runtimeExports).toEqual(["inspectWorkspace", "prepareQuarantineWorkspace"]);
+    expect(exports.exports).toEqual(["inspectWorkspace", "quarantineWorkspace"]);
+    expect(exports.runtimeExports).toEqual([
+      "inspectWorkspace",
+      "prepareQuarantineWorkspace",
+      "quarantineWorkspace",
+    ]);
     expect(exports.legacyExports).not.toContain("prepareQuarantineWorkspace");
     const packageJson = JSON.parse(readFileSync(join(__dirname, "../../package.json"), "utf8"));
     expect(Object.hasOwn(packageJson, "exports")).toBe(false);
+  });
+
+  it("returns QUARANTINED only after the complete durable atomic-move protocol", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const worker = invoke("apply", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-slice-2-happy",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, {}, 30_000);
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    expect(worker.result).toEqual({
+      transactionId: "tx-slice-2-happy",
+      status: "QUARANTINED",
+      movedEntries: 3,
+      manifestSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    });
+    expect(worker.phases).toEqual([
+      "after-layout-sync",
+      "after-pre-inventories",
+      "after-prepared-generation",
+      "after-event:PREPARED",
+      "after-event:MOVING",
+      "after-event:MOVE_INTENT:generated-next",
+      "after-rename:generated-next",
+      "after-payload-sync:generated-next",
+      "after-destination-parent-sync:generated-next",
+      "after-source-parent-sync:generated-next",
+      "after-inventory:moved-pass-1:generated-next",
+      "after-event:MOVED:generated-next",
+      "after-event:MOVE_INTENT:generated-node-modules",
+      "after-rename:generated-node-modules",
+      "after-payload-sync:generated-node-modules",
+      "after-destination-parent-sync:generated-node-modules",
+      "after-source-parent-sync:generated-node-modules",
+      "after-inventory:moved-pass-1:generated-node-modules",
+      "after-event:MOVED:generated-node-modules",
+      "after-event:MOVE_INTENT:copy-0001",
+      "after-rename:copy-0001",
+      "after-payload-sync:copy-0001",
+      "after-destination-parent-sync:copy-0001",
+      "after-source-parent-sync:copy-0001",
+      "after-inventory:moved-pass-1:copy-0001",
+      "after-event:MOVED:copy-0001",
+      "after-event:VERIFYING",
+      "after-inventory:moved-pass-2:generated-next",
+      "after-inventory:moved-pass-2:generated-node-modules",
+      "after-inventory:moved-pass-2:copy-0001",
+      "after-event:QUARANTINED",
+      "before-lock-cleanup",
+    ]);
+    expect(existsSync(join(f.repoRoot, ".next"))).toBe(false);
+    expect(existsSync(join(f.repoRoot, "node_modules"))).toBe(false);
+    expect(existsSync(join(f.repoRoot, "notes 2.txt"))).toBe(false);
+    expect(existsSync(join(f.quarantineRoot, "current"))).toBe(false);
+  });
+
+  it("prioritizes a durable PREPARED journal over precommit mismatch before Git discovery", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-existing-journal",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const seeded = invoke("seed-prepared", request, {}, 30_000);
+    if (!seeded.ok) throw new Error(JSON.stringify(seeded.error));
+    writeFileSync(join(f.quarantineRoot, request.transactionId, "manifests", "foreign"), "preserve");
+    const sentinel = join(f.base, "git-was-invoked");
+    const bin = join(f.base, "reject-git");
+    privateDirectory(bin);
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\nprintf invoked > ${JSON.stringify(sentinel)}\nexit 99\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(join(bin, "git"), 0o700);
+
+    const worker = invoke("apply", request, { PATH: `${bin}:${process.env.PATH ?? ""}` });
+    expectWorkerError(
+      worker,
+      "ERR_RECOVERY_REQUIRED",
+      "Explicit quarantine recovery is required.",
+    );
+    expect(existsSync(sentinel)).toBe(false);
+    expect(readFileSync(
+      join(f.quarantineRoot, request.transactionId, "manifests", "foreign"),
+      "utf8",
+    )).toBe("preserve");
+  });
+
+  it("completes an ancestor-closed partial layout before advancing apply", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const runRoot = join(f.quarantineRoot, "tx-partial-layout");
+    privateDirectory(runRoot);
+    privateDirectory(join(runRoot, "manifests"));
+    const worker = invoke("apply-stop-after-layout", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-partial-layout",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    }, {}, 30_000);
+    expect(worker.ok).toBe(false);
+    expect(worker.phases).toEqual(["after-layout-sync"]);
+    expect(worker.error).toMatchObject({ name: "RangeError", message: "stop after layout" });
+    for (const relativePath of LAYOUT_RELATIVES) {
+      expect(statSync(relativePath === "" ? runRoot : join(runRoot, relativePath)).mode & 0o7777)
+        .toBe(0o700);
+    }
+  });
+
+  it("keeps direct prepare strict while private apply admits only closed precommit finals", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-private-resume",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const prepared = invoke("prepare-raw", request, {}, 30_000);
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    const preInventory = join(
+      f.quarantineRoot,
+      request.transactionId,
+      "inventories/pre/copy-0001.jsonl",
+    );
+    writeFileSync(preInventory, "preserve", { mode: 0o600 });
+    chmodSync(preInventory, 0o600);
+    expectWorkerError(
+      invoke("prepare-raw", request, {}, 30_000),
+      "ERR_INTEGRITY",
+      "Quarantine evidence failed integrity validation.",
+    );
+    const apply = invoke("apply-stop-after-layout", request, {}, 30_000);
+    expect(apply.ok).toBe(false);
+    expect(apply.phases).toEqual(["after-layout-sync"]);
+    expect(apply.error).toMatchObject({ name: "RangeError", message: "stop after layout" });
+    expect(readFileSync(preInventory, "utf8")).toBe("preserve");
   });
 
   it("returns the exact body-free INSPECTED summary without writing quarantine", async () => {

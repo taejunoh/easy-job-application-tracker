@@ -28,6 +28,8 @@ import {
 } from "node:path";
 
 import { canonicalPathForNumberedCopy } from "./quarantine-path-policy.mjs";
+import { replayJournal } from "./quarantine-journal.mjs";
+import { withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
 
 const FS_METHODS = Object.freeze([
   "lstat",
@@ -87,6 +89,10 @@ const HISTORY_OID_BODY_LIMIT = 64;
 const STDERR_LIMIT = 64 * 1024;
 const BLOB_STREAM_HIGH_WATER_MARK = 64 * 1024;
 const PRIVATE_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+const ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
+const COPY_ID = /^copy-(?!0000)[0-9]{4}$/u;
+const SHA256 = /^[0-9a-f]{64}$/u;
 
 const LAYOUT = Object.freeze([
   "",
@@ -108,39 +114,13 @@ const LAYOUT = Object.freeze([
   "divergent-diffs",
 ]);
 
-const EXPECTED_CHILDREN = Object.freeze({
-  "": Object.freeze(["conflicts", "divergent-diffs", "inventories", "manifests", "payload", "rollback"]),
-  inventories: Object.freeze([
-    "moved-pass-1",
-    "moved-pass-2",
-    "pre",
-    "restore-active",
-    "validation-pass-1",
-    "validation-pass-2",
-    "work",
-  ]),
-  payload: Object.freeze(["generated", "source-copies"]),
-  rollback: Object.freeze(["regenerated-before-restore"]),
-  manifests: Object.freeze([]),
-  "inventories/pre": Object.freeze([]),
-  "inventories/moved-pass-1": Object.freeze([]),
-  "inventories/moved-pass-2": Object.freeze([]),
-  "inventories/restore-active": Object.freeze([]),
-  "inventories/validation-pass-1": Object.freeze([]),
-  "inventories/validation-pass-2": Object.freeze([]),
-  "inventories/work": Object.freeze([]),
-  "payload/source-copies": Object.freeze([]),
-  "payload/generated": Object.freeze([]),
-  "rollback/regenerated-before-restore": Object.freeze([]),
-  conflicts: Object.freeze([]),
-  "divergent-diffs": Object.freeze([]),
-});
-
 const ERROR_MESSAGES = Object.freeze({
   ERR_USAGE: "Invalid quarantine request.",
   ERR_PREFLIGHT: "Workspace preflight failed.",
+  ERR_RECOVERY_REQUIRED: "Explicit quarantine recovery is required.",
   ERR_INTEGRITY: "Quarantine evidence failed integrity validation.",
   ERR_EXDEV: "Repository and quarantine must be on the same filesystem.",
+  ERR_INDETERMINATE_JOURNAL_APPEND: "Journal durability could not be determined.",
   ERR_INTERNAL: "Unexpected quarantine failure.",
 });
 
@@ -952,10 +932,51 @@ async function verifyLayoutIdentity(path, runRoot, expected, fsSource) {
   }
 }
 
-async function scanExistingLayout(runRoot, rootDevice, fsSource) {
+function isAllowedPrecommitFile(relativePath) {
+  if (relativePath.startsWith("inventories/pre/")) {
+    const name = relativePath.slice("inventories/pre/".length);
+    return name.endsWith(".jsonl") && ENTRY_ID.test(name.slice(0, -".jsonl".length));
+  }
+  if (relativePath.startsWith("manifests/")) {
+    const name = relativePath.slice("manifests/".length);
+    return name.endsWith(".json") && SHA256.test(name.slice(0, -".json".length));
+  }
+  if (relativePath.startsWith("divergent-diffs/")) {
+    const name = relativePath.slice("divergent-diffs/".length);
+    if (name.endsWith(".patch")) return COPY_ID.test(name.slice(0, -".patch".length));
+    if (name.startsWith(".") && name.endsWith(".tmp")) {
+      return COPY_ID.test(name.slice(1, -".tmp".length));
+    }
+  }
+  return false;
+}
+
+async function validatePrecommitFile(path, runRoot, rootDevice, fsSource) {
+  let stats;
+  let resolved;
+  try {
+    stats = await fsSource.lstat(path);
+    resolved = await fsSource.realpath(path);
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  if (
+    stats.isSymbolicLink() || !stats.isFile() || modeOf(stats) !== PRIVATE_FILE_MODE ||
+    Number(stats.dev) !== rootDevice || resolved !== path || !isInside(runRoot, resolved)
+  ) fail("ERR_INTEGRITY");
+}
+
+async function scanExistingLayout(
+  runRoot,
+  rootDevice,
+  fsSource,
+  mode = "strict",
+  readFailureCode = "ERR_INTEGRITY",
+) {
   const allowed = new Set(LAYOUT.slice(1));
   const pending = [""];
   const identities = new Map();
+  const files = [];
   while (pending.length > 0) {
     const parentRelative = pending.pop();
     const parentPath = parentRelative === "" ? runRoot : join(runRoot, ...parentRelative.split("/"));
@@ -964,7 +985,7 @@ async function scanExistingLayout(runRoot, rootDevice, fsSource) {
     try {
       names = await fsSource.readdir(parentPath);
     } catch {
-      fail("ERR_INTEGRITY");
+      fail(readFailureCode);
     }
     if (!Array.isArray(names) || names.some((name) => typeof name !== "string")) fail("ERR_INTEGRITY");
     for (const name of names) {
@@ -972,12 +993,22 @@ async function scanExistingLayout(runRoot, rootDevice, fsSource) {
         fail("ERR_INTEGRITY");
       }
       const childRelative = parentRelative === "" ? name : `${parentRelative}/${name}`;
-      if (!allowed.has(childRelative)) fail("ERR_INTEGRITY");
-      await validateLayoutDirectory(join(runRoot, ...childRelative.split("/")), runRoot, rootDevice, fsSource);
-      pending.push(childRelative);
+      const childPath = join(runRoot, ...childRelative.split("/"));
+      if (allowed.has(childRelative)) {
+        await validateLayoutDirectory(childPath, runRoot, rootDevice, fsSource);
+        pending.push(childRelative);
+      } else if (mode === "apply-precommit-resume" && isAllowedPrecommitFile(childRelative)) {
+        await validatePrecommitFile(childPath, runRoot, rootDevice, fsSource);
+        files.push(childRelative);
+      } else {
+        fail("ERR_INTEGRITY");
+      }
     }
   }
-  return identities;
+  if (files.length > 0 && identities.size !== LAYOUT.length) fail("ERR_INTEGRITY");
+  const manifestFiles = files.filter((path) => path.startsWith("manifests/"));
+  if (manifestFiles.length > 1) fail("ERR_INTEGRITY");
+  return { identities, files: Object.freeze(files.sort(byteCompare)) };
 }
 
 async function syncDirectory(path, fsSource) {
@@ -1009,7 +1040,7 @@ async function syncDirectory(path, fsSource) {
   if (syncFailed || closeFailed) fail("ERR_PREFLIGHT");
 }
 
-async function ensureLayout(discovery, options, fsSource) {
+async function ensureLayout(discovery, options, fsSource, mode = "strict") {
   const { roots } = discovery;
   const runRoot = join(roots.quarantineRoot, options.transactionId);
   let runExisted = false;
@@ -1019,9 +1050,10 @@ async function ensureLayout(discovery, options, fsSource) {
   } catch (error) {
     if (error?.code !== "ENOENT") fail("ERR_INTEGRITY");
   }
-  const existingIdentities = runExisted
-    ? await scanExistingLayout(runRoot, roots.quarantineIdentity.dev, fsSource)
-    : new Map();
+  const existing = runExisted
+    ? await scanExistingLayout(runRoot, roots.quarantineIdentity.dev, fsSource, mode)
+    : { identities: new Map(), files: Object.freeze([]) };
+  const existingIdentities = existing.identities;
   const identities = new Map();
   for (const relativePath of LAYOUT) {
     await verifyRootIdentity(roots.repoRoot, roots.repoIdentity, fsSource);
@@ -1076,18 +1108,81 @@ async function ensureLayout(discovery, options, fsSource) {
 
   await verifyRootIdentity(roots.repoRoot, roots.repoIdentity, fsSource);
   await verifyRootIdentity(roots.quarantineRoot, roots.quarantineIdentity, fsSource);
+  const completed = await scanExistingLayout(
+    runRoot,
+    roots.quarantineIdentity.dev,
+    fsSource,
+    mode,
+    mode === "strict" ? "ERR_PREFLIGHT" : "ERR_INTEGRITY",
+  );
   for (const relativePath of LAYOUT) {
     const path = relativePath === "" ? runRoot : join(runRoot, ...relativePath.split("/"));
     await verifyLayoutIdentity(path, runRoot, identities.get(relativePath), fsSource);
-    const expected = EXPECTED_CHILDREN[relativePath];
-    const actual = await fsSource.readdir(path);
-    if (!Array.isArray(actual) || actual.some((name) => typeof name !== "string")) fail("ERR_INTEGRITY");
-    actual.sort(byteCompare);
-    if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
-      fail("ERR_INTEGRITY");
-    }
+    if (!completed.identities.has(relativePath)) fail("ERR_INTEGRITY");
   }
   return runRoot;
+}
+
+function isJournalResidueName(name) {
+  return name === "journal.log" || name === "journal.lock" ||
+    name.startsWith("journal.lock.tombstone.");
+}
+
+async function gateExistingRun(options, roots, fsSource) {
+  const runRoot = join(roots.quarantineRoot, options.transactionId);
+  let exists = true;
+  try {
+    await fsSource.lstat(runRoot);
+  } catch (error) {
+    if (error?.code === "ENOENT") exists = false;
+    else fail("ERR_INTEGRITY");
+  }
+  if (!exists) return;
+  await validateLayoutDirectory(
+    runRoot,
+    runRoot,
+    roots.quarantineIdentity.dev,
+    fsSource,
+  );
+  let rootNames;
+  try {
+    rootNames = await fsSource.readdir(runRoot);
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  if (!Array.isArray(rootNames) || rootNames.some((name) => typeof name !== "string")) {
+    fail("ERR_INTEGRITY");
+  }
+  if (rootNames.some(isJournalResidueName)) {
+    try {
+      await withQuarantineRunCapability({
+        repoRoot: roots.repoRoot,
+        quarantineRoot: roots.quarantineRoot,
+        transactionId: options.transactionId,
+        writersStopped: true,
+        fsApi: fsSource,
+      }, async (capability) => {
+        if (rootNames.includes("journal.log")) {
+          try {
+            await replayJournal({ capability });
+          } catch {
+            // A malformed or torn journal is still recovery evidence. The gate
+            // deliberately performs no repair or append.
+          }
+        }
+      });
+    } catch (error) {
+      if (error instanceof ClassifiedFailure) throw error;
+      fail("ERR_INTEGRITY");
+    }
+    fail("ERR_RECOVERY_REQUIRED");
+  }
+  await scanExistingLayout(
+    runRoot,
+    roots.quarantineIdentity.dev,
+    fsSource,
+    "apply-precommit-resume",
+  );
 }
 
 const INSPECT_ALLOWED = Object.freeze([
@@ -1133,43 +1228,62 @@ export async function inspectWorkspace(input) {
   }
 }
 
-export async function prepareQuarantineWorkspace(input) {
-  let hook;
-  let hookRejected = false;
-  try {
-    const options = snapshotOptions(input, PREPARE_ALLOWED, PREPARE_REQUIRED);
-    validateCommon(options);
-    validateTransactionId(options.transactionId);
-    validateCreatedAt(options.createdAt);
-    if (options.writersStopped !== true) fail("ERR_USAGE");
-    if (Object.hasOwn(options, "faultHook") && typeof options.faultHook !== "function") fail("ERR_USAGE");
-    hook = options.faultHook;
-    const fsSource = captureFsSource(options.fsApi);
-    const environment = snapshotGitEnvironment();
-    const discovery = await discover(options, fsSource, environment);
-    const runRoot = await ensureLayout(discovery, options, fsSource);
-    if (hook !== undefined) {
-      try {
-        await hook("after-layout-sync");
-      } catch (error) {
-        hookRejected = true;
-        throw error;
-      }
+async function prepareWorkspaceCore(input, mode, hookState) {
+  const options = snapshotOptions(input, PREPARE_ALLOWED, PREPARE_REQUIRED);
+  validateCommon(options);
+  validateTransactionId(options.transactionId);
+  validateCreatedAt(options.createdAt);
+  if (options.writersStopped !== true) fail("ERR_USAGE");
+  if (Object.hasOwn(options, "faultHook") && typeof options.faultHook !== "function") {
+    fail("ERR_USAGE");
+  }
+  const fsSource = captureFsSource(options.fsApi);
+  if (mode === "apply-precommit-resume") {
+    const roots = await validateRoots(options, fsSource);
+    await gateExistingRun(options, roots, fsSource);
+  }
+  const environment = snapshotGitEnvironment();
+  const discovery = await discover(options, fsSource, environment);
+  const runRoot = await ensureLayout(discovery, options, fsSource, mode);
+  if (options.faultHook !== undefined) {
+    try {
+      await options.faultHook("after-layout-sync");
+    } catch (error) {
+      hookState.rejected = true;
+      throw error;
     }
-    return record([
-      ["status", "LAYOUT_READY"],
-      ["transactionId", options.transactionId],
-      ["createdAt", options.createdAt],
-      ["repoRoot", discovery.roots.repoRoot],
-      ["quarantineRoot", discovery.roots.quarantineRoot],
-      ["runRoot", runRoot],
-      ["branch", discovery.branch],
-      ["head", discovery.head],
-      ["entries", discovery.entries],
-      ["fsSource", fsSource],
-    ]);
+  }
+  return record([
+    ["status", "LAYOUT_READY"],
+    ["transactionId", options.transactionId],
+    ["createdAt", options.createdAt],
+    ["repoRoot", discovery.roots.repoRoot],
+    ["quarantineRoot", discovery.roots.quarantineRoot],
+    ["runRoot", runRoot],
+    ["branch", discovery.branch],
+    ["head", discovery.head],
+    ["entries", discovery.entries],
+    ["fsSource", fsSource],
+  ]);
+}
+
+export async function prepareQuarantineWorkspace(input) {
+  const hookState = { rejected: false };
+  try {
+    return await prepareWorkspaceCore(input, "strict", hookState);
   } catch (error) {
-    if (hookRejected) throw error;
+    if (hookState.rejected) throw error;
     throw publicError(error, "ERR_PREFLIGHT");
+  }
+}
+
+export async function quarantineWorkspace(input) {
+  const hookState = { rejected: false };
+  try {
+    await prepareWorkspaceCore(input, "apply-precommit-resume", hookState);
+    fail("ERR_INTERNAL");
+  } catch (error) {
+    if (hookState.rejected) throw error;
+    throw publicError(error, "ERR_INTERNAL");
   }
 }

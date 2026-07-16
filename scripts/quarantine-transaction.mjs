@@ -1,1 +1,4 @@
-export { inspectWorkspace } from "./quarantine-workspace-runtime.mjs";
+export {
+  inspectWorkspace,
+  quarantineWorkspace,
+} from "./quarantine-workspace-runtime.mjs";
