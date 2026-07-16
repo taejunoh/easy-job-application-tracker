@@ -866,6 +866,112 @@ const result = await withQuarantineRunCapability({
       bytesUnchanged: before.equals(await fsPromises.readFile(journalPath)),
     };
   }
+  if (request.operation === "intent-ledger-cap") {
+    const canonicalizeValue = (value) => {
+      if (value === null || typeof value !== "object") return value;
+      if (Array.isArray(value)) return value.map(canonicalizeValue);
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [
+        key,
+        canonicalizeValue(value[key]),
+      ]));
+    };
+    const summary = { sha256: "b".repeat(64), entries: 1, bytes: 1 };
+    const prepared = {
+      event: "PREPARED",
+      payload: { transactionId: "tx-0001", manifestSha256: "a".repeat(64) },
+    };
+    const moving = { event: "MOVING", payload: {} };
+    const intentIds = Array.from({ length: request.count }, (_, index) =>
+      "copy-" + String(index + 1).padStart(4, "0"));
+    const moveIntent = (id) => ({ event: "MOVE_INTENT", payload: { id, expected: summary } });
+    const restoreIntent = (id) => ({ event: "RESTORE_INTENT", payload: { id } });
+    const values = request.context === "apply"
+      ? [prepared, moving, ...intentIds.map(moveIntent)]
+      : [
+        prepared,
+        moving,
+        moveIntent("copy-9999"),
+        { event: "MOVED", payload: { id: "copy-9999", observed: summary } },
+        { event: "VERIFYING", payload: {} },
+        { event: "QUARANTINED", payload: {} },
+        {
+          event: "RESTORE_PREPARED",
+          payload: {
+            restoreId: "22222222-2222-4222-8222-222222222222",
+            activeGenerated: [
+              { id: "generated-next", inventory: null },
+              { id: "generated-node-modules", inventory: null },
+            ],
+          },
+        },
+        { event: "RESTORING", payload: {} },
+        ...intentIds.map(restoreIntent),
+      ];
+    const chunks = [];
+    let previousHash = "0".repeat(64);
+    for (let index = 0; index < values.length; index += 1) {
+      const sequence = index + 1;
+      const event = values[index].event;
+      const payload = canonicalizeValue(values[index].payload);
+      const recordHash = createHash("sha256")
+        .update(JSON.stringify({ sequence, previousHash, event, payload }))
+        .digest("hex");
+      const body = Buffer.from(JSON.stringify({
+        sequence,
+        previousHash,
+        event,
+        payload,
+        recordHash,
+      }));
+      const length = Buffer.alloc(4);
+      length.writeUInt32BE(body.length);
+      chunks.push(length, body);
+      previousHash = recordHash;
+    }
+    const journalPath = deriveRunPath(capability, { purpose: "journal" });
+    await fsPromises.writeFile(journalPath, Buffer.concat(chunks), { mode: 0o600 });
+    await fsPromises.chmod(journalPath, 0o600);
+    if (request.case === "crafted-replay") {
+      const replayed = await capture(() => journal.replayJournal({ capability }));
+      return replayed.ok
+        ? {
+          ok: true,
+          value: {
+            state: replayed.value.state,
+            recordCount: replayed.value.records.length,
+          },
+        }
+        : replayed;
+    }
+    const before = await journal.replayJournal({ capability });
+    const beforeBytes = await fsPromises.readFile(journalPath);
+    const record = request.case === "recovery-boundary"
+      ? {
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: intentIds },
+      }
+      : request.context === "apply"
+        ? moveIntent("copy-4097")
+        : restoreIntent("copy-4097");
+    const outcome = await capture(() => appendAll(capability, [record]));
+    const after = await journal.replayJournal({ capability });
+    const compactReplay = (replayed) => ({
+      state: replayed.state,
+      recordCount: replayed.records.length,
+      tipSequence: replayed.records.at(-1).sequence,
+      tipHash: replayed.records.at(-1).recordHash,
+      lastEntryIds: replayed.records.at(-1).payload.entryIds?.length ?? null,
+    });
+    return {
+      outcome,
+      before: compactReplay(before),
+      after: compactReplay(after),
+      bytesUnchanged: beforeBytes.equals(await fsPromises.readFile(journalPath)),
+      tipUnchanged:
+        before.records.at(-1).sequence === after.records.at(-1).sequence &&
+        before.records.at(-1).recordHash === after.records.at(-1).recordHash,
+    };
+  }
   if (request.operation === "journal-regression") {
     await appendAll(capability, request.prefix);
     const journalPath = deriveRunPath(capability, { purpose: "journal" });
@@ -2042,6 +2148,53 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.elementReads).toBe(0);
     expect(result.bytesUnchanged).toBe(false);
   });
+
+  it.each(["apply", "restore"])(
+    "accepts a 4096-entry %s intent ledger and exact recovery array",
+    (context) => {
+      const result = invoke(join(fixture, `intent-ledger-boundary-${context}`), {
+        operation: "intent-ledger-cap",
+        case: "recovery-boundary",
+        context,
+        count: 4096,
+      });
+      expect(result.outcome.ok).toBe(true);
+      expect(result.after.state).toBe("RECOVERY_REQUIRED");
+      expect(result.after.lastEntryIds).toBe(4096);
+      expect(result.bytesUnchanged).toBe(false);
+    },
+  );
+
+  it.each(["apply", "restore"])(
+    "rejects the 4097th public %s intent append without changing the tip",
+    (context) => {
+      const result = invoke(join(fixture, `intent-ledger-append-cap-${context}`), {
+        operation: "intent-ledger-cap",
+        case: "public-append",
+        context,
+        count: 4096,
+      });
+      expect(result.outcome.ok).toBe(false);
+      expect(result.bytesUnchanged).toBe(true);
+      expect(result.tipUnchanged).toBe(true);
+      expect(result.before.state).toBe(context === "apply" ? "MOVING" : "RESTORING");
+      expect(result.after).toEqual(result.before);
+    },
+  );
+
+  it.each(["apply", "restore"])(
+    "rejects a crafted replay containing 4097 unique %s intents",
+    (context) => {
+      const result = invoke(join(fixture, `intent-ledger-replay-cap-${context}`), {
+        operation: "intent-ledger-cap",
+        case: "crafted-replay",
+        context,
+        count: 4097,
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error.message).toMatch(/4096|intent|limit|maximum/u);
+    },
+  );
 
   it.each([
     ["RECOVERY_REQUIRED", [records.prepared, records.moving], {

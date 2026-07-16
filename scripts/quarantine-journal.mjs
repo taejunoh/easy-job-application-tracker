@@ -520,6 +520,11 @@ function validateJournalSemantics(records) {
       if (applyIntents.includes(record.payload.id)) {
         throw new Error("duplicate MOVE_INTENT entry ID");
       }
+      if (applyIntents.length >= MAX_JOURNAL_ENTRY_IDS) {
+        throw new Error(
+          `MOVE_INTENT ledger exceeds the ${MAX_JOURNAL_ENTRY_IDS} recoverable entry limit`,
+        );
+      }
       applyIntents.push(record.payload.id);
     } else if (record.event === "MOVED") {
       if (firstUnresolved(applyIntents, applyCompleted) !== record.payload.id) {
@@ -535,6 +540,11 @@ function validateJournalSemantics(records) {
     } else if (record.event === "RESTORE_INTENT") {
       if (restoreIntents.includes(record.payload.id)) {
         throw new Error("duplicate RESTORE_INTENT entry ID");
+      }
+      if (restoreIntents.length >= MAX_JOURNAL_ENTRY_IDS) {
+        throw new Error(
+          `RESTORE_INTENT ledger exceeds the ${MAX_JOURNAL_ENTRY_IDS} recoverable entry limit`,
+        );
       }
       restoreIntents.push(record.payload.id);
     } else if (record.event === "RESTORED_ENTRY") {
