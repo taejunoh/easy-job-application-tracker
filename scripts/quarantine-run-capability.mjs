@@ -51,7 +51,7 @@ function snapshotPublicRecord(value, allowed, required, label) {
   const keys = Reflect.ownKeys(value);
   for (const key of keys) {
     if (typeof key !== "string" || !allowed.includes(key)) {
-      throw new TypeError(`${label} has an unknown field: ${key}`);
+      throw new TypeError(`${label} has an unknown field: ${String(key)}`);
     }
   }
   for (const key of required) {
@@ -199,6 +199,11 @@ const PURPOSES = Object.freeze({
     parent: join(runRoot, "divergent-diffs"),
     parentRoot: "run",
   }),
+  "divergent-diff-temp": ({ runRoot, id }) => ({
+    path: join(runRoot, "divergent-diffs", `.${id}.tmp`),
+    parent: join(runRoot, "divergent-diffs"),
+    parentRoot: "run",
+  }),
 });
 
 function validateRequest(request, includeBoundary = false) {
@@ -256,6 +261,7 @@ function validateRequest(request, includeBoundary = false) {
       assertGeneratedEntryId(normalized.phase);
       break;
     case "divergent-diff":
+    case "divergent-diff-temp":
       assertIdOnly(normalized, (id) => assertIdentifier(id, COPY_ID, "source copy"));
       break;
     case "inventory":
@@ -354,6 +360,63 @@ async function assertSelectedParent(state, derived, fsApi) {
     !isWithinOrEqual(root.realPath, resolvedParent)
   ) {
     throw new Error("selected path parent identity or containment changed");
+  }
+}
+
+function isMissingPath(error) {
+  return error !== null && typeof error === "object" && error.code === "ENOENT";
+}
+
+function assertTemporaryFileStat(stat, state) {
+  if (stat.isSymbolicLink()) {
+    throw new TypeError("divergent diff temporary must not be a symlink");
+  }
+  if (!stat.isFile()) {
+    throw new TypeError("divergent diff temporary must be a regular file");
+  }
+  if ((stat.mode & 0o7777) !== 0o600) {
+    throw new TypeError("divergent diff temporary must have mode 0600");
+  }
+  if (stat.dev !== state.run.dev) {
+    throw new Error("divergent diff temporary is on a different device");
+  }
+}
+
+function assertOptionalTemporarySync(state, derived, fsApi) {
+  let before;
+  try {
+    before = fsApi.lstatSync(derived.path);
+  } catch (error) {
+    if (isMissingPath(error)) return;
+    throw error;
+  }
+  assertTemporaryFileStat(before, state);
+  if (fsApi.realpathSync(derived.path) !== derived.path) {
+    throw new Error("divergent diff temporary canonical path changed");
+  }
+  const after = fsApi.lstatSync(derived.path);
+  assertTemporaryFileStat(after, state);
+  if (!sameIdentity(before, after)) {
+    throw new Error("divergent diff temporary identity changed");
+  }
+}
+
+async function assertOptionalTemporary(state, derived, fsApi) {
+  let before;
+  try {
+    before = await fsApi.lstat(derived.path);
+  } catch (error) {
+    if (isMissingPath(error)) return;
+    throw error;
+  }
+  assertTemporaryFileStat(before, state);
+  if ((await fsApi.realpath(derived.path)) !== derived.path) {
+    throw new Error("divergent diff temporary canonical path changed");
+  }
+  const after = await fsApi.lstat(derived.path);
+  assertTemporaryFileStat(after, state);
+  if (!sameIdentity(before, after)) {
+    throw new Error("divergent diff temporary identity changed");
   }
 }
 
@@ -484,6 +547,9 @@ export function deriveRunPath(capability, request) {
     fsApi,
   );
   assertSelectedParentSync(state, derived, fsApi);
+  if (validatedRequest.purpose === "divergent-diff-temp") {
+    assertOptionalTemporarySync(state, derived, fsApi);
+  }
   return derived.path;
 }
 
@@ -505,4 +571,7 @@ export async function revalidateRunCapability(capability, request) {
     fsApi,
   );
   await assertSelectedParent(state, derived, fsApi);
+  if (validatedRequest.purpose === "divergent-diff-temp") {
+    await assertOptionalTemporary(state, derived, fsApi);
+  }
 }

@@ -110,6 +110,7 @@ import {
   realpathSync,
   renameSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -309,6 +310,10 @@ async function run() {
         purpose: ["journal"],
         boundary: ["before-mutation", "invalid"],
       });
+      const divergentTemporary = changingProxy({
+        purpose: ["divergent-diff-temp", "divergent-diff"],
+        id: ["copy-0001", "copy-9999"],
+      });
       return {
         sha: {
           counts: sha.counts,
@@ -330,8 +335,98 @@ async function run() {
           frozen: Object.isFrozen(boundary.proxy),
           outcome: await capture(() => revalidateRunCapability(capability, boundary.proxy)),
         },
+        divergentTemporary: {
+          counts: divergentTemporary.counts,
+          frozen: Object.isFrozen(divergentTemporary.proxy),
+          outcome: await capture(() => deriveRunPath(capability, divergentTemporary.proxy)),
+        },
       };
     });
+  }
+  if (request.operation === "temp-hostile-requests") {
+    return withQuarantineRunCapability(options(), async (capability) => {
+      const withSymbol = { purpose: "divergent-diff-temp", id: "copy-0001" };
+      withSymbol[Symbol("unknown")] = true;
+      const requests = [
+        {},
+        { id: "copy-0001" },
+        { purpose: "divergent-diff-temp" },
+        { purpose: "divergent-diff-temp", id: "copy-0001", phase: "pre" },
+        { purpose: "divergent-diff-temp", id: "copy-0001", unknown: true },
+        withSymbol,
+      ];
+      return Promise.all(requests.map((pathRequest) =>
+        capture(() => deriveRunPath(capability, pathRequest))
+      ));
+    });
+  }
+  if (request.operation === "temp-target-validation") {
+    const tempPath = join(
+      request.fixture.runRoot,
+      "divergent-diffs",
+      ".copy-0001.tmp",
+    );
+    if (["valid", "wrong-mode", "device", "swap", "swap-async"].includes(request.variant)) {
+      writeFileSync(tempPath, "temporary patch", { mode: 0o600 });
+      chmodSync(tempPath, request.variant === "wrong-mode" ? 0o644 : 0o600);
+    }
+    if (request.variant === "directory") privateDirectory(tempPath);
+    if (request.variant === "symlink") {
+      const external = join(request.fixture.base, "external-temp");
+      writeFileSync(external, "external", { mode: 0o600 });
+      symlinkSync(external, tempPath);
+    }
+
+    let swapped = false;
+    const maybeDeviceMismatch = (path, stat) => {
+      if (request.variant !== "device" || path !== tempPath) return stat;
+      return new Proxy(stat, {
+        get(target, property) {
+          if (property === "dev") return Number(target.dev) + 1;
+          return Reflect.get(target, property, target);
+        },
+      });
+    };
+    const swap = () => {
+      if (swapped) return;
+      swapped = true;
+      renameSync(tempPath, tempPath + ".original");
+      writeFileSync(tempPath, "replacement", { mode: 0o600 });
+    };
+    const fsApi = completeNodeAdapter({
+      lstatSync(path) {
+        return maybeDeviceMismatch(path, lstatSync(path));
+      },
+      async lstat(path) {
+        return maybeDeviceMismatch(path, await fsPromises.lstat(path));
+      },
+      realpathSync(path) {
+        const resolved = realpathSync(path);
+        if (request.variant === "swap" && path === tempPath) swap();
+        return resolved;
+      },
+      async realpath(path) {
+        const resolved = await fsPromises.realpath(path);
+        if (request.variant === "swap-async" && path === tempPath) swap();
+        return resolved;
+      },
+    });
+    return withQuarantineRunCapability(options({ fsApi }), async (capability) => ({
+      derive: await capture(() => deriveRunPath(capability, {
+        purpose: "divergent-diff-temp",
+        id: "copy-0001",
+      })),
+      before: await capture(() => revalidateRunCapability(capability, {
+        purpose: "divergent-diff-temp",
+        id: "copy-0001",
+        boundary: "before-mutation",
+      })),
+      after: await capture(() => revalidateRunCapability(capability, {
+        purpose: "divergent-diff-temp",
+        id: "copy-0001",
+        boundary: "after-sync",
+      })),
+    }));
   }
   if (request.operation === "virtual-adapter") {
     const virtual = {
@@ -689,6 +784,7 @@ describe("callback-scoped quarantine run capability", () => {
       { purpose: "rollback-entry", id: RESTORE_ID, phase: "generated-node-modules" },
       { purpose: "conflict", id: "generated-node-modules" },
       { purpose: "divergent-diff", id: "copy-0042" },
+      { purpose: "divergent-diff-temp", id: "copy-0042" },
     ];
     const expected = [
       join(fixture.runRoot, "journal.log"),
@@ -720,6 +816,7 @@ describe("callback-scoped quarantine run capability", () => {
       ),
       join(fixture.runRoot, "conflicts", "generated-node-modules"),
       join(fixture.runRoot, "divergent-diffs", "copy-0042.patch"),
+      join(fixture.runRoot, "divergent-diffs", ".copy-0042.tmp"),
     ];
 
     expect(workerValue(invoke(fixture, { operation: "derive-many", requests }))).toEqual(expected);
@@ -795,7 +892,23 @@ describe("callback-scoped quarantine run capability", () => {
         frozen: true,
         outcome: { threw: false },
       },
+      divergentTemporary: {
+        counts: { purpose: 1, id: 1 },
+        frozen: true,
+        outcome: {
+          threw: false,
+          value: join(fixture.runRoot, "divergent-diffs", ".copy-0001.tmp"),
+        },
+      },
     });
+  });
+
+  it("rejects missing, unknown, extra, and symbol fields for divergent diff temporaries", () => {
+    const values = workerValue(invoke(fixture, { operation: "temp-hostile-requests" }));
+    expect(values).toHaveLength(6);
+    for (const value of values) {
+      expectCapturedError(value, /purpose|request|field|symbol/u);
+    }
   });
 
   it("uses one virtual filesystem adapter for open, derive, and revalidation", () => {
@@ -972,6 +1085,7 @@ describe("callback-scoped quarantine run capability", () => {
       phase: "generated-next",
       entryId: "generated-next",
     },
+    { purpose: "divergent-diff-temp", id: "copy-0001", phase: "pre" },
   ])("rejects invalid purpose/id/phase combinations: %o", (pathRequest) => {
     const value = workerValue(invoke(fixture, { operation: "derive-error", pathRequest }));
     expectCapturedError(value, /purpose|request|phase|field/u);
@@ -1000,6 +1114,9 @@ describe("callback-scoped quarantine run capability", () => {
     { purpose: "rollback-entry", id: RESTORE_ID, phase: "generated-dist" },
     { purpose: "conflict", id: RESTORE_ID },
     { purpose: "divergent-diff", id: "generated-next" },
+    { purpose: "divergent-diff-temp", id: "generated-next" },
+    { purpose: "divergent-diff-temp", id: "copy-001" },
+    { purpose: "divergent-diff-temp", id: "copy-10000" },
     { purpose: "inventory", phase: "pre", id: RESTORE_ID },
     { purpose: "inventory", phase: "restore-active", id: "copy-0001" },
     { purpose: "inventory", phase: "restore-active", id: RESTORE_ID },
@@ -1014,6 +1131,7 @@ describe("callback-scoped quarantine run capability", () => {
     { purpose: "payload", id: "copy-0000" },
     { purpose: "conflict", id: "copy-0000" },
     { purpose: "divergent-diff", id: "copy-0000" },
+    { purpose: "divergent-diff-temp", id: "copy-0000" },
     { purpose: "inventory", phase: "pre", id: "copy-0000" },
     { purpose: "inventory", phase: "moved-pass-1", id: "copy-0000" },
     { purpose: "inventory", phase: "moved-pass-2", id: "copy-0000" },
@@ -1091,6 +1209,11 @@ describe("callback-scoped quarantine run capability", () => {
     ["inventory", { purpose: "inventory", phase: "pre", id: "copy-0001" }, "inventories/pre"],
     ["manifest", { purpose: "manifest-generation", id: DIGEST }, "manifests"],
     [
+      "divergent diff temporary",
+      { purpose: "divergent-diff-temp", id: "copy-0001" },
+      "divergent-diffs",
+    ],
+    [
       "rollback entry",
       { purpose: "rollback-entry", id: RESTORE_ID, phase: "generated-next" },
       `rollback/regenerated-before-restore/${RESTORE_ID}`,
@@ -1117,6 +1240,7 @@ describe("callback-scoped quarantine run capability", () => {
 
   it.each([
     ["manifest", { purpose: "manifest-generation", id: DIGEST }],
+    ["divergent diff temporary", { purpose: "divergent-diff-temp", id: "copy-0001" }],
     [
       "rollback entry",
       { purpose: "rollback-entry", id: RESTORE_ID, phase: "generated-next" },
@@ -1126,5 +1250,67 @@ describe("callback-scoped quarantine run capability", () => {
     expectCapturedError(value.derive, /0700|mode/u);
     expectCapturedError(value.before, /0700|mode/u);
     expectCapturedError(value.after, /0700|mode/u);
+  });
+
+  it.each(["absent", "valid"])(
+    "accepts a %s divergent diff temporary at derivation and both boundaries",
+    (variant) => {
+      const value = workerValue(
+        invoke(fixture, { operation: "temp-target-validation", variant }),
+      );
+      const expected = join(fixture.runRoot, "divergent-diffs", ".copy-0001.tmp");
+      expect(value).toEqual({
+        derive: { threw: false, value: expected },
+        before: { threw: false },
+        after: { threw: false },
+      });
+    },
+  );
+
+  it.each(["symlink", "directory", "wrong-mode", "device"])(
+    "rejects a divergent diff temporary with invalid %s state at every check",
+    (variant) => {
+      const value = workerValue(
+        invoke(fixture, { operation: "temp-target-validation", variant }),
+      );
+      expectCapturedError(value.derive, /temporary|symlink|regular|0600|device|mode/u);
+      expectCapturedError(value.before, /temporary|symlink|regular|0600|device|mode/u);
+      expectCapturedError(value.after, /temporary|symlink|regular|0600|device|mode/u);
+    },
+  );
+
+  it("rejects a divergent diff temporary path swap during validation", () => {
+    const value = workerValue(
+      invoke(fixture, { operation: "temp-target-validation", variant: "swap" }),
+    );
+    expectCapturedError(value.derive, /identity|changed|temporary/u);
+  });
+
+  it("rejects an asynchronous divergent diff temporary path swap at a boundary", () => {
+    const value = workerValue(
+      invoke(fixture, { operation: "temp-target-validation", variant: "swap-async" }),
+    );
+    expect(value.derive).toEqual({
+      threw: false,
+      value: join(fixture.runRoot, "divergent-diffs", ".copy-0001.tmp"),
+    });
+    expectCapturedError(value.before, /identity|changed|temporary/u);
+  });
+
+  it("keeps the final divergent diff path distinct and unchanged", () => {
+    const finalPath = join(fixture.runRoot, "divergent-diffs", "copy-0001.patch");
+    writeFileSync(finalPath, "published patch", { mode: 0o600 });
+    const value = workerValue(invoke(fixture, {
+      operation: "derive-many",
+      requests: [
+        { purpose: "divergent-diff", id: "copy-0001" },
+        { purpose: "divergent-diff-temp", id: "copy-0001" },
+      ],
+    }));
+    expect(value).toEqual([
+      finalPath,
+      join(fixture.runRoot, "divergent-diffs", ".copy-0001.tmp"),
+    ]);
+    expect(readFileSync(finalPath, "utf8")).toBe("published patch");
   });
 });
