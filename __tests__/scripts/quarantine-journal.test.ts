@@ -14,7 +14,7 @@ const capabilityModuleUrl = pathToFileURL(
 
 const manifestSha256 = "a".repeat(64);
 const validSummary = { sha256: "b".repeat(64), entries: 1, bytes: 1 };
-const restoreId = "restore-22222222-2222-4222-8222-222222222222";
+const restoreId = "restore-123e4567-e89b-42d3-a456-426614174000";
 const inventoryRecord = {
   scope: "root",
   type: "file",
@@ -898,7 +898,7 @@ const result = await withQuarantineRunCapability({
         {
           event: "RESTORE_PREPARED",
           payload: {
-            restoreId: "restore-22222222-2222-4222-8222-222222222222",
+            restoreId: "restore-123e4567-e89b-42d3-a456-426614174000",
             activeGenerated: [
               { id: "generated-next", inventory: null },
               { id: "generated-node-modules", inventory: null },
@@ -2826,7 +2826,11 @@ describe("capability-bound durable quarantine journal", () => {
     ["unknown key", { restoreId, activeGenerated: activeGenerated(), extra: true }],
     ["invalid restoreId", { restoreId: "restore-1", activeGenerated: activeGenerated() }],
     ["bare restore UUID", {
-      restoreId: "22222222-2222-4222-8222-222222222222",
+      restoreId: "123e4567-e89b-42d3-a456-426614174000",
+      activeGenerated: activeGenerated(),
+    }],
+    ["double-prefixed restore ID", {
+      restoreId: "restore-restore-123e4567-e89b-42d3-a456-426614174000",
       activeGenerated: activeGenerated(),
     }],
     ["uppercase restore ID", {
@@ -2834,11 +2838,11 @@ describe("capability-bound durable quarantine journal", () => {
       activeGenerated: activeGenerated(),
     }],
     ["wrong restore UUID version", {
-      restoreId: "restore-22222222-2222-3222-8222-222222222222",
+      restoreId: "restore-123e4567-e89b-32d3-a456-426614174000",
       activeGenerated: activeGenerated(),
     }],
     ["wrong restore UUID variant", {
-      restoreId: "restore-22222222-2222-4222-7222-222222222222",
+      restoreId: "restore-123e4567-e89b-42d3-7456-426614174000",
       activeGenerated: activeGenerated(),
     }],
     ["missing generated record", { restoreId, activeGenerated: activeGenerated().slice(0, 1) }],

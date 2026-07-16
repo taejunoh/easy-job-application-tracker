@@ -37,7 +37,7 @@ const REQUIRED_FS_METHODS = [
 ] as const;
 const TRANSACTION_ID = "cleanup.2026-07-15_A";
 const UUID = "123e4567-e89b-42d3-a456-426614174000";
-const RESTORE_ID = `restore-${UUID}`;
+const RESTORE_ID = "restore-123e4567-e89b-42d3-a456-426614174000";
 const DIGEST = "a".repeat(64);
 
 type Fixture = {
