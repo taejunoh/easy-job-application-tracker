@@ -984,12 +984,29 @@ async function syncDirectory(path, fsSource) {
   let handle;
   try {
     handle = await fsSource.open(path, "r");
-    await handle.sync();
-    await handle.close();
   } catch {
-    try { await handle?.close(); } catch {}
     fail("ERR_PREFLIGHT");
   }
+  let close;
+  try {
+    close = handle.close;
+  } catch {
+    fail("ERR_PREFLIGHT");
+  }
+  if (typeof close !== "function") fail("ERR_PREFLIGHT");
+  let syncFailed = false;
+  try {
+    await handle.sync();
+  } catch {
+    syncFailed = true;
+  }
+  let closeFailed = false;
+  try {
+    await Reflect.apply(close, handle, []);
+  } catch {
+    closeFailed = true;
+  }
+  if (syncFailed || closeFailed) fail("ERR_PREFLIGHT");
 }
 
 async function ensureLayout(discovery, options, fsSource) {
@@ -1026,8 +1043,14 @@ async function ensureLayout(discovery, options, fsSource) {
       try {
         await fsSource.mkdir(path, { mode: PRIVATE_MODE });
       } catch (error) {
-        if (error?.code !== "EEXIST") {
-          if (error?.code === "EXDEV") fail("ERR_EXDEV");
+        let code;
+        try {
+          code = error?.code;
+        } catch {
+          fail("ERR_PREFLIGHT");
+        }
+        if (code !== "EEXIST") {
+          if (code === "EXDEV") fail("ERR_EXDEV");
           fail("ERR_PREFLIGHT");
         }
       }
@@ -1112,7 +1135,7 @@ export async function inspectWorkspace(input) {
 
 export async function prepareQuarantineWorkspace(input) {
   let hook;
-  let hookError;
+  let hookRejected = false;
   try {
     const options = snapshotOptions(input, PREPARE_ALLOWED, PREPARE_REQUIRED);
     validateCommon(options);
@@ -1129,7 +1152,7 @@ export async function prepareQuarantineWorkspace(input) {
       try {
         await hook("after-layout-sync");
       } catch (error) {
-        hookError = error;
+        hookRejected = true;
         throw error;
       }
     }
@@ -1146,7 +1169,7 @@ export async function prepareQuarantineWorkspace(input) {
       ["fsSource", fsSource],
     ]);
   } catch (error) {
-    if (error === hookError) throw error;
+    if (hookRejected) throw error;
     throw publicError(error, "ERR_PREFLIGHT");
   }
 }

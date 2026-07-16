@@ -222,6 +222,12 @@ type WorkerResult = {
   wrongReceiver?: number;
   firstCode?: string;
   runRootOpenAttempts?: number;
+  hookCalls?: number;
+  thrownUndefined?: boolean;
+  codeReads?: number;
+  closeGetterReads?: number;
+  closeCalls?: number;
+  closeWrongReceiver?: number;
   active?: { callable: boolean; distinctRejected: boolean };
   revoked?: boolean;
   sourceFrozen?: boolean;
@@ -584,6 +590,117 @@ try {
       faultHook() { throw injected; },
     });
     process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "hook-sentinel") {
+    const { variant, ...runtimeRequest } = request;
+    let hookCalls = 0;
+    let rejected = false;
+    let captured;
+    const adapter = variant === "prehook-undefined" ? {
+      ...fsPromises,
+      async readdir() { throw undefined; },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    } : undefined;
+    try {
+      await runtime.prepareQuarantineWorkspace({
+        ...runtimeRequest,
+        ...(adapter === undefined ? {} : { fsApi: adapter }),
+        faultHook() {
+          hookCalls += 1;
+          if (variant === "hook-undefined") throw undefined;
+        },
+      });
+    } catch (error) {
+      rejected = true;
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: !rejected,
+      hookCalls,
+      thrownUndefined: rejected && captured === undefined,
+      error: rejected && captured !== undefined ? errorShape(captured) : undefined,
+    }));
+  } else if (operation === "mkdir-error-code") {
+    const { variant, ...runtimeRequest } = request;
+    let codeReads = 0;
+    const mkdirError = {};
+    Object.defineProperty(mkdirError, "code", {
+      get() {
+        codeReads += 1;
+        if (variant === "throw") throw new Error("code getter failure");
+        return codeReads === 1 ? "EXDEV" : "EACCES";
+      },
+    });
+    const adapter = {
+      ...fsPromises,
+      async mkdir() { throw mkdirError; },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let rejected = false;
+    let captured;
+    try {
+      await runtime.prepareQuarantineWorkspace({ ...runtimeRequest, fsApi: adapter });
+    } catch (error) {
+      rejected = true;
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: !rejected,
+      codeReads,
+      error: rejected ? errorShape(captured) : undefined,
+    }));
+  } else if (operation === "sync-close-lifecycle") {
+    const { variant, ...runtimeRequest } = request;
+    let closeGetterReads = 0;
+    let closeCalls = 0;
+    let closeWrongReceiver = 0;
+    let wrapped = false;
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        const realHandle = await fsPromises.open(path, ...args);
+        if (wrapped) return realHandle;
+        wrapped = true;
+        let handle;
+        handle = {
+          async sync() {
+            if (variant === "sync-reject") throw new Error("sync failure");
+            return realHandle.sync();
+          },
+          get close() {
+            closeGetterReads += 1;
+            return async function () {
+              closeCalls += 1;
+              if (this !== handle) closeWrongReceiver += 1;
+              try { await realHandle.close(); } catch {}
+              if (variant === "close-reject") throw new Error("close failure");
+            };
+          },
+        };
+        return handle;
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let rejected = false;
+    let captured;
+    try {
+      await runtime.prepareQuarantineWorkspace({ ...runtimeRequest, fsApi: adapter });
+    } catch (error) {
+      rejected = true;
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: !rejected,
+      closeGetterReads,
+      closeCalls,
+      closeWrongReceiver,
+      error: rejected ? errorShape(captured) : undefined,
+    }));
   } else if (operation === "layout-retry") {
     const { failureRelative, ...runtimeRequest } = request;
     const runRoot = join(request.quarantineRoot, request.transactionId);
@@ -2145,6 +2262,88 @@ describe("quarantine transaction Slice 1", () => {
       error: { name: "RangeError", message: "injected hook failure", frozen: false },
     });
   });
+
+  it("propagates hook throw undefined only after the hook was actually invoked", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const worker = invoke("hook-sentinel", {
+      variant: "hook-undefined",
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-hook-undefined",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    });
+    expect(worker).toMatchObject({ ok: false, hookCalls: 1, thrownUndefined: true });
+    expect(worker.error).toBeUndefined();
+  });
+
+  it("sanitizes a pre-hook internal throw undefined without invoking the hook", () => {
+    const f = fixture();
+    bases.push(f.base);
+    const worker = invoke("hook-sentinel", {
+      variant: "prehook-undefined",
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: "tx-prehook-undefined",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    });
+    expect(worker).toMatchObject({ hookCalls: 0, thrownUndefined: false });
+    expectWorkerError(worker, "ERR_PREFLIGHT", "Workspace preflight failed.");
+  });
+
+  it.each([
+    ["stateful", "ERR_EXDEV", "Repository and quarantine must be on the same filesystem."],
+    ["throw", "ERR_PREFLIGHT", "Workspace preflight failed."],
+  ] as const)("snapshots a %s mkdir error code exactly once", (variant, code, message) => {
+    const f = fixture();
+    bases.push(f.base);
+    const worker = invoke("mkdir-error-code", {
+      variant,
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      transactionId: `tx-mkdir-code-${variant}`,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    });
+    expect(worker.codeReads).toBe(1);
+    expectWorkerError(worker, code, message);
+  });
+
+  it.each(["close-reject", "sync-reject"] as const)(
+    "captures and invokes directory close exactly once for %s",
+    (variant) => {
+      const f = fixture();
+      bases.push(f.base);
+      const worker = invoke("sync-close-lifecycle", {
+        variant,
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: 1,
+        transactionId: `tx-sync-close-${variant}`,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      });
+      expect(worker).toMatchObject({
+        closeGetterReads: 1,
+        closeCalls: 1,
+        closeWrongReceiver: 0,
+      });
+      expectWorkerError(worker, "ERR_PREFLIGHT", "Workspace preflight failed.");
+    },
+  );
 
   it("rejects a non-safe source mode instead of framing a coerced value", () => {
     const f = fixture();
