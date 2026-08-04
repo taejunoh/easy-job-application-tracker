@@ -46,15 +46,15 @@ exactly those defined in the original plan.
 
 The internal handoff has one ordered, testable sequence:
 
-1. Capture the caller-provided `fsApi` and freeze that exact snapshot before
-   the first `await`.
+1. Capture the supplied `fsApi`, or the existing default filesystem source when
+   it is omitted, and freeze that exact source before the first `await`.
 2. Bind that snapshot to the live callback capability; all later core work
    uses the bound snapshot and cannot select another mutable adapter.
 3. Derive the selected transaction and run root only through capability rules,
    never from a caller path string.
 4. Validate the live quarantine/run-root identity, repository root and exact
-   HEAD, the replayed durable journal tip, and the journal-named immutable
-   manifest generation and state.
+   HEAD, the replayed durable journal tip, and the applicable journal-named
+   immutable manifest generation and state.
 5. Reject every identity, state, digest, pointer, or adapter mismatch before
    validation or restore mutation.
 6. Return only the minimum frozen, validated handoff required by the internal
@@ -64,6 +64,24 @@ Any precondition failure leaves journal, manifest pointer, and payload bytes
 unchanged. In particular, an interrupted pointer publication is evidence to
 validate and reconcile, not permission to publish a replacement during
 precondition checking.
+
+Generation provenance is state-specific. For a `QUARANTINED` run, obtain and
+validate the baseline digest and generation from the semantic `PREPARED` ledger
+record; that immutable manifest is in state `PREPARED`. Do not require a
+`QUARANTINED` tip payload or a `QUARANTINED` manifest generation. For an
+already durable `VALIDATED` run, the `VALIDATED` journal tip payload names the
+authoritative immutable `VALIDATED` generation and digest, including its stored
+retention metadata. Restore uses the applicable durable state-specific evidence
+for the run it is restoring.
+
+Pointer retry semantics are equally narrow. Preconditions never repair or
+replace a pointer. A missing `current` pointer with a valid durable
+`VALIDATED` tip and its exact journal-named generation is an
+activation-pending, recoverable state; only after all validation succeeds may
+activation publish that same existing digest. Any present malformed, foreign,
+path-bearing, or mismatched pointer is fatal and causes no mutation. Tests must
+distinguish precondition no-mutation from this explicitly allowed
+post-validation activation.
 
 Slice 4's tracked deliverables are the new
 `scripts/quarantine-lifecycle-core.mjs`, a focused private-core test suite
@@ -76,8 +94,11 @@ reuse of it.
 The private-core RED cases must cover forged or stale run identity, changed
 quarantine root or repository HEAD, torn or changed journal, a wrong, missing,
 or corrupt journal-named immutable generation, interrupted pointer
-publication, and `fsApi` identity or method mutation. Every failure case must
-prove that no journal, pointer, or payload mutation occurred.
+publication, missing-pointer activation-pending retry, each fatal present
+pointer variant, and `fsApi` identity or method mutation. Every failure case
+must prove that no journal, pointer, or payload mutation occurred; the
+activation-pending case must separately prove byte preservation before its
+allowed post-validation activation.
 
 ## Decision 2: canonical CLI invocation
 
@@ -102,8 +123,32 @@ CLI tests use the npm form, including the `--` separator.
 
 The historical design and plan remain unchanged records. For implementation
 and documentation, however, the old Slice 6 bare `cleanup:quarantine ...`
-examples are superseded by the exact commands
-`npm run cleanup:quarantine -- inspect|apply|recover|mark-validated|restore ...`.
+examples are superseded by these five independently spawned and tested command
+forms:
+
+```text
+npm run cleanup:quarantine -- inspect --repo-root <abs> --quarantine-root <abs> --expected-branch <name> --expected-head <sha> --expected-count <n>
+```
+
+```text
+npm run cleanup:quarantine -- apply --repo-root <abs> --quarantine-root <abs> --expected-branch <name> --expected-head <sha> --expected-count <n> --writers-stopped
+```
+
+```text
+npm run cleanup:quarantine -- recover --repo-root <abs> --quarantine-root <abs> --transaction-id <id> --action <action> --writers-stopped
+```
+
+The recover form is spawned independently with `<action>` set to `resume` and
+again with it set to `rollback`.
+
+```text
+npm run cleanup:quarantine -- mark-validated --repo-root <abs> --quarantine-root <abs> --transaction-id <id> --writers-stopped
+```
+
+```text
+npm run cleanup:quarantine -- restore --repo-root <abs> --quarantine-root <abs> --transaction-id <id> --writers-stopped
+```
+
 The old Slice 4 file/test scope is superseded and expanded by the lifecycle-core
 module, focused private-core suite, transaction validation integration, and
 their joint staging and review described above. Direct `node` invocation
@@ -193,11 +238,14 @@ This continuation does not authorize:
    including its required crash-boundary RED cases.
 2. Add `scripts/quarantine-lifecycle-core.mjs`, the focused private-core suite,
    and transaction validation integration; run the exact private-core RED cases
-   and stage/review all Slice 4 deliverables together.
+   for state-specific generation provenance, missing-pointer activation-pending
+   retry, fatal present-pointer variants, and adapter mutation, then
+   stage/review all Slice 4 deliverables together.
 3. Reuse the core for Slice 5 restore and restore recovery, including real
    apply/restore interruption tests and conflict/evidence preservation.
 4. Complete Slice 6's exact facade export set and closed CLI, with all public
-   documentation and tests using
-   `npm run cleanup:quarantine -- inspect|apply|recover|mark-validated|restore ...`.
+   documentation and tests using the five independently spawned command forms
+   listed under Superseded plan wording (including separate recover runs for
+   `resume` and `rollback`).
 5. Execute the aggregate tests, lint, typecheck, build, security/error review,
    and final scope checks before integration.
