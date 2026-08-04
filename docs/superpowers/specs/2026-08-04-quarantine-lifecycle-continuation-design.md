@@ -34,12 +34,50 @@ repository/HEAD evidence. It must not silently perform a generic bootstrap or
 accept an empty or merely well-shaped run as a substitute for the requested
 state.
 
-The module is imported only by internal implementation call sites. It is never
-re-exported from `quarantine-transaction`, `quarantine-workspace-runtime`, the
-compatibility facade, or the CLI. The original public export sets remain
-unchanged, and the Slice 3 `recoverQuarantine` and Slice 4
-`markQuarantineValidated` interfaces remain exactly those defined in the
-original plan. No new public API is introduced by this amendment.
+The core may be imported into internal implementation bodies of
+`quarantine-transaction`, `quarantine-restore`, and
+`quarantine-workspace-runtime`. No module may export, re-export, return, or
+otherwise expose any lifecycle-core binding; the core has no public API. The
+original public export sets remain unchanged, and the Slice 3
+`recoverQuarantine` and Slice 4 `markQuarantineValidated` interfaces remain
+exactly those defined in the original plan.
+
+### Private-core handoff contract
+
+The internal handoff has one ordered, testable sequence:
+
+1. Capture the caller-provided `fsApi` and freeze that exact snapshot before
+   the first `await`.
+2. Bind that snapshot to the live callback capability; all later core work
+   uses the bound snapshot and cannot select another mutable adapter.
+3. Derive the selected transaction and run root only through capability rules,
+   never from a caller path string.
+4. Validate the live quarantine/run-root identity, repository root and exact
+   HEAD, the replayed durable journal tip, and the journal-named immutable
+   manifest generation and state.
+5. Reject every identity, state, digest, pointer, or adapter mismatch before
+   validation or restore mutation.
+6. Return only the minimum frozen, validated handoff required by the internal
+   caller; no capability, registry, raw path, or mutable adapter escapes.
+
+Any precondition failure leaves journal, manifest pointer, and payload bytes
+unchanged. In particular, an interrupted pointer publication is evidence to
+validate and reconcile, not permission to publish a replacement during
+precondition checking.
+
+Slice 4's tracked deliverables are the new
+`scripts/quarantine-lifecycle-core.mjs`, a focused private-core test suite
+(the final test filename may be selected by the later writing-plans pass), the
+transaction validation integration that consumes the handoff, and staging and
+review of all of those changes together. This core is the only existing-run
+setup path for validation and restore; Slice 5 completes and verifies restore's
+reuse of it.
+
+The private-core RED cases must cover forged or stale run identity, changed
+quarantine root or repository HEAD, torn or changed journal, a wrong, missing,
+or corrupt journal-named immutable generation, interrupted pointer
+publication, and `fsApi` identity or method mutation. Every failure case must
+prove that no journal, pointer, or payload mutation occurred.
 
 ## Decision 2: canonical CLI invocation
 
@@ -60,6 +98,17 @@ internal or testing detail only. It must not appear as the user-facing guide,
 API, or canonical CLI contract. User documentation, examples, and canonical
 CLI tests use the npm form, including the `--` separator.
 
+## Superseded plan wording
+
+The historical design and plan remain unchanged records. For implementation
+and documentation, however, the old Slice 6 bare `cleanup:quarantine ...`
+examples are superseded by the exact commands
+`npm run cleanup:quarantine -- inspect|apply|recover|mark-validated|restore ...`.
+The old Slice 4 file/test scope is superseded and expanded by the lifecycle-core
+module, focused private-core suite, transaction validation integration, and
+their joint staging and review described above. Direct `node` invocation
+remains internal/testing detail only.
+
 ## Sequence and task boundary
 
 Keep the work reviewable and TDD-driven, with a focused RED test, GREEN
@@ -69,15 +118,18 @@ implementation, and review gate for each slice.
    in the existing runtime/transaction implementation. Do not extract the
    lifecycle core here; this slice remains recovery work and preserves its
    approved interface.
-2. **Slice 4 — validation and retention.** Introduce the narrow lifecycle-core
-   boundary immediately before validation requires it. Extract only the shared
-   existing-run setup and handoff, add focused tests for the core, and reuse it
-   for validation. Establish four-day retention only when the run reaches
-   `VALIDATED`.
-3. **Slice 5 — restore and restore recovery.** Reuse the same core and its
-   validated handoff for restore. Keep restore lifecycle and recovery behavior
-   in the restore/runtime implementation and preserve the approved restore
-   interfaces.
+2. **Slice 4 — validation and retention.** Add
+   `scripts/quarantine-lifecycle-core.mjs`, its focused private-core RED/GREEN
+   suite, and the transaction validation integration. Exercise forged/stale
+   identity, root/HEAD drift, torn/changed journal, missing/wrong/corrupt
+   generation, interrupted pointer publication, and adapter mutation, proving
+   no precondition mutation. Establish four-day retention only when the run
+   reaches `VALIDATED`, then stage and review all core and integration changes
+   together.
+3. **Slice 5 — restore and restore recovery.** Reuse that sole existing-run
+   setup path and validated handoff for restore, complete the reuse tests, and
+   keep restore lifecycle and recovery behavior in the restore/runtime
+   implementation while preserving the approved restore interfaces.
 4. **Slice 6 — facade and closed CLI.** Close the compatibility facade and
    CLI around the already reviewed implementations, preserve the exact public
    export set, and document/test the canonical npm invocation.
@@ -137,12 +189,15 @@ This continuation does not authorize:
 
 ## Five-stage decomposition for a later writing-plans pass
 
-1. Complete and review Slice 3 apply recovery and rollback in the runtime.
-2. Add and test the narrow internal lifecycle core, then use it to implement
-   and verify Slice 4 validation and post-`VALIDATED` retention metadata.
+1. Complete and review Slice 3 apply recovery and rollback in the runtime,
+   including its required crash-boundary RED cases.
+2. Add `scripts/quarantine-lifecycle-core.mjs`, the focused private-core suite,
+   and transaction validation integration; run the exact private-core RED cases
+   and stage/review all Slice 4 deliverables together.
 3. Reuse the core for Slice 5 restore and restore recovery, including real
-   interruption tests and conflict/evidence preservation.
+   apply/restore interruption tests and conflict/evidence preservation.
 4. Complete Slice 6's exact facade export set and closed CLI, with all public
-   documentation and tests using `npm run cleanup:quarantine -- ...`.
+   documentation and tests using
+   `npm run cleanup:quarantine -- inspect|apply|recover|mark-validated|restore ...`.
 5. Execute the aggregate tests, lint, typecheck, build, security/error review,
    and final scope checks before integration.
