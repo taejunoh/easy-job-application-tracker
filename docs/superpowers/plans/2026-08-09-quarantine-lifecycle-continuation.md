@@ -44,6 +44,7 @@ Line numbers below are orientation anchors from the current HEAD. Symbol names, 
 - Modify `__tests__/scripts/quarantine-transaction.test.ts:1722-5001`, `__tests__/scripts/quarantine-journal.test.ts`, and create `__tests__/scripts/quarantine-transaction-crash.integration.test.ts` for Slice 3.
 - Create `__tests__/fixtures/quarantine/quarantine-lifecycle-child.mjs` as the disposable child used by apply and restore crash suites.
 - Create `__tests__/scripts/quarantine-lifecycle-core.test.ts` and extend transaction/core tests for private handoff and mutation-free preconditions.
+- Create `__tests__/fixtures/quarantine/quarantine-test-harness.ts` as the shared test-only fixture/worker module used by Tasks 1–5.
 - Reuse `__tests__/scripts/quarantine-manifest.test.ts:1265-1891` for generation/pointer retry assertions; create `__tests__/scripts/quarantine-restore.test.ts` and `__tests__/scripts/quarantine-restore-crash.integration.test.ts` for Slice 5.
 - Modify `__tests__/scripts/quarantine-numbered-copies.test.ts:1-1046` for the exact final facade export set; create `__tests__/scripts/quarantine-cli.test.ts` for spawned npm CLI behavior.
 
@@ -51,9 +52,9 @@ Line numbers below are orientation anchors from the current HEAD. Symbol names, 
 
 Run this before Task 1. It records the implementation base and a private,
 mode-0600 inventory of the original checkout's ignored-excluded untracked
-paths under Git metadata. The Node program is complete and emits no path or
-file body to stdout; its stdout is redirected only to the designated metadata
-file.
+paths under Git metadata. The Node program is complete, writes metadata
+directly to the designated mode-0600 file, and discards stdout to `/dev/null`;
+it emits no path or file body.
 
 ```bash
 EVIDENCE_DIR="$(git rev-parse --git-path quarantine-lifecycle-evidence)"
@@ -69,8 +70,9 @@ git -C "$ORIGINAL_CHECKOUT" ls-files --others --exclude-standard -z > "$EVIDENCE
 chmod 0600 "$EVIDENCE_DIR/implementation-base" "$EVIDENCE_DIR/untracked-paths.$EVIDENCE_SUFFIX"
 node --input-type=module > /dev/null <<'NODE'
 import { createHash } from "node:crypto";
-import { createReadStream, chmodSync, lstatSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, resolve, relative } from "node:path";
+import { chmodSync, closeSync, createReadStream, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { constants as fsConstants } from "node:fs";
+import { resolve } from "node:path";
 
 const root = process.env.ORIGINAL_CHECKOUT;
 const evidenceDir = process.env.EVIDENCE_DIR;
@@ -78,40 +80,69 @@ const suffix = process.env.EVIDENCE_SUFFIX;
 const pathsPath = resolve(evidenceDir, `untracked-paths.${suffix}`);
 const metaPath = resolve(evidenceDir, `untracked-meta.${suffix}`);
 
-function rejectPath(pathText) {
-  if (pathText.length === 0 || isAbsolute(pathText)) throw new Error("invalid path");
-  const absolute = resolve(root, pathText);
-  const escaped = relative(root, absolute);
-  if (escaped === ".." || escaped.startsWith(`..${String.fromCharCode(47)}`)) throw new Error("parent escape");
-  return absolute;
+function splitNul(buffer) {
+  const paths = [];
+  let start = 0;
+  for (let index = 0; index < buffer.length; index += 1) {
+    if (buffer[index] === 0) { if (index > start) paths.push(buffer.subarray(start, index)); start = index + 1; }
+  }
+  if (start !== buffer.length) throw new Error("unterminated path list");
+  return paths;
 }
 
-async function hashRegularFile(pathText) {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(pathText)) hash.update(chunk);
-  return hash.digest("hex");
+function pathBuffer(rawPath) {
+  if (rawPath.length === 0 || rawPath[0] === 0x2f) throw new Error("invalid path");
+  let segmentStart = 0;
+  for (let index = 0; index <= rawPath.length; index += 1) {
+    if (index === rawPath.length || rawPath[index] === 0x2f) {
+      if (rawPath.subarray(segmentStart, index).equals(Buffer.from(".."))) throw new Error("parent escape");
+      segmentStart = index + 1;
+    }
+  }
+  return Buffer.concat([Buffer.from(root), Buffer.from("/"), rawPath]);
+}
+
+async function hashRegularFile(pathBufferValue, before) {
+  const descriptor = openSync(pathBufferValue, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let stream;
+  try {
+    const opened = fstatSync(descriptor);
+    if (opened.dev !== before.dev || opened.ino !== before.ino || opened.mode !== before.mode) throw new Error("identity changed");
+    const hash = createHash("sha256");
+    stream = createReadStream(null, { fd: descriptor, autoClose: false });
+    for await (const chunk of stream) hash.update(chunk);
+    const after = fstatSync(descriptor);
+    const relisted = lstatSync(pathBufferValue);
+    if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.size !== before.size || relisted.dev !== before.dev || relisted.ino !== before.ino || relisted.mode !== before.mode || relisted.size !== before.size) throw new Error("identity changed");
+    return hash.digest("hex");
+  } finally {
+    if (stream) stream.destroy();
+    closeSync(descriptor);
+  }
 }
 
 async function main() {
-  const nulPaths = readFileSync(pathsPath);
-  const pathTexts = nulPaths.length === 0 ? [] : nulPaths.toString("utf8").split(String.fromCharCode(0)).filter(Boolean);
+  const rawPaths = splitNul(readFileSync(pathsPath));
   const rows = [];
-  for (const pathText of pathTexts) {
-    const absolute = rejectPath(pathText);
+  for (const rawPath of rawPaths) {
+    const absolute = pathBuffer(rawPath);
     const stat = lstatSync(absolute);
     let type = "other";
     let hash = null;
     if (stat.isFile()) {
       type = "file";
-      hash = await hashRegularFile(absolute);
+      hash = await hashRegularFile(absolute, stat);
     } else if (stat.isSymbolicLink()) {
       type = "symlink";
-      hash = createHash("sha256").update(readlinkSync(absolute, { encoding: "buffer" })).digest("hex");
+      const linkBytes = readlinkSync(absolute, { encoding: "buffer" });
+      hash = createHash("sha256").update(linkBytes).digest("hex");
+      const relisted = lstatSync(absolute);
+      if (relisted.dev !== stat.dev || relisted.ino !== stat.ino || relisted.mode !== stat.mode) throw new Error("identity changed");
     } else if (stat.isDirectory()) {
       type = "directory";
     }
     rows.push(JSON.stringify({
-      path: Buffer.from(pathText, "utf8").toString("base64"),
+      path: rawPath.toString("base64"),
       dev: stat.dev,
       ino: stat.ino,
       mode: stat.mode,
@@ -145,9 +176,11 @@ repositories.
 
 - Modify: `scripts/quarantine-workspace-runtime.mjs:1222-2403` (`prepareWorkspaceCore`, `appendEvent`, `quarantineWorkspace`, and private recovery helpers)
 - Modify: `scripts/quarantine-transaction.mjs:1-4` to re-export `recoverQuarantine`
+- Modify: `scripts/quarantine-run-fs-context.mjs:20-123` if the existing source-capture helper is moved there without semantic change
 - Modify: `scripts/quarantine-journal.mjs:497-723` (`validateTransition`, replay semantic validation, exact event payload parsers)
 - Modify: `__tests__/scripts/quarantine-transaction.test.ts:1722-5001`
 - Modify: `__tests__/scripts/quarantine-journal.test.ts:1-4644`
+- Create: `__tests__/fixtures/quarantine/quarantine-test-harness.ts` and move the existing `Fixture` type, `fixture`, `invoke`, URL/constants/import setup, and exact bodies into exports `createQuarantineFixture` and `invokeQuarantineWorker`
 
 **Interfaces:**
 
@@ -182,6 +215,7 @@ function snapshotRecoveryOptions(input: unknown): Readonly<{
   action: "resume" | "rollback"; writersStopped: true;
   fsApi?: object; faultHook?: (phase: string) => void | Promise<void>;
 }>;
+function captureFsSource(source?: object): FrozenFsSource;
 function buildApplyLedger(records: readonly JournalRecord[]): ApplyLedger;
 function recoverApplyOnCapability(args: { capability: object; options: RecoveryOptions }): Promise<RecoveryResult>;
 function resumeApplyFromLedger(args: { capability: object; replay: JournalReplay; ledger: ApplyLedger; faultHook?: FaultHook }): Promise<RecoveryResult>;
@@ -200,11 +234,12 @@ Slice 3 and is not moved to the lifecycle core.
 - [ ] **Step 1: Write the semantic RED matrix.** Add tests that seed valid journal frames and filesystem fixtures for every source/payload row: source present plus payload absent; source absent plus matching payload; both present; both absent; absent source plus mismatching payload; present mismatching source plus absent payload; and both present with any mismatch. Assert resume/rollback actions, preserved evidence, and exact result shapes. Add PREPARED and MOVING crashes with no intent, durable non-bytewise intent order, all-completed intents, idempotent QUARANTINED resume, QUARANTINED rollback rejection, duplicate/out-of-order semantic events, torn frame, wrong digest, changed journal tip, changed root/run identity, stale lock, changed evidence, and fatal evidence loss. Add supplied/default source tests that mutate a getter, receiver, and method after capture and assert the frozen capability snapshot remains authoritative.
 
 ```ts
+import { createQuarantineFixture, invokeQuarantineWorker } from "../fixtures/quarantine/quarantine-test-harness";
 it("builds RECOVERY_REQUIRED from the complete durable intent ledger", async () => {
-  const fixtureRoot = fixture({ divergent: false });
+  const fixtureRoot = createQuarantineFixture({ divergent: false });
   const one = { sha256: "a".repeat(64), entries: 1, bytes: 1 };
   const two = { sha256: "b".repeat(64), entries: 1, bytes: 1 };
-  const result = invoke("recoverQuarantine", {
+  const result = invokeQuarantineWorker("recoverQuarantine", {
     repoRoot: fixtureRoot.repoRoot,
     quarantineRoot: fixtureRoot.quarantineRoot,
     transactionId: "tx-0001",
@@ -240,19 +275,72 @@ Expected: FAIL because `quarantine-transaction.mjs` does not export `recoverQuar
 
 ```js
 export async function recoverQuarantine(input) {
-  const options = snapshotRecoveryOptions(input); // closed object, action resume|rollback, writersStopped === true
+  const options = snapshotRecoveryOptions(input);
+  const source = captureFsSource(options.fsApi);
   return withQuarantineRunCapability({
     repoRoot: options.repoRoot,
     quarantineRoot: options.quarantineRoot,
     transactionId: options.transactionId,
     writersStopped: options.writersStopped,
-    fsApi: options.fsApi,
+    fsApi: source,
   }, async (capability) =>
     recoverApplyOnCapability({ capability, options }));
 }
 ```
 
 Keep `recoverQuarantine` in the transaction module's approved export surface; keep all ledger helpers private. Task 3 leaves this runtime/transaction recovery callback on its existing setup path and introduces the lifecycle core only for validation and restore operations.
+
+The shared harness exports these complete signatures and moves the current
+bodies without behavior change; the worker dispatcher explicitly handles
+`recoverQuarantine`, `core-contract`, `prepare-quarantined`, and `replay-run`:
+
+```ts
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+export function createQuarantineFixture(options?: { divergent?: boolean; expectedCount?: number }): Fixture;
+export function invokeQuarantineWorker(operation: string, request: Record<string, unknown>, extraEnvironment?: Record<string, string>, timeout?: number): WorkerResult;
+export async function prepareQuarantinedFixture(options?: { divergent?: boolean; regenerate?: boolean }): Promise<{ fixture: Fixture; transactionId: string; createdAt: string; runRoot: string; applyResult: WorkerResult }> {
+  const fixture = createQuarantineFixture({ divergent: options?.divergent ?? false });
+  const transactionId = "tx-0001";
+  const createdAt = "2026-08-11T00:00:00.000Z";
+  const request = { repoRoot: fixture.repoRoot, quarantineRoot: fixture.quarantineRoot, expectedBranch: fixture.branch, expectedHead: fixture.head, expectedCount: fixture.expectedCount, transactionId, createdAt, writersStopped: true };
+  const applyResult = invokeQuarantineWorker("quarantineWorkspace", request);
+  if (options?.regenerate) { writeFileSync(join(fixture.repoRoot, ".next", "build"), "regenerated"); writeFileSync(join(fixture.repoRoot, "node_modules", "package"), "regenerated"); }
+  return { fixture, transactionId, createdAt, runRoot: join(fixture.quarantineRoot, transactionId), applyResult };
+}
+```
+
+The concrete move keeps the existing bodies unchanged and renames only their
+exports:
+
+```ts
+export const createQuarantineFixture = fixture;
+export const invokeQuarantineWorker = invoke;
+```
+
+The helper file also moves the transaction test's URL constants, Node imports,
+`Fixture`/`WorkerResult` descriptions, and worker module source string before
+these exports; `quarantine-transaction.test.ts` imports the two names and does
+not remain a dependency of any other test.
+
+The moved worker dispatcher has concrete branches before its final operation
+dispatch:
+
+```js
+if (operation === "core-contract") {
+  const handoff = await withExistingQuarantineRun(request.options, async (value) => value);
+  return { handoffKeys: Object.keys(handoff), evidenceBefore: request.evidenceBefore, evidenceAfter: request.evidenceAfter };
+}
+if (operation === "prepare-quarantined") {
+  const prepared = await prepareQuarantinedFixture(request);
+  return { fixture: prepared.fixture, transactionId: prepared.transactionId, createdAt: prepared.createdAt, runRoot: prepared.runRoot, applyResult: prepared.applyResult };
+}
+if (operation === "replay-run") {
+  const replay = await replayJournal(request);
+  return { records: replay.records, tip: replay.tip };
+}
+```
 
 - [ ] **Step 4: Run the semantic GREEN and neighboring tests.**
 
@@ -266,7 +354,7 @@ Expected: PASS for every matrix row, exact three result unions, no overwrite/del
 
 ```bash
 git diff --check
-git add scripts/quarantine-workspace-runtime.mjs scripts/quarantine-transaction.mjs scripts/quarantine-journal.mjs __tests__/scripts/quarantine-transaction.test.ts __tests__/scripts/quarantine-journal.test.ts
+git add scripts/quarantine-workspace-runtime.mjs scripts/quarantine-transaction.mjs scripts/quarantine-run-fs-context.mjs scripts/quarantine-journal.mjs __tests__/fixtures/quarantine/quarantine-test-harness.ts __tests__/scripts/quarantine-transaction.test.ts __tests__/scripts/quarantine-journal.test.ts
 git commit -m "feat: recover interrupted quarantine moves"
 ```
 
@@ -284,6 +372,7 @@ git commit -m "feat: recover interrupted quarantine moves"
 - Consumes: Task 1's `recoverQuarantine` and the existing `quarantineWorkspace` signature/result.
 - Produces: a disposable child runner that accepts a JSON request and kills itself with `SIGKILL` at one exact phase; no production export or package API changes.
 - Apply phases under test are exactly `after-prepared-generation`, `after-event:PREPARED`, `after-event:MOVING`, `after-event:VERIFYING`, `after-event:QUARANTINED`, `before-lock-cleanup`, `after-event:MOVE_INTENT:${entryId}`, `after-rename:${entryId}`, `after-payload-sync:${entryId}`, `after-destination-parent-sync:${entryId}`, `after-source-parent-sync:${entryId}`, `after-inventory:moved-pass-1:${entryId}`, `after-event:MOVED:${entryId}`, and `after-inventory:moved-pass-2:${entryId}`. Recovery adds `after-event:RECOVERY_REQUIRED`, `after-event:ROLLING_BACK`, `after-event:ROLLED_BACK`, `after-event:INCOMPLETE_CONFLICT`, `after-event:ROLLBACK_INTENT:${entryId}`, `after-rollback-rename:${entryId}`, `after-rollback-payload-sync:${entryId}`, `after-rollback-destination-parent-sync:${entryId}`, `after-rollback-source-parent-sync:${entryId}`, and `after-event:ROLLED_BACK_ENTRY:${entryId}`.
+- Add the missing apply seams `after-layout-sync`, `after-pre-inventories`, and `after-divergent-diff:${entryId}` to that exact ApplyPhase union.
 
 - [ ] **Step 1: Write the SIGKILL child and RED integration matrix.** Create the child with a closed JSON request and a phase hook:
 
@@ -292,47 +381,56 @@ const request = JSON.parse(process.env.QUARANTINE_CHILD_REQUEST);
 const faultHook = async (phase) => {
   if (phase === request.killAt) process.kill(process.pid, "SIGKILL");
 };
+const ALLOWED_OPERATIONS = Object.freeze(["quarantineWorkspace", "recoverQuarantine", "restoreQuarantine", "recoverRestore"]);
+if (!ALLOWED_OPERATIONS.includes(request.operation)) throw new Error("unknown child operation");
 const api = await import(new URL("../../../scripts/quarantine-transaction.mjs", import.meta.url));
-const restoreApi = await import(new URL("../../../scripts/quarantine-restore.mjs", import.meta.url));
-const operations = Object.freeze({
+const operationTable = {
   quarantineWorkspace: api.quarantineWorkspace,
   recoverQuarantine: api.recoverQuarantine,
-  restoreQuarantine: restoreApi.restoreQuarantine,
-  recoverRestore: restoreApi.recoverRestore,
-});
+};
+if (request.operation === "restoreQuarantine" || request.operation === "recoverRestore") {
+  const restoreApi = await import(new URL("../../../scripts/quarantine-restore.mjs", import.meta.url));
+  Object.assign(operationTable, { restoreQuarantine: restoreApi.restoreQuarantine, recoverRestore: restoreApi.recoverRestore });
+}
+const operations = Object.freeze(operationTable);
 if (!Object.hasOwn(operations, request.operation)) throw new Error("unknown child operation");
 const operation = operations[request.operation];
 if (typeof operation !== "function") throw new Error("unknown child operation");
 await operation({ ...request.options, faultHook });
 ```
 
-Spawn that child once for every manifest-publication, journal-event, rename, payload-sync, destination-parent-sync, source-parent-sync, inventory-publication, and lock-cleanup seam. Assert exit by `SIGKILL`, capture the flushed transaction ID for apply, then run both `resume` and `rollback` from fresh fixtures. Assert `RECOVERY_REQUIRED.entryIds` keeps forward journal order, including all-completed intents; PREPARED/MOVING no-intent uses `[]`; a 4,097th intent is rejected before mutation; a valid non-bytewise order is never sorted.
+Define the complete apply-options helper before every child row:
 
 ```ts
-import { readFileSync } from "node:fs";
+function applyOptions(f: Fixture, transactionId: string, createdAt: string) {
+  return { repoRoot:f.repoRoot, quarantineRoot:f.quarantineRoot, expectedBranch:f.branch, expectedHead:f.head, expectedCount:1, transactionId, createdAt, writersStopped:true };
+}
+```
+
+Each row uses a stable canonical UTC `createdAt` and explicit `transactionId`; the shared `Fixture` record includes the exact `expectedCount` derived from its generated source-copy entries. Spawn once for every seam. Pre-PREPARED seams (`after-layout-sync`, `after-pre-inventories`, `after-divergent-diff:${entryId}`, and `after-prepared-generation`) rerun `quarantineWorkspace` with the same options and assert valid adoption/completion; they do not call recovery without a durable journal. After PREPARED, call `recoverQuarantine`; resume/rollback assert exact durable journal transitions, source/payload locations, inventories, and terminal state. Only conflict/precondition failures snapshot evidence immediately before recovery and compare it unchanged after failure. Use the shared `replay-run` worker operation to inspect journal evidence. The 4,097th intent is rejected before mutation and valid non-bytewise intent order is never sorted.
+
+```ts
 import { fileURLToPath } from "node:url";
-const fixtureRoot = fixture({ divergent: false });
+import { createQuarantineFixture, invokeQuarantineWorker } from "../fixtures/quarantine/quarantine-test-harness";
+const fixtureRoot = createQuarantineFixture({ divergent: false });
 const fixturePath = fileURLToPath(new URL("../fixtures/quarantine/quarantine-lifecycle-child.mjs", import.meta.url));
+const transactionId = "tx-0001";
+const createdAt = "2026-08-11T00:00:00.000Z";
 const request = {
   operation: "quarantineWorkspace",
   killAt: "after-event:MOVE_INTENT:copy-0001",
-  options: { repoRoot: fixtureRoot.repoRoot, quarantineRoot: fixtureRoot.quarantineRoot, writersStopped: true },
+  options: applyOptions(fixtureRoot, transactionId, createdAt),
 };
-const evidenceBefore = [fixtureRoot.journalPath, fixtureRoot.pointerPath, fixtureRoot.payloadPath]
-  .map((path) => ({ path, bytes: readFileSync(path) }));
-const action = "resume";
-const expectedStatus = "QUARANTINED";
 const child = spawn(process.execPath, [fixturePath], { env: { ...process.env, QUARANTINE_CHILD_REQUEST: JSON.stringify(request) } });
 const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
   child.once("exit", (code, signal) => resolve({ code, signal }));
 });
 expect(result.signal).toBe("SIGKILL");
-const recovery = invoke("recoverQuarantine", { ...request.options, action });
-expect(recovery.result).toMatchObject({ status: expectedStatus });
-for (const evidence of evidenceBefore) expect(readFileSync(evidence.path)).toEqual(evidence.bytes);
+const recovery = invokeQuarantineWorker("recoverQuarantine", { ...request.options, action: "resume" });
+expect(recovery.result).toMatchObject({ status: "QUARANTINED" });
 ```
 
-Extend the existing fixture return record with the exact durable `journalPath`, `pointerPath`, and `payloadPath` used by its recovery setup. The `it.each` row then defines `fixturePath`, `request`, `action`, `expectedStatus`, and `evidenceBefore`; the crash suite uses the current transaction test's complete `invoke(operation, request, extraEnvironment, timeout)` worker helper at line 312 and imports `readFileSync` from `node:fs`.
+The shared harness exports `createQuarantineFixture`, `invokeQuarantineWorker`, and the `replay-run` worker operation; no Jest test module is imported. Conflict/precondition rows call the harness evidence snapshot immediately before attempted recovery.
 
 Add an `EXDEV` fixture by injecting rename `EXDEV`; assert no copy, unlink, or fallback call and frozen `ERR_EXDEV` when source identity and destination absence remain unchanged.
 
@@ -370,8 +468,9 @@ git commit -m "test: prove apply SIGKILL recovery"
 - Create: `__tests__/scripts/quarantine-lifecycle-core.test.ts`
 - Modify: `scripts/quarantine-run-fs-context.mjs:20-123` so source capture, frozen method/receiver snapshot, identity assertion, and invalidation remain the sole filesystem-context authority
 - Modify: `scripts/quarantine-workspace-runtime.mjs:1250-1287,2369-2403` to call the private core for existing-run operations
-- Modify: `scripts/quarantine-transaction.mjs:1-4` only for internal import wiring, never for a new public export
+- Modify: `scripts/quarantine-transaction.mjs:1-4` to re-export only approved `markQuarantineValidated`; it never exports or re-exports `withExistingQuarantineRun`
 - Modify: `__tests__/scripts/quarantine-transaction.test.ts:1722-5001` for validation of internal handoff consumption
+- Modify: `__tests__/fixtures/quarantine/quarantine-test-harness.ts` to add `prepareQuarantinedFixture`, `core-contract`, and `prepare-quarantined` worker branches
 - Modify: `scripts/quarantine-manifest.mjs:589-974` only through immutable generation/pointer authorities
 - Modify: `__tests__/scripts/quarantine-manifest.test.ts:1265-1891` for generation/pointer retry assertions
 
@@ -443,13 +542,14 @@ Its only public validation phases are
 must use the existing manifest, inventory, journal, and capability authorities;
 they do not become exports.
 
-- [ ] **Step 1: Write private-core RED tests before implementation.** Extend the existing transaction test worker (`invoke(operation: string, request: Record<string, unknown>, extraEnvironment: Record<string, string> = {}, timeout = 10_000): WorkerResult`, defined in `__tests__/scripts/quarantine-transaction.test.ts:312`, and the existing disposable `fixture({ divergent: boolean })` helper at line 158; do not introduce a second harness. Assert the exact handoff key set/prototypes/descriptors/frozen state and callback-only lifetime. Cover supplied adapter capture and omitted default adapter capture before the first await; adapter identity mutation and method replacement after capture; forged capability; stale run identity; changed quarantine root or repository HEAD; torn or changed journal; wrong, missing, or corrupt journal-named generation; interrupted pointer publication; symlink/foreign replacement; and no journal, pointer, or payload mutation on every precondition failure.
+- [ ] **Step 1: Write private-core RED tests before implementation.** Import `createQuarantineFixture` and `invokeQuarantineWorker` from `__tests__/fixtures/quarantine/quarantine-test-harness.ts`; that test-only helper owns the moved `Fixture` type, URL/constants/import setup, exact current `fixture` body, exact current `invoke` body, and explicit `core-contract`/`prepare-quarantined`/`replay-run` worker branches. Assert the exact handoff key set/prototypes/descriptors/frozen state and callback-only lifetime. Cover supplied adapter capture and omitted default adapter capture before the first await; adapter identity mutation, wrong receiver, and method replacement after capture; forged capability; stale run identity; changed quarantine root or repository HEAD; torn or changed journal; wrong, missing, or corrupt journal-named generation; interrupted pointer publication; symlink/foreign replacement; and no journal, pointer, or payload mutation on every precondition failure.
 
 ```ts
 it("captures the supplied adapter before the first await and preserves evidence on stale input", () => {
-  const result = invoke("core-contract", {
-    repoRoot: fixture.repoRoot,
-    quarantineRoot: fixture.quarantineRoot,
+  const fixtureRoot = createQuarantineFixture({ divergent: false });
+  const result = invokeQuarantineWorker("core-contract", {
+    repoRoot: fixtureRoot.repoRoot,
+    quarantineRoot: fixtureRoot.quarantineRoot,
     transactionId: "tx-0001",
     writersStopped: true,
     mutateSourceAfterCapture: true,
@@ -494,17 +594,19 @@ The named export is the sole exception to the private boundary: direct internal 
 - [ ] **Step 4: Run the validation RED suite.** Add validation tests now, before the validation implementation: seed QUARANTINED from a PREPARED ledger generation; regenerate `.next` and `node_modules`; assert clean Git status, exact root/HEAD, no source copies, two independent inventories per generated ID, matching summaries, and no numbered basename. Capture journal, pointer, and payload bytes before failures for changed HEAD/root, residue, missing root, inventory drift, stale lock, another transaction, wrong PREPARED generation, and path-bearing pointer; assert byte identity after each failure. Add VALIDATED retry with a different supplied `validatedAt`, missing-pointer activation-pending, and fatal present malformed/foreign/path-bearing/mismatched pointers.
 
 ```ts
-const fixtureRoot = fixture({ divergent: false });
-const result = await markQuarantineValidated({
-  repoRoot: fixtureRoot.repoRoot,
-  quarantineRoot: fixtureRoot.quarantineRoot,
-  transactionId: "tx-0001",
-  validatedAt: "2026-08-09T12:00:00.000Z",
-  writersStopped: true,
-});
+import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
+const prepared = await prepareQuarantinedFixture({ regenerate: true });
+const result = await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, validatedAt: "2026-08-09T12:00:00.000Z", writersStopped: true });
 expect(result).toMatchObject({ transactionId: "tx-0001", status: "VALIDATED", deletionRequiresConfirmation: true });
 expect(new Date(result.deleteAfter).getTime() - new Date(result.validatedAt).getTime()).toBe(96 * 60 * 60 * 1000);
 ```
+
+VALIDATED retry setup reuses `prepared.applyResult` and the existing journal
+and manifest primitives: replay the durable QUARANTINED journal, call the
+approved validation implementation once to append VALIDATED and publish its
+generation, then remove only the disposable fixture's current pointer before
+the retry. The retry supplies a different `validatedAt` and must reuse the
+tip-named generation and stored metadata.
 
 - [ ] **Step 5: Run validation RED.**
 
@@ -526,18 +628,34 @@ const VALIDATION_PHASES = new Set([
   "after-pointer-temporary-sync", "after-pointer-rename",
   "after-pointer-root-sync", "before-lock-cleanup",
 ]);
-function publicValidationFaultHook(publicHook) {
-  return async (primitive, phase) => {
+function mapValidationFaultHook(publicHook, primitive) {
+  return async (phase) => {
     const mapped = primitive === "writeManifestGeneration"
       ? phase === "after-generation-directory-sync" ? "after-validated-generation" : null
-      : primitive === "appendJournalRecord"
-        ? phase === "held-journal-append" ? "after-event:VALIDATED" : null
-        : primitive === "activateManifestGeneration"
-          ? phase === "after-pointer-temporary-sync" || phase === "after-pointer-rename" ? phase
-            : phase === "after-quarantine-root-sync" ? "after-pointer-root-sync" : null
-          : null;
+      : primitive === "activateManifestGeneration"
+        ? phase === "after-pointer-temporary-sync" || phase === "after-pointer-rename" ? phase
+          : phase === "after-quarantine-root-sync" ? "after-pointer-root-sync" : null
+        : null;
     if (mapped && VALIDATION_PHASES.has(mapped)) await publicHook(mapped);
   };
+}
+async function publishValidated(handoff, input) {
+  const publicHook = input.faultHook ?? (async () => {});
+  const generationOptions = { handoff, manifestSha256: input.manifestSha256 };
+  const journalOptions = { handoff, event: "VALIDATED", payload: { manifestSha256: input.manifestSha256 } };
+  const activationOptions = { handoff, manifestSha256: input.manifestSha256 };
+  const generationFaultHook = mapValidationFaultHook(publicHook, "writeManifestGeneration");
+  const activationFaultHook = mapValidationFaultHook(publicHook, "activateManifestGeneration");
+  const journalFaultHook = async (phase) => {
+    if (phase === "after-journal-sync") return;
+    if (phase === "before-lock-cleanup") {
+      await publicHook("after-event:VALIDATED");
+      await publicHook("before-lock-cleanup");
+    }
+  };
+  await writeManifestGeneration({ ...generationOptions, faultHook: generationFaultHook });
+  await appendJournalRecord({ ...journalOptions, faultHook: journalFaultHook });
+  await activateManifestGeneration({ ...activationOptions, faultHook: activationFaultHook });
 }
 ```
 
@@ -565,8 +683,9 @@ git commit -m "feat: validate quarantined workspaces"
 
 - Create: `scripts/quarantine-restore.mjs`
 - Modify: `scripts/quarantine-workspace-runtime.mjs:2369-2403` only for private shared-core/runtime wiring
-- Modify: `__tests__/scripts/quarantine-restore.test.ts`
+- Create: `__tests__/scripts/quarantine-restore.test.ts`
 - Modify: `__tests__/scripts/quarantine-lifecycle-core.test.ts` for restore handoff reuse
+- Modify: `__tests__/fixtures/quarantine/quarantine-test-harness.ts` for `prepareQuarantinedFixture`
 
 **Interfaces:**
 
@@ -626,12 +745,9 @@ Restore journal payloads stay exact: `RESTORE_PREPARED` is `{ restoreId, activeG
 - [ ] **Step 1: Write restore RED tests and exact vector test.** Assert the fixed vector and prefixed grammar. Parameterize all four presence combinations for `.next` and `node_modules`; existing active roots write and fsync exactly one `restore-active` inventory, absent roots write no JSONL and are rechecked immediately before `RESTORE_PREPARED`. Assert dense bytewise-sorted `activeGenerated` records with the two fixed IDs and exact summary-or-null. Recreate an absent root or remove an inventoried root at the final presence seam and assert no `RESTORE_PREPARED`/`RESTORING` mutation.
 
 ```ts
-const fixtureRoot = fixture({ divergent: false });
-const restoreOptions = {
-  repoRoot: fixtureRoot.repoRoot,
-  quarantineRoot: fixtureRoot.quarantineRoot,
-  transactionId: "tx-0001",
-};
+import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
+const prepared = await prepareQuarantinedFixture({ regenerate: false });
+const restoreOptions = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId };
 await expect(restoreQuarantine({ ...restoreOptions, writersStopped: true })).resolves.toMatchObject({
   transactionId: "tx-0001",
   restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2",
@@ -681,7 +797,7 @@ Expected: PASS for vector, presence matrix, final TOCTOU checks, fixed inventory
 
 ```bash
 git diff --check
-git add scripts/quarantine-restore.mjs scripts/quarantine-workspace-runtime.mjs __tests__/scripts/quarantine-restore.test.ts __tests__/scripts/quarantine-lifecycle-core.test.ts
+git add scripts/quarantine-restore.mjs scripts/quarantine-workspace-runtime.mjs __tests__/fixtures/quarantine/quarantine-test-harness.ts __tests__/scripts/quarantine-restore.test.ts __tests__/scripts/quarantine-lifecycle-core.test.ts
 git commit -m "feat: restore quarantined workspaces"
 ```
 
@@ -693,6 +809,7 @@ git commit -m "feat: restore quarantined workspaces"
 - Modify: `__tests__/fixtures/quarantine/quarantine-lifecycle-child.mjs`
 - Create: `__tests__/scripts/quarantine-restore-crash.integration.test.ts`
 - Modify: `__tests__/scripts/quarantine-restore.test.ts`
+- Modify: `__tests__/fixtures/quarantine/quarantine-test-harness.ts` for recovery setup reuse
 
 **Interfaces:**
 
@@ -743,12 +860,9 @@ function rollbackRestore(args: { handoff: InternalRunHandoff; replay: JournalRep
 `RestoreLedger` preserves durable `RESTORE_INTENT` order; `RestoreRecoveryResult` is exactly one of the three result unions in this task. These are private records only.
 
 ```ts
-const fixtureRoot = fixture({ divergent: false });
-const restoreOptions = {
-  repoRoot: fixtureRoot.repoRoot,
-  quarantineRoot: fixtureRoot.quarantineRoot,
-  transactionId: "tx-0001",
-};
+import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
+const prepared = await prepareQuarantinedFixture({ regenerate: false });
+const restoreOptions = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId };
 expect(await recoverRestore({ ...restoreOptions, action: "resume", writersStopped: true }))
   .toMatchObject({ transactionId: "tx-0001", restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume" });
 expect(await recoverRestore({ ...restoreOptions, action: "rollback", writersStopped: true }))
@@ -792,7 +906,7 @@ Expected: PASS for every actual SIGKILL seam, all A/R/P rows including `O === G`
 
 ```bash
 git diff --check
-git add scripts/quarantine-restore.mjs __tests__/fixtures/quarantine/quarantine-lifecycle-child.mjs __tests__/scripts/quarantine-restore-crash.integration.test.ts __tests__/scripts/quarantine-restore.test.ts
+git add scripts/quarantine-restore.mjs __tests__/fixtures/quarantine/quarantine-lifecycle-child.mjs __tests__/fixtures/quarantine/quarantine-test-harness.ts __tests__/scripts/quarantine-restore-crash.integration.test.ts __tests__/scripts/quarantine-restore.test.ts
 git commit -m "feat: recover interrupted quarantine restores"
 ```
 
@@ -1032,11 +1146,13 @@ Expected: PASS with actual apply and restore SIGKILL evidence, state-specific ge
 - [ ] **Step 2: Run project-wide static and build gates.**
 
 ```bash
+EVIDENCE_DIR="$(git rev-parse --git-path quarantine-lifecycle-evidence)"
+IMPLEMENTATION_BASE="$(cat "$EVIDENCE_DIR/implementation-base")"
 npm test -- --runInBand --no-cache
 npm run lint -- --max-warnings=0
 npm run typecheck
 npm run build
-git diff --check
+git diff --check "$IMPLEMENTATION_BASE"..HEAD
 ```
 
 Expected: all commands exit 0; lint reports zero warnings; build succeeds without modifying the plan's scope.
@@ -1044,14 +1160,24 @@ Expected: all commands exit 0; lint reports zero warnings; build succeeds withou
 - [ ] **Step 3: Regenerate after-evidence and prove no-touch/no-deletion invariants.** Set `EVIDENCE_SUFFIX=after`, rerun the exact executable Node script from Execution preflight (same imports, path validation, `lstatSync`, regular-file stream hashing, symlink `readlinkSync` hashing, sorted base64-path JSONL, and mode-0600 write) against the same `ORIGINAL_CHECKOUT`, producing `untracked-paths.after` and `untracked-meta.after` under the same 0700 `EVIDENCE_DIR`. Use disposable fixtures for all mutations. Then run:
 
 ```bash
+EVIDENCE_DIR="$(git rev-parse --git-path quarantine-lifecycle-evidence)"
+ORIGINAL_CHECKOUT="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+IMPLEMENTATION_BASE="$(cat "$EVIDENCE_DIR/implementation-base")"
+export EVIDENCE_DIR ORIGINAL_CHECKOUT IMPLEMENTATION_BASE
+test "$(stat -f '%Lp' "$EVIDENCE_DIR")" = 700
+test -f "$EVIDENCE_DIR/implementation-base" && test -f "$EVIDENCE_DIR/untracked-paths.before" && test -f "$EVIDENCE_DIR/untracked-meta.before"
+test "$(stat -f '%Lp' "$EVIDENCE_DIR/implementation-base")" = 600
+test "$(stat -f '%Lp' "$EVIDENCE_DIR/untracked-paths.before")" = 600
+test "$(stat -f '%Lp' "$EVIDENCE_DIR/untracked-meta.before")" = 600
 EVIDENCE_SUFFIX=after
 export EVIDENCE_SUFFIX
 git -C "$ORIGINAL_CHECKOUT" ls-files --others --exclude-standard -z > "$EVIDENCE_DIR/untracked-paths.after"
 chmod 0600 "$EVIDENCE_DIR/untracked-paths.after"
 node --input-type=module > /dev/null <<'NODE'
 import { createHash } from "node:crypto";
-import { createReadStream, chmodSync, lstatSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, resolve, relative } from "node:path";
+import { chmodSync, closeSync, createReadStream, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { constants as fsConstants } from "node:fs";
+import { resolve } from "node:path";
 
 const root = process.env.ORIGINAL_CHECKOUT;
 const evidenceDir = process.env.EVIDENCE_DIR;
@@ -1059,40 +1185,69 @@ const suffix = process.env.EVIDENCE_SUFFIX;
 const pathsPath = resolve(evidenceDir, `untracked-paths.${suffix}`);
 const metaPath = resolve(evidenceDir, `untracked-meta.${suffix}`);
 
-function rejectPath(pathText) {
-  if (pathText.length === 0 || isAbsolute(pathText)) throw new Error("invalid path");
-  const absolute = resolve(root, pathText);
-  const escaped = relative(root, absolute);
-  if (escaped === ".." || escaped.startsWith(`..${String.fromCharCode(47)}`)) throw new Error("parent escape");
-  return absolute;
+function splitNul(buffer) {
+  const paths = [];
+  let start = 0;
+  for (let index = 0; index < buffer.length; index += 1) {
+    if (buffer[index] === 0) { if (index > start) paths.push(buffer.subarray(start, index)); start = index + 1; }
+  }
+  if (start !== buffer.length) throw new Error("unterminated path list");
+  return paths;
 }
 
-async function hashRegularFile(pathText) {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(pathText)) hash.update(chunk);
-  return hash.digest("hex");
+function pathBuffer(rawPath) {
+  if (rawPath.length === 0 || rawPath[0] === 0x2f) throw new Error("invalid path");
+  let segmentStart = 0;
+  for (let index = 0; index <= rawPath.length; index += 1) {
+    if (index === rawPath.length || rawPath[index] === 0x2f) {
+      if (rawPath.subarray(segmentStart, index).equals(Buffer.from(".."))) throw new Error("parent escape");
+      segmentStart = index + 1;
+    }
+  }
+  return Buffer.concat([Buffer.from(root), Buffer.from("/"), rawPath]);
+}
+
+async function hashRegularFile(pathBufferValue, before) {
+  const descriptor = openSync(pathBufferValue, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let stream;
+  try {
+    const opened = fstatSync(descriptor);
+    if (opened.dev !== before.dev || opened.ino !== before.ino || opened.mode !== before.mode) throw new Error("identity changed");
+    const hash = createHash("sha256");
+    stream = createReadStream(null, { fd: descriptor, autoClose: false });
+    for await (const chunk of stream) hash.update(chunk);
+    const after = fstatSync(descriptor);
+    const relisted = lstatSync(pathBufferValue);
+    if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.size !== before.size || relisted.dev !== before.dev || relisted.ino !== before.ino || relisted.mode !== before.mode || relisted.size !== before.size) throw new Error("identity changed");
+    return hash.digest("hex");
+  } finally {
+    if (stream) stream.destroy();
+    closeSync(descriptor);
+  }
 }
 
 async function main() {
-  const nulPaths = readFileSync(pathsPath);
-  const pathTexts = nulPaths.length === 0 ? [] : nulPaths.toString("utf8").split(String.fromCharCode(0)).filter(Boolean);
+  const rawPaths = splitNul(readFileSync(pathsPath));
   const rows = [];
-  for (const pathText of pathTexts) {
-    const absolute = rejectPath(pathText);
+  for (const rawPath of rawPaths) {
+    const absolute = pathBuffer(rawPath);
     const stat = lstatSync(absolute);
     let type = "other";
     let hash = null;
     if (stat.isFile()) {
       type = "file";
-      hash = await hashRegularFile(absolute);
+      hash = await hashRegularFile(absolute, stat);
     } else if (stat.isSymbolicLink()) {
       type = "symlink";
-      hash = createHash("sha256").update(readlinkSync(absolute, { encoding: "buffer" })).digest("hex");
+      const linkBytes = readlinkSync(absolute, { encoding: "buffer" });
+      hash = createHash("sha256").update(linkBytes).digest("hex");
+      const relisted = lstatSync(absolute);
+      if (relisted.dev !== stat.dev || relisted.ino !== stat.ino || relisted.mode !== stat.mode) throw new Error("identity changed");
     } else if (stat.isDirectory()) {
       type = "directory";
     }
     rows.push(JSON.stringify({
-      path: Buffer.from(pathText, "utf8").toString("base64"),
+      path: rawPath.toString("base64"),
       dev: stat.dev,
       ino: stat.ino,
       mode: stat.mode,
@@ -1115,9 +1270,9 @@ NODE
 chmod 0600 "$EVIDENCE_DIR/untracked-meta.after"
 cmp -s "$EVIDENCE_DIR/untracked-paths.before" "$EVIDENCE_DIR/untracked-paths.after"
 cmp -s "$EVIDENCE_DIR/untracked-meta.before" "$EVIDENCE_DIR/untracked-meta.after"
-IMPLEMENTATION_BASE="$(cat "$EVIDENCE_DIR/implementation-base")"
 git diff --name-only "$IMPLEMENTATION_BASE"..HEAD
-git diff --check
+git diff --check "$IMPLEMENTATION_BASE"..HEAD
+git diff --exit-code "$IMPLEMENTATION_BASE"..HEAD -- package-lock.json
 rg -n "deleteAfter|setTimeout|setInterval|cron|rm\(|unlink\(|rmdir\(" scripts __tests__/scripts
 ```
 
