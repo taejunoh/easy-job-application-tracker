@@ -70,7 +70,7 @@ git -C "$ORIGINAL_CHECKOUT" ls-files --others --exclude-standard -z > "$EVIDENCE
 chmod 0600 "$EVIDENCE_DIR/implementation-base" "$EVIDENCE_DIR/untracked-paths.$EVIDENCE_SUFFIX"
 node --input-type=module > /dev/null <<'NODE'
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, createReadStream, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, readSync, writeFileSync } from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import { resolve } from "node:path";
 
@@ -102,21 +102,25 @@ function pathBuffer(rawPath) {
   return Buffer.concat([Buffer.from(root), Buffer.from("/"), rawPath]);
 }
 
-async function hashRegularFile(pathBufferValue, before) {
+function hashRegularFile(pathBufferValue, before) {
   const descriptor = openSync(pathBufferValue, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  let stream;
   try {
     const opened = fstatSync(descriptor);
     if (opened.dev !== before.dev || opened.ino !== before.ino || opened.mode !== before.mode) throw new Error("identity changed");
     const hash = createHash("sha256");
-    stream = createReadStream(null, { fd: descriptor, autoClose: false });
-    for await (const chunk of stream) hash.update(chunk);
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let offset = 0;
+    while (true) {
+      const count = readSync(descriptor, buffer, 0, buffer.length, offset);
+      if (count === 0) break;
+      hash.update(buffer.subarray(0, count));
+      offset += count;
+    }
     const after = fstatSync(descriptor);
     const relisted = lstatSync(pathBufferValue);
     if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.size !== before.size || relisted.dev !== before.dev || relisted.ino !== before.ino || relisted.mode !== before.mode || relisted.size !== before.size) throw new Error("identity changed");
     return hash.digest("hex");
   } finally {
-    if (stream) stream.destroy();
     closeSync(descriptor);
   }
 }
@@ -131,7 +135,7 @@ async function main() {
     let hash = null;
     if (stat.isFile()) {
       type = "file";
-      hash = await hashRegularFile(absolute, stat);
+      hash = hashRegularFile(absolute, stat);
     } else if (stat.isSymbolicLink()) {
       type = "symlink";
       const linkBytes = readlinkSync(absolute, { encoding: "buffer" });
@@ -181,6 +185,19 @@ repositories.
 - Modify: `__tests__/scripts/quarantine-transaction.test.ts:1722-5001`
 - Modify: `__tests__/scripts/quarantine-journal.test.ts:1-4644`
 - Create: `__tests__/fixtures/quarantine/quarantine-test-harness.ts` and move the existing `Fixture` type, `fixture`, `invoke`, URL/constants/import setup, and exact bodies into exports `createQuarantineFixture` and `invokeQuarantineWorker`
+
+Move the current implementations verbatim into concrete exported definitions:
+`export function createQuarantineFixture(options?: FixtureOptions): Fixture`
+contains the complete current fixture body, and
+`export function invokeQuarantineWorker(operation: string, request:
+Record<string, unknown>, extraEnvironment: Record<string, string> = {}, timeout
+= 10_000): WorkerResult` contains the complete current invoke body. No
+declaration-only signatures or aliases remain.
+
+The helper's worker dispatcher adds only `recoverQuarantine` and the existing
+`replay-run` operation in Task 1. It does not import lifecycle core and has no
+`core-contract` or preparation worker branch. The transaction test imports
+these two helpers and is no longer a dependency of other tests.
 
 **Interfaces:**
 
@@ -290,58 +307,6 @@ export async function recoverQuarantine(input) {
 
 Keep `recoverQuarantine` in the transaction module's approved export surface; keep all ledger helpers private. Task 3 leaves this runtime/transaction recovery callback on its existing setup path and introduces the lifecycle core only for validation and restore operations.
 
-The shared harness exports these complete signatures and moves the current
-bodies without behavior change; the worker dispatcher explicitly handles
-`recoverQuarantine`, `core-contract`, `prepare-quarantined`, and `replay-run`:
-
-```ts
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
-
-export function createQuarantineFixture(options?: { divergent?: boolean; expectedCount?: number }): Fixture;
-export function invokeQuarantineWorker(operation: string, request: Record<string, unknown>, extraEnvironment?: Record<string, string>, timeout?: number): WorkerResult;
-export async function prepareQuarantinedFixture(options?: { divergent?: boolean; regenerate?: boolean }): Promise<{ fixture: Fixture; transactionId: string; createdAt: string; runRoot: string; applyResult: WorkerResult }> {
-  const fixture = createQuarantineFixture({ divergent: options?.divergent ?? false });
-  const transactionId = "tx-0001";
-  const createdAt = "2026-08-11T00:00:00.000Z";
-  const request = { repoRoot: fixture.repoRoot, quarantineRoot: fixture.quarantineRoot, expectedBranch: fixture.branch, expectedHead: fixture.head, expectedCount: fixture.expectedCount, transactionId, createdAt, writersStopped: true };
-  const applyResult = invokeQuarantineWorker("quarantineWorkspace", request);
-  if (options?.regenerate) { writeFileSync(join(fixture.repoRoot, ".next", "build"), "regenerated"); writeFileSync(join(fixture.repoRoot, "node_modules", "package"), "regenerated"); }
-  return { fixture, transactionId, createdAt, runRoot: join(fixture.quarantineRoot, transactionId), applyResult };
-}
-```
-
-The concrete move keeps the existing bodies unchanged and renames only their
-exports:
-
-```ts
-export const createQuarantineFixture = fixture;
-export const invokeQuarantineWorker = invoke;
-```
-
-The helper file also moves the transaction test's URL constants, Node imports,
-`Fixture`/`WorkerResult` descriptions, and worker module source string before
-these exports; `quarantine-transaction.test.ts` imports the two names and does
-not remain a dependency of any other test.
-
-The moved worker dispatcher has concrete branches before its final operation
-dispatch:
-
-```js
-if (operation === "core-contract") {
-  const handoff = await withExistingQuarantineRun(request.options, async (value) => value);
-  return { handoffKeys: Object.keys(handoff), evidenceBefore: request.evidenceBefore, evidenceAfter: request.evidenceAfter };
-}
-if (operation === "prepare-quarantined") {
-  const prepared = await prepareQuarantinedFixture(request);
-  return { fixture: prepared.fixture, transactionId: prepared.transactionId, createdAt: prepared.createdAt, runRoot: prepared.runRoot, applyResult: prepared.applyResult };
-}
-if (operation === "replay-run") {
-  const replay = await replayJournal(request);
-  return { records: replay.records, tip: replay.tip };
-}
-```
-
 - [ ] **Step 4: Run the semantic GREEN and neighboring tests.**
 
 ```bash
@@ -371,8 +336,7 @@ git commit -m "feat: recover interrupted quarantine moves"
 
 - Consumes: Task 1's `recoverQuarantine` and the existing `quarantineWorkspace` signature/result.
 - Produces: a disposable child runner that accepts a JSON request and kills itself with `SIGKILL` at one exact phase; no production export or package API changes.
-- Apply phases under test are exactly `after-prepared-generation`, `after-event:PREPARED`, `after-event:MOVING`, `after-event:VERIFYING`, `after-event:QUARANTINED`, `before-lock-cleanup`, `after-event:MOVE_INTENT:${entryId}`, `after-rename:${entryId}`, `after-payload-sync:${entryId}`, `after-destination-parent-sync:${entryId}`, `after-source-parent-sync:${entryId}`, `after-inventory:moved-pass-1:${entryId}`, `after-event:MOVED:${entryId}`, and `after-inventory:moved-pass-2:${entryId}`. Recovery adds `after-event:RECOVERY_REQUIRED`, `after-event:ROLLING_BACK`, `after-event:ROLLED_BACK`, `after-event:INCOMPLETE_CONFLICT`, `after-event:ROLLBACK_INTENT:${entryId}`, `after-rollback-rename:${entryId}`, `after-rollback-payload-sync:${entryId}`, `after-rollback-destination-parent-sync:${entryId}`, `after-rollback-source-parent-sync:${entryId}`, and `after-event:ROLLED_BACK_ENTRY:${entryId}`.
-- Add the missing apply seams `after-layout-sync`, `after-pre-inventories`, and `after-divergent-diff:${entryId}` to that exact ApplyPhase union.
+- Apply phases under test are exactly `after-layout-sync`, `after-pre-inventories`, `after-divergent-diff:${entryId}`, `after-prepared-generation`, `after-event:PREPARED`, `after-event:MOVING`, `after-event:VERIFYING`, `after-event:QUARANTINED`, `before-lock-cleanup`, `after-event:MOVE_INTENT:${entryId}`, `after-rename:${entryId}`, `after-payload-sync:${entryId}`, `after-destination-parent-sync:${entryId}`, `after-source-parent-sync:${entryId}`, `after-inventory:moved-pass-1:${entryId}`, `after-event:MOVED:${entryId}`, and `after-inventory:moved-pass-2:${entryId}`. Recovery adds `after-event:RECOVERY_REQUIRED`, `after-event:ROLLING_BACK`, `after-event:ROLLED_BACK`, `after-event:INCOMPLETE_CONFLICT`, `after-event:ROLLBACK_INTENT:${entryId}`, `after-rollback-rename:${entryId}`, `after-rollback-payload-sync:${entryId}`, `after-rollback-destination-parent-sync:${entryId}`, `after-rollback-source-parent-sync:${entryId}`, and `after-event:ROLLED_BACK_ENTRY:${entryId}`.
 
 - [ ] **Step 1: Write the SIGKILL child and RED integration matrix.** Create the child with a closed JSON request and a phase hook:
 
@@ -403,7 +367,7 @@ Define the complete apply-options helper before every child row:
 
 ```ts
 function applyOptions(f: Fixture, transactionId: string, createdAt: string) {
-  return { repoRoot:f.repoRoot, quarantineRoot:f.quarantineRoot, expectedBranch:f.branch, expectedHead:f.head, expectedCount:1, transactionId, createdAt, writersStopped:true };
+  return { repoRoot:f.repoRoot, quarantineRoot:f.quarantineRoot, expectedBranch:f.branch, expectedHead:f.head, expectedCount:f.expectedCount, transactionId, createdAt, writersStopped:true };
 }
 ```
 
@@ -470,7 +434,7 @@ git commit -m "test: prove apply SIGKILL recovery"
 - Modify: `scripts/quarantine-workspace-runtime.mjs:1250-1287,2369-2403` to call the private core for existing-run operations
 - Modify: `scripts/quarantine-transaction.mjs:1-4` to re-export only approved `markQuarantineValidated`; it never exports or re-exports `withExistingQuarantineRun`
 - Modify: `__tests__/scripts/quarantine-transaction.test.ts:1722-5001` for validation of internal handoff consumption
-- Modify: `__tests__/fixtures/quarantine/quarantine-test-harness.ts` to add `prepareQuarantinedFixture`, `core-contract`, and `prepare-quarantined` worker branches
+- Modify: `__tests__/fixtures/quarantine/quarantine-test-harness.ts` to add host-only `prepareQuarantinedFixture` and the `core-contract` worker branch
 - Modify: `scripts/quarantine-manifest.mjs:589-974` only through immutable generation/pointer authorities
 - Modify: `__tests__/scripts/quarantine-manifest.test.ts:1265-1891` for generation/pointer retry assertions
 
@@ -542,7 +506,7 @@ Its only public validation phases are
 must use the existing manifest, inventory, journal, and capability authorities;
 they do not become exports.
 
-- [ ] **Step 1: Write private-core RED tests before implementation.** Import `createQuarantineFixture` and `invokeQuarantineWorker` from `__tests__/fixtures/quarantine/quarantine-test-harness.ts`; that test-only helper owns the moved `Fixture` type, URL/constants/import setup, exact current `fixture` body, exact current `invoke` body, and explicit `core-contract`/`prepare-quarantined`/`replay-run` worker branches. Assert the exact handoff key set/prototypes/descriptors/frozen state and callback-only lifetime. Cover supplied adapter capture and omitted default adapter capture before the first await; adapter identity mutation, wrong receiver, and method replacement after capture; forged capability; stale run identity; changed quarantine root or repository HEAD; torn or changed journal; wrong, missing, or corrupt journal-named generation; interrupted pointer publication; symlink/foreign replacement; and no journal, pointer, or payload mutation on every precondition failure.
+- [ ] **Step 1: Write private-core RED tests before implementation.** Import `createQuarantineFixture` and `invokeQuarantineWorker` from `__tests__/fixtures/quarantine/quarantine-test-harness.ts`; that test-only helper owns the moved `Fixture` type, URL/constants/import setup, exact current `fixture` body, exact current `invoke` body, and explicit `core-contract`/`replay-run` worker branches. Assert the exact handoff key set/prototypes/descriptors/frozen state and callback-only lifetime. Cover supplied adapter capture and omitted default adapter capture before the first await; adapter identity mutation, wrong receiver, and method replacement after capture; forged capability; stale run identity; changed quarantine root or repository HEAD; torn or changed journal; wrong, missing, or corrupt journal-named generation; interrupted pointer publication; symlink/foreign replacement; and no journal, pointer, or payload mutation on every precondition failure.
 
 ```ts
 it("captures the supplied adapter before the first await and preserves evidence on stale input", () => {
@@ -566,6 +530,51 @@ it("captures the supplied adapter before the first await and preserves evidence 
 The worker branch for `operation === "core-contract"` mutates the captured source getter, receiver, and method after capture and returns `handoffKeys`, `evidenceBefore`, and `evidenceAfter` as JSON-safe contract observations; all setup and cleanup remain the existing helper bodies.
 
 Add state-specific tests: QUARANTINED obtains baseline digest/generation from PREPARED and requires manifest state PREPARED; it does not require a QUARANTINED tip payload or QUARANTINED generation. VALIDATED obtains the digest/generation and stored retention metadata from the VALIDATED tip. Add pointer tests that distinguish missing activation-pending from present malformed, foreign, path-bearing, or mismatched fatal pointers.
+
+Modify the shared host harness here with this executable helper; it is not a
+worker operation. It invokes the existing worker operation `"apply"`, checks
+the exact successful result, then optionally regenerates ignored roots:
+
+```ts
+export async function prepareQuarantinedFixture(options: { divergent?: boolean; regenerate?: boolean } = {}) {
+  const fixture = createQuarantineFixture({ divergent: options.divergent ?? false });
+  const transactionId = "tx-0001";
+  const createdAt = "2026-08-11T00:00:00.000Z";
+  const applyOptions = { repoRoot: fixture.repoRoot, quarantineRoot: fixture.quarantineRoot, expectedBranch: fixture.branch, expectedHead: fixture.head, expectedCount: fixture.expectedCount, transactionId, createdAt, writersStopped: true };
+  const applyResult = invokeQuarantineWorker("apply", applyOptions);
+  if (!applyResult.ok || applyResult.result?.status !== "QUARANTINED") throw new Error("apply did not produce QUARANTINED");
+  if (options.regenerate) {
+    mkdirSync(join(fixture.repoRoot, ".next"), { recursive: true, mode: 0o700 });
+    mkdirSync(join(fixture.repoRoot, "node_modules"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(fixture.repoRoot, ".next", "build"), "regenerated");
+    writeFileSync(join(fixture.repoRoot, "node_modules", "package"), "regenerated");
+  }
+  return { fixture, transactionId, createdAt, runRoot: join(fixture.quarantineRoot, transactionId), applyResult };
+}
+```
+
+The host imports `mkdirSync`, `writeFileSync`, and `join`. The inline worker
+source gains `core-contract` only in this task: it conditionally imports the
+private lifecycle core, invokes it with `request.options`, and returns only
+JSON-safe handoff keys, frozen/prototype/descriptor observations, and evidence
+bytes read from exact capability-derived fixture evidence paths. It never
+returns the capability or handoff. The worker also keeps the existing
+`recoverQuarantine` and `replay-run` branches; preparation remains host-only.
+That worker branch imports `readFileSync` and the existing `deriveRunPath`
+authority before reading those capability-derived evidence paths.
+
+```js
+if (operation === "core-contract") {
+  const { withExistingQuarantineRun } = await import(new URL("../../../scripts/quarantine-lifecycle-core.mjs", import.meta.url));
+  return withExistingQuarantineRun(request.options, async (handoff) => {
+    const evidencePaths = [deriveRunPath(handoff.capability, "journal"), deriveRunPath(handoff.capability, "current"), deriveRunPath(handoff.capability, "payload")];
+    const evidenceBefore = evidencePaths.map((path) => readFileSync(path));
+    const observations = { handoffKeys: Object.keys(handoff), handoffFrozen: Object.isFrozen(handoff), prototype: Object.getPrototypeOf(handoff) === null, descriptors: Object.fromEntries(Object.keys(handoff).map((key) => [key, Object.getOwnPropertyDescriptor(handoff, key)])), evidenceBefore };
+    const evidenceAfter = evidencePaths.map((path) => readFileSync(path));
+    return { ...observations, evidenceAfter };
+  });
+}
+```
 
 - [ ] **Step 2: Run the private-core RED suite.**
 
@@ -596,10 +605,21 @@ The named export is the sole exception to the private boundary: direct internal 
 ```ts
 import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
 const prepared = await prepareQuarantinedFixture({ regenerate: true });
-const result = await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, validatedAt: "2026-08-09T12:00:00.000Z", writersStopped: true });
-expect(result).toMatchObject({ transactionId: "tx-0001", status: "VALIDATED", deletionRequiresConfirmation: true });
-expect(new Date(result.deleteAfter).getTime() - new Date(result.validatedAt).getTime()).toBe(96 * 60 * 60 * 1000);
+const result = invokeQuarantineWorker("core-contract", { options: { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true }, mutateSourceAfterCapture: true });
+expect(result.result?.handoffKeys).toEqual(["capability", "fsApi", "head", "journalTip", "manifestGeneration", "quarantineRoot", "repoRoot", "runRoot", "transactionId"]);
 ```
+
+Prepare a second fixture independently, set `replaceRunIdentity: true`, and
+assert the worker returns an error with no callback observation; compare the
+exact evidence files read immediately before the call with the bytes after the
+failure. Never assert handoff keys on this stale-input case.
+
+The separate test uses `const stale = await prepareQuarantinedFixture()` and
+invokes `invokeQuarantineWorker("core-contract", { options: { ... },
+replaceRunIdentity: true })`; it expects `ok === false` and no result/callback.
+The harness's complete evidence reader derives journal, pointer, and payload
+paths through the live capability, stores bytes before the call, and compares
+the stored bytes with the post-failure read.
 
 VALIDATED retry setup reuses `prepared.applyResult` and the existing journal
 and manifest primitives: replay the durable QUARANTINED journal, call the
@@ -607,6 +627,15 @@ approved validation implementation once to append VALIDATED and publish its
 generation, then remove only the disposable fixture's current pointer before
 the retry. The retry supplies a different `validatedAt` and must reuse the
 tip-named generation and stored metadata.
+
+The validation RED test then calls the public transaction operation on the same
+prepared fixture and asserts the closed result and exact 96-hour deadline:
+
+```ts
+const validated = await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, validatedAt: "2026-08-09T12:00:00.000Z", writersStopped: true });
+expect(validated).toMatchObject({ transactionId: prepared.transactionId, status: "VALIDATED", deletionRequiresConfirmation: true });
+expect(new Date(validated.deleteAfter).getTime() - new Date(validated.validatedAt).getTime()).toBe(96 * 60 * 60 * 1000);
+```
 
 - [ ] **Step 5: Run validation RED.**
 
@@ -629,6 +658,7 @@ const VALIDATION_PHASES = new Set([
   "after-pointer-root-sync", "before-lock-cleanup",
 ]);
 function mapValidationFaultHook(publicHook, primitive) {
+  if (!publicHook) return undefined;
   return async (phase) => {
     const mapped = primitive === "writeManifestGeneration"
       ? phase === "after-generation-directory-sync" ? "after-validated-generation" : null
@@ -639,23 +669,32 @@ function mapValidationFaultHook(publicHook, primitive) {
     if (mapped && VALIDATION_PHASES.has(mapped)) await publicHook(mapped);
   };
 }
-async function publishValidated(handoff, input) {
-  const publicHook = input.faultHook ?? (async () => {});
-  const generationOptions = { handoff, manifestSha256: input.manifestSha256 };
-  const journalOptions = { handoff, event: "VALIDATED", payload: { manifestSha256: input.manifestSha256 } };
-  const activationOptions = { handoff, manifestSha256: input.manifestSha256 };
-  const generationFaultHook = mapValidationFaultHook(publicHook, "writeManifestGeneration");
-  const activationFaultHook = mapValidationFaultHook(publicHook, "activateManifestGeneration");
-  const journalFaultHook = async (phase) => {
+function journalValidationFaultHook(publicHook) {
+  if (!publicHook) return undefined;
+  return async (phase) => {
     if (phase === "after-journal-sync") return;
     if (phase === "before-lock-cleanup") {
       await publicHook("after-event:VALIDATED");
       await publicHook("before-lock-cleanup");
     }
   };
-  await writeManifestGeneration({ ...generationOptions, faultHook: generationFaultHook });
-  await appendJournalRecord({ ...journalOptions, faultHook: journalFaultHook });
-  await activateManifestGeneration({ ...activationOptions, faultHook: activationFaultHook });
+}
+async function ensureValidated({ capability, transactionId, manifestSha256, fsApi, publicHook }) {
+  return withJournalLock({ capability, fsApi }, async (heldLock) => {
+    const replay = await replayJournal({ capability, fsApi });
+    if (replay.tip?.state === "VALIDATED") {
+      if (replay.tip.payload.manifestSha256 !== manifestSha256) throw new Error("validated digest mismatch");
+      return { status: "already-present", manifestSha256 };
+    }
+    if (replay.tip?.state !== "QUARANTINED") throw new Error("invalid validation state");
+    await appendJournalRecord({ capability, heldLock, event: "VALIDATED", payload: { manifestSha256 }, transactionId, fsApi, faultHook: journalValidationFaultHook(publicHook) });
+    return { status: "appended", manifestSha256 };
+  });
+}
+async function publishValidated({ handoff, manifest, publicHook }) {
+  const manifestSha256 = manifest.manifestSha256;
+  await writeManifestGeneration({ capability: handoff.capability, manifest, fsApi: handoff.fsApi, faultHook: mapValidationFaultHook(publicHook, "writeManifestGeneration") });
+  return activateManifestGeneration({ capability: handoff.capability, transactionId: handoff.transactionId, manifestSha256, fsApi: handoff.fsApi, faultHook: mapValidationFaultHook(publicHook, "activateManifestGeneration"), appendValidated: ({ manifestSha256: requested }) => ensureValidated({ capability: handoff.capability, transactionId: handoff.transactionId, manifestSha256: requested, fsApi: handoff.fsApi, publicHook }) });
 }
 ```
 
@@ -861,15 +900,35 @@ function rollbackRestore(args: { handoff: InternalRunHandoff; replay: JournalRep
 
 ```ts
 import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
-const prepared = await prepareQuarantinedFixture({ regenerate: false });
-const restoreOptions = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId };
-expect(await recoverRestore({ ...restoreOptions, action: "resume", writersStopped: true }))
+const resumePrepared = await prepareQuarantinedFixture({ regenerate: false });
+const resumeOptions = { repoRoot: resumePrepared.fixture.repoRoot, quarantineRoot: resumePrepared.fixture.quarantineRoot, transactionId: resumePrepared.transactionId };
+const resumeChild = spawnLifecycleChild({ operation: "restoreQuarantine", options: { ...resumeOptions, writersStopped: true }, killAt: "after-event:RESTORE_INTENT:copy-0001" });
+expect(resumeChild.signal).toBe("SIGKILL");
+expect(await recoverRestore({ ...resumeOptions, action: "resume", writersStopped: true }))
   .toMatchObject({ transactionId: "tx-0001", restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume" });
-expect(await recoverRestore({ ...restoreOptions, action: "rollback", writersStopped: true }))
+const rollbackPrepared = await prepareQuarantinedFixture({ regenerate: false });
+const rollbackOptions = { repoRoot: rollbackPrepared.fixture.repoRoot, quarantineRoot: rollbackPrepared.fixture.quarantineRoot, transactionId: rollbackPrepared.transactionId };
+const rollbackChild = spawnLifecycleChild({ operation: "restoreQuarantine", options: { ...rollbackOptions, writersStopped: true }, killAt: "after-event:RESTORE_PREPARED" });
+expect(rollbackChild.signal).toBe("SIGKILL");
+expect(await recoverRestore({ ...rollbackOptions, action: "rollback", writersStopped: true }))
   .toMatchObject({ status: "QUARANTINED", action: "rollback", restoreAborted: true });
 ```
 
-The restore-recovery test defines `restoreOptions` from the disposable fixture's absolute roots and transaction ID and reuses the copied transaction `invoke` helper for child-process setup.
+`spawnLifecycleChild` is the existing crash-test helper body moved into the
+shared harness with this signature and behavior:
+
+```ts
+function spawnLifecycleChild(request: { operation: string; options: Record<string, unknown>; killAt: string }) {
+  const child = spawn(process.execPath, [fixturePath], { env: { ...process.env, QUARANTINE_CHILD_REQUEST: JSON.stringify(request) } });
+  return waitForExit(child);
+}
+```
+
+`waitForExit` is the existing helper that resolves `{ code, signal }` from the
+child's `exit` event. Each action uses a fresh prepared fixture. Resume asserts the
+durable post-RESTORE_INTENT journal and terminal RESTORED state. Rollback
+asserts the exact prior QUARANTINED state and its rollback events; neither
+action calls recovery on a plain fixture or reuses the other action's fixture.
 
 - [ ] **Step 2: Run restore recovery RED.**
 
@@ -1175,7 +1234,7 @@ git -C "$ORIGINAL_CHECKOUT" ls-files --others --exclude-standard -z > "$EVIDENCE
 chmod 0600 "$EVIDENCE_DIR/untracked-paths.after"
 node --input-type=module > /dev/null <<'NODE'
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, createReadStream, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, readSync, writeFileSync } from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import { resolve } from "node:path";
 
@@ -1207,21 +1266,25 @@ function pathBuffer(rawPath) {
   return Buffer.concat([Buffer.from(root), Buffer.from("/"), rawPath]);
 }
 
-async function hashRegularFile(pathBufferValue, before) {
+function hashRegularFile(pathBufferValue, before) {
   const descriptor = openSync(pathBufferValue, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  let stream;
   try {
     const opened = fstatSync(descriptor);
     if (opened.dev !== before.dev || opened.ino !== before.ino || opened.mode !== before.mode) throw new Error("identity changed");
     const hash = createHash("sha256");
-    stream = createReadStream(null, { fd: descriptor, autoClose: false });
-    for await (const chunk of stream) hash.update(chunk);
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let offset = 0;
+    while (true) {
+      const count = readSync(descriptor, buffer, 0, buffer.length, offset);
+      if (count === 0) break;
+      hash.update(buffer.subarray(0, count));
+      offset += count;
+    }
     const after = fstatSync(descriptor);
     const relisted = lstatSync(pathBufferValue);
     if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.size !== before.size || relisted.dev !== before.dev || relisted.ino !== before.ino || relisted.mode !== before.mode || relisted.size !== before.size) throw new Error("identity changed");
     return hash.digest("hex");
   } finally {
-    if (stream) stream.destroy();
     closeSync(descriptor);
   }
 }
@@ -1236,7 +1299,7 @@ async function main() {
     let hash = null;
     if (stat.isFile()) {
       type = "file";
-      hash = await hashRegularFile(absolute, stat);
+      hash = hashRegularFile(absolute, stat);
     } else if (stat.isSymbolicLink()) {
       type = "symlink";
       const linkBytes = readlinkSync(absolute, { encoding: "buffer" });
