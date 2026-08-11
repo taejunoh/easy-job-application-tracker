@@ -193,6 +193,9 @@ contains the complete current fixture body, and
 Record<string, unknown>, extraEnvironment: Record<string, string> = {}, timeout
 = 10_000): WorkerResult` contains the complete current invoke body. No
 declaration-only signatures or aliases remain.
+The moved `Fixture` record retains every existing field and adds the exact
+`expectedCount: number` derived from its generated source-copy entries, so all
+apply requests use the fixture's recorded count (including divergent fixtures).
 
 The helper's worker dispatcher adds only `recoverQuarantine` and the existing
 `replay-run` operation in Task 1. It does not import lifecycle core and has no
@@ -509,25 +512,27 @@ they do not become exports.
 - [ ] **Step 1: Write private-core RED tests before implementation.** Import `createQuarantineFixture` and `invokeQuarantineWorker` from `__tests__/fixtures/quarantine/quarantine-test-harness.ts`; that test-only helper owns the moved `Fixture` type, URL/constants/import setup, exact current `fixture` body, exact current `invoke` body, and explicit `core-contract`/`replay-run` worker branches. Assert the exact handoff key set/prototypes/descriptors/frozen state and callback-only lifetime. Cover supplied adapter capture and omitted default adapter capture before the first await; adapter identity mutation, wrong receiver, and method replacement after capture; forged capability; stale run identity; changed quarantine root or repository HEAD; torn or changed journal; wrong, missing, or corrupt journal-named generation; interrupted pointer publication; symlink/foreign replacement; and no journal, pointer, or payload mutation on every precondition failure.
 
 ```ts
-it("captures the supplied adapter before the first await and preserves evidence on stale input", () => {
-  const fixtureRoot = createQuarantineFixture({ divergent: false });
-  const result = invokeQuarantineWorker("core-contract", {
-    repoRoot: fixtureRoot.repoRoot,
-    quarantineRoot: fixtureRoot.quarantineRoot,
-    transactionId: "tx-0001",
-    writersStopped: true,
-    mutateSourceAfterCapture: true,
-    replaceRunIdentity: true,
-  });
-  expect(result.result?.handoffKeys).toEqual([
-    "capability", "fsApi", "head", "journalTip", "manifestGeneration",
-    "quarantineRoot", "repoRoot", "runRoot", "transactionId",
-  ]);
-  expect(result.result?.evidenceBefore).toEqual(result.result?.evidenceAfter);
-});
+const prepared = await prepareQuarantinedFixture();
+const result = invokeQuarantineWorker("core-contract", { options: { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true }, mutateSourceAfterCapture: true });
+expect(result.result?.handoffKeys).toEqual([
+  "capability", "fsApi", "head", "journalTip", "manifestGeneration",
+  "quarantineRoot", "repoRoot", "runRoot", "transactionId",
+]);
+expect(result.result?.handoffFrozen).toBe(true);
+expect(result.result?.prototype).toBe("null");
+expect(result.result?.descriptors).toEqual(expect.any(Object));
+expect(result.result?.evidenceBefore).toEqual(result.result?.evidenceAfter);
 ```
 
-The worker branch for `operation === "core-contract"` mutates the captured source getter, receiver, and method after capture and returns `handoffKeys`, `evidenceBefore`, and `evidenceAfter` as JSON-safe contract observations; all setup and cleanup remain the existing helper bodies.
+The worker branch for `operation === "core-contract"` mutates every captured
+source method/getter after synchronous capture and returns only JSON-safe
+observations; it never returns the capability or handoff.
+
+The separate stale test prepares a second fixture, snapshots its exact journal,
+current-pointer (including absence), and manifest-generation bytes, then sets
+`replaceRunIdentity: true` and invokes the worker with the same nested
+`options`. It expects `ok === false`, no callback/result, and byte-identical
+known evidence after failure; it never expects handoff keys on stale input.
 
 Add state-specific tests: QUARANTINED obtains baseline digest/generation from PREPARED and requires manifest state PREPARED; it does not require a QUARANTINED tip payload or QUARANTINED generation. VALIDATED obtains the digest/generation and stored retention metadata from the VALIDATED tip. Add pointer tests that distinguish missing activation-pending from present malformed, foreign, path-bearing, or mismatched fatal pointers.
 
@@ -562,17 +567,37 @@ returns the capability or handoff. The worker also keeps the existing
 `recoverQuarantine` and `replay-run` branches; preparation remains host-only.
 That worker branch imports `readFileSync` and the existing `deriveRunPath`
 authority before reading those capability-derived evidence paths.
+The host computes `const coreUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-lifecycle-core.mjs")).href` beside the existing transaction URL and injects `${JSON.stringify(coreUrl)}` into the worker source; the generated worker never resolves this module relative to its own evaluated `import.meta.url`.
 
 ```js
-if (operation === "core-contract") {
-  const { withExistingQuarantineRun } = await import(new URL("../../../scripts/quarantine-lifecycle-core.mjs", import.meta.url));
-  return withExistingQuarantineRun(request.options, async (handoff) => {
-    const evidencePaths = [deriveRunPath(handoff.capability, "journal"), deriveRunPath(handoff.capability, "current"), deriveRunPath(handoff.capability, "payload")];
-    const evidenceBefore = evidencePaths.map((path) => readFileSync(path));
-    const observations = { handoffKeys: Object.keys(handoff), handoffFrozen: Object.isFrozen(handoff), prototype: Object.getPrototypeOf(handoff) === null, descriptors: Object.fromEntries(Object.keys(handoff).map((key) => [key, Object.getOwnPropertyDescriptor(handoff, key)])), evidenceBefore };
-    const evidenceAfter = evidencePaths.map((path) => readFileSync(path));
-    return { ...observations, evidenceAfter };
+const FS_METHODS = Object.freeze([
+  "lstat", "realpath", "mkdir", "open", "readdir", "rm", "rename", "unlink",
+  "link", "opendir", "readlink", "createReadStream", "lstatSync", "realpathSync",
+]);
+const baseFsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+function makeMutableFsSource() {
+  const source = Object.create(null);
+  const calls = Object.fromEntries(FS_METHODS.map((name) => [name, 0]));
+  let wrongReceiver = 0;
+  for (const name of FS_METHODS) source[name] = function (...args) { if (this !== source) wrongReceiver += 1; calls[name] += 1; return Reflect.apply(baseFsApi[name], baseFsApi, args); };
+  return { source, calls, get wrongReceiver() { return wrongReceiver; } };
+}
+} else if (operation === "core-contract") {
+  const { withExistingQuarantineRun } = await import(${JSON.stringify(coreUrl)});
+  const mutable = makeMutableFsSource();
+  const pending = withExistingQuarantineRun({ ...request.options, fsApi: mutable.source }, async (handoff) => {
+    const journalPath = deriveRunPath(handoff.capability, { purpose: "journal" });
+    const pointerPath = deriveRunPath(handoff.capability, { purpose: "current-pointer" });
+    const generationPath = deriveRunPath(handoff.capability, { purpose: "manifest-generation", id: handoff.manifestGeneration.manifestSha256 });
+    const readOptional = (path) => { try { return readFileSync(path).toString("base64"); } catch (error) { if (error.code === "ENOENT") return null; throw error; } };
+    const evidenceBefore = [readFileSync(journalPath).toString("base64"), readOptional(pointerPath), readFileSync(generationPath).toString("base64")];
+    const result = { handoffKeys: Object.keys(handoff), handoffFrozen: Object.isFrozen(handoff), prototype: Object.getPrototypeOf(handoff) === null ? "null" : "other", descriptors: Object.fromEntries(Object.keys(handoff).map((key) => [key, Object.getOwnPropertyDescriptor(handoff, key)])), evidenceBefore };
+    return { result, evidencePaths: [journalPath, pointerPath, generationPath] };
   });
+  if (request.mutateSourceAfterCapture) for (const name of FS_METHODS) mutable.source[name] = () => { throw new Error("poison"); };
+  const settled = await pending;
+  const evidenceAfter = settled.evidencePaths.map((path) => { try { return readFileSync(path).toString("base64"); } catch (error) { if (error.code === "ENOENT") return null; throw error; } });
+  process.stdout.write(JSON.stringify({ ok: true, result: { ...settled.result.result, evidenceAfter, calls: mutable.calls, wrongReceiver: mutable.wrongReceiver } }) + "\n");
 }
 ```
 
@@ -604,22 +629,11 @@ The named export is the sole exception to the private boundary: direct internal 
 
 ```ts
 import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
+import { markQuarantineValidated } from "../../scripts/quarantine-transaction.mjs";
 const prepared = await prepareQuarantinedFixture({ regenerate: true });
-const result = invokeQuarantineWorker("core-contract", { options: { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true }, mutateSourceAfterCapture: true });
-expect(result.result?.handoffKeys).toEqual(["capability", "fsApi", "head", "journalTip", "manifestGeneration", "quarantineRoot", "repoRoot", "runRoot", "transactionId"]);
+const validated = await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, validatedAt: "2026-08-09T12:00:00.000Z", writersStopped: true });
+expect(validated.status).toBe("VALIDATED");
 ```
-
-Prepare a second fixture independently, set `replaceRunIdentity: true`, and
-assert the worker returns an error with no callback observation; compare the
-exact evidence files read immediately before the call with the bytes after the
-failure. Never assert handoff keys on this stale-input case.
-
-The separate test uses `const stale = await prepareQuarantinedFixture()` and
-invokes `invokeQuarantineWorker("core-contract", { options: { ... },
-replaceRunIdentity: true })`; it expects `ok === false` and no result/callback.
-The harness's complete evidence reader derives journal, pointer, and payload
-paths through the live capability, stores bytes before the call, and compares
-the stored bytes with the post-failure read.
 
 VALIDATED retry setup reuses `prepared.applyResult` and the existing journal
 and manifest primitives: replay the durable QUARANTINED journal, call the
@@ -635,6 +649,11 @@ prepared fixture and asserts the closed result and exact 96-hour deadline:
 const validated = await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, validatedAt: "2026-08-09T12:00:00.000Z", writersStopped: true });
 expect(validated).toMatchObject({ transactionId: prepared.transactionId, status: "VALIDATED", deletionRequiresConfirmation: true });
 expect(new Date(validated.deleteAfter).getTime() - new Date(validated.validatedAt).getTime()).toBe(96 * 60 * 60 * 1000);
+const phases: string[] = [];
+await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true, faultHook: (phase) => { phases.push(phase); expect(["after-inventory:validation-pass-1:generated-next", "after-inventory:validation-pass-1:generated-node-modules", "after-inventory:validation-pass-2:generated-next", "after-inventory:validation-pass-2:generated-node-modules", "after-validated-generation", "after-event:VALIDATED", "after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync", "before-lock-cleanup"]).toContain(phase); } });
+expect(phases).not.toContain("after-generation-directory-sync");
+expect(phases).not.toContain("after-journal-sync");
+expect(phases).not.toContain("after-quarantine-root-sync");
 ```
 
 - [ ] **Step 5: Run validation RED.**
@@ -682,18 +701,18 @@ function journalValidationFaultHook(publicHook) {
 async function ensureValidated({ capability, transactionId, manifestSha256, fsApi, publicHook }) {
   return withJournalLock({ capability, fsApi }, async (heldLock) => {
     const replay = await replayJournal({ capability, fsApi });
-    if (replay.tip?.state === "VALIDATED") {
-      if (replay.tip.payload.manifestSha256 !== manifestSha256) throw new Error("validated digest mismatch");
+    const tip = replay.records.at(-1);
+    if (replay.state === "VALIDATED") {
+      if (tip?.event !== "VALIDATED" || tip.payload.manifestSha256 !== manifestSha256) throw new Error("validated digest mismatch");
       return { status: "already-present", manifestSha256 };
     }
-    if (replay.tip?.state !== "QUARANTINED") throw new Error("invalid validation state");
-    await appendJournalRecord({ capability, heldLock, event: "VALIDATED", payload: { manifestSha256 }, transactionId, fsApi, faultHook: journalValidationFaultHook(publicHook) });
+    if (replay.state !== "QUARANTINED") throw new Error("invalid validation state");
+    await appendJournalRecord({ capability, heldLock, event: "VALIDATED", payload: { manifestSha256 }, fsApi, faultHook: journalValidationFaultHook(publicHook) });
     return { status: "appended", manifestSha256 };
   });
 }
 async function publishValidated({ handoff, manifest, publicHook }) {
-  const manifestSha256 = manifest.manifestSha256;
-  await writeManifestGeneration({ capability: handoff.capability, manifest, fsApi: handoff.fsApi, faultHook: mapValidationFaultHook(publicHook, "writeManifestGeneration") });
+  const { manifestSha256 } = await writeManifestGeneration({ capability: handoff.capability, manifest, fsApi: handoff.fsApi, faultHook: mapValidationFaultHook(publicHook, "writeManifestGeneration") });
   return activateManifestGeneration({ capability: handoff.capability, transactionId: handoff.transactionId, manifestSha256, fsApi: handoff.fsApi, faultHook: mapValidationFaultHook(publicHook, "activateManifestGeneration"), appendValidated: ({ manifestSha256: requested }) => ensureValidated({ capability: handoff.capability, transactionId: handoff.transactionId, manifestSha256: requested, fsApi: handoff.fsApi, publicHook }) });
 }
 ```
@@ -712,7 +731,7 @@ Expected: PASS for core source/method mutation, callback invalidation, exact QUA
 
 ```bash
 git diff --check
-git add scripts/quarantine-lifecycle-core.mjs scripts/quarantine-run-fs-context.mjs scripts/quarantine-workspace-runtime.mjs scripts/quarantine-transaction.mjs scripts/quarantine-manifest.mjs __tests__/scripts/quarantine-lifecycle-core.test.ts __tests__/scripts/quarantine-transaction.test.ts __tests__/scripts/quarantine-manifest.test.ts
+git add scripts/quarantine-lifecycle-core.mjs scripts/quarantine-run-fs-context.mjs scripts/quarantine-workspace-runtime.mjs scripts/quarantine-transaction.mjs scripts/quarantine-manifest.mjs __tests__/fixtures/quarantine/quarantine-test-harness.ts __tests__/scripts/quarantine-lifecycle-core.test.ts __tests__/scripts/quarantine-transaction.test.ts __tests__/scripts/quarantine-manifest.test.ts
 git commit -m "feat: validate quarantined workspaces"
 ```
 
@@ -848,7 +867,7 @@ git commit -m "feat: restore quarantined workspaces"
 - Modify: `__tests__/fixtures/quarantine/quarantine-lifecycle-child.mjs`
 - Create: `__tests__/scripts/quarantine-restore-crash.integration.test.ts`
 - Modify: `__tests__/scripts/quarantine-restore.test.ts`
-- Modify: `__tests__/fixtures/quarantine/quarantine-test-harness.ts` for recovery setup reuse
+- Modify: `__tests__/fixtures/quarantine/quarantine-test-harness.ts` to export `spawnLifecycleChild` for recovery setup reuse
 
 **Interfaces:**
 
@@ -899,25 +918,32 @@ function rollbackRestore(args: { handoff: InternalRunHandoff; replay: JournalRep
 `RestoreLedger` preserves durable `RESTORE_INTENT` order; `RestoreRecoveryResult` is exactly one of the three result unions in this task. These are private records only.
 
 ```ts
-import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
+import { prepareQuarantinedFixture, spawnLifecycleChild } from "../fixtures/quarantine/quarantine-test-harness";
 const resumePrepared = await prepareQuarantinedFixture({ regenerate: false });
 const resumeOptions = { repoRoot: resumePrepared.fixture.repoRoot, quarantineRoot: resumePrepared.fixture.quarantineRoot, transactionId: resumePrepared.transactionId };
-const resumeChild = spawnLifecycleChild({ operation: "restoreQuarantine", options: { ...resumeOptions, writersStopped: true }, killAt: "after-event:RESTORE_INTENT:copy-0001" });
+const resumeChild = await spawnLifecycleChild({ operation: "restoreQuarantine", options: { ...resumeOptions, writersStopped: true }, killAt: "after-event:RESTORE_INTENT:copy-0001" });
 expect(resumeChild.signal).toBe("SIGKILL");
 expect(await recoverRestore({ ...resumeOptions, action: "resume", writersStopped: true }))
   .toMatchObject({ transactionId: "tx-0001", restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume" });
 const rollbackPrepared = await prepareQuarantinedFixture({ regenerate: false });
 const rollbackOptions = { repoRoot: rollbackPrepared.fixture.repoRoot, quarantineRoot: rollbackPrepared.fixture.quarantineRoot, transactionId: rollbackPrepared.transactionId };
-const rollbackChild = spawnLifecycleChild({ operation: "restoreQuarantine", options: { ...rollbackOptions, writersStopped: true }, killAt: "after-event:RESTORE_PREPARED" });
+const rollbackChild = await spawnLifecycleChild({ operation: "restoreQuarantine", options: { ...rollbackOptions, writersStopped: true }, killAt: "after-event:RESTORE_PREPARED" });
 expect(rollbackChild.signal).toBe("SIGKILL");
 expect(await recoverRestore({ ...rollbackOptions, action: "rollback", writersStopped: true }))
   .toMatchObject({ status: "QUARANTINED", action: "rollback", restoreAborted: true });
 ```
 
 `spawnLifecycleChild` is the existing crash-test helper body moved into the
-shared harness with this signature and behavior:
+shared harness with this signature and behavior. The harness imports `spawn`
+and `fileURLToPath`, defines `fixturePath` from the sibling child module, and
+keeps the exit waiter executable in the same file:
 
 ```ts
+const fixturePath = fileURLToPath(new URL("./quarantine-lifecycle-child.mjs", import.meta.url));
+type ChildExit = { once(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): void };
+function waitForExit(child: ChildExit): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+}
 function spawnLifecycleChild(request: { operation: string; options: Record<string, unknown>; killAt: string }) {
   const child = spawn(process.execPath, [fixturePath], { env: { ...process.env, QUARANTINE_CHILD_REQUEST: JSON.stringify(request) } });
   return waitForExit(child);
@@ -1216,7 +1242,7 @@ git diff --check "$IMPLEMENTATION_BASE"..HEAD
 
 Expected: all commands exit 0; lint reports zero warnings; build succeeds without modifying the plan's scope.
 
-- [ ] **Step 3: Regenerate after-evidence and prove no-touch/no-deletion invariants.** Set `EVIDENCE_SUFFIX=after`, rerun the exact executable Node script from Execution preflight (same imports, path validation, `lstatSync`, regular-file stream hashing, symlink `readlinkSync` hashing, sorted base64-path JSONL, and mode-0600 write) against the same `ORIGINAL_CHECKOUT`, producing `untracked-paths.after` and `untracked-meta.after` under the same 0700 `EVIDENCE_DIR`. Use disposable fixtures for all mutations. Then run:
+- [ ] **Step 3: Regenerate after-evidence and prove no-touch/no-deletion invariants.** Set `EVIDENCE_SUFFIX=after`, rerun the exact executable Node script from Execution preflight (same imports, raw-buffer NUL/path validation, `lstatSync`, one-open `readSync` hashing with post-read identity/size checks, symlink `readlinkSync` hashing, sorted base64-path JSONL, and mode-0600 write) against the same `ORIGINAL_CHECKOUT`, producing `untracked-paths.after` and `untracked-meta.after` under the same 0700 `EVIDENCE_DIR`. Use disposable fixtures for all mutations. Then run:
 
 ```bash
 EVIDENCE_DIR="$(git rev-parse --git-path quarantine-lifecycle-evidence)"
