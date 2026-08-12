@@ -500,10 +500,31 @@ try {
       },
     }));
   } else if (operation === "recover") {
-    const { fsMutation, ...recoveryRequest } = request;
+    const { fsMutation, race, ...recoveryRequest } = request;
     let getterReads = 0;
     let wrongReceiver = 0;
     let recoveryOptions = recoveryRequest;
+    if (race !== undefined) {
+      let journalSyncs = 0;
+      recoveryOptions = {
+        ...recoveryOptions,
+        async faultHook(phase) {
+          if (phase !== "after-journal-sync") return;
+          journalSyncs += 1;
+          if (journalSyncs !== 2) return;
+          const payload = join(
+            request.quarantineRoot,
+            request.transactionId,
+            "payload/source-copies/copy-0001",
+          );
+          if (race === "resume-source") {
+            writeFileSync(join(request.repoRoot, "notes 2.txt"), "foreign source\\n");
+          } else if (race === "rollback-payload") {
+            writeFileSync(payload, "foreign payload\\n");
+          }
+        },
+      };
+    }
     let result;
     if (fsMutation !== undefined) {
       const source = {

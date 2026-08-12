@@ -1919,10 +1919,11 @@ function buildApplyLedger(replayed, manifest) {
   const entries = new Map(manifest.entries.map((entry) => [entry.id, entry]));
   const intents = [];
   const completed = new Set();
+  let completionIndex = 0;
   for (const record of replayed.records) {
     if (record.event === "MOVE_INTENT") {
-      const entry = entries.get(record.payload.id);
-      if (entry === undefined) fail("ERR_INTEGRITY");
+      const entry = manifest.entries[intents.length];
+      if (entry === undefined || entry.id !== record.payload.id) fail("ERR_INTEGRITY");
       if (
         record.payload.expected.sha256 !== entry.preMoveInventory.sha256 ||
         record.payload.expected.entries !== entry.preMoveInventory.entries ||
@@ -1930,9 +1931,22 @@ function buildApplyLedger(replayed, manifest) {
       ) fail("ERR_INTEGRITY");
       intents.push(entry);
     } else if (record.event === "MOVED") {
+      if (intents[completionIndex]?.id !== record.payload.id) fail("ERR_INTEGRITY");
       completed.add(record.payload.id);
+      completionIndex += 1;
+    } else if (
+      record.event === "VALIDATED" &&
+      record.payload.manifestSha256 !== prepared.payload.manifestSha256
+    ) {
+      fail("ERR_INTEGRITY");
     }
   }
+  if (
+    (replayed.state === "QUARANTINED" || replayed.state === "VALIDATED") &&
+    (intents.length !== manifest.entries.length ||
+      completed.size !== manifest.entries.length ||
+      completionIndex !== manifest.entries.length)
+  ) fail("ERR_INTEGRITY");
   return Object.freeze({
     completed,
     entries,
@@ -2012,24 +2026,71 @@ async function classifyApplyEndpoint({ capability, entry, repoRoot, fsApi }) {
   return { payload, payloadObserved, payloadStat, source, sourceObserved, sourceStat };
 }
 
-async function renameRecoveryEndpoint({ capability, entry, from, to, fsApi }) {
-  await revalidateRunCapability(capability, {
-    purpose: "payload",
-    id: entry.id,
-    boundary: "before-mutation",
-  });
-  const destination = await endpointStat(to, fsApi);
-  if (destination !== null) fail("ERR_INTEGRITY");
-  const source = await endpointStat(from, fsApi);
-  if (source === null) fail("ERR_INTEGRITY");
+async function guardedRecoveryRename({ capability, entry, repoRoot, workspace, payload, toPayload, fsApi }) {
+  const workspaceAncestors = await captureSourceAncestors(repoRoot, workspace, fsApi);
+  const payloadParent = dirname(payload);
+  const payloadParentIdentity = await capturePrivateDirectory(payloadParent, fsApi);
+  const expectedSource = toPayload ? workspace : payload;
+  const expectedDestination = toPayload ? payload : workspace;
+  const sourcePhase = toPayload ? "validation-pass-1" : "validation-pass-2";
+  const destinationPhase = toPayload ? "validation-pass-2" : "validation-pass-1";
+
+  const assertBeforeRename = async () => {
+    await revalidateRunCapability(capability, {
+      purpose: "payload",
+      id: entry.id,
+      boundary: "before-mutation",
+    });
+    await assertSourceAncestors(repoRoot, workspaceAncestors, fsApi);
+    await assertPrivateDirectoryIdentity(payloadParent, payloadParentIdentity, fsApi);
+    if (await endpointStat(expectedDestination, fsApi) !== null) fail("ERR_INTEGRITY");
+    if (await endpointStat(expectedSource, fsApi) === null) fail("ERR_INTEGRITY");
+    if ((await endpointMatchesInventory({
+      capability,
+      entry,
+      path: expectedSource,
+      phase: sourcePhase,
+    })) === null) fail("ERR_INTEGRITY");
+  };
+  const assertAfterRename = async () => {
+    await revalidateRunCapability(capability, {
+      purpose: "payload",
+      id: entry.id,
+      boundary: "after-sync",
+    });
+    await assertSourceAncestors(repoRoot, workspaceAncestors, fsApi);
+    await assertPrivateDirectoryIdentity(payloadParent, payloadParentIdentity, fsApi);
+    await assertPathMissing(expectedSource, fsApi);
+    if ((await endpointMatchesInventory({
+      capability,
+      entry,
+      path: expectedDestination,
+      phase: destinationPhase,
+    })) === null) fail("ERR_INTEGRITY");
+  };
+
+  await assertBeforeRename();
   try {
-    await fsApi.rename(from, to);
+    await fsApi.rename(expectedSource, expectedDestination);
   } catch (error) {
     if (error?.code === "EXDEV") fail("ERR_EXDEV");
     throw error;
   }
-  await syncDirectory(dirname(to), fsApi);
-  await syncDirectory(dirname(from), fsApi);
+  if (toPayload) {
+    try {
+      await fsyncTree({ capability, root: payload, entryId: entry.id, purpose: "payload" });
+    } catch {
+      fail("ERR_INTEGRITY");
+    }
+  }
+  await assertAfterRename();
+  try {
+    await syncDirectory(payloadParent, fsApi);
+    await syncDirectory(dirname(workspace), fsApi);
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  await assertAfterRename();
 }
 
 async function readRecoveryManifest({ capability, options, replayed }) {
@@ -2108,14 +2169,15 @@ async function resumeApplyFromLedger({ capability, heldLock, ledger, manifest, o
       intended.add(entry.id);
     }
     if (endpoint.sourceStat !== null) {
-      await renameRecoveryEndpoint({
+      await guardedRecoveryRename({
         capability,
         entry,
-        from: endpoint.source,
-        to: endpoint.payload,
+        repoRoot: options.repoRoot,
+        workspace: endpoint.source,
+        payload: endpoint.payload,
+        toPayload: true,
         fsApi,
       });
-      await fsyncTree({ capability, root: endpoint.payload, entryId: entry.id, purpose: "payload" });
       const observed = await endpointMatchesInventory({
         capability,
         entry,
@@ -2183,7 +2245,15 @@ async function rollbackApplyFromLedger({ capability, heldLock, ledger, manifest,
       faultHook: options.faultHook,
     });
     if (endpoint.payloadStat !== null) {
-      await renameRecoveryEndpoint({ capability, entry, from: endpoint.payload, to: endpoint.source, fsApi });
+      await guardedRecoveryRename({
+        capability,
+        entry,
+        repoRoot: options.repoRoot,
+        workspace: endpoint.source,
+        payload: endpoint.payload,
+        toPayload: false,
+        fsApi,
+      });
       reconciledEntries += 1;
     }
     await appendHeldEvent({
@@ -2210,14 +2280,12 @@ async function recoverApplyOnCapability({ capability, options }) {
     initial,
     await readRecoveryManifest({ capability, options, replayed: initial }),
   );
-  if (initial.state === "QUARANTINED" && options.action === "resume") {
-    return recoveryResult(options.transactionId, "QUARANTINED", "resume", 0);
+  if (initial.state === "QUARANTINED" || initial.state === "VALIDATED") {
+    if (options.action !== "resume") fail("ERR_USAGE");
+    return recoveryResult(options.transactionId, initial.state, "resume", 0);
   }
-  if (initial.state === "VALIDATED" && options.action === "resume") {
-    return recoveryResult(options.transactionId, "VALIDATED", "resume", 0);
-  }
-  if (initial.state === "QUARANTINED" && options.action === "rollback") fail("ERR_USAGE");
-  if (initial.state === "ROLLED_BACK" && options.action === "rollback") {
+  if (initial.state === "ROLLED_BACK") {
+    if (options.action !== "rollback") fail("ERR_USAGE");
     return recoveryResult(options.transactionId, "ROLLED_BACK", "rollback", 0);
   }
   if (initial.state === "INCOMPLETE_CONFLICT") {

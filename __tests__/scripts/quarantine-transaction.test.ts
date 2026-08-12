@@ -60,6 +60,39 @@ function expectWorkerError(result: WorkerResult, code: string, message: string) 
   }
 }
 
+function journalRecords(path: string) {
+  const bytes = readFileSync(path);
+  const records = [];
+  for (let offset = 0; offset < bytes.length;) {
+    const length = bytes.readUInt32BE(offset);
+    records.push(JSON.parse(bytes.subarray(offset + 4, offset + 4 + length).toString("utf8")));
+    offset += 4 + length;
+  }
+  return records;
+}
+
+function rewriteJournal(path: string, records: Array<{ event: string; payload: unknown }>) {
+  let previousHash = "0".repeat(64);
+  const frames = records.map((record, index) => {
+    const sequence = index + 1;
+    const recordHash = createHash("sha256")
+      .update(JSON.stringify({ sequence, previousHash, event: record.event, payload: record.payload }))
+      .digest("hex");
+    const body = Buffer.from(JSON.stringify({
+      sequence,
+      previousHash,
+      event: record.event,
+      payload: record.payload,
+      recordHash,
+    }));
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(body.length);
+    previousHash = recordHash;
+    return Buffer.concat([length, body]);
+  });
+  writeFileSync(path, Buffer.concat(frames));
+}
+
 describe("quarantine transaction Slice 1", () => {
   it("exports explicit semantic apply recovery", () => {
     const result = invokeQuarantineWorker("exports", {});
@@ -303,6 +336,147 @@ describe("quarantine transaction Slice 1", () => {
       action: "rollback",
       writersStopped: true,
     }), "ERR_USAGE", "Invalid quarantine request.");
+  });
+
+  it.each(["QUARANTINED", "VALIDATED"] as const)(
+    "rejects a rehashed partial manifest ledger before returning terminal %s",
+    (terminal) => {
+      const f = createQuarantineFixture();
+      bases.push(f.base);
+      const transactionId = `tx-partial-terminal-${terminal.toLowerCase()}`;
+      const request = {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: f.expectedCount,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      };
+      expect(invokeQuarantineWorker("apply", request)).toMatchObject({ ok: true });
+      const journal = join(f.quarantineRoot, transactionId, "journal.log");
+      const original = journalRecords(journal);
+      const partial = [
+        original.find((record) => record.event === "PREPARED")!,
+        original.find((record) => record.event === "MOVING")!,
+        original.find((record) => record.event === "MOVE_INTENT")!,
+        original.find((record) => record.event === "MOVED")!,
+        original.find((record) => record.event === "VERIFYING")!,
+        original.find((record) => record.event === "QUARANTINED")!,
+      ];
+      if (terminal === "VALIDATED") {
+        const prepared = partial[0];
+        partial.push({
+          event: "VALIDATED",
+          payload: { manifestSha256: prepared.payload.manifestSha256 },
+        });
+      }
+      rewriteJournal(journal, partial);
+      const beforeJournal = readFileSync(journal);
+      const payload = join(f.quarantineRoot, transactionId, "payload/source-copies/copy-0001");
+      const beforePayload = readFileSync(payload);
+
+      expectWorkerError(invokeQuarantineWorker("recover", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        transactionId,
+        action: "resume",
+        writersStopped: true,
+      }), "ERR_INTEGRITY", "Quarantine evidence failed integrity validation.");
+      expect(readFileSync(journal)).toEqual(beforeJournal);
+      expect(readFileSync(payload)).toEqual(beforePayload);
+    },
+  );
+
+  it("rejects a rehashed VALIDATED record whose digest differs from PREPARED", () => {
+    const f = createQuarantineFixture();
+    bases.push(f.base);
+    const transactionId = "tx-terminal-validated-digest";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: f.expectedCount,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    expect(invokeQuarantineWorker("apply", request)).toMatchObject({ ok: true });
+    const journal = join(f.quarantineRoot, transactionId, "journal.log");
+    const records = journalRecords(journal);
+    rewriteJournal(journal, [...records, {
+      event: "VALIDATED",
+      payload: { manifestSha256: "b".repeat(64) },
+    }]);
+    const beforeJournal = readFileSync(journal);
+
+    expectWorkerError(invokeQuarantineWorker("recover", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      transactionId,
+      action: "resume",
+      writersStopped: true,
+    }), "ERR_INTEGRITY", "Quarantine evidence failed integrity validation.");
+    expect(readFileSync(journal)).toEqual(beforeJournal);
+  });
+
+  it.each([
+    ["VALIDATED", "rollback"],
+    ["ROLLED_BACK", "resume"],
+  ] as const)("rejects unsupported intact terminal %s %s without mutation", (terminal, action) => {
+    const f = createQuarantineFixture();
+    bases.push(f.base);
+    const transactionId = `tx-terminal-action-${terminal.toLowerCase()}`;
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: f.expectedCount,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    if (terminal === "VALIDATED") {
+      expect(invokeQuarantineWorker("apply", request)).toMatchObject({ ok: true });
+      const journal = join(f.quarantineRoot, transactionId, "journal.log");
+      const records = journalRecords(journal);
+      rewriteJournal(journal, [...records, {
+        event: "VALIDATED",
+        payload: { manifestSha256: records[0].payload.manifestSha256 },
+      }]);
+    } else {
+      expect(invokeQuarantineWorker("apply-stop", {
+        ...request,
+        stopPhase: "after-event:MOVE_INTENT:copy-0001",
+      }).ok).toBe(false);
+      expect(invokeQuarantineWorker("recover", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        transactionId,
+        action: "rollback",
+        writersStopped: true,
+      }).result).toMatchObject({ status: "ROLLED_BACK" });
+    }
+    const runRoot = join(f.quarantineRoot, transactionId);
+    const journal = join(runRoot, "journal.log");
+    const beforeJournal = readFileSync(journal);
+    const evidence = [
+      join(f.repoRoot, "notes 2.txt"),
+      join(runRoot, "payload/source-copies/copy-0001"),
+    ].filter(existsSync).map((path) => [path, readFileSync(path)] as const);
+
+    expectWorkerError(invokeQuarantineWorker("recover", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      transactionId,
+      action,
+      writersStopped: true,
+    }), "ERR_USAGE", "Invalid quarantine request.");
+    expect(readFileSync(journal)).toEqual(beforeJournal);
+    for (const [path, bytes] of evidence) expect(readFileSync(path)).toEqual(bytes);
   });
 
   it("validates terminal manifest evidence before returning VALIDATED resume", () => {
@@ -551,6 +725,55 @@ describe("quarantine transaction Slice 1", () => {
       expect(recovered.getterReads).toBe(fsMutation === "getter" ? 1 : 0);
     },
   );
+
+  it.each([
+    ["resume-source", "after-event:MOVE_INTENT:copy-0001", "resume", "MOVED"],
+    ["rollback-payload", "after-rename:copy-0001", "rollback", "ROLLED_BACK_ENTRY"],
+  ] as const)("does not rename foreign evidence injected at the %s journal seam", (
+    race,
+    stopPhase,
+    action,
+    completionEvent,
+  ) => {
+    const f = createQuarantineFixture();
+    bases.push(f.base);
+    const transactionId = `tx-rename-race-${action}`;
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: f.expectedCount,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    expect(invokeQuarantineWorker("apply-stop", { ...request, stopPhase }).ok).toBe(false);
+    const runRoot = join(f.quarantineRoot, transactionId);
+    const source = join(f.repoRoot, "notes 2.txt");
+    const payload = join(runRoot, "payload/source-copies/copy-0001");
+
+    expectWorkerError(invokeQuarantineWorker("recover", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      transactionId,
+      action,
+      writersStopped: true,
+      race,
+    }), "ERR_INTEGRITY", "Quarantine evidence failed integrity validation.");
+    if (race === "resume-source") {
+      expect(readFileSync(source, "utf8")).toBe("foreign source\n");
+      expect(existsSync(payload)).toBe(false);
+    } else {
+      expect(readFileSync(payload, "utf8")).toBe("foreign payload\n");
+      expect(existsSync(source)).toBe(false);
+    }
+    const replay = invokeQuarantineWorker("replay-run", request).result!;
+    expect(replay.records).not.toContainEqual(expect.objectContaining({
+      event: completionEvent,
+      payload: expect.objectContaining({ id: "copy-0001" }),
+    }));
+  });
 
   const bases: string[] = [];
 
