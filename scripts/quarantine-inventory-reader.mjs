@@ -61,9 +61,7 @@ async function assertPathMatchesHandle(path, expected, type, fsApi) {
   if (!sameIdentity(expected, observed) || modeOf(expected) !== modeOf(observed)) {
     throw new Error("restore endpoint pathname identity changed");
   }
-  if ((await fsApi.realpath(path)) !== path) {
-    throw new Error("restore endpoint pathname is not canonical");
-  }
+  return fsApi.realpath(path);
 }
 
 async function withVerifiedDirectory(path, expected, fsApi, callback) {
@@ -78,11 +76,13 @@ async function withVerifiedDirectory(path, expected, fsApi, callback) {
     // opendir(path) is allowed only to acquire a held stream. Before its first
     // read, bind that pathname back to the already-open no-follow handle.
     dir = await fsApi.opendir(path);
-    await assertPathMatchesHandle(path, opened, "isDirectory", fsApi);
+    const canonicalPath = await assertPathMatchesHandle(path, opened, "isDirectory", fsApi);
     value = await callback(dir);
     const finalHandle = await handle.stat();
     assertIdentity(opened, finalHandle, "isDirectory", "restore directory handle");
-    await assertPathMatchesHandle(path, opened, "isDirectory", fsApi);
+    if (canonicalPath !== await assertPathMatchesHandle(path, opened, "isDirectory", fsApi)) {
+      throw new Error("restore directory pathname changed while being read");
+    }
   } catch (error) {
     primary = error;
   }
