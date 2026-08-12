@@ -309,7 +309,7 @@ async function invokeHook(hook, phase) {
   if (hook !== undefined) await hook(phase);
 }
 
-async function captureActiveGenerated(handoff, faultHook, publications) {
+async function captureActiveGenerated(handoff, faultHook, publications, { replaceExisting = false } = {}) {
   const active = [];
   for (const id of GENERATED_IDS) {
     const entry = handoff.manifestGeneration.manifest.entries.find((candidate) => candidate.id === id);
@@ -329,7 +329,7 @@ async function captureActiveGenerated(handoff, faultHook, publications) {
       fsApi: handoff.fsApi, ancestorChain: ancestors, snapshot: true,
     });
     const published = await publishVerifiedRestoreActiveInventory({
-      capability: handoff.capability, entryId: id, snapshot: heldSnapshot,
+      capability: handoff.capability, entryId: id, snapshot: heldSnapshot, replaceExisting,
     });
     publications.push(published.publication);
     await invokeHook(faultHook, `after-inventory:restore-active:${id}`);
@@ -668,7 +668,7 @@ export async function restoreQuarantine(input) {
       const publications = [];
       let activeGenerated;
       try {
-        activeGenerated = await captureActiveGenerated(handoff, options.faultHook, publications);
+        activeGenerated = await captureActiveGenerated(handoff, options.faultHook, publications, { replaceExisting: true });
         await assertActiveStable(handoff, activeGenerated);
         await append(heldLock, handoff.capability, "RESTORE_PREPARED", { restoreId, activeGenerated });
       } catch (error) {

@@ -549,7 +549,8 @@ describe("quarantine restore real SIGKILL recovery", () => {
     try {
       if (prior === "VALIDATED") validatePriorState(prepared);
       const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
-      expect((await spawnLifecycleChild("restoreQuarantine", options, { killAt: "after-event:RESTORE_INTENT:copy-0001" })).signal).toBe("SIGKILL");
+      const secondCrash = await spawnLifecycleChild("restoreQuarantine", options, { killAt: "after-event:RESTORE_INTENT:copy-0001" });
+      if (secondCrash.signal !== "SIGKILL") throw new Error(JSON.stringify(secondCrash));
       writeFileSync(join(prepared.runRoot, "payload", "source-copies", "copy-0001"), "foreign\n");
       rmSync(join(prepared.runRoot, "journal.lock"));
       const { release } = await killThenReleaseFixtureLock(
@@ -561,6 +562,36 @@ describe("quarantine restore real SIGKILL recovery", () => {
       const conflict = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
       if (conflict.code !== 0) throw new Error(JSON.stringify(conflict));
       expect(JSON.parse(conflict.stdout)).toEqual(expect.objectContaining({ status: "INCOMPLETE_CONFLICT", action: "rollback", conflictEntryIds: ["copy-0001"] }));
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it.each(["resume", "rollback"] as const)("recovers only the second public restore epoch after Q abort then V validation: %s", async (action) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      expect((await spawnLifecycleChild("restoreQuarantine", options, { killAt: "after-event:RESTORED_ENTRY:copy-0001" })).signal).toBe("SIGKILL");
+      rmSync(join(prepared.runRoot, "journal.lock"));
+      const firstAbort = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
+      if (firstAbort.code !== 0) throw new Error(JSON.stringify(firstAbort));
+      expect(JSON.parse(firstAbort.stdout)).toEqual({ transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 3, restoreAborted: true });
+      validatePriorState(prepared);
+      const secondEpochCrash = await spawnLifecycleChild("restoreQuarantine", options, { killAt: "after-event:RESTORE_INTENT:copy-0001" });
+      if (secondEpochCrash.signal !== "SIGKILL") throw new Error(JSON.stringify(secondEpochCrash));
+      rmSync(join(prepared.runRoot, "journal.lock"));
+      const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action });
+      if (recovered.code !== 0) throw new Error(JSON.stringify(recovered));
+      const expected = action === "resume"
+        ? { transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume", reconciledEntries: 3 }
+        : { transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "VALIDATED", action: "rollback", reconciledEntries: 3, restoreAborted: true };
+      expect(JSON.parse(recovered.stdout)).toEqual(expected);
+      const events = journalEvents(join(prepared.runRoot, "journal.log"));
+      const currentPrepared = events.lastIndexOf("RESTORE_PREPARED");
+      expect(events[currentPrepared - 1]).toBe("VALIDATED");
+      expect(events.slice(currentPrepared)).toEqual(action === "resume"
+        ? ["RESTORE_PREPARED", "RESTORING", "RESTORE_INTENT", "RESTORED_ENTRY", "RESTORE_INTENT", "RESTORED_ENTRY", "RESTORE_INTENT", "RECOVERY_REQUIRED", "RESTORING", "RESTORED_ENTRY", "RESTORED"]
+        : ["RESTORE_PREPARED", "RESTORING", "RESTORE_INTENT", "RESTORED_ENTRY", "RESTORE_INTENT", "RESTORED_ENTRY", "RESTORE_INTENT", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK", "RESTORE_ROLLBACK_INTENT", "RESTORE_ROLLED_BACK_ENTRY", "RESTORE_ROLLBACK_INTENT", "RESTORE_ROLLED_BACK_ENTRY", "RESTORE_ROLLBACK_INTENT", "RESTORE_ROLLED_BACK_ENTRY", "RESTORE_ABORTED_TO_VALIDATED"]);
+      expect(existsSync(join(prepared.fixture.repoRoot, "notes 2.txt"))).toBe(action === "resume");
+      expect(existsSync(join(prepared.runRoot, "payload", "source-copies", "copy-0001"))).toBe(action === "rollback");
     } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
   }, 60_000);
 });

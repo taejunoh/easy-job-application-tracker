@@ -275,7 +275,7 @@ export async function summarizeInventoryDirectory(root, {
   });
 }
 
-export async function publishVerifiedRestoreActiveInventory({ capability, entryId, snapshot }) {
+export async function publishVerifiedRestoreActiveInventory({ capability, entryId, snapshot, replaceExisting = false }) {
   if (snapshot === null || typeof snapshot !== "object" || !Array.isArray(snapshot.records)) {
     throw new TypeError("verified restore inventory snapshot is invalid");
   }
@@ -307,7 +307,18 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
   };
   let primary;
   try {
-    handle = await fsApi.open(path, "wx", 0o600);
+    try {
+      handle = await fsApi.open(path, "wx", 0o600);
+    } catch (error) {
+      if (!replaceExisting || error?.code !== "EEXIST") throw error;
+      const existing = await fsApi.lstat(path);
+      if (existing.isSymbolicLink() || !existing.isFile() || modeOf(existing) !== 0o600 || existing.nlink !== 1) {
+        throw new Error("existing restore-active inventory is unsafe");
+      }
+      await fsApi.unlink(path);
+      await revalidateRunCapability(capability, { purpose: "inventory", id: entryId, phase: "restore-active", boundary: "before-mutation" });
+      handle = await fsApi.open(path, "wx", 0o600);
+    }
     await handle.chmod(0o600);
     const opened = await handle.stat();
     if (opened.isSymbolicLink() || !opened.isFile() || modeOf(opened) !== 0o600 || opened.nlink !== 1) {
