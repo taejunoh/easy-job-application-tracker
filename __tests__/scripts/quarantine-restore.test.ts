@@ -99,6 +99,19 @@ describe("quarantine restore", () => {
     `], { encoding: "utf8" }));
     expect(invalid).toEqual([expect.stringMatching(/exact record/u), expect.stringMatching(/invalid/u)]);
 
+    const synchronous = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+      const { restoreQuarantine } = await import(${JSON.stringify(restoreUrl)});
+      const counts = { toString: 0, valueOf: 0 }; const hostile = { toString() { counts.toString++; return "/x"; }, valueOf() { counts.valueOf++; return "/x"; } };
+      const custom = Object.create({}); Object.assign(custom, { repoRoot: "/r", quarantineRoot: "/q", transactionId: "tx", writersStopped: true });
+      const hidden = { repoRoot: "/r", quarantineRoot: "/q", transactionId: "tx", writersStopped: true }; Object.defineProperty(hidden, "extra", { value: true });
+      const inherited = Object.create({ repoRoot: "/r" }); Object.assign(inherited, { quarantineRoot: "/q", transactionId: "tx", writersStopped: true });
+      const invalid = [null, [], custom, hidden, inherited, { repoRoot: hostile, quarantineRoot: "/q", transactionId: "tx", writersStopped: true }, { repoRoot: "/r", quarantineRoot: "/q", transactionId: "bad id", writersStopped: true }, { repoRoot: "/r", quarantineRoot: "/q", transactionId: "tx", writersStopped: false }];
+      const messages = []; for (const input of invalid) try { await restoreQuarantine(input); } catch (error) { messages.push(error.message); }
+      process.stdout.write(JSON.stringify({ counts, messages }));
+    `], { encoding: "utf8" }));
+    expect(synchronous.counts).toEqual({ toString: 0, valueOf: 0 });
+    expect(synchronous.messages).toHaveLength(8);
+
     const prepared = prepareQuarantinedFixture();
     try {
       const output = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `

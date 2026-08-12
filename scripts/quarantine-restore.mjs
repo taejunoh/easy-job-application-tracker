@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
-import { fsyncTree, writeInventoryJsonl } from "./quarantine-inventory.mjs";
+import { fsyncTree } from "./quarantine-inventory.mjs";
 import {
   fsyncVerifiedTree,
+  publishVerifiedRestoreActiveInventory,
   summarizeInventoryDirectory,
   hashVerifiedRegularFile,
 } from "./quarantine-inventory-reader.mjs";
@@ -16,6 +17,7 @@ const OPTION_KEYS = Object.freeze([
 ]);
 const REQUIRED_KEYS = Object.freeze(["repoRoot", "quarantineRoot", "transactionId", "writersStopped"]);
 const GENERATED_IDS = Object.freeze(["generated-next", "generated-node-modules"]);
+const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 
 function record(entries) {
   const value = Object.create(null);
@@ -42,6 +44,15 @@ function snapshotOptions(input) {
   const snapshot = Object.create(null);
   for (const key of OPTION_KEYS) if (keys.includes(key)) snapshot[key] = input[key];
   if (snapshot.writersStopped !== true) throw new TypeError("writers-stopped attestation must be true");
+  for (const [key, value] of [["repoRoot", snapshot.repoRoot], ["quarantineRoot", snapshot.quarantineRoot]]) {
+    if (typeof value !== "string" || !isAbsolute(value) || value.includes("\0") || value !== value.normalize("NFC")) {
+      throw new TypeError(`restore ${key} is invalid`);
+    }
+  }
+  if (
+    typeof snapshot.transactionId !== "string" || snapshot.transactionId === "." || snapshot.transactionId === ".." ||
+    snapshot.transactionId !== snapshot.transactionId.normalize("NFC") || !TRANSACTION_ID.test(snapshot.transactionId)
+  ) throw new TypeError("restore transaction ID is invalid");
   if (snapshot.faultHook !== undefined && typeof snapshot.faultHook !== "function") {
     throw new TypeError("restore fault hook must be a function");
   }
@@ -217,11 +228,12 @@ async function captureActiveGenerated(handoff, faultHook) {
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("active generated root is unsafe");
     // Inventory publication is capability-owned. The read-only summary is the
     // held-reader validation of the active endpoint and ancestor chain.
-    const heldSummary = await summarizeInventoryDirectory(root, {
-      fsApi: handoff.fsApi, ancestorChain: ancestors,
+    const heldSnapshot = await summarizeInventoryDirectory(root, {
+      fsApi: handoff.fsApi, ancestorChain: ancestors, snapshot: true,
     });
-    const inventory = await writeInventoryJsonl({ capability: handoff.capability, root, entryId: id, phase: "restore-active" });
-    if (!sameSummary(heldSummary, inventory)) throw new Error("restore active inventory changed while published");
+    const inventory = await publishVerifiedRestoreActiveInventory({
+      capability: handoff.capability, entryId: id, snapshot: heldSnapshot,
+    });
     await invokeHook(faultHook, `after-inventory:restore-active:${id}`);
     active.push(record([["id", id], ["inventory", inventory]]));
   }

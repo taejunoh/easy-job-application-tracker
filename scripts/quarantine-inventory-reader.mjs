@@ -1,8 +1,10 @@
 import { constants as fsConstants } from "node:fs";
 import { createHash } from "node:crypto";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 import { parseInventoryRecord, parseInventorySummary } from "./quarantine-inventory.mjs";
+import { deriveRunPath, revalidateRunCapability } from "./quarantine-run-capability.mjs";
+import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
 
 const LIMITS = Object.freeze({
   records: 4096,
@@ -169,16 +171,17 @@ async function readVerifiedLink(path, expected, ancestorChain, fsApi) {
   return linkTarget;
 }
 
-export async function summarizeInventoryDirectory(root, { fsApi, ancestorChain = Object.freeze([]) }) {
+export async function summarizeInventoryDirectory(root, { fsApi, ancestorChain = Object.freeze([]), snapshot = false }) {
   assertAbsolutePath(root, "read-only inventory root");
   const rootStat = await fsApi.lstat(root);
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
     throw new Error("restore tree endpoint is unsafe");
   }
+  const rootIdentity = frozenDirectoryIdentity(root, rootStat, await fsApi.realpath(root));
   const records = [];
   const pending = [{
     absolutePath: root, relativePath: "", depth: 0, root: true,
-    expected: frozenDirectoryIdentity(root, rootStat, await fsApi.realpath(root)),
+    expected: rootIdentity,
     ancestorChain,
   }];
   let pendingBytes = Buffer.byteLength(JSON.stringify(pending[0])) + 1;
@@ -253,7 +256,52 @@ export async function summarizeInventoryDirectory(root, { fsApi, ancestorChain =
   records.sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)));
   const digest = createHash("sha256");
   for (const record of records) digest.update(Buffer.from(`${JSON.stringify(record)}\n`));
-  return parseInventorySummary({ sha256: digest.digest("hex"), entries: records.length, bytes });
+  const summary = parseInventorySummary({ sha256: digest.digest("hex"), entries: records.length, bytes });
+  if (!snapshot) return summary;
+  return Object.freeze({
+    summary,
+    records: Object.freeze(records.map((record) => Object.freeze(record))),
+    rootIdentity,
+    ancestorChain,
+  });
+}
+
+export async function publishVerifiedRestoreActiveInventory({ capability, entryId, snapshot }) {
+  if (snapshot === null || typeof snapshot !== "object" || !Array.isArray(snapshot.records)) {
+    throw new TypeError("verified restore inventory snapshot is invalid");
+  }
+  const fsApi = getRunFsContext(capability);
+  const path = deriveRunPath(capability, { purpose: "inventory", id: entryId, phase: "restore-active" });
+  const chain = Object.freeze([...snapshot.ancestorChain, snapshot.rootIdentity]);
+  await validateAncestorChain(chain, fsApi);
+  await revalidateRunCapability(capability, { purpose: "inventory", id: entryId, phase: "restore-active", boundary: "before-mutation" });
+  const handle = await fsApi.open(path, "wx", 0o600);
+  let primary;
+  try {
+    let position = 0;
+    for (const record of snapshot.records) {
+      const bytes = Buffer.from(`${JSON.stringify(record)}\n`);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const written = await handle.write(bytes, offset, bytes.length - offset, position + offset);
+        if (written.bytesWritten <= 0) throw new Error("verified restore inventory write made no progress");
+        offset += written.bytesWritten;
+      }
+      position += bytes.length;
+    }
+    await validateAncestorChain(chain, fsApi);
+    await handle.sync();
+    await validateAncestorChain(chain, fsApi);
+  } catch (error) { primary = error; }
+  await closeAll(undefined, handle, primary);
+  await validateAncestorChain(chain, fsApi);
+  const directory = await fsApi.open(dirname(path), "r");
+  let directoryPrimary;
+  try { await directory.sync(); } catch (error) { directoryPrimary = error; }
+  await closeAll(undefined, directory, directoryPrimary);
+  await revalidateRunCapability(capability, { purpose: "inventory", id: entryId, phase: "restore-active", boundary: "after-sync" });
+  await validateAncestorChain(chain, fsApi);
+  return snapshot.summary;
 }
 
 /* Internal restore authority.  Each pathname is rebound to an O_NOFOLLOW
