@@ -16,8 +16,8 @@ const LIMITS = Object.freeze({
 });
 
 export class InventoryStructuralError extends Error {
-  constructor() {
-    super("read-only inventory evidence is structurally invalid");
+  constructor(message = "read-only inventory evidence is structurally invalid") {
+    super(message);
     Object.defineProperty(this, "code", { value: "ERR_INVENTORY_STRUCTURAL", enumerable: false });
   }
 }
@@ -48,7 +48,7 @@ function assertInventoryIdentity(expected, observed, type) {
   if (
     observed.isSymbolicLink() || !observed[type]() ||
     !sameIdentity(expected, observed) || modeOf(expected) !== modeOf(observed)
-  ) throw new InventoryStructuralError();
+  ) throw new InventoryStructuralError("read-only restore inventory identity changed while being read");
 }
 
 function frozenDirectoryIdentity(path, stat, canonicalRealpath) {
@@ -64,7 +64,7 @@ function frozenDirectoryIdentity(path, stat, canonicalRealpath) {
 
 function appendAncestorChain(chain, identity) {
   if (chain.length >= LIMITS.depth + 1) {
-    throw new InventoryStructuralError();
+    throw new InventoryStructuralError("read-only restore inventory path depth exceeds fixed bounds");
   }
   return Object.freeze([...chain, identity]);
 }
@@ -76,7 +76,7 @@ async function validateAncestorChain(chain, fsApi) {
       observed.isSymbolicLink() || !observed.isDirectory() ||
       !sameIdentity(expected, observed) || modeOf(expected) !== modeOf(observed) ||
       await fsApi.realpath(expected.path) !== expected.canonicalRealpath
-    ) throw new InventoryStructuralError();
+    ) throw new InventoryStructuralError("restore ancestor pathname changed while being read");
   }
 }
 
@@ -101,10 +101,10 @@ async function closeAll(dir, handle, primary) {
 async function assertPathMatchesHandle(path, expected, type, fsApi) {
   const observed = await fsApi.lstat(path);
   if (observed.isSymbolicLink() || !observed[type]()) {
-    throw new InventoryStructuralError();
+    throw new InventoryStructuralError("restore endpoint pathname is unsafe");
   }
   if (!sameIdentity(expected, observed) || modeOf(expected) !== modeOf(observed)) {
-    throw new InventoryStructuralError();
+    throw new InventoryStructuralError("restore endpoint pathname identity changed");
   }
   return fsApi.realpath(path);
 }
@@ -129,7 +129,7 @@ async function withVerifiedDirectory(path, expected, ancestorChain, fsApi, callb
     assertInventoryIdentity(opened, finalHandle, "isDirectory");
     await validateAncestorChain(ancestorChain, fsApi);
     if (canonicalPath !== await assertPathMatchesHandle(path, opened, "isDirectory", fsApi)) {
-      throw new InventoryStructuralError();
+      throw new InventoryStructuralError("restore directory pathname changed while being read");
     }
   } catch (error) {
     primary = error;
@@ -159,12 +159,12 @@ export async function hashVerifiedRegularFile(path, expected, fsApi, ancestorCha
       hash.update(buffer.subarray(0, read.bytesRead));
       bytes += read.bytesRead;
     }
-    if (bytes !== opened.size) throw new InventoryStructuralError();
+    if (bytes !== opened.size) throw new InventoryStructuralError("restore file changed while being read");
     const finalHandle = await handle.stat();
     assertInventoryIdentity(opened, finalHandle, "isFile");
     await validateAncestorChain(ancestorChain, fsApi);
     if (canonicalPath !== await assertPathMatchesHandle(path, opened, "isFile", fsApi)) {
-      throw new InventoryStructuralError();
+      throw new InventoryStructuralError("restore file pathname changed while being read");
     }
     value = { sha256: hash.digest("hex"), bytes };
   } catch (error) {
@@ -180,7 +180,7 @@ async function readVerifiedLink(path, expected, ancestorChain, fsApi) {
   await validateAncestorChain(ancestorChain, fsApi);
   const final = await fsApi.lstat(path);
   if (!final.isSymbolicLink() || !sameIdentity(expected, final) || modeOf(expected) !== modeOf(final)) {
-    throw new InventoryStructuralError();
+    throw new InventoryStructuralError("restore symlink changed while being read");
   }
   return linkTarget;
 }
@@ -191,13 +191,13 @@ export async function summarizeInventoryDirectory(root, {
   assertAbsolutePath(root, "read-only inventory root");
   const rootStat = await fsApi.lstat(root);
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    throw new InventoryStructuralError();
+    throw new InventoryStructuralError("restore tree endpoint is unsafe");
   }
   const rootRealpath = await fsApi.realpath(root);
   if (expectedRootIdentity !== undefined) {
     assertInventoryIdentity(expectedRootIdentity, rootStat, "isDirectory");
     if (rootRealpath !== expectedRootIdentity.canonicalRealpath) {
-      throw new InventoryStructuralError();
+      throw new InventoryStructuralError("restore tree root pathname identity changed");
     }
   }
   const rootIdentity = frozenDirectoryIdentity(root, rootStat, rootRealpath);
@@ -213,7 +213,7 @@ export async function summarizeInventoryDirectory(root, {
   const addRecord = (record, contentBytes) => {
     const serialized = Buffer.byteLength(JSON.stringify(record)) + 1;
     if (records.length >= LIMITS.records || recordBytes + serialized > LIMITS.recordBytes) {
-      throw new InventoryStructuralError();
+      throw new InventoryStructuralError("read-only restore inventory exceeded fixed record bounds");
     }
     records.push(record);
     recordBytes += serialized;
@@ -222,7 +222,7 @@ export async function summarizeInventoryDirectory(root, {
   const enqueue = (item) => {
     const serialized = Buffer.byteLength(JSON.stringify(item)) + 1;
     if (pending.length >= LIMITS.frontier || pendingBytes + serialized > LIMITS.frontierBytes) {
-      throw new InventoryStructuralError();
+      throw new InventoryStructuralError("read-only restore inventory exceeded fixed traversal bounds");
     }
     pending.push(item);
     pendingBytes += serialized;
@@ -236,7 +236,7 @@ export async function summarizeInventoryDirectory(root, {
       assertInventoryIdentity(item.expected, stat, "isDirectory");
     }
     if (stat.isSymbolicLink()) {
-      if (item.root) throw new InventoryStructuralError();
+      if (item.root) throw new InventoryStructuralError("restore tree endpoint is unsafe");
       const linkTarget = await readVerifiedLink(item.absolutePath, stat, item.ancestorChain, fsApi);
       addRecord(parseInventoryRecord({
         scope: "relative", path: item.relativePath, type: "symlink", mode: modeOf(stat),
@@ -245,7 +245,7 @@ export async function summarizeInventoryDirectory(root, {
       continue;
     }
     if (stat.isFile()) {
-      if (item.root) throw new InventoryStructuralError();
+      if (item.root) throw new InventoryStructuralError("restore tree endpoint is unsafe");
       const hashed = await hashVerifiedRegularFile(item.absolutePath, stat, fsApi, item.ancestorChain);
       addRecord(parseInventoryRecord({
         scope: "relative", path: item.relativePath, type: "file", mode: modeOf(stat),
@@ -253,7 +253,7 @@ export async function summarizeInventoryDirectory(root, {
       }), stat.size);
       continue;
     }
-    if (!stat.isDirectory()) throw new InventoryStructuralError();
+    if (!stat.isDirectory()) throw new InventoryStructuralError("restore tree contains an unsupported endpoint");
     if (!item.root) addRecord(parseInventoryRecord({
       scope: "relative", path: item.relativePath, type: "directory", mode: modeOf(stat), size: 0,
     }), 0);
@@ -263,10 +263,10 @@ export async function summarizeInventoryDirectory(root, {
         if (entry === null) break;
         const name = entry.name;
         if (typeof name !== "string" || Buffer.byteLength(name) > LIMITS.nameBytes) {
-          throw new InventoryStructuralError();
+          throw new InventoryStructuralError("read-only restore inventory entry name exceeds fixed bounds");
         }
         if (item.depth + 1 > LIMITS.depth) {
-          throw new InventoryStructuralError();
+          throw new InventoryStructuralError("read-only restore inventory path depth exceeds fixed bounds");
         }
         const relativePath = item.relativePath ? `${item.relativePath}/${name}` : name;
         enqueue({

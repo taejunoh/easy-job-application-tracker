@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import {
@@ -7,7 +6,11 @@ import {
   readManifestGeneration,
 } from "./quarantine-manifest.mjs";
 import { replayJournal } from "./quarantine-journal.mjs";
-import { summarizeInventoryDirectory, hashVerifiedRegularFile } from "./quarantine-inventory-reader.mjs";
+import {
+  summarizeInventoryDirectory,
+  hashVerifiedRegularFile,
+  InventoryStructuralError,
+} from "./quarantine-inventory-reader.mjs";
 import { captureRunFsSource, getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
 import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
@@ -15,8 +18,6 @@ import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
 const OPTION_KEYS = Object.freeze([
   "repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi",
 ]);
-const RECOVERY_OPTION_KEYS = Object.freeze([...OPTION_KEYS, "action", "faultHook"]);
-const restoreRecoveryStorage = new AsyncLocalStorage();
 
 class LifecycleIntegrityError extends Error {
   constructor(message) {
@@ -29,6 +30,17 @@ function lifecycleIntegrityError(message) {
   return new LifecycleIntegrityError(message);
 }
 
+class RestoreLocationConflictError extends Error {
+  constructor() {
+    super("restore locations conflict with durable evidence");
+    Object.defineProperty(this, "code", { value: "ERR_RESTORE_LOCATION_CONFLICT", enumerable: false });
+  }
+}
+
+function restoreLocationConflict() {
+  return new RestoreLocationConflictError();
+}
+
 function frozenRecord(entries) {
   const result = Object.create(null);
   for (const [key, value] of entries) {
@@ -39,7 +51,7 @@ function frozenRecord(entries) {
   return Object.freeze(result);
 }
 
-function snapshotOptions(input, recovery) {
+function snapshotOptions(input) {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError("existing quarantine run options must be a plain object");
   }
@@ -48,7 +60,7 @@ function snapshotOptions(input, recovery) {
     throw new TypeError("existing quarantine run options must be a plain object");
   }
   const keys = Reflect.ownKeys(input);
-  const optionKeys = recovery ? RECOVERY_OPTION_KEYS : OPTION_KEYS;
+  const optionKeys = OPTION_KEYS;
   if (keys.some((key) => typeof key !== "string" || !optionKeys.includes(key)) ||
       OPTION_KEYS.slice(0, 4).some((key) => !keys.includes(key))) {
     throw new TypeError("existing quarantine run options are invalid");
@@ -57,12 +69,6 @@ function snapshotOptions(input, recovery) {
   for (const key of optionKeys) if (keys.includes(key)) result[key] = input[key];
   if (result.writersStopped !== true) {
     throw new TypeError("writers-stopped attestation must be true");
-  }
-  if (recovery && result.action !== "resume" && result.action !== "rollback") {
-    throw new TypeError("restore recovery action is invalid");
-  }
-  if (recovery && result.faultHook !== undefined && typeof result.faultHook !== "function") {
-    throw new TypeError("restore fault hook must be a function");
   }
   return Object.freeze(result);
 }
@@ -194,7 +200,12 @@ async function optionalStat(path, fsApi) {
 async function privateTreeSummary(root, fsApi) {
   const rootStat = await optionalStat(root, fsApi);
   if (rootStat === null) return null;
-  return summarizeInventoryDirectory(root, { fsApi });
+  try {
+    return await summarizeInventoryDirectory(root, { fsApi });
+  } catch (error) {
+    if (error instanceof InventoryStructuralError) throw restoreLocationConflict();
+    throw error;
+  }
 }
 
 function sameSummary(expected, observed) {
@@ -205,15 +216,21 @@ function sameSummary(expected, observed) {
 async function verifySourceEndpoint(path, entry, expectedPresent, fsApi, ancestorChain = Object.freeze([])) {
   const stat = await optionalStat(path, fsApi);
   if (!expectedPresent) {
-    if (stat !== null) throw lifecycleIntegrityError("restore source endpoint should be absent");
+    if (stat !== null) throw restoreLocationConflict();
     return;
   }
   if (stat === null || stat.isSymbolicLink() || !stat.isFile() || modeOf(stat) !== entry.mode || stat.size !== entry.size) {
-    throw lifecycleIntegrityError("restore source endpoint is invalid");
+    throw restoreLocationConflict();
   }
-  const hashed = await hashVerifiedRegularFile(path, stat, fsApi, ancestorChain);
+  let hashed;
+  try {
+    hashed = await hashVerifiedRegularFile(path, stat, fsApi, ancestorChain);
+  } catch (error) {
+    if (error instanceof InventoryStructuralError) throw restoreLocationConflict();
+    throw error;
+  }
   if (hashed.bytes !== entry.size || hashed.sha256 !== entry.sha256) {
-    throw lifecycleIntegrityError("restore source endpoint content is invalid");
+    throw restoreLocationConflict();
   }
 }
 
@@ -239,7 +256,7 @@ async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, 
           : !completed
             ? (payloadPresent && !activePresent) || (!payloadPresent && activePresent)
             : !payloadPresent && activePresent;
-      if (!legal) throw lifecycleIntegrityError("restore source locations are inconsistent with its ledger state");
+      if (!legal) throw restoreLocationConflict();
       await verifySourceEndpoint(payload, entry, payloadPresent, fsApi);
       await verifySourceEndpoint(active, entry, activePresent, fsApi, ancestors);
       await assertWorkspaceAncestors(ancestors, fsApi);
@@ -272,7 +289,7 @@ async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, 
         : !completed
           ? initial || staging || final
           : final;
-    if (!legal) throw lifecycleIntegrityError("restore generated locations are inconsistent with its ledger state");
+    if (!legal) throw restoreLocationConflict();
     await assertWorkspaceAncestors(ancestors, fsApi);
   }
 }
@@ -289,7 +306,7 @@ async function readPointer(capability) {
   }
 }
 
-async function validateExistingRun(capability, options, fsApi, { allowRestoreLocationConflict = false } = {}) {
+async function validateExistingRun(capability, options, fsApi) {
   const repository = await repositoryEvidence(options.repoRoot, fsApi);
   let replayed;
   try {
@@ -339,6 +356,7 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
   ) {
     throw lifecycleIntegrityError("quarantine lifecycle provenance does not match the live repository");
   }
+  let restoreLocations = null;
   if (restoreContext && replayed.state !== "INCOMPLETE_CONFLICT") {
     const ledger = buildRestoreLedger(replayed, manifest);
     try {
@@ -350,15 +368,10 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
         fsApi,
       });
     } catch (error) {
-      // Only recovery may inspect a durable-but-mismatched restore and turn it
-      // into INCOMPLETE_CONFLICT.  Generic lifecycle callers retain the
-      // fail-closed validation boundary; structural/provenance and ancestor
-      // failures are always fatal.
-      if (!allowRestoreLocationConflict ||
-          !/restore (?:source|generated) locations are inconsistent|restore source endpoint is invalid|restore source endpoint content is invalid/u.test(error?.message ?? "")) {
-        throw error;
-      }
+      if (!(error instanceof RestoreLocationConflictError)) throw error;
+      restoreLocations = frozenRecord([["status", "CONFLICT"]]);
     }
+    if (restoreLocations === null) restoreLocations = frozenRecord([["status", "EXACT"]]);
   }
 
   const pointer = await readPointer(capability);
@@ -396,6 +409,7 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
       ["manifest", manifest],
     ])],
     ["pointer", pointer],
+    ["restoreLocations", restoreLocations],
   ]);
 }
 
@@ -403,8 +417,7 @@ function sameSnapshot(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-async function enterExistingRun(input, { recovery, callback }) {
-  const recoveryOptions = Object.freeze({ allowRestoreLocationConflict: recovery });
+async function enterExistingRun(input, callback) {
   const source = captureRunFsSource(input.fsApi);
   return withQuarantineRunCapability({
     repoRoot: input.repoRoot,
@@ -414,16 +427,17 @@ async function enterExistingRun(input, { recovery, callback }) {
     fsApi: source,
   }, async (capability) => {
     const fsApi = getRunFsContext(capability, source);
-    const validated = await validateExistingRun(capability, input, fsApi, recoveryOptions);
+    const validated = await validateExistingRun(capability, input, fsApi);
     // Re-read every mutable evidence boundary immediately before capability
     // handoff.  This is cooperative TOCTOU detection; all reads still use the
     // exact adapter captured synchronously above.
-    const stable = await validateExistingRun(capability, input, fsApi, recoveryOptions);
+    const stable = await validateExistingRun(capability, input, fsApi);
     if (
       !sameSnapshot(validated.repository, stable.repository) ||
       !sameSnapshot(validated.journalTip, stable.journalTip) ||
       !sameSnapshot(validated.manifestGeneration, stable.manifestGeneration) ||
-      !sameSnapshot(validated.pointer, stable.pointer)
+      !sameSnapshot(validated.pointer, stable.pointer) ||
+      !sameSnapshot(validated.restoreLocations, stable.restoreLocations)
     ) {
       throw lifecycleIntegrityError("quarantine lifecycle evidence changed before callback");
     }
@@ -436,36 +450,15 @@ async function enterExistingRun(input, { recovery, callback }) {
       ["head", validated.head],
       ["journalTip", validated.journalTip],
       ["manifestGeneration", validated.manifestGeneration],
+      ["restoreLocations", validated.restoreLocations],
       ["fsApi", fsApi],
-      ...(recovery ? [["recoveryOptions", input]] : []),
     ]);
     return callback(handoff);
   });
 }
 
 export async function withExistingQuarantineRunInternal(options, callback) {
-  const input = snapshotOptions(options, false);
+  const input = snapshotOptions(options);
   if (typeof callback !== "function") throw new TypeError("existing quarantine run callback must be a function");
-  return enterExistingRun(input, { recovery: false, callback });
-}
-
-// This entry is intentionally fixed: it validates the recovery-only evidence
-// and invokes the public recovery algorithm itself.  It never accepts a
-// caller-provided callback, authority flag, or handoff.
-export async function withRestoreRecoveryRunInternal(options) {
-  const input = snapshotOptions(options, true);
-  return enterExistingRun(input, {
-    recovery: true,
-    callback: async (handoff) => restoreRecoveryStorage.run(handoff, async () => {
-      const { recoverRestore } = await import("./quarantine-restore.mjs");
-      return recoverRestore(input);
-    }),
-  });
-}
-
-// This read-only lookup has no paired setter.  Only the fixed entry above can
-// install the scoped handoff, and identity ties it to its immutable input.
-export function takeRestoreRecoveryHandoff(input) {
-  const handoff = restoreRecoveryStorage.getStore();
-  return handoff?.recoveryOptions === input ? handoff : null;
+  return enterExistingRun(input, callback);
 }

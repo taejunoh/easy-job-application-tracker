@@ -1344,7 +1344,7 @@ describe("bounded quarantine inventory", () => {
       summary?: unknown; failure?: { message: string; code?: string };
     };
       expect(result).toEqual({ summary: undefined, failure: {
-        message: expect.any(String),
+        message: expect.stringMatching(/fixed (record|traversal) bounds/i),
         code: "ERR_INVENTORY_STRUCTURAL",
       } });
       expect(readdirSync(join(quarantineRoot, transactionId, "inventories/work"))).toEqual([]);
@@ -1356,12 +1356,12 @@ describe("bounded quarantine inventory", () => {
     ["depth", 1_025, /path depth exceeds fixed bounds/i],
     ["unsupported", 0, /unsupported endpoint/i],
     ["identity", 0, /identity changed/i],
-  ])("rejects read-only %s bounds before any mutation", (variant, depth) => {
+  ])("rejects read-only %s bounds before any mutation", (variant, depth, error) => {
     const result = runWorker({ operation: "read-only-virtual-bounds", variant, depth }).result as {
       summary?: unknown; failure?: { message: string; code?: string }; calls: Record<string, number>;
     };
     expect(result.summary).toBeUndefined();
-    expect(result.failure?.message).toBe("read-only inventory evidence is structurally invalid");
+    expect(result.failure?.message).toMatch(error);
     expect(result.failure?.code).toBe("ERR_INVENTORY_STRUCTURAL");
     expect(result.calls.readlink).toBe(0);
   });

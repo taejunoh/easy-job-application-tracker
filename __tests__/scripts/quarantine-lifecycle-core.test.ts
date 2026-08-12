@@ -13,11 +13,8 @@ import {
 const coreUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-lifecycle-core.mjs"),
 ).href;
-const removedRecoveryContextUrl = pathToFileURL(
-  join(__dirname, "../../scripts/quarantine-lifecycle-recovery-context.mjs"),
-).href;
 const internalUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-lifecycle-internal.mjs")).href;
-const recoveryRunUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-lifecycle-recovery-run.mjs")).href;
+const restorePath = join(__dirname, "../../scripts/quarantine-restore.mjs");
 
 describe("quarantine lifecycle core", () => {
   it("keeps its single private entry point closed", async () => {
@@ -36,15 +33,7 @@ describe("quarantine lifecycle core", () => {
     expect(publicExports.legacyExports).not.toContain("summarizeInventoryDirectory");
   });
 
-  it("does not expose a callback brand that can relax generic recovery validation", () => {
-    const attempt = execFileSync(process.execPath, ["--input-type=module", "--eval", `
-      try { await import(${JSON.stringify(removedRecoveryContextUrl)}); process.stdout.write("imported"); }
-      catch { process.stdout.write("missing"); }
-    `], { encoding: "utf8" }).trim();
-    expect(attempt).toBe("missing");
-  });
-
-  it("keeps direct lifecycle imports from injecting a relaxed arbitrary callback", () => {
+  it("keeps direct lifecycle imports from bypassing the sole core setup", () => {
     const direct = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
       const internal = await import(${JSON.stringify(internalUrl)});
       let called = false;
@@ -55,20 +44,19 @@ describe("quarantine lifecycle core", () => {
           transactionId: "test", writersStopped: true, action: "resume",
         }, async () => { called = true; });
       } catch (caught) { error = caught.message; }
-      let removed = "imported";
-      try { await import(${JSON.stringify(recoveryRunUrl)}); } catch { removed = "missing"; }
       process.stdout.write(JSON.stringify({
         keys: Object.keys(internal), genericArity: internal.withExistingQuarantineRunInternal.length,
-        fixedArity: internal.withRestoreRecoveryRunInternal.length,
-        takeArity: internal.takeRestoreRecoveryHandoff.length,
-        called, error, removed,
+        recoveryEntry: internal.withRestoreRecoveryRunInternal ?? null,
+        recoveryHandoff: internal.takeRestoreRecoveryHandoff ?? null,
+        called, error,
       }));
     `], { encoding: "utf8" }));
     expect(direct).toEqual({
-      keys: ["takeRestoreRecoveryHandoff", "withExistingQuarantineRunInternal", "withRestoreRecoveryRunInternal"],
-      genericArity: 2, fixedArity: 1, takeArity: 1,
-      called: false, error: "existing quarantine run options are invalid", removed: "missing",
+      keys: ["withExistingQuarantineRunInternal"], genericArity: 2,
+      recoveryEntry: null, recoveryHandoff: null,
+      called: false, error: "existing quarantine run options are invalid",
     });
+    expect(readFileSync(restorePath, "utf8")).not.toContain("quarantine-lifecycle-internal.mjs");
   });
 
   it("publishes one immutable VALIDATED generation and reuses it on retry", () => {

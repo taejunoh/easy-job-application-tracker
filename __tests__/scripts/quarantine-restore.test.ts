@@ -592,6 +592,32 @@ describe("quarantine restore", () => {
     }
   });
 
+  it("refuses an in-progress restore location conflict before mutating its journal", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const first = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        writersStopped: true,
+        stopPhase: "after-event:RESTORE_PREPARED",
+      });
+      expect(first.ok).toBe(false);
+      writeFileSync(join(prepared.fixture.repoRoot, "notes 2.txt"), "foreign\n");
+      const before = readFileSync(join(prepared.runRoot, "journal.log"));
+      const retry = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        writersStopped: true,
+      });
+      expect(retry.ok).toBe(false);
+      expect(readFileSync(join(prepared.runRoot, "journal.log"))).toEqual(before);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("restores a validated run and retains regenerated roots in its rollback namespace", () => {
     const prepared = prepareQuarantinedFixture();
     try {

@@ -54,8 +54,8 @@ export class IndeterminateJournalAppendError extends Error {
 }
 
 class JournalIntegrityError extends Error {
-  constructor() {
-    super("durable journal evidence is invalid");
+  constructor(message = "durable journal evidence is invalid") {
+    super(message);
     Object.defineProperty(this, "code", { value: "ERR_JOURNAL_INTEGRITY", enumerable: false });
   }
 }
@@ -785,7 +785,7 @@ function replayJournalBuffer(input) {
     return replayJournalBufferUnchecked(input);
   } catch (error) {
     if (error?.code === "ERR_JOURNAL_INTEGRITY") throw error;
-    throw new JournalIntegrityError();
+    throw new JournalIntegrityError(error instanceof Error ? error.message : undefined);
   }
 }
 
@@ -800,17 +800,17 @@ async function writeComplete(handle, buffer) {
 
 async function readCompleteFile(handle, maxBytes = MAX_FRAME_BYTES, invalidError = undefined) {
   const before = await handle.stat();
-  if (!before.isFile()) throw invalidError?.() ?? new Error("journal must be a regular file");
-  if (before.size > maxBytes) throw invalidError?.() ?? new Error("journal is too large");
+  if (!before.isFile()) throw invalidError?.("journal must be a regular file") ?? new Error("journal must be a regular file");
+  if (before.size > maxBytes) throw invalidError?.("journal is too large") ?? new Error("journal is too large");
   const input = Buffer.alloc(before.size);
   let offset = 0;
   while (offset < input.length) {
     const { bytesRead } = await handle.read(input, offset, input.length - offset, offset);
-    if (bytesRead <= 0) throw invalidError?.() ?? new Error("journal changed while being read");
+    if (bytesRead <= 0) throw invalidError?.("journal changed while being read") ?? new Error("journal changed while being read");
     offset += bytesRead;
   }
   const after = await handle.stat();
-  if (after.size !== before.size) throw invalidError?.() ?? new Error("journal changed while being read");
+  if (after.size !== before.size) throw invalidError?.("journal changed while being read") ?? new Error("journal changed while being read");
   return input;
 }
 
@@ -1000,7 +1000,7 @@ function assertPrivateRegularFile(stat, label, invalidError = undefined) {
     !stat.isFile() ||
     (stat.mode & 0o7777) !== 0o600
   ) {
-    throw invalidError?.() ?? new Error(`${label} must be a non-symlink regular file with exact mode 0600`);
+    throw invalidError?.(`${label} must be a non-symlink regular file with exact mode 0600`) ?? new Error(`${label} must be a non-symlink regular file with exact mode 0600`);
   }
 }
 
@@ -1040,7 +1040,7 @@ function addInventoryRecord(line, observed) {
 
 async function summarizeRestoreInventory(path, fsApi) {
   const before = await fsApi.lstat(path);
-  assertPrivateRegularFile(before, "restore-active inventory", () => new JournalIntegrityError());
+  assertPrivateRegularFile(before, "restore-active inventory", (message) => new JournalIntegrityError(message));
   const stream = fsApi.createReadStream(path, { highWaterMark: 64 * 1024 });
   const digest = createHash("sha256");
   const observed = { entries: 0, bytes: 0 };
@@ -1055,7 +1055,7 @@ async function summarizeRestoreInventory(path, fsApi) {
       if (chunk[index] !== 0x0a) continue;
       const part = chunk.subarray(start, index);
       if (pending.length + part.length > MAX_INVENTORY_LINE_BYTES) {
-        throw new JournalIntegrityError();
+        throw new JournalIntegrityError("restore-active inventory record is too large");
       }
       const line = pending.length === 0
         ? part
@@ -1064,14 +1064,14 @@ async function summarizeRestoreInventory(path, fsApi) {
         addInventoryRecord(line, observed);
       } catch (error) {
         if (error?.code === "ERR_JOURNAL_INTEGRITY") throw error;
-        throw new JournalIntegrityError();
+        throw new JournalIntegrityError(error instanceof Error ? error.message : undefined);
       }
       pending = Buffer.alloc(0);
       start = index + 1;
     }
     const tail = chunk.subarray(start);
     if (pending.length + tail.length > MAX_INVENTORY_LINE_BYTES) {
-      throw new JournalIntegrityError();
+      throw new JournalIntegrityError("restore-active inventory record is too large");
     }
     if (tail.length > 0) {
       pending = pending.length === 0
@@ -1079,11 +1079,11 @@ async function summarizeRestoreInventory(path, fsApi) {
         : Buffer.concat([pending, tail], pending.length + tail.length);
     }
   }
-  if (totalBytes > 0 && pending.length !== 0) throw new JournalIntegrityError();
+  if (totalBytes > 0 && pending.length !== 0) throw new JournalIntegrityError("restore-active inventory must end with a JSONL newline");
   const after = await fsApi.lstat(path);
-  assertPrivateRegularFile(after, "restore-active inventory", () => new JournalIntegrityError());
+  assertPrivateRegularFile(after, "restore-active inventory", (message) => new JournalIntegrityError(message));
   if (!sameIdentity(before, after) || before.size !== after.size) {
-    throw new JournalIntegrityError();
+    throw new JournalIntegrityError("restore-active inventory changed while being streamed");
   }
   try {
     return parseInventorySummary({
@@ -1093,7 +1093,7 @@ async function summarizeRestoreInventory(path, fsApi) {
     });
   } catch (error) {
     if (error?.code === "ERR_JOURNAL_INTEGRITY") throw error;
-    throw new JournalIntegrityError();
+    throw new JournalIntegrityError(error instanceof Error ? error.message : undefined);
   }
 }
 
@@ -1111,7 +1111,7 @@ async function validateRestorePreparedBacking(record, capability, fsApi) {
       observed = await summarizeRestoreInventory(path, fsApi);
     } catch (error) {
       if (error?.code === "ENOENT" || error?.code === "ERR_JOURNAL_INTEGRITY") {
-        throw new JournalIntegrityError();
+        throw new JournalIntegrityError(`RESTORE_PREPARED inventory backing is invalid for ${active.id}: ${error.message}`);
       }
       throw error;
     }
@@ -1120,7 +1120,7 @@ async function validateRestorePreparedBacking(record, capability, fsApi) {
       observed.entries !== active.inventory.entries ||
       observed.bytes !== active.inventory.bytes
     ) {
-      throw new JournalIntegrityError();
+      throw new JournalIntegrityError(`RESTORE_PREPARED inventory backing mismatch for ${active.id}`);
     }
   }
 }
@@ -1150,16 +1150,16 @@ async function readJournalSnapshot({ capability, fsApi, maxBytes = MAX_FRAME_BYT
     }
     throw error;
   }
-  assertPrivateRegularFile(before, "journal", () => new JournalIntegrityError());
-  if (before.size > maxBytes) throw new JournalIntegrityError();
+  assertPrivateRegularFile(before, "journal", (message) => new JournalIntegrityError(message));
+  if (before.size > maxBytes) throw new JournalIntegrityError("journal is too large");
   const handle = await fsApi.open(journalPath, "r");
   return withHandle(handle, async (openedHandle) => {
     const opened = await openedHandle.stat();
-    assertPrivateRegularFile(opened, "opened journal", () => new JournalIntegrityError());
+    assertPrivateRegularFile(opened, "opened journal", (message) => new JournalIntegrityError(message));
     if (!sameIdentity(before, opened) || opened.size !== before.size) {
-      throw new JournalIntegrityError();
+      throw new JournalIntegrityError("journal changed while being inspected");
     }
-    const bytes = await readCompleteFile(openedHandle, maxBytes, () => new JournalIntegrityError());
+    const bytes = await readCompleteFile(openedHandle, maxBytes, (message) => new JournalIntegrityError(message));
     const replayed = replayJournalBuffer(bytes);
     await validateRestorePreparedBackings(replayed.records, capability, fsApi);
     return {

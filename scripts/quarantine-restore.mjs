@@ -12,7 +12,6 @@ import {
 } from "./quarantine-inventory-reader.mjs";
 import { appendJournalRecord, IndeterminateJournalAppendError, replayJournal, withJournalLock } from "./quarantine-journal.mjs";
 import { withExistingQuarantineRun } from "./quarantine-lifecycle-core.mjs";
-import { takeRestoreRecoveryHandoff, withRestoreRecoveryRunInternal } from "./quarantine-lifecycle-internal.mjs";
 import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
 import { deriveRunPath, revalidateRunCapability } from "./quarantine-run-capability.mjs";
 
@@ -64,6 +63,14 @@ function record(entries) {
     });
   }
   return Object.freeze(value);
+}
+
+function existingRunOptions(options) {
+  return record([
+    ["repoRoot", options.repoRoot], ["quarantineRoot", options.quarantineRoot],
+    ["transactionId", options.transactionId], ["writersStopped", true],
+    ...(Object.hasOwn(options, "fsApi") ? [["fsApi", options.fsApi]] : []),
+  ]);
 }
 
 function activeRecord(id, inventory, ancestors, rootIdentity = null) {
@@ -699,12 +706,7 @@ export async function restoreQuarantine(input) {
   // This must precede capability derivation and every await so later caller
   // mutations cannot affect the deterministically chosen rollback namespace.
   const restoreId = deriveRestoreId(options.transactionId);
-  const existing = record([
-    ["repoRoot", options.repoRoot], ["quarantineRoot", options.quarantineRoot],
-    ["transactionId", options.transactionId], ["writersStopped", true],
-    ...(Object.hasOwn(options, "fsApi") ? [["fsApi", options.fsApi]] : []),
-  ]);
-  return withExistingQuarantineRun(existing, async (handoff) => {
+  return withExistingQuarantineRun(existingRunOptions(options), async (handoff) => {
     if (handoff.journalTip.state !== "QUARANTINED" && handoff.journalTip.state !== "VALIDATED") {
       throw restoreRecoveryRequired();
     }
@@ -744,10 +746,11 @@ export async function restoreQuarantine(input) {
 }
 
 export async function recoverRestore(input) {
-  const handoff = takeRestoreRecoveryHandoff(input);
   const options = snapshotOptions(input, { recovery: true });
-  if (handoff !== null) return recoverRestoreWithHandoff(options, handoff);
-  return withRestoreRecoveryRunInternal(options);
+  return withExistingQuarantineRun(
+    existingRunOptions(options),
+    async (handoff) => recoverRestoreWithHandoff(options, handoff),
+  );
 }
 
 async function recoverRestoreWithHandoff(options, handoff) {
