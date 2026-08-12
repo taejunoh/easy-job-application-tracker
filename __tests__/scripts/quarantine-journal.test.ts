@@ -4095,6 +4095,22 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.error.message).toMatch(/intent|complete|pending/u);
   });
 
+  it("rejects a rehashed MOVED summary that differs from its durable intent", () => {
+    const result = invoke(join(fixture, "moved-summary-mismatch"), {
+      operation: "tamper",
+      case: "rehashed-invalid-payload",
+      prefix: [records.prepared, records.moving, records.moveIntent],
+      event: "MOVED",
+      payload: {
+        id: "copy-0001",
+        observed: { bytes: 1, entries: 1, sha256: "d".repeat(64) },
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toMatch(/MOVED|summary|intent/u);
+  });
+
   it.each([
     ["PREPARED apply resume", [
       records.prepared,

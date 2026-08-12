@@ -41,6 +41,7 @@ import {
 } from "./quarantine-inventory.mjs";
 import {
   buildValidatedManifest,
+  readManifestGeneration,
   writeManifestGeneration,
 } from "./quarantine-manifest.mjs";
 import {
@@ -1871,6 +1872,373 @@ async function appendEvent({ capability, event, payload, faultHook }) {
   }));
 }
 
+const RECOVERY_ALLOWED = Object.freeze([
+  "repoRoot", "quarantineRoot", "transactionId", "action", "writersStopped", "fsApi", "faultHook",
+]);
+const RECOVERY_REQUIRED = Object.freeze([
+  "repoRoot", "quarantineRoot", "transactionId", "action", "writersStopped",
+]);
+
+function snapshotRecoveryOptions(input) {
+  const options = snapshotOptions(input, RECOVERY_ALLOWED, RECOVERY_REQUIRED);
+  validateAbsolute(options.repoRoot);
+  validateAbsolute(options.quarantineRoot);
+  validateTransactionId(options.transactionId);
+  if (options.writersStopped !== true) fail("ERR_USAGE");
+  if (options.action !== "resume" && options.action !== "rollback") fail("ERR_USAGE");
+  if (options.faultHook !== undefined && typeof options.faultHook !== "function") {
+    fail("ERR_USAGE");
+  }
+  return options;
+}
+
+function recoveryResult(transactionId, status, action, reconciledEntries) {
+  return record([
+    ["transactionId", transactionId],
+    ["status", status],
+    ["action", action],
+    ["reconciledEntries", reconciledEntries],
+  ]);
+}
+
+function recoveryConflict(transactionId, action, ids) {
+  return record([
+    ["transactionId", transactionId],
+    ["status", "INCOMPLETE_CONFLICT"],
+    ["action", action],
+    ["conflictEntryIds", Object.freeze([...ids].sort(byteCompare))],
+  ]);
+}
+
+function buildApplyLedger(replayed, manifest) {
+  const prepared = replayed.records.find((record) => record.event === "PREPARED");
+  if (
+    prepared === undefined ||
+    prepared.payload.transactionId !== manifest.transactionId
+  ) fail("ERR_INTEGRITY");
+  const entries = new Map(manifest.entries.map((entry) => [entry.id, entry]));
+  const intents = [];
+  const completed = new Set();
+  for (const record of replayed.records) {
+    if (record.event === "MOVE_INTENT") {
+      const entry = entries.get(record.payload.id);
+      if (entry === undefined) fail("ERR_INTEGRITY");
+      if (
+        record.payload.expected.sha256 !== entry.preMoveInventory.sha256 ||
+        record.payload.expected.entries !== entry.preMoveInventory.entries ||
+        record.payload.expected.bytes !== entry.preMoveInventory.bytes
+      ) fail("ERR_INTEGRITY");
+      intents.push(entry);
+    } else if (record.event === "MOVED") {
+      completed.add(record.payload.id);
+    }
+  }
+  return Object.freeze({
+    completed,
+    entries,
+    intents: Object.freeze(intents),
+    intentIds: Object.freeze(intents.map((entry) => entry.id)),
+  });
+}
+
+async function appendHeldEvent({ capability, heldLock, event, payload, faultHook }) {
+  return appendJournalRecord({ capability, heldLock, event, payload, faultHook });
+}
+
+async function endpointStat(path, fsApi) {
+  try {
+    const stat = await fsApi.lstat(path);
+    if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) fail("ERR_INTEGRITY");
+    return stat;
+  } catch (error) {
+    if (error instanceof ClassifiedFailure) throw error;
+    if (error?.code === "ENOENT") return null;
+    fail("ERR_INTEGRITY");
+  }
+}
+
+async function endpointMatchesInventory({ capability, entry, path, phase }) {
+  if (entry.kind === "source-copy") {
+    try {
+      const fsApi = getRunFsContext(capability);
+      const stat = await fsApi.lstat(path);
+      if (
+        stat.isSymbolicLink() || !stat.isFile() || modeOf(stat) !== entry.mode ||
+        Number(stat.size) !== entry.size
+      ) return null;
+      const hash = createHash("sha256");
+      const stream = fsApi.createReadStream(path, { highWaterMark: BLOB_STREAM_HIGH_WATER_MARK });
+      for await (const chunk of stream) hash.update(chunk);
+      return hash.digest("hex") === entry.sha256 ? entry.preMoveInventory : null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const observed = await writeInventoryJsonl({
+      capability,
+      root: path,
+      entryId: entry.id,
+      phase,
+    });
+    await compareInventorySummary(entry.preMoveInventory, observed);
+    return observed;
+  } catch {
+    return null;
+  }
+}
+
+async function classifyApplyEndpoint({ capability, entry, repoRoot, fsApi }) {
+  const source = workspaceEntryPath(repoRoot, entry);
+  const payload = deriveRunPath(capability, { purpose: "payload", id: entry.id });
+  const sourceStat = await endpointStat(source, fsApi);
+  const payloadStat = await endpointStat(payload, fsApi);
+  const sourceObserved = sourceStat === null
+    ? null
+    : await endpointMatchesInventory({
+      capability,
+      entry,
+      path: source,
+      phase: "validation-pass-1",
+    });
+  const payloadObserved = payloadStat === null
+    ? null
+    : await endpointMatchesInventory({
+      capability,
+      entry,
+      path: payload,
+      phase: "validation-pass-2",
+    });
+  return { payload, payloadObserved, payloadStat, source, sourceObserved, sourceStat };
+}
+
+async function renameRecoveryEndpoint({ capability, entry, from, to, fsApi }) {
+  await revalidateRunCapability(capability, {
+    purpose: "payload",
+    id: entry.id,
+    boundary: "before-mutation",
+  });
+  const destination = await endpointStat(to, fsApi);
+  if (destination !== null) fail("ERR_INTEGRITY");
+  const source = await endpointStat(from, fsApi);
+  if (source === null) fail("ERR_INTEGRITY");
+  try {
+    await fsApi.rename(from, to);
+  } catch (error) {
+    if (error?.code === "EXDEV") fail("ERR_EXDEV");
+    throw error;
+  }
+  await syncDirectory(dirname(to), fsApi);
+  await syncDirectory(dirname(from), fsApi);
+}
+
+async function readRecoveryManifest({ capability, options, replayed }) {
+  const prepared = replayed.records.find((record) => record.event === "PREPARED");
+  if (prepared === undefined || prepared.payload.transactionId !== options.transactionId) {
+    fail("ERR_INTEGRITY");
+  }
+  let manifest;
+  try {
+    manifest = await readManifestGeneration({
+      capability,
+      manifestSha256: prepared.payload.manifestSha256,
+    });
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  if (
+    manifest.transactionId !== options.transactionId ||
+    manifest.repositoryRoot !== options.repoRoot ||
+    manifest.state !== "PREPARED"
+  ) fail("ERR_INTEGRITY");
+  return manifest;
+}
+
+async function resumeApplyFromLedger({ capability, heldLock, ledger, manifest, options }) {
+  const fsApi = getRunFsContext(capability);
+  const classifications = new Map();
+  const conflicts = [];
+  for (const entry of manifest.entries) {
+    const endpoint = await classifyApplyEndpoint({
+      capability,
+      entry,
+      repoRoot: options.repoRoot,
+      fsApi,
+    });
+    classifications.set(entry.id, endpoint);
+    const sourceMatches = endpoint.sourceStat !== null && endpoint.sourceObserved !== null;
+    const payloadMatches = endpoint.payloadStat !== null && endpoint.payloadObserved !== null;
+    if ((endpoint.sourceStat !== null && !sourceMatches) ||
+        (endpoint.payloadStat !== null && !payloadMatches) ||
+        (endpoint.sourceStat !== null && endpoint.payloadStat !== null) ||
+        (endpoint.sourceStat === null && endpoint.payloadStat === null) ||
+        (!ledger.intentIds.includes(entry.id) && endpoint.sourceStat === null) ||
+        (ledger.completed.has(entry.id) && endpoint.sourceStat !== null)) {
+      conflicts.push(entry.id);
+    }
+  }
+  if (conflicts.length > 0) {
+    await appendHeldEvent({
+      capability,
+      heldLock,
+      event: "INCOMPLETE_CONFLICT",
+      payload: { conflictEntryIds: [...conflicts].sort(byteCompare) },
+      faultHook: options.faultHook,
+    });
+    return recoveryConflict(options.transactionId, "resume", conflicts);
+  }
+
+  await appendHeldEvent({ capability, heldLock, event: "MOVING", payload: {}, faultHook: options.faultHook });
+  let reconciledEntries = 0;
+  const intended = new Set(ledger.intentIds);
+  const workOrder = [
+    ...ledger.intents,
+    ...manifest.entries.filter((entry) => !intended.has(entry.id)),
+  ];
+  for (const entry of workOrder) {
+    const endpoint = classifications.get(entry.id);
+    if (!intended.has(entry.id)) {
+      await appendHeldEvent({
+        capability,
+        heldLock,
+        event: "MOVE_INTENT",
+        payload: { id: entry.id, expected: entry.preMoveInventory },
+        faultHook: options.faultHook,
+      });
+      intended.add(entry.id);
+    }
+    if (endpoint.sourceStat !== null) {
+      await renameRecoveryEndpoint({
+        capability,
+        entry,
+        from: endpoint.source,
+        to: endpoint.payload,
+        fsApi,
+      });
+      await fsyncTree({ capability, root: endpoint.payload, entryId: entry.id, purpose: "payload" });
+      const observed = await endpointMatchesInventory({
+        capability,
+        entry,
+        path: endpoint.payload,
+        phase: "validation-pass-2",
+      });
+      if (observed === null) fail("ERR_INTEGRITY");
+      await appendHeldEvent({
+        capability,
+        heldLock,
+        event: "MOVED",
+        payload: { id: entry.id, observed },
+        faultHook: options.faultHook,
+      });
+      reconciledEntries += 1;
+    } else if (!ledger.completed.has(entry.id)) {
+      await appendHeldEvent({
+        capability,
+        heldLock,
+        event: "MOVED",
+        payload: { id: entry.id, observed: endpoint.payloadObserved },
+        faultHook: options.faultHook,
+      });
+      reconciledEntries += 1;
+    }
+  }
+  await appendHeldEvent({ capability, heldLock, event: "VERIFYING", payload: {}, faultHook: options.faultHook });
+  await appendHeldEvent({ capability, heldLock, event: "QUARANTINED", payload: {}, faultHook: options.faultHook });
+  return recoveryResult(options.transactionId, "QUARANTINED", "resume", reconciledEntries);
+}
+
+async function rollbackApplyFromLedger({ capability, heldLock, ledger, manifest, options }) {
+  const fsApi = getRunFsContext(capability);
+  const classifications = new Map();
+  const conflicts = [];
+  for (const entry of ledger.intents) {
+    const endpoint = await classifyApplyEndpoint({ capability, entry, repoRoot: options.repoRoot, fsApi });
+    classifications.set(entry.id, endpoint);
+    const sourceMatches = endpoint.sourceStat !== null && endpoint.sourceObserved !== null;
+    const payloadMatches = endpoint.payloadStat !== null && endpoint.payloadObserved !== null;
+    if ((endpoint.sourceStat !== null && !sourceMatches) ||
+        (endpoint.payloadStat !== null && !payloadMatches) ||
+        (endpoint.sourceStat !== null && endpoint.payloadStat !== null) ||
+        (endpoint.sourceStat === null && endpoint.payloadStat === null)) conflicts.push(entry.id);
+  }
+  if (conflicts.length > 0) {
+    await appendHeldEvent({
+      capability,
+      heldLock,
+      event: "INCOMPLETE_CONFLICT",
+      payload: { conflictEntryIds: [...conflicts].sort(byteCompare) },
+      faultHook: options.faultHook,
+    });
+    return recoveryConflict(options.transactionId, "rollback", conflicts);
+  }
+  await appendHeldEvent({ capability, heldLock, event: "ROLLING_BACK", payload: {}, faultHook: options.faultHook });
+  let reconciledEntries = 0;
+  for (const entry of [...ledger.intents].reverse()) {
+    const endpoint = classifications.get(entry.id);
+    await appendHeldEvent({
+      capability,
+      heldLock,
+      event: "ROLLBACK_INTENT",
+      payload: { id: entry.id },
+      faultHook: options.faultHook,
+    });
+    if (endpoint.payloadStat !== null) {
+      await renameRecoveryEndpoint({ capability, entry, from: endpoint.payload, to: endpoint.source, fsApi });
+      reconciledEntries += 1;
+    }
+    await appendHeldEvent({
+      capability,
+      heldLock,
+      event: "ROLLED_BACK_ENTRY",
+      payload: { id: entry.id },
+      faultHook: options.faultHook,
+    });
+  }
+  await appendHeldEvent({ capability, heldLock, event: "ROLLED_BACK", payload: {}, faultHook: options.faultHook });
+  return recoveryResult(options.transactionId, "ROLLED_BACK", "rollback", reconciledEntries);
+}
+
+async function recoverApplyOnCapability({ capability, options }) {
+  const initial = await replayJournal({ capability });
+  if (initial.state === "QUARANTINED" && options.action === "resume") {
+    return recoveryResult(options.transactionId, "QUARANTINED", "resume", 0);
+  }
+  if (initial.state === "VALIDATED" && options.action === "resume") {
+    return recoveryResult(options.transactionId, "VALIDATED", "resume", 0);
+  }
+  if (initial.state === "QUARANTINED" && options.action === "rollback") fail("ERR_USAGE");
+  if (initial.state === "ROLLED_BACK" && options.action === "rollback") {
+    return recoveryResult(options.transactionId, "ROLLED_BACK", "rollback", 0);
+  }
+  if (initial.state === "INCOMPLETE_CONFLICT") {
+    const conflict = initial.records.at(-1)?.payload?.conflictEntryIds;
+    if (!Array.isArray(conflict)) fail("ERR_INTEGRITY");
+    return recoveryConflict(options.transactionId, options.action, conflict);
+  }
+  return withJournalLock({ capability }, async (heldLock) => {
+    const replayed = await replayJournal({ capability });
+    const manifest = await readRecoveryManifest({ capability, options, replayed });
+    const ledger = buildApplyLedger(replayed, manifest);
+    if (replayed.state !== "RECOVERY_REQUIRED") {
+      if (
+        replayed.state !== "PREPARED" &&
+        replayed.state !== "MOVING" &&
+        replayed.state !== "VERIFYING"
+      ) fail("ERR_INTEGRITY");
+      await appendHeldEvent({
+        capability,
+        heldLock,
+        event: "RECOVERY_REQUIRED",
+        payload: { entryIds: ledger.intentIds },
+        faultHook: options.faultHook,
+      });
+    }
+    return options.action === "resume"
+      ? resumeApplyFromLedger({ capability, heldLock, ledger, manifest, options })
+      : rollbackApplyFromLedger({ capability, heldLock, ledger, manifest, options });
+  });
+}
+
 async function assertEntrySourceIdentity(path, entry, fsApi) {
   let stats;
   try {
@@ -2399,5 +2767,28 @@ export async function quarantineWorkspace(input) {
       throw new QuarantineError("ERR_INTEGRITY");
     }
     throw publicError(error, "ERR_INTERNAL");
+  }
+}
+
+export async function recoverQuarantine(input) {
+  let options;
+  let source;
+  try {
+    options = snapshotRecoveryOptions(input);
+    // Capture before the first await: a later getter, receiver, or method mutation
+    // cannot change the filesystem authority used by the run capability.
+    source = captureFsSource(options.fsApi);
+    return await withQuarantineRunCapability({
+      repoRoot: options.repoRoot,
+      quarantineRoot: options.quarantineRoot,
+      transactionId: options.transactionId,
+      writersStopped: options.writersStopped,
+      fsApi: source,
+    }, async (capability) => recoverApplyOnCapability({ capability, options }));
+  } catch (error) {
+    if (error instanceof IndeterminateJournalAppendError) {
+      throw new QuarantineError("ERR_INDETERMINATE_JOURNAL_APPEND");
+    }
+    throw publicError(error, "ERR_INTEGRITY");
   }
 }

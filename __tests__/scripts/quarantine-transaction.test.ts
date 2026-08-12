@@ -21,6 +21,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { createQuarantineFixture } from "../fixtures/quarantine/quarantine-test-harness";
+
 const transactionUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-transaction.mjs"),
 ).href;
@@ -495,6 +497,25 @@ try {
           payload: record.payload,
         })),
       },
+    }));
+  } else if (operation === "recover") {
+    const result = await transaction.recoverQuarantine(request);
+    let replayed;
+    await withQuarantineRunCapability({
+      repoRoot: request.repoRoot,
+      quarantineRoot: request.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+    }, async (capability) => {
+      replayed = await replayJournal({ capability });
+    });
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      result,
+      replayEvents: replayed.records.map((record) => ({
+        event: record.event,
+        payload: record.payload,
+      })),
     }));
   } else if (operation === "apply-rename-exdev") {
     const { variant, ...applyRequest } = request;
@@ -1720,6 +1741,55 @@ function expectWorkerError(result: WorkerResult, code: string, message: string) 
 }
 
 describe("quarantine transaction Slice 1", () => {
+  it("exports explicit semantic apply recovery", () => {
+    const result = invoke("exports", {});
+
+    expect(result).toMatchObject({ ok: true });
+    expect(result.exports).toContain("recoverQuarantine");
+  });
+
+  it("resumes a durable move intent left before its rename", () => {
+    const f = createQuarantineFixture();
+    bases.push(f.base);
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: f.expectedCount,
+      transactionId: "tx-recover-intent",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    expect(invoke("apply-stop", {
+      ...request,
+      stopPhase: "after-event:MOVE_INTENT:copy-0001",
+    }).ok).toBe(false);
+
+    const recovered = invoke("recover", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      transactionId: request.transactionId,
+      action: "resume",
+      writersStopped: true,
+    });
+
+    expect(recovered).toMatchObject({
+      ok: true,
+      result: {
+        transactionId: request.transactionId,
+        status: "QUARANTINED",
+        action: "resume",
+      },
+    });
+    expect(recovered.replayEvents?.map((record) => record.event)).toEqual(expect.arrayContaining([
+      "RECOVERY_REQUIRED", "MOVED", "VERIFYING", "QUARANTINED",
+    ]));
+    expect(existsSync(join(f.repoRoot, "notes 2.txt"))).toBe(false);
+    expect(existsSync(join(f.quarantineRoot, request.transactionId,
+      "payload/source-copies/copy-0001"))).toBe(true);
+  });
+
   const bases: string[] = [];
 
   afterEach(() => {

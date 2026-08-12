@@ -524,6 +524,7 @@ function validateJournalSemantics(records) {
   let recoveryContext = null;
   let preRestoreState = null;
   const applyIntents = [];
+  const applyExpected = new Map();
   const applyCompleted = new Set();
   let applyRollbackIndex = -1;
   let applyRollbackPending = null;
@@ -546,9 +547,19 @@ function validateJournalSemantics(records) {
         );
       }
       applyIntents.push(record.payload.id);
+      applyExpected.set(record.payload.id, record.payload.expected);
     } else if (record.event === "MOVED") {
       if (firstUnresolved(applyIntents, applyCompleted) !== record.payload.id) {
         throw new Error("MOVED must complete the next durable MOVE_INTENT");
+      }
+      const expected = applyExpected.get(record.payload.id);
+      const observed = record.payload.observed;
+      if (
+        expected.sha256 !== observed.sha256 ||
+        expected.entries !== observed.entries ||
+        expected.bytes !== observed.bytes
+      ) {
+        throw new Error("MOVED summary must equal its durable MOVE_INTENT expected summary");
       }
       applyCompleted.add(record.payload.id);
     } else if (record.event === "RESTORE_PREPARED") {
