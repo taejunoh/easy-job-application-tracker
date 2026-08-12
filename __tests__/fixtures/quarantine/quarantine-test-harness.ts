@@ -518,7 +518,7 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "restore") {
-    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, traceRestoreFs, ...restoreRequest } = request;
+    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, indeterminatePrepared, traceRestoreFs, ...restoreRequest } = request;
     const phases = [];
     let finalPrecheckTargetReads = 0;
     let finalInterloperPath;
@@ -540,6 +540,24 @@ try {
       let generatedMoved = false;
       let fsApi;
       let activeRootExchanged = false;
+      if (indeterminatePrepared === true) {
+        fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+        const originalOpen = fsApi.open;
+        fsApi.open = async (path, ...args) => {
+          const handle = await originalOpen(path, ...args);
+          if (path !== join(request.quarantineRoot, request.transactionId, "journal.log") || !["r+", "wx+"].includes(args[0])) return handle;
+          return new Proxy(handle, {
+            get(inner, property) {
+              const value = Reflect.get(inner, property, inner);
+              if (property === "sync") return async (...syncArgs) => {
+                await Reflect.apply(value, inner, syncArgs);
+                throw new Error("injected prepared journal sync failure");
+              };
+              return typeof value === "function" ? value.bind(inner) : value;
+            },
+          });
+        };
+      }
       if (traceRestoreFs === true) {
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
         for (const method of ["lstat", "open", "rename"]) {

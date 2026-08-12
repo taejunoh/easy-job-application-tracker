@@ -296,14 +296,10 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
   const cleanupOwned = async (error) => {
     if (ownedIdentity === undefined) throw error;
     try {
-      const observed = await fsApi.lstat(path);
-      if (!observed.isSymbolicLink() && observed.isFile() && sameIdentity(ownedIdentity, observed) && modeOf(observed) === 0o600) {
-        await fsApi.unlink(path);
-        const directory = await fsApi.open(parent, DIRECTORY_OPEN_FLAGS);
-        let directoryPrimary;
-        try { await directory.sync(); } catch (syncError) { directoryPrimary = syncError; }
-        await closeAll(undefined, directory, directoryPrimary);
-      } else throw new Error("restore-active inventory cleanup ownership changed");
+      await cleanupVerifiedRestoreActiveInventory({
+        capability,
+        publication: Object.freeze({ path, identity: ownedIdentity, parentIdentity }),
+      });
     } catch (cleanupError) {
       throw new AggregateError([error, cleanupError], "restore-active inventory publish and cleanup failed");
     }
@@ -314,10 +310,10 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
     handle = await fsApi.open(path, "wx", 0o600);
     await handle.chmod(0o600);
     const opened = await handle.stat();
-    if (opened.isSymbolicLink() || !opened.isFile() || modeOf(opened) !== 0o600) {
+    if (opened.isSymbolicLink() || !opened.isFile() || modeOf(opened) !== 0o600 || opened.nlink !== 1) {
       throw new Error("restore-active inventory output is not private regular file");
     }
-    ownedIdentity = Object.freeze({ dev: opened.dev, ino: opened.ino, mode: modeOf(opened), type: "file" });
+    ownedIdentity = Object.freeze({ dev: opened.dev, ino: opened.ino, mode: modeOf(opened), nlink: opened.nlink, type: "file" });
     let position = 0;
     for (const record of snapshot.records) {
       const bytes = Buffer.from(`${JSON.stringify(record)}\n`);
@@ -345,7 +341,7 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
     await validateAncestorChain(chain, fsApi);
     const final = await fsApi.lstat(path);
     if (ownedIdentity === undefined || final.isSymbolicLink() || !final.isFile() ||
-        !sameIdentity(ownedIdentity, final) || modeOf(final) !== 0o600) {
+      !sameIdentity(ownedIdentity, final) || modeOf(final) !== 0o600 || final.nlink !== 1) {
       throw new Error("restore-active inventory output changed before parent sync");
     }
     const directory = await fsApi.open(parent, DIRECTORY_OPEN_FLAGS);
@@ -355,7 +351,7 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
     await revalidateRunCapability(capability, { purpose: "inventory", id: entryId, phase: "restore-active", boundary: "after-sync" });
     await validateAncestorChain(chain, fsApi);
     const published = await fsApi.lstat(path);
-    if (published.isSymbolicLink() || !published.isFile() || !sameIdentity(ownedIdentity, published) || modeOf(published) !== 0o600) {
+    if (published.isSymbolicLink() || !published.isFile() || !sameIdentity(ownedIdentity, published) || modeOf(published) !== 0o600 || published.nlink !== 1) {
       throw new Error("restore-active inventory output changed after parent sync");
     }
   } catch (error) {
@@ -382,7 +378,7 @@ export async function cleanupVerifiedRestoreActiveInventory({ capability, public
     throw new Error("restore-active inventory cleanup parent changed");
   }
   const stat = await fsApi.lstat(publication.path);
-  if (stat.isSymbolicLink() || !stat.isFile() || !sameIdentity(expectedFile, stat) || modeOf(stat) !== 0o600) {
+  if (stat.isSymbolicLink() || !stat.isFile() || !sameIdentity(expectedFile, stat) || modeOf(stat) !== 0o600 || stat.nlink !== 1) {
     throw new Error("restore-active inventory cleanup ownership changed");
   }
   await fsApi.unlink(publication.path);
@@ -438,25 +434,27 @@ export async function fsyncVerifiedTree(root, {
     } catch (error) { primary = error; }
     await closeAll(undefined, handle, primary);
   };
+  const budget = { records: 0, recordBytes: 0 };
   const enumerateDirectory = async (path, expected, chain) => withVerifiedDirectory(
     path, expected, chain, fsApi,
     async (dir, identity) => {
       const names = [];
-      let nameBytes = 0;
       while (true) {
         const item = await dir.read();
         if (item === null) break;
         if (typeof item.name !== "string" || Buffer.byteLength(item.name) > LIMITS.nameBytes) {
           throw new Error("restore sync directory entry is invalid");
         }
-        if (names.length >= LIMITS.records || nameBytes + Buffer.byteLength(item.name) > LIMITS.recordBytes) {
+        const canonicalBytes = Buffer.byteLength(join(path, item.name));
+        if (budget.records >= LIMITS.records || budget.recordBytes + canonicalBytes > LIMITS.recordBytes) {
           throw new Error("restore sync tree exceeded fixed entry bounds");
         }
         names.push(item.name);
-        nameBytes += Buffer.byteLength(item.name);
+        budget.records += 1;
+        budget.recordBytes += canonicalBytes;
       }
       names.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
-      return Object.freeze({ identity, names: Object.freeze(names), nameBytes });
+      return Object.freeze({ identity, names: Object.freeze(names) });
     },
   );
   const visit = async (path, expected, chain) => {

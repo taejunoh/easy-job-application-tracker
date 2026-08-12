@@ -250,6 +250,29 @@ describe("quarantine restore", () => {
     }
   });
 
+  it("preserves restore-active inventory ownership after an indeterminate RESTORE_PREPARED append", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, indeterminatePrepared: true,
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error?.name).toBe("IndeterminateJournalAppendError");
+      expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_PREPARED");
+      for (const id of ["generated-next", "generated-node-modules"]) {
+        expect(lstatSync(join(prepared.runRoot, "inventories", "restore-active", `${id}.jsonl`)).mode & 0o7777).toBe(0o600);
+      }
+      const retry = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true,
+      });
+      expect(retry.ok).toBe(false);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("publishes restore-active inventories as exact 0600 files under restrictive umask", () => {
     const prepared = prepareQuarantinedFixture();
     const previousUmask = process.umask(0o777);

@@ -9,7 +9,7 @@ import {
   summarizeInventoryDirectory,
   hashVerifiedRegularFile,
 } from "./quarantine-inventory-reader.mjs";
-import { appendJournalRecord, replayJournal, withJournalLock } from "./quarantine-journal.mjs";
+import { appendJournalRecord, IndeterminateJournalAppendError, replayJournal, withJournalLock } from "./quarantine-journal.mjs";
 import { withExistingQuarantineRun } from "./quarantine-lifecycle-core.mjs";
 import { deriveRunPath, revalidateRunCapability } from "./quarantine-run-capability.mjs";
 
@@ -496,6 +496,7 @@ export async function restoreQuarantine(input) {
         await assertActiveStable(handoff, activeGenerated);
         await append(heldLock, handoff.capability, "RESTORE_PREPARED", { restoreId, activeGenerated });
       } catch (error) {
+        if (error instanceof IndeterminateJournalAppendError || error?.code === "ERR_INDETERMINATE_JOURNAL_APPEND") throw error;
         await cleanupRestoreActivePublications(handoff.capability, publications, error);
       }
       await invokeHook(options.faultHook, "after-event:RESTORE_PREPARED");
