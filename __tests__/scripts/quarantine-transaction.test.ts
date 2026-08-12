@@ -782,13 +782,14 @@ describe("quarantine transaction Slice 1", () => {
     for (const base of bases.splice(0)) rmSync(base, { recursive: true, force: true });
   });
 
-  it("exposes the completed atomic apply API only at the Slice 2 surfaces", async () => {
+  it("exposes the completed atomic apply and recovery API only at the Slice 2 surfaces", async () => {
     const exports = invokeQuarantineWorker("exports", {});
-    expect(exports.exports).toEqual(["inspectWorkspace", "quarantineWorkspace"]);
+    expect(exports.exports).toEqual(["inspectWorkspace", "quarantineWorkspace", "recoverQuarantine"]);
     expect(exports.runtimeExports).toEqual([
       "inspectWorkspace",
       "prepareQuarantineWorkspace",
       "quarantineWorkspace",
+      "recoverQuarantine",
     ]);
     expect(exports.legacyExports).not.toContain("prepareQuarantineWorkspace");
     const packageJson = JSON.parse(readFileSync(join(__dirname, "../../package.json"), "utf8"));
