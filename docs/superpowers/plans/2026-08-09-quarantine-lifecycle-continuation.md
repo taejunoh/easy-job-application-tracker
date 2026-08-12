@@ -196,6 +196,22 @@ The moved `Fixture` record retains every existing field and adds the exact
 `expectedCount: number` derived from its generated source-copy entries, so all
 apply requests use the fixture's recorded count (including divergent fixtures).
 
+The shared harness declares the concrete type used by every task:
+
+```ts
+export type Fixture = {
+  base: string;
+  repoRoot: string;
+  quarantineRoot: string;
+  branch: string;
+  head: string;
+  expectedCount: number;
+  historyHead?: string;
+  canonicalPath?: string;
+  copyPath?: string;
+};
+```
+
 The helper's worker dispatcher adds only `recoverQuarantine` and the existing
 `replay-run` operation in Task 1. It does not import lifecycle core and has no
 `core-contract` or preparation worker branch. The transaction test imports
@@ -258,7 +274,7 @@ it("builds RECOVERY_REQUIRED from the complete durable intent ledger", async () 
   const fixtureRoot = createQuarantineFixture({ divergent: false });
   const one = { sha256: "a".repeat(64), entries: 1, bytes: 1 };
   const two = { sha256: "b".repeat(64), entries: 1, bytes: 1 };
-  const result = invokeQuarantineWorker("recoverQuarantine", {
+  const response = invokeQuarantineWorker("recoverQuarantine", {
     repoRoot: fixtureRoot.repoRoot,
     quarantineRoot: fixtureRoot.quarantineRoot,
     transactionId: "tx-0001",
@@ -272,7 +288,8 @@ it("builds RECOVERY_REQUIRED from the complete durable intent ledger", async () 
       { event: "MOVE_INTENT", payload: { id: "copy-0001", expected: one } },
     ],
   });
-  expect(result).toMatchObject({ transactionId: "tx-0001", action: "resume" });
+  expect(response.ok).toBe(true);
+  expect(response.result).toMatchObject({ transactionId: "tx-0001", action: "resume" });
 });
 ```
 
@@ -368,6 +385,8 @@ await operation({ ...request.options, faultHook });
 Define the complete apply-options helper before every child row:
 
 ```ts
+import type { Fixture } from "../fixtures/quarantine/quarantine-test-harness";
+
 function applyOptions(f: Fixture, transactionId: string, createdAt: string) {
   return { repoRoot:f.repoRoot, quarantineRoot:f.quarantineRoot, expectedBranch:f.branch, expectedHead:f.head, expectedCount:f.expectedCount, transactionId, createdAt, writersStopped:true };
 }
@@ -393,6 +412,7 @@ const result = await new Promise<{ code: number | null; signal: NodeJS.Signals |
 });
 expect(result.signal).toBe("SIGKILL");
 const recovery = invokeQuarantineWorker("recoverQuarantine", { ...request.options, action: "resume" });
+expect(recovery.ok).toBe(true);
 expect(recovery.result).toMatchObject({ status: "QUARANTINED" });
 ```
 
@@ -481,6 +501,10 @@ function validateExistingRun(args: { capability: object; fsApi: object } & Exist
   repoRoot: string; quarantineRoot: string; runRoot: string; transactionId: string;
   head: string; journalTip: JournalTip; manifestGeneration: ManifestGeneration;
 }>;
+function validateRestoreProvenance(args: {
+  capability: object; fsApi: object; replay: JournalReplay;
+  manifestGeneration: ManifestGeneration;
+}): Promise<void>;
 ```
 
 `ExistingRunOptions` is the five-key closed record defined above; `FrozenFsSource` is the existing 14-method source contract; `JournalTip` and `ManifestGeneration` are the frozen records in the handoff. These names are private descriptions only and are not runtime exports.
@@ -513,16 +537,18 @@ they do not become exports.
 ```ts
 const prepared = await prepareQuarantinedFixture();
 const result = invokeQuarantineWorker("core-contract", { options: { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true }, mutateSourceAfterCapture: true });
-expect(result.result?.handoffKeys).toEqual([
+expect(result.ok).toBe(true);
+expect([...(result.result?.handoffKeys ?? [])].sort()).toEqual([
   "capability", "fsApi", "head", "journalTip", "manifestGeneration",
   "quarantineRoot", "repoRoot", "runRoot", "transactionId",
-]);
+].sort());
 expect(result.result?.handoffFrozen).toBe(true);
 expect(result.result?.prototype).toBe("null");
 expect(result.result?.descriptors).toEqual(expect.any(Object));
 expect(result.result?.evidenceBefore).toEqual(result.result?.evidenceAfter);
 expect(result.result?.wrongReceiver).toBe(0);
 expect(result.result?.callbackInvoked).toBe(true);
+expect(result.result?.manifestGenerationKeys).toEqual(["manifestSha256", "state", "manifest"]);
 expect(result.result?.getterReads).toEqual(Object.fromEntries([
   "lstat", "realpath", "mkdir", "open", "readdir", "rm", "rename", "unlink",
   "link", "opendir", "readlink", "createReadStream", "lstatSync", "realpathSync",
@@ -551,7 +577,7 @@ byte with the corresponding file under the deterministic `.original` roots;
 foreign sentinels remain untouched. It never expects handoff keys on stale
 input.
 
-Add state-specific tests: QUARANTINED obtains baseline digest/generation from PREPARED and requires manifest state PREPARED; it does not require a QUARANTINED tip payload or QUARANTINED generation. VALIDATED obtains the digest/generation and stored retention metadata from the VALIDATED tip. Add pointer tests that distinguish missing activation-pending from present malformed, foreign, path-bearing, or mismatched fatal pointers.
+Add state-specific tests: QUARANTINED obtains baseline digest/generation from PREPARED and requires manifest state PREPARED; it does not require a QUARANTINED tip payload or QUARANTINED generation. VALIDATED obtains the digest/generation and stored retention metadata from the VALIDATED tip. Add pointer tests that distinguish missing activation-pending from present malformed, foreign, path-bearing, or mismatched fatal pointers. Add restore-context RED cases for durable `RESTORE_PREPARED`, `RESTORING`, `RECOVERY_REQUIRED` emitted during restore, and `RESTORE_ROLLING_BACK`: reconstruct the pre-restore QUARANTINED-or-VALIDATED provenance from the durable restore ledger, validate every active/rollback/payload location and state-specific generation through the existing journal authority, and assert callback-not-invoked plus no mutation on any mismatch.
 
 Modify the shared host harness here with this executable helper; it is not a
 worker operation. It invokes the existing worker operation `"apply"`, checks
@@ -629,7 +655,6 @@ function replaceActualRunIdentity(runRootPath) {
   mkdirSync(quarantineRootPath, { recursive: true, mode: 0o700 });
   mkdirSync(runRootPath, { recursive: true, mode: 0o700 });
   writeFileSync(join(runRootPath, "foreign-sentinel"), "foreign");
-  return { originalRunRootPath, originalQuarantineRootPath };
 }
 } else if (operation === "core-contract") {
   const { withExistingQuarantineRun } = await import(${JSON.stringify(coreUrl)});
@@ -651,7 +676,7 @@ function replaceActualRunIdentity(runRootPath) {
     const generationPath = deriveRunPath(handoff.capability, { purpose: "manifest-generation", id: handoff.manifestGeneration.manifestSha256 });
     const readOptional = (path) => { try { return readFileSync(path).toString("base64"); } catch (error) { if (error.code === "ENOENT") return null; throw error; } };
     const evidenceBefore = [readFileSync(journalPath).toString("base64"), readOptional(pointerPath), readFileSync(generationPath).toString("base64")];
-    const result = { handoffKeys: Object.keys(handoff), handoffFrozen: Object.isFrozen(handoff), prototype: Object.getPrototypeOf(handoff) === null ? "null" : "other", descriptors: Object.fromEntries(Object.keys(handoff).map((key) => [key, Object.getOwnPropertyDescriptor(handoff, key)])), evidenceBefore };
+    const result = { handoffKeys: Object.keys(handoff), handoffFrozen: Object.isFrozen(handoff), prototype: Object.getPrototypeOf(handoff) === null ? "null" : "other", descriptors: Object.fromEntries(Object.keys(handoff).map((key) => [key, Object.getOwnPropertyDescriptor(handoff, key)])), manifestGenerationKeys: Object.keys(handoff.manifestGeneration), evidenceBefore };
     return { result, evidencePaths: [journalPath, pointerPath, generationPath] };
   });
   if (request.mutateSourceAfterCapture) for (const name of FS_METHODS) {
@@ -672,7 +697,7 @@ npm test -- --runInBand __tests__/scripts/quarantine-lifecycle-core.test.ts
 
 Expected: FAIL because `scripts/quarantine-lifecycle-core.mjs` is absent and the existing runtime still owns source capture/hand-off setup.
 
-- [ ] **Step 3: Move source capture and implement the private core (GREEN).** In `quarantine-run-fs-context.mjs`, make the supplied source or `DEFAULT_SOURCE` snapshot occur synchronously before any filesystem await, evaluate each of the 14 method getters once, freeze the source and adapter, bind the exact source object to the live capability, and invalidate it before callback settlement on both success and failure. In `quarantine-lifecycle-core.mjs`, export only `withExistingQuarantineRun`, create the capability, derive the lexical transaction/run root only through capability rules, replay the journal, validate live run/root/repository identity and exact HEAD, then validate the state-specific generation and pointer evidence. Reject all mismatches before invoking the callback; return only the frozen internal handoff above. Do not reimplement path containment, bootstrap, or security checks.
+- [ ] **Step 3: Move source capture and implement the private core (GREEN).** In `quarantine-run-fs-context.mjs`, make the supplied source or `DEFAULT_SOURCE` snapshot occur synchronously before any filesystem await, evaluate each of the 14 method getters once, freeze the source and adapter, bind the exact source object to the live capability, and invalidate it before callback settlement on both success and failure. In `quarantine-lifecycle-core.mjs`, export only `withExistingQuarantineRun`, create the capability, derive the lexical transaction/run root only through capability rules, replay the journal, validate live run/root/repository identity and exact HEAD, then validate the state-specific generation and pointer evidence. Before invoking the callback, call `validateRestoreProvenance` for any restore ledger state (`RESTORE_PREPARED`, `RESTORING`, restore-context `RECOVERY_REQUIRED`, or `RESTORE_ROLLING_BACK`); reconstruct the durable pre-restore QUARANTINED-or-VALIDATED state, restore ID, intent order, active-generated inventory, rollback/payload locations, and state-specific generation from existing journal replay and path authorities, rejecting any mismatch without mutation. Return only the null-prototype frozen internal handoff above; do not add a restore field or public state, and do not reimplement path containment, bootstrap, or security checks.
 
 ```js
 export async function withExistingQuarantineRun(options, callback) {
@@ -681,7 +706,10 @@ export async function withExistingQuarantineRun(options, callback) {
   return withQuarantineRunCapability({ ...input, fsApi: source }, async (capability) => {
     const fsApi = getRunFsContext(capability, source);
     const handoff = await validateExistingRun({ capability, fsApi, ...input });
-    return callback(Object.freeze({ ...handoff, capability, fsApi }));
+    const replay = await replayJournal({ capability, fsApi });
+    await validateRestoreProvenance({ capability, fsApi, replay, manifestGeneration: handoff.manifestGeneration });
+    const frozenHandoff = Object.freeze(Object.assign(Object.create(null), handoff, { capability, fsApi }));
+    return callback(frozenHandoff);
   });
 }
 ```
@@ -853,6 +881,8 @@ Private helper signatures are:
 
 ```ts
 function deriveRestoreId(transactionId: string): string;
+function snapshotRestoreOptions(input: unknown): Readonly<RestoreOptions>;
+function snapshotRestoreRecoveryOptions(input: unknown): Readonly<RestoreRecoveryOptions>;
 function pickExistingRunOptions(input: RestoreOptions): ExistingRunOptions;
 function captureActiveGenerated(handoff: InternalRunHandoff, restoreId: string, faultHook?: FaultHook): Promise<ActiveGenerated>;
 function appendRestorePrepared(handoff: InternalRunHandoff, restoreId: string, activeGenerated: ActiveGenerated, faultHook?: FaultHook): Promise<void>;
@@ -861,11 +891,48 @@ function restoreEntry(args: { handoff: InternalRunHandoff; restoreId: string; en
 function appendRestored(handoff: InternalRunHandoff, faultHook?: FaultHook): Promise<void>;
 ```
 
+Both public entry points use these complete synchronous snapshots before any
+`await` or `deriveRestoreId` call. They read each input getter once, reject
+unknown keys and non-literal `writersStopped`, validate recovery action exactly,
+and return a null-prototype frozen record; later caller mutation cannot affect
+the captured values:
+
+```js
+function snapshotRestoreRecord(input, recovery) {
+  if (!input || typeof input !== "object") throw new Error("invalid restore options");
+  const allowed = new Set(["repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi", "faultHook", ...(recovery ? ["action"] : [])]);
+  for (const key of Object.keys(input)) if (!allowed.has(key)) throw new Error("invalid restore options");
+  const repoRoot = input.repoRoot;
+  const quarantineRoot = input.quarantineRoot;
+  const transactionId = input.transactionId;
+  const writersStopped = input.writersStopped;
+  const fsApi = input.fsApi;
+  const faultHook = input.faultHook;
+  if (typeof repoRoot !== "string" || typeof quarantineRoot !== "string" || typeof transactionId !== "string" || writersStopped !== true || (faultHook !== undefined && typeof faultHook !== "function")) throw new Error("invalid restore options");
+  const snapshot = Object.create(null);
+  Object.assign(snapshot, { repoRoot, quarantineRoot, transactionId, writersStopped, fsApi, faultHook });
+  if (recovery) {
+    const action = input.action;
+    if (action !== "resume" && action !== "rollback") throw new Error("invalid restore action");
+    snapshot.action = action;
+  }
+  return Object.freeze(snapshot);
+}
+function snapshotRestoreOptions(input) { return snapshotRestoreRecord(input, false); }
+function snapshotRestoreRecoveryOptions(input) { return snapshotRestoreRecord(input, true); }
+```
+
+`RestoreOptions` is the closed record `{ repoRoot, quarantineRoot,
+transactionId, writersStopped, fsApi?, faultHook? }`; `RestoreRecoveryOptions`
+is that same record plus `action: "resume" | "rollback"`. The snapshots retain
+the supplied `transactionId` and `faultHook` values and are private records,
+not additional public APIs.
+
 `ActiveGenerated` is the fixed two-record `{ id, inventory: InventorySummary | null }[]` payload; `ManifestEntry` is the closed manifest union from the original design. Both descriptions are private and are not new public APIs.
 
 Restore journal payloads stay exact: `RESTORE_PREPARED` is `{ restoreId, activeGenerated }`; `RESTORING`, `RESTORED`, and `RESTORE_ROLLING_BACK` are `{}`; `RESTORE_INTENT`, `RESTORE_ROLLBACK_INTENT`, `RESTORED_ENTRY`, and `RESTORE_ROLLED_BACK_ENTRY` are `{ id }`; `RESTORE_ABORTED_TO_QUARANTINED` and `RESTORE_ABORTED_TO_VALIDATED` are `{}`; and `INCOMPLETE_CONFLICT` is `{ conflictEntryIds }`.
 
-- [ ] **Step 1: Write restore RED tests and exact vector test.** Assert the fixed vector and prefixed grammar. Parameterize all four presence combinations for `.next` and `node_modules`; existing active roots write and fsync exactly one `restore-active` inventory, absent roots write no JSONL and are rechecked immediately before `RESTORE_PREPARED`. Assert dense bytewise-sorted `activeGenerated` records with the two fixed IDs and exact summary-or-null. Recreate an absent root or remove an inventoried root at the final presence seam and assert no `RESTORE_PREPARED`/`RESTORING` mutation.
+- [ ] **Step 1: Write restore RED tests and exact vector test.** Assert the fixed vector and prefixed grammar. Parameterize all four presence combinations for `.next` and `node_modules`; existing active roots write and fsync exactly one `restore-active` inventory, absent roots write no JSONL and are rechecked immediately before `RESTORE_PREPARED`. Assert dense bytewise-sorted `activeGenerated` records with the two fixed IDs and exact summary-or-null. Recreate an absent root or remove an inventoried root at the final presence seam and assert no `RESTORE_PREPARED`/`RESTORING` mutation. Add closed-option tests with accessor-backed `repoRoot`, `quarantineRoot`, `transactionId`, `writersStopped`, and `faultHook`: each getter is read once, the frozen null-prototype snapshot remains unchanged after caller mutation, and invalid extra keys or non-literal writers/action values are rejected before `deriveRestoreId` or any await.
 
 ```ts
 import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
@@ -880,6 +947,12 @@ await expect(restoreQuarantine({ ...restoreOptions, writersStopped: true })).res
 
 The restore test reuses the copied transaction `invoke` worker helper and defines `restoreOptions` from the disposable fixture's absolute repository/quarantine roots and transaction ID before this assertion.
 
+Run separate crash/replay rows for `RESTORE_PREPARED`, `RESTORING`,
+restore-context `RECOVERY_REQUIRED`, and `RESTORE_ROLLING_BACK`; each row must
+prove the private core reconstructs the same pre-restore QUARANTINED-or-VALIDATED
+provenance and rejects altered journal, generation, or inventory evidence before
+any callback or filesystem mutation.
+
 Assert source-copy P-to-A moves and generated A-to-R followed by P-to-A moves, each with payload/tree sync, destination-parent sync, and source-parent sync in order, with no overwrite or unlink of active concurrent evidence. Assert exact hooks `after-event:RESTORE_PREPARED`, `after-event:RESTORING`, `after-inventory:restore-active:${generatedEntryId}`, `after-event:RESTORE_INTENT:${entryId}`, `after-active-to-rollback-rename:${generatedEntryId}`, `after-rollback-tree-sync:${generatedEntryId}`, `after-rollback-destination-parent-sync:${generatedEntryId}`, `after-rollback-source-parent-sync:${generatedEntryId}`, `after-payload-to-active-rename:${entryId}`, `after-restored-payload-sync:${entryId}`, `after-restore-destination-parent-sync:${entryId}`, `after-restore-source-parent-sync:${entryId}`, `after-event:RESTORED_ENTRY:${entryId}`, `after-event:RESTORED`, and `before-lock-cleanup`.
 
 - [ ] **Step 2: Run restore RED.**
@@ -890,20 +963,22 @@ npm test -- --runInBand __tests__/scripts/quarantine-restore.test.ts
 
 Expected: FAIL because `scripts/quarantine-restore.mjs` and its `restoreQuarantine` implementation/test do not exist.
 
-- [ ] **Step 3: Implement normal restore through the private core.** Validate the exact durable QUARANTINED or VALIDATED evidence, derive the deterministic prefixed restore ID, create only capability-derived rollback entries, write the fixed inventories, append `RESTORE_PREPARED` and `RESTORING`, then process entries in manifest order with the required sync order. Preserve regenerated rollback content after successful restore; never overwrite or delete an active concurrent replacement.
+- [ ] **Step 3: Implement normal restore through the private core.** Validate the exact durable QUARANTINED or VALIDATED evidence, reject any already-present in-progress restore ledger mutation-free (recovery owns those states), derive the deterministic prefixed restore ID, create only capability-derived rollback entries, write the fixed inventories, append `RESTORE_PREPARED` and `RESTORING`, then process entries in manifest order with the required sync order. Preserve regenerated rollback content after successful restore; never overwrite or delete an active concurrent replacement.
 
 ```js
 export async function restoreQuarantine(input) {
-  const restoreId = deriveRestoreId(input.transactionId);
-  return withExistingQuarantineRun(pickExistingRunOptions(input), async (handoff) => {
-    const activeGenerated = await captureActiveGenerated(handoff, restoreId, input.faultHook);
-    await appendRestorePrepared(handoff, restoreId, activeGenerated, input.faultHook);
-    await appendRestoreStarted(handoff, input.faultHook);
+  const options = snapshotRestoreOptions(input);
+  const restoreId = deriveRestoreId(options.transactionId);
+  return withExistingQuarantineRun(pickExistingRunOptions(options), async (handoff) => {
+    if (["RESTORE_PREPARED", "RESTORING", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK"].includes(handoff.journalTip.state)) throw new Error("restore recovery required");
+    const activeGenerated = await captureActiveGenerated(handoff, restoreId, options.faultHook);
+    await appendRestorePrepared(handoff, restoreId, activeGenerated, options.faultHook);
+    await appendRestoreStarted(handoff, options.faultHook);
     for (const entry of handoff.manifestGeneration.manifest.entries) {
-      await restoreEntry({ handoff, restoreId, entry, faultHook: input.faultHook });
+      await restoreEntry({ handoff, restoreId, entry, faultHook: options.faultHook });
     }
-    await appendRestored(handoff, input.faultHook);
-    return Object.freeze({ transactionId: input.transactionId, restoreId, status: "RESTORED", restoredEntries: handoff.manifestGeneration.manifest.entries.length });
+    await appendRestored(handoff, options.faultHook);
+    return Object.freeze({ transactionId: options.transactionId, restoreId, status: "RESTORED", restoredEntries: handoff.manifestGeneration.manifest.entries.length });
   });
 }
 ```
@@ -1029,17 +1104,18 @@ npm test -- --runInBand __tests__/scripts/quarantine-restore.test.ts __tests__/s
 
 Expected: FAIL because `recoverRestore` and the restore crash integration suite are absent and no A/R/P replay can yet return the exact prior state.
 
-- [ ] **Step 3: Implement forward resume and reverse rollback.** Replay before mutation, preserve `RESTORE_INTENT` order, and process rollback in reverse durable order. For generated entries rollback moves active original A to payload P, then regenerated R to active A; append the abort event matching the state immediately before `RESTORE_PREPARED`. Use the exact `RESTORE_ROLLING_BACK`, `RESTORE_ROLLBACK_INTENT`, `RESTORE_ROLLED_BACK_ENTRY`, `RESTORE_ABORTED_TO_QUARANTINED`, and `RESTORE_ABORTED_TO_VALIDATED` schemas. Treat `O === G` by persisted role, phase, authorized path, and inode, never by digest multiplicity.
+- [ ] **Step 3: Implement forward resume and reverse rollback.** Snapshot and freeze restore-recovery options before deriving the restore ID or awaiting; replay before mutation, preserve `RESTORE_INTENT` order, and process rollback in reverse durable order. The private core has already reconstructed and validated the durable pre-restore QUARANTINED-or-VALIDATED provenance for `RESTORE_PREPARED`, `RESTORING`, restore-context `RECOVERY_REQUIRED`, and `RESTORE_ROLLING_BACK`; recovery then uses that ledger and state-specific generation without exposing a new public state. For generated entries rollback moves active original A to payload P, then regenerated R to active A; append the abort event matching the state immediately before `RESTORE_PREPARED`. Use the exact `RESTORE_ROLLING_BACK`, `RESTORE_ROLLBACK_INTENT`, `RESTORE_ROLLED_BACK_ENTRY`, `RESTORE_ABORTED_TO_QUARANTINED`, and `RESTORE_ABORTED_TO_VALIDATED` schemas. Treat `O === G` by persisted role, phase, authorized path, and inode, never by digest multiplicity.
 
 ```js
 export async function recoverRestore(input) {
-  const restoreId = deriveRestoreId(input.transactionId);
-  return withExistingQuarantineRun(pickExistingRunOptions(input), async (handoff) => {
-    const replay = await replayJournal({ capability: handoff.capability });
+  const options = snapshotRestoreRecoveryOptions(input);
+  const restoreId = deriveRestoreId(options.transactionId);
+  return withExistingQuarantineRun(pickExistingRunOptions(options), async (handoff) => {
+    const replay = await replayJournal({ capability: handoff.capability, fsApi: handoff.fsApi });
     const ledger = buildRestoreLedger(replay.records); // original durable order
-    return input.action === "resume"
-      ? resumeRestore({ handoff, replay, ledger, restoreId, faultHook: input.faultHook })
-      : rollbackRestore({ handoff, replay, ledger, restoreId, faultHook: input.faultHook });
+    return options.action === "resume"
+      ? resumeRestore({ handoff, replay, ledger, restoreId, faultHook: options.faultHook })
+      : rollbackRestore({ handoff, replay, ledger, restoreId, faultHook: options.faultHook });
   });
 }
 ```
