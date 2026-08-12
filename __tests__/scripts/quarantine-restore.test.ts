@@ -409,4 +409,38 @@ describe("quarantine restore", () => {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    ["QUARANTINED rollback before its first held sync", "QUARANTINED", "rollback"],
+    ["VALIDATED rollback before its first held sync", "VALIDATED", "rollback"],
+    ["QUARANTINED restored generated root before its first held sync", "QUARANTINED", "restored-generated"],
+    ["VALIDATED restored source before its first held sync", "VALIDATED", "restored-source"],
+  ])("never follows a replaced tree at %s", (_label, provenance, target) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      if (provenance === "VALIDATED") {
+        const validated = invokeQuarantineWorker("mark-validated", {
+          repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId, validatedAt: "2026-08-11T00:00:00.000Z", writersStopped: true,
+        });
+        expect(validated.ok).toBe(true);
+      }
+      const result = invokeQuarantineWorker("restore-authority-seam", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, target,
+      }) as unknown as {
+        ok: boolean; injected: boolean; externalReads: number; externalSync: number;
+        foreignIntact: boolean; evidenceStable: boolean; error?: { message: string };
+      };
+      expect(result.injected).toBe(true);
+      expect(result.ok).toBe(false);
+      expect(result.externalReads).toBe(0);
+      expect(result.externalSync).toBe(0);
+      expect(result.foreignIntact).toBe(true);
+      expect(result.evidenceStable).toBe(true);
+      expect(result.error?.message).toMatch(/changed|identity|unsafe/u);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
 });

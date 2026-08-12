@@ -308,7 +308,9 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
  * handle and every ancestor identity is checked before and after the handle
  * operation.  It deliberately does not use path-recursive `readdir`/`open`
  * sequences, which could traverse an exchanged ancestor between calls. */
-export async function fsyncVerifiedTree(root, { fsApi, ancestorChain = Object.freeze([]) }) {
+export async function fsyncVerifiedTree(root, {
+  fsApi, ancestorChain = Object.freeze([]), rootIdentity = undefined,
+}) {
   assertAbsolutePath(root, "verified sync root");
   const syncFile = async (path, expected, chain) => {
     let handle;
@@ -331,10 +333,12 @@ export async function fsyncVerifiedTree(root, { fsApi, ancestorChain = Object.fr
     await closeAll(undefined, handle, primary);
   };
   const visit = async (path, expected, chain) => {
-    if (expected.isSymbolicLink() || (!expected.isFile() && !expected.isDirectory())) {
+    const expectedFile = expected.type === undefined ? expected.isFile() : expected.type === "file";
+    const expectedDirectory = expected.type === undefined ? expected.isDirectory() : expected.type === "directory";
+    if ((!expectedFile && !expectedDirectory) || expected.isSymbolicLink?.()) {
       throw new Error("restore sync endpoint is unsafe");
     }
-    if (expected.isFile()) return syncFile(path, expected, chain);
+    if (expectedFile) return syncFile(path, expected, chain);
     return withVerifiedDirectory(path, expected, chain, fsApi, async (dir, identity, handle) => {
       const children = [];
       while (true) {
@@ -360,5 +364,13 @@ export async function fsyncVerifiedTree(root, { fsApi, ancestorChain = Object.fr
     });
   };
   const stat = await fsApi.lstat(root);
-  await visit(root, stat, ancestorChain);
+  if (rootIdentity !== undefined) {
+    const expectedFile = rootIdentity.type === undefined ? rootIdentity.isFile() : rootIdentity.type === "file";
+    const expectedDirectory = rootIdentity.type === undefined ? rootIdentity.isDirectory() : rootIdentity.type === "directory";
+    if ((!expectedFile && !expectedDirectory) || stat.isSymbolicLink()) {
+      throw new Error("restore sync expected root is unsafe");
+    }
+    assertIdentity(rootIdentity, stat, expectedFile ? "isFile" : "isDirectory", "restore sync root");
+  }
+  await visit(root, rootIdentity ?? stat, ancestorChain);
 }

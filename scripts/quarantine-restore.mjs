@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
-import { fsyncTree } from "./quarantine-inventory.mjs";
 import {
   fsyncVerifiedTree,
   publishVerifiedRestoreActiveInventory,
@@ -148,7 +147,10 @@ async function capturePrivateParent(path, fsApi) {
   if (stat.isSymbolicLink() || !stat.isDirectory() || (stat.mode & 0o7777) !== 0o700 || realPath !== path) {
     throw new Error("restore private parent is unsafe");
   }
-  return Object.freeze({ path, dev: stat.dev, ino: stat.ino, mode: stat.mode & 0o7777 });
+  return Object.freeze({
+    path, dev: stat.dev, ino: stat.ino, mode: stat.mode & 0o7777,
+    type: "directory", canonicalRealpath: realPath,
+  });
 }
 
 async function assertPrivateParent(expected, fsApi) {
@@ -161,6 +163,20 @@ async function assertPrivateParent(expected, fsApi) {
 
 async function assertMissing(path, fsApi) {
   if (await optionalStat(path, fsApi) !== null) throw new Error("restore destination is not absent");
+}
+
+async function captureVerifiedSyncIdentity(path, expected, fsApi) {
+  const stat = await fsApi.lstat(path);
+  if (!sameIdentity(expected, stat) || stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) {
+    throw new Error("restore sync root changed before held sync");
+  }
+  if (stat.isFile()) return stat;
+  const canonicalRealpath = await fsApi.realpath(path);
+  if (canonicalRealpath !== path) throw new Error("restore sync root is unsafe");
+  return Object.freeze({
+    path, dev: stat.dev, ino: stat.ino, mode: stat.mode & 0o7777,
+    type: "directory", canonicalRealpath,
+  });
 }
 
 /* writersStopped is a cooperative exclusion boundary.  Node exposes no
@@ -280,6 +296,7 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
   await assertPayload(handoff.capability, entry, payload, fsApi);
   await assertAncestors(ancestors, fsApi);
   if (entry.kind === "source-copy") {
+    let restoredIdentity;
     await guardedRestoreRename({
       capability: handoff.capability, pathRequest: { purpose: "payload", id: entry.id }, source: payload, destination: active, fsApi,
       before: async () => {
@@ -287,10 +304,13 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
         await assertAncestors(ancestors, fsApi);
         await assertPayload(handoff.capability, entry, payload, fsApi);
       },
-      after: async () => assertRestoredEndpoint(entry, active, fsApi, ancestors),
+      after: async (destinationStat) => {
+        restoredIdentity = await captureVerifiedSyncIdentity(active, destinationStat, fsApi);
+        await assertRestoredEndpoint(entry, active, fsApi, ancestors);
+      },
     });
     await invokeHook(faultHook, `after-payload-to-active-rename:${entry.id}`);
-    await fsyncVerifiedTree(active, { fsApi, ancestorChain: ancestors });
+    await fsyncVerifiedTree(active, { fsApi, ancestorChain: ancestors, rootIdentity: restoredIdentity });
     await invokeHook(faultHook, `after-restored-payload-sync:${entry.id}`);
     await revalidateRunCapability(handoff.capability, { purpose: "payload", id: entry.id, boundary: "after-sync" });
     await assertRestoredEndpoint(entry, active, fsApi, ancestors);
@@ -310,6 +330,7 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
         purpose: "rollback-entry", id: restoreId, phase: entry.id,
       });
       const rollbackParent = await capturePrivateParent(dirname(rollback), fsApi);
+      let rollbackIdentity;
       await guardedRestoreRename({
         capability: handoff.capability, pathRequest: { purpose: "rollback-entry", id: restoreId, phase: entry.id }, source: active, destination: rollback, fsApi,
         before: async () => {
@@ -320,14 +341,15 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
           const observed = await summarizeInventoryDirectory(active, { fsApi, ancestorChain: ancestors });
           if (!sameSummary(captured.inventory, observed)) throw new Error("active generated root changed during restore");
         },
-        after: async () => {
+        after: async (destinationStat) => {
+          rollbackIdentity = await captureVerifiedSyncIdentity(rollback, destinationStat, fsApi);
           await assertPrivateParent(rollbackParent, fsApi);
           const observed = await summarizeInventoryDirectory(rollback, { fsApi });
           if (!sameSummary(captured.inventory, observed)) throw new Error("rollback generated root changed");
         },
       });
       await invokeHook(faultHook, `after-active-to-rollback-rename:${entry.id}`);
-      await fsyncTree({ capability: handoff.capability, root: rollback, entryId: entry.id, purpose: "rollback-entry", restoreId });
+      await fsyncVerifiedTree(rollback, { fsApi, ancestorChain: Object.freeze([rollbackParent]), rootIdentity: rollbackIdentity });
       await invokeHook(faultHook, `after-rollback-tree-sync:${entry.id}`);
       await assertPrivateParent(rollbackParent, fsApi);
       await syncDirectory(rollbackParent.path, fsApi);
@@ -339,6 +361,7 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
       await assertAncestors(ancestors, fsApi);
       await assertMissing(active, fsApi);
     }
+    let restoredIdentity;
     await guardedRestoreRename({
       capability: handoff.capability, pathRequest: { purpose: "payload", id: entry.id }, source: payload, destination: active, fsApi,
       before: async () => {
@@ -346,10 +369,13 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
         await assertAncestors(ancestors, fsApi);
         await assertPayload(handoff.capability, entry, payload, fsApi);
       },
-      after: async () => assertRestoredEndpoint(entry, active, fsApi, ancestors),
+      after: async (destinationStat) => {
+        restoredIdentity = await captureVerifiedSyncIdentity(active, destinationStat, fsApi);
+        await assertRestoredEndpoint(entry, active, fsApi, ancestors);
+      },
     });
     await invokeHook(faultHook, `after-payload-to-active-rename:${entry.id}`);
-    await fsyncVerifiedTree(active, { fsApi, ancestorChain: ancestors });
+    await fsyncVerifiedTree(active, { fsApi, ancestorChain: ancestors, rootIdentity: restoredIdentity });
     await invokeHook(faultHook, `after-restored-payload-sync:${entry.id}`);
     await revalidateRunCapability(handoff.capability, { purpose: "payload", id: entry.id, boundary: "after-sync" });
     await assertRestoredEndpoint(entry, active, fsApi, ancestors);

@@ -567,6 +567,104 @@ try {
     } catch (error) {
       process.stdout.write(JSON.stringify({ ok: false, phases, error: errorShape(error) }));
     }
+  } else if (operation === "restore-authority-seam") {
+    const { target, ...restoreRequest } = request;
+    const generated = join(request.repoRoot, ".next");
+    const source = join(request.repoRoot, "notes 2.txt");
+    const foreign = join(request.quarantineRoot, "restore-authority-foreign");
+    mkdirSync(foreign, { recursive: true, mode: 0o700 });
+    const sentinel = join(foreign, "sentinel");
+    writeFileSync(sentinel, "foreign");
+    let injected = false;
+    let targetPath;
+    let externalReads = 0;
+    let externalSync = 0;
+    let foreignMutation = false;
+    let beforeEvidence;
+    const endpointPaths = { generated, source };
+    const snapshot = () => restoreEvidenceSnapshot({
+      runRoot: join(request.quarantineRoot, request.transactionId),
+      pointer: join(request.quarantineRoot, "current"), endpointPaths,
+    });
+    const replaceWithForeign = (path) => {
+      if (injected) return;
+      renameSync(path, path + ".restore-held-original");
+      if (target === "restored-source") writeFileSync(path, "canonical\\n");
+      else {
+        mkdirSync(path, { recursive: true, mode: 0o700 });
+        writeFileSync(join(path, "build"), "ignored");
+      }
+      injected = true;
+      beforeEvidence = snapshot();
+    };
+    const isResolvedForeign = (path) => injected && typeof path === "string" &&
+      targetPath !== undefined && (path === targetPath || path.startsWith(targetPath + "/"));
+    const adapter = {
+      ...fsPromises,
+      async rename(from, to) {
+        if (isResolvedForeign(from) || isResolvedForeign(to)) foreignMutation = true;
+        const result = await fsPromises.rename(from, to);
+        if (target === "rollback" && typeof to === "string" && to.includes("/rollback/")) targetPath = to;
+        return result;
+      },
+      async unlink(path, ...args) {
+        if (isResolvedForeign(path)) foreignMutation = true;
+        return fsPromises.unlink(path, ...args);
+      },
+      async rm(path, ...args) {
+        if (isResolvedForeign(path)) foreignMutation = true;
+        return fsPromises.rm(path, ...args);
+      },
+      async open(path, ...args) {
+        const handle = await fsPromises.open(path, ...args);
+        const resolvedForeign = isResolvedForeign(path);
+        return new Proxy(handle, {
+          get(inner, property) {
+            const value = Reflect.get(inner, property, inner);
+            if (property === "read") return async (...readArgs) => {
+              if (resolvedForeign) externalReads += 1;
+              return Reflect.apply(value, inner, readArgs);
+            };
+            if (property === "sync") return async (...syncArgs) => {
+              const result = await Reflect.apply(value, inner, syncArgs);
+              if (resolvedForeign) externalSync += 1;
+              return result;
+            };
+            return typeof value === "function" ? value.bind(inner) : value;
+          },
+        });
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await restore.restoreQuarantine({
+        ...restoreRequest,
+        fsApi: adapter,
+        async faultHook(phase) {
+          if (target === "rollback" && phase === "after-active-to-rollback-rename:generated-next") replaceWithForeign(targetPath);
+          if (target === "restored-generated" && phase === "after-payload-to-active-rename:generated-next") {
+            targetPath = generated;
+            replaceWithForeign(targetPath);
+          }
+          if (target === "restored-source" && phase === "after-payload-to-active-rename:copy-0001") {
+            targetPath = source;
+            replaceWithForeign(targetPath);
+          }
+        },
+      });
+    } catch (error) { captured = error; }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      injected,
+      externalReads,
+      externalSync,
+      foreignIntact: readFileSync(sentinel, "utf8") === "foreign" && !foreignMutation,
+      evidenceStable: beforeEvidence === undefined ? false : beforeEvidence === snapshot(),
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
   } else if (operation === "mark-validated") {
     const { stopPhase, ...validationRequest } = request;
     const phases = [];
