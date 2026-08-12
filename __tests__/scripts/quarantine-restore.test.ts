@@ -295,16 +295,16 @@ describe("quarantine restore", () => {
   ])("preserves the dense activeGenerated provenance for VALIDATED (%s, %s)", (nextPresent, modulesPresent) => {
     const prepared = prepareQuarantinedFixture({ regenerate: false });
     try {
-      for (const [present, directory, file] of [[nextPresent, ".next", "build"], [modulesPresent, "node_modules", "package"]] as const) {
-        if (!present) continue;
-        mkdirSync(join(prepared.fixture.repoRoot, directory), { recursive: true, mode: 0o700 });
-        writeFileSync(join(prepared.fixture.repoRoot, directory, file), "regenerated\n");
-      }
       const validated = invokeQuarantineWorker("mark-validated", {
         repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
         transactionId: prepared.transactionId, validatedAt: "2026-08-11T00:00:00.000Z", writersStopped: true,
       });
       if (!validated.ok) throw new Error(JSON.stringify(validated));
+      for (const [present, directory, file] of [[nextPresent, ".next", "build"], [modulesPresent, "node_modules", "package"]] as const) {
+        if (!present) continue;
+        mkdirSync(join(prepared.fixture.repoRoot, directory), { recursive: true, mode: 0o700 });
+        writeFileSync(join(prepared.fixture.repoRoot, directory, file), "regenerated\n");
+      }
       const restored = invokeQuarantineWorker("restore", {
         repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
         transactionId: prepared.transactionId, writersStopped: true,

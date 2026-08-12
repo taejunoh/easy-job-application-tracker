@@ -584,7 +584,7 @@ try {
             writeFileSync(join(request.repoRoot, "node_modules", "package"), "ignored");
             writeFileSync(join(request.repoRoot, "foreign-sentinel"), "foreign");
           }
-          if (!drifted && finalPresenceDrift !== undefined && phase.startsWith("after-inventory:restore-active:")) {
+          if (!drifted && finalPresenceDrift !== undefined && phase === "after-inventory:restore-active:generated-node-modules") {
             drifted = true;
             const target = join(request.repoRoot, finalPresenceDrift === "remove-next" ? ".next" : "node_modules");
             if (finalPresenceDrift === "remove-next") rmSync(target, { recursive: true, force: true });
