@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { invokeQuarantineWorker, prepareQuarantinedFixture, spawnLifecycleChild } from "../fixtures/quarantine/quarantine-test-harness";
@@ -359,6 +359,55 @@ describe("quarantine restore real SIGKILL recovery", () => {
       expect(after.generations).toEqual(before.generations);
       expect(readFileSync(join(active, "foreign"), "utf8")).toBe("foreign completed endpoint\n");
     } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("rejects a valid-digest completed entry reversed to its initial endpoint roles", async () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      await crashRestoreWithProof(prepared, options, "after-event:RESTORED_ENTRY:generated-next");
+      const restoreId = "restore-c3624475-87d7-4886-b0bf-68a5061663d2";
+      const payload = join(prepared.runRoot, "payload", "generated", ".next");
+      const active = join(prepared.fixture.repoRoot, ".next");
+      const rollback = join(prepared.runRoot, "rollback", "regenerated-before-restore", restoreId, ".next");
+      // Both trees remain exact durable digests, but their P/A/R roles are
+      // reversed from completed=final to the valid-looking initial row.
+      renameSync(active, payload);
+      renameSync(rollback, active);
+      const before = durableRecoveryEvidence(prepared, [payload, active, rollback]);
+      const result = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
+      if (result.code !== 0) throw new Error(JSON.stringify(result));
+      expect(JSON.parse(result.stdout)).toEqual({
+        transactionId: prepared.transactionId, restoreId, status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
+      });
+      const after = durableRecoveryEvidence(prepared, [payload, active, rollback]);
+      expect(after.endpoints).toEqual(before.endpoints);
+      expect(after.pointer).toBe(before.pointer);
+      expect(after.generations).toEqual(before.generations);
+      expect(readFileSync(join(prepared.runRoot, "journal.log")).subarray(0, Buffer.from(before.journal, "base64").length).toString("base64")).toBe(before.journal);
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("keeps concurrent fixed recovery handoffs isolated", async () => {
+    const first = prepareQuarantinedFixture();
+    const second = prepareQuarantinedFixture();
+    try {
+      const firstOptions = { repoRoot: first.fixture.repoRoot, quarantineRoot: first.fixture.quarantineRoot, transactionId: first.transactionId, writersStopped: true };
+      const secondOptions = { repoRoot: second.fixture.repoRoot, quarantineRoot: second.fixture.quarantineRoot, transactionId: second.transactionId, writersStopped: true };
+      await crashRestoreWithProof(first, firstOptions, "after-event:RESTORE_INTENT:generated-next");
+      await crashRestoreWithProof(second, secondOptions, "after-event:RESTORE_INTENT:generated-next");
+      const concurrent = invokeQuarantineWorker("recover-concurrent", {
+        first: { ...firstOptions, action: "resume" }, second: { ...secondOptions, action: "rollback" },
+      }) as unknown as { ok: boolean; first: Record<string, unknown>; second: Record<string, unknown> };
+      expect(concurrent).toEqual({
+        ok: true,
+        first: { transactionId: first.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume", reconciledEntries: 3 },
+        second: { transactionId: second.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 1, restoreAborted: true },
+      });
+    } finally {
+      rmSync(first.fixture.base, { recursive: true, force: true });
+      rmSync(second.fixture.base, { recursive: true, force: true });
+    }
   }, 60_000);
 
   it("returns an exact immutable public conflict result record", async () => {

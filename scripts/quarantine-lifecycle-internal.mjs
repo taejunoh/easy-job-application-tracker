@@ -10,10 +10,12 @@ import { summarizeInventoryDirectory, hashVerifiedRegularFile } from "./quaranti
 import { captureRunFsSource, getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
 import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
+import { restoreRecoveryCallback } from "./quarantine-lifecycle-recovery-run.mjs";
 
 const OPTION_KEYS = Object.freeze([
   "repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi",
 ]);
+const RECOVERY_OPTION_KEYS = Object.freeze([...OPTION_KEYS, "action", "faultHook"]);
 
 function frozenRecord(entries) {
   const result = Object.create(null);
@@ -25,7 +27,7 @@ function frozenRecord(entries) {
   return Object.freeze(result);
 }
 
-function snapshotOptions(input) {
+function snapshotOptions(input, recovery) {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError("existing quarantine run options must be a plain object");
   }
@@ -34,14 +36,21 @@ function snapshotOptions(input) {
     throw new TypeError("existing quarantine run options must be a plain object");
   }
   const keys = Reflect.ownKeys(input);
-  if (keys.some((key) => typeof key !== "string" || !OPTION_KEYS.includes(key)) ||
+  const optionKeys = recovery ? RECOVERY_OPTION_KEYS : OPTION_KEYS;
+  if (keys.some((key) => typeof key !== "string" || !optionKeys.includes(key)) ||
       OPTION_KEYS.slice(0, 4).some((key) => !keys.includes(key))) {
     throw new TypeError("existing quarantine run options are invalid");
   }
   const result = Object.create(null);
-  for (const key of OPTION_KEYS) if (keys.includes(key)) result[key] = input[key];
+  for (const key of optionKeys) if (keys.includes(key)) result[key] = input[key];
   if (result.writersStopped !== true) {
     throw new TypeError("writers-stopped attestation must be true");
+  }
+  if (recovery && result.action !== "resume" && result.action !== "rollback") {
+    throw new TypeError("restore recovery action is invalid");
+  }
+  if (recovery && result.faultHook !== undefined && typeof result.faultHook !== "function") {
+    throw new TypeError("restore fault hook must be a function");
   }
   return Object.freeze(result);
 }
@@ -363,10 +372,11 @@ function sameSnapshot(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-export async function withExistingQuarantineRunInternal(options, callback, { allowRestoreLocationConflict = false } = {}) {
-  const input = snapshotOptions(options);
+export async function withExistingQuarantineRunInternal(options, callback) {
+  const recoveryCallback = callback === restoreRecoveryCallback;
+  const input = snapshotOptions(options, recoveryCallback);
   if (typeof callback !== "function") throw new TypeError("existing quarantine run callback must be a function");
-  const recovery = Object.freeze({ allowRestoreLocationConflict });
+  const recovery = Object.freeze({ allowRestoreLocationConflict: recoveryCallback });
   const source = captureRunFsSource(input.fsApi);
   return withQuarantineRunCapability({
     repoRoot: input.repoRoot,
@@ -399,6 +409,7 @@ export async function withExistingQuarantineRunInternal(options, callback, { all
       ["journalTip", validated.journalTip],
       ["manifestGeneration", validated.manifestGeneration],
       ["fsApi", fsApi],
+      ...(recoveryCallback ? [["recoveryOptions", input]] : []),
     ]);
     return callback(handoff);
   });

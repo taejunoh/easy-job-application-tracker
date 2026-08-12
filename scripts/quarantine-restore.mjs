@@ -11,7 +11,7 @@ import {
 } from "./quarantine-inventory-reader.mjs";
 import { appendJournalRecord, IndeterminateJournalAppendError, replayJournal, withJournalLock } from "./quarantine-journal.mjs";
 import { withExistingQuarantineRun } from "./quarantine-lifecycle-core.mjs";
-import { withRestoreRecoveryRun } from "./quarantine-lifecycle-recovery-run.mjs";
+import { restoreRecoveryCallback, takeRestoreRecoveryHandoff } from "./quarantine-lifecycle-recovery-run.mjs";
 import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
 import { deriveRunPath, revalidateRunCapability } from "./quarantine-run-capability.mjs";
 
@@ -695,13 +695,20 @@ export async function restoreQuarantine(input) {
 }
 
 export async function recoverRestore(input) {
+  const handoff = takeRestoreRecoveryHandoff(input);
   const options = snapshotOptions(input, { recovery: true });
+  if (handoff !== null) return recoverRestoreWithHandoff(options, handoff);
   const existing = record([
     ["repoRoot", options.repoRoot], ["quarantineRoot", options.quarantineRoot],
-    ["transactionId", options.transactionId], ["writersStopped", true],
+    ["transactionId", options.transactionId], ["action", options.action], ["writersStopped", true],
     ...(Object.hasOwn(options, "fsApi") ? [["fsApi", options.fsApi]] : []),
+    ...(Object.hasOwn(options, "faultHook") ? [["faultHook", options.faultHook]] : []),
   ]);
-  return withRestoreRecoveryRun(existing, async (handoff) => withJournalLock({ capability: handoff.capability }, async (heldLock) => {
+  return withExistingQuarantineRun(existing, restoreRecoveryCallback);
+}
+
+async function recoverRestoreWithHandoff(options, handoff) {
+  return withJournalLock({ capability: handoff.capability }, async (heldLock) => {
     const replayed = await replayJournal({ capability: handoff.capability });
     if (replayed.truncatedTail) throw new Error("restore recovery journal has a torn tail");
     const tip = replayed.records.at(-1);
@@ -728,7 +735,9 @@ export async function recoverRestore(input) {
     }
     const missing = inspected.filter((entry) => entry.state === "missing");
     if (missing.length > 0) throw new Error("restore recovery evidence is missing");
-    const conflicts = inspected.filter((entry) => entry.state === "conflict").map((entry) => entry.id).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+    const conflicts = inspected.filter((entry) => entry.state === "conflict" ||
+      (completed.has(entry.id) && entry.state !== "final"))
+      .map((entry) => entry.id).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
     if (conflicts.length > 0) {
       if (replayed.state !== "RECOVERY_REQUIRED") {
         await append(heldLock, handoff.capability, "RECOVERY_REQUIRED", { entryIds: Object.freeze(intents) });
@@ -774,5 +783,5 @@ export async function recoverRestore(input) {
     await invokeHook(options.faultHook, prior === "VALIDATED" ? "after-event:RESTORE_ABORTED_TO_VALIDATED" : "after-event:RESTORE_ABORTED_TO_QUARANTINED");
     await invokeHook(options.faultHook, "before-lock-cleanup");
     return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", prior], ["action", "rollback"], ["reconciledEntries", intents.length], ["restoreAborted", true]]);
-  }));
+  });
 }

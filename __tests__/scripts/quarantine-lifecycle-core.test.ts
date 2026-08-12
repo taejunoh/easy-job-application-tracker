@@ -16,6 +16,8 @@ const coreUrl = pathToFileURL(
 const removedRecoveryContextUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-lifecycle-recovery-context.mjs"),
 ).href;
+const internalUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-lifecycle-internal.mjs")).href;
+const recoveryRunUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-lifecycle-recovery-run.mjs")).href;
 
 describe("quarantine lifecycle core", () => {
   it("keeps its single private entry point closed", async () => {
@@ -40,6 +42,21 @@ describe("quarantine lifecycle core", () => {
       catch { process.stdout.write("missing"); }
     `], { encoding: "utf8" }).trim();
     expect(attempt).toBe("missing");
+  });
+
+  it("keeps every directly importable lifecycle helper free of arbitrary relaxed callbacks", () => {
+    const exports = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+      const internal = await import(${JSON.stringify(internalUrl)});
+      const recovery = await import(${JSON.stringify(recoveryRunUrl)});
+      process.stdout.write(JSON.stringify({
+        internal: Object.keys(internal), arity: internal.withExistingQuarantineRunInternal.length,
+        recovery: Object.keys(recovery), callbackArity: recovery.restoreRecoveryCallback.length,
+      }));
+    `], { encoding: "utf8" }));
+    expect(exports).toEqual({
+      internal: ["withExistingQuarantineRunInternal"], arity: 2,
+      recovery: ["restoreRecoveryCallback", "takeRestoreRecoveryHandoff"], callbackArity: 1,
+    });
   });
 
   it("publishes one immutable VALIDATED generation and reuses it on retry", () => {

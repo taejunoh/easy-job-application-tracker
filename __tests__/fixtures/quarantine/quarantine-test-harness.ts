@@ -562,6 +562,16 @@ try {
     } catch (error) {
       process.stdout.write(JSON.stringify({ ok: false, error: errorShape(error) }));
     }
+  } else if (operation === "recover-concurrent") {
+    try {
+      const [first, second] = await Promise.all([
+        restore.recoverRestore(request.first),
+        restore.recoverRestore(request.second),
+      ]);
+      process.stdout.write(JSON.stringify({ ok: true, first, second }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, error: errorShape(error) }));
+    }
   } else if (operation === "restore") {
     const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, indeterminatePrepared, preexistingRestoreInventory, partialPublisher, publisherParentExchange, publisherCleanupFailure, publisherHardlink, publisherCapabilityExchange, oversizedRestoredTree, traceRestoreFs, ...restoreRequest } = request;
     const phases = [];
