@@ -59,6 +59,42 @@ describe("quarantine lifecycle core", () => {
     expect(readFileSync(restorePath, "utf8")).not.toContain("quarantine-lifecycle-internal.mjs");
   });
 
+  it("keeps an injected selected-run ENOENT outside the native integrity boundary", () => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    try {
+      const result = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+        import { withExistingQuarantineRun } from ${JSON.stringify(coreUrl)};
+        import * as promises from "node:fs/promises";
+        import { createReadStream, lstatSync, realpathSync } from "node:fs";
+        import { join } from "node:path";
+        const fsApi = { ...promises, createReadStream, lstatSync, realpathSync };
+        const originalLstat = fsApi.lstat;
+        fsApi.lstat = async (path, ...args) => {
+          if (path === join(${JSON.stringify(prepared.fixture.quarantineRoot)}, ${JSON.stringify(prepared.transactionId)})) {
+            const error = new Error("injected missing run");
+            error.code = "ENOENT";
+            throw error;
+          }
+          return originalLstat(path, ...args);
+        };
+        let code = null;
+        try {
+          await withExistingQuarantineRun({ ...${JSON.stringify({
+            repoRoot: prepared.fixture.repoRoot,
+            quarantineRoot: prepared.fixture.quarantineRoot,
+            transactionId: prepared.transactionId,
+            writersStopped: true,
+          })}, fsApi }, async () => {});
+        } catch (error) { code = error?.code ?? null; }
+        process.stdout.write(JSON.stringify({ code }));
+      `], { encoding: "utf8" }));
+
+      expect(result).toEqual({ code: "ENOENT" });
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("publishes one immutable VALIDATED generation and reuses it on retry", () => {
     const prepared = prepareQuarantinedFixture();
     try {

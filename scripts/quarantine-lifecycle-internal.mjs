@@ -422,11 +422,17 @@ function sameSnapshot(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function nativeExistingRunCapabilityMissing(input, callbackEntered, error) {
+  return input.fsApi === undefined && !callbackEntered &&
+    error instanceof Error && error.code === "ENOENT";
+}
+
 async function enterExistingRun(input, callback) {
   const recoveryValidation = Object.freeze({
     allowRestoreLocationConflict: isFixedRestoreRecoveryCallback(callback),
   });
   const source = captureRunFsSource(input.fsApi);
+  let callbackEntered = false;
   return withQuarantineRunCapability({
     repoRoot: input.repoRoot,
     quarantineRoot: input.quarantineRoot,
@@ -434,6 +440,7 @@ async function enterExistingRun(input, callback) {
     writersStopped: true,
     fsApi: source,
   }, async (capability) => {
+    callbackEntered = true;
     const fsApi = getRunFsContext(capability, source);
     const validated = await validateExistingRun(capability, input, fsApi, recoveryValidation);
     // Re-read every mutable evidence boundary immediately before capability
@@ -460,6 +467,11 @@ async function enterExistingRun(input, callback) {
       ["fsApi", fsApi],
     ]);
     return callback(handoff);
+  }).catch((error) => {
+    if (nativeExistingRunCapabilityMissing(input, callbackEntered, error)) {
+      throw lifecycleIntegrityError("selected quarantine run evidence is missing");
+    }
+    throw error;
   });
 }
 

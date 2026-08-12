@@ -23,7 +23,7 @@ const ERROR_MESSAGES = Object.freeze({
   ERR_INTEGRITY: "Quarantine evidence failed integrity validation.",
   ERR_EXDEV: "Repository and quarantine must be on the same filesystem.",
   ERR_INDETERMINATE_JOURNAL_APPEND: "Journal durability could not be determined.",
-  ERR_CONFLICT: "Quarantine recovery has unresolved conflicts.",
+  ERR_CONFLICT: "Quarantine recovery found preserved conflicts.",
   ERR_INTERNAL: "Unexpected quarantine failure.",
 });
 

@@ -95,6 +95,33 @@ describe("quarantine cleanup CLI", () => {
     });
   });
 
+  it.each([
+    ["restore", (fixture: ReturnType<typeof createQuarantineFixture>) => [
+      "restore", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot,
+      "--transaction-id", "missing-run", "--writers-stopped",
+    ]],
+    ["mark-validated", (fixture: ReturnType<typeof createQuarantineFixture>) => [
+      "mark-validated", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot,
+      "--transaction-id", "missing-run", "--writers-stopped",
+    ]],
+    ["recover", (fixture: ReturnType<typeof createQuarantineFixture>) => [
+      "recover", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot,
+      "--transaction-id", "missing-run", "--action", "resume", "--writers-stopped",
+    ]],
+  ])("classifies a missing selected run as integrity evidence for %s", (command, argsFor) => {
+    const fixture = createQuarantineFixture();
+    bases.push(fixture.base);
+
+    const result = run(argsFor(fixture));
+
+    expectSpawned(result);
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe(
+      `{\"ok\":false,\"command\":\"${command}\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n`,
+    );
+  });
+
   it("flushes apply STARTING before an indeterminate journal append failure", () => {
     const fixture = createQuarantineFixture();
     bases.push(fixture.base);
@@ -335,7 +362,7 @@ describe("quarantine cleanup CLI", () => {
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
     expect(JSON.parse(result.stderr)).toEqual({
-      ok: false, command: "recover", code: "ERR_CONFLICT", message: "Quarantine recovery has unresolved conflicts.",
+      ok: false, command: "recover", code: "ERR_CONFLICT", message: "Quarantine recovery found preserved conflicts.",
     });
     expect(result.stderr).not.toContain("copy-0001");
   });
