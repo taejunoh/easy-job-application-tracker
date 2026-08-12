@@ -2991,6 +2991,17 @@ function validationFaultHook(hook) {
   };
 }
 
+async function assertValidationJournalUnlocked(handoff) {
+  const lockPath = deriveRunPath(handoff.capability, { purpose: "journal-lock" });
+  try {
+    await handoff.fsApi.lstat(lockPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error("journal lock already exists before validation");
+}
+
 async function validateValidationWorkspace(handoff, options) {
   const fsApi = handoff.fsApi;
   let workspace;
@@ -3083,6 +3094,7 @@ export async function markQuarantineValidated(input) {
       writersStopped: options.writersStopped,
       fsApi: options.fsApi,
     }, async (handoff) => {
+      await assertValidationJournalUnlocked(handoff);
       const prior = handoff.manifestGeneration;
       let generation;
       if (prior.state === "VALIDATED") {

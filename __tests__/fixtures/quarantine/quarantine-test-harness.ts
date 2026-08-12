@@ -466,7 +466,50 @@ try {
   } else if (operation === "core-contract") {
     let observed;
     let callbackInvoked = 0;
-    await withExistingQuarantineRun({ ...request, writersStopped: true }, async (handoff) => {
+    let revoked = false;
+    let getters = {};
+    let calls = {};
+    let wrongReceiver = 0;
+    let source;
+    let afterFs;
+    let staleIdentity = false;
+    if (request.fsCapture === true || request.staleIdentity === true) {
+      const implementations = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+      source = {};
+      for (const method of ${JSON.stringify(FS_METHODS)}) {
+        Object.defineProperty(source, method, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            getters[method] = (getters[method] ?? 0) + 1;
+            const implementation = implementations[method];
+            return function (...args) {
+              calls[method] = (calls[method] ?? 0) + 1;
+              if (this !== source) wrongReceiver += 1;
+              if (
+                method === "lstat" && request.staleIdentity === true && !staleIdentity &&
+                args[0] === join(request.quarantineRoot, request.transactionId)
+              ) {
+                staleIdentity = true;
+                renameSync(request.quarantineRoot, request.quarantineRoot + ".original");
+                mkdirSync(request.quarantineRoot, { recursive: true, mode: 0o700 });
+                chmodSync(request.quarantineRoot, 0o700);
+                mkdirSync(join(request.quarantineRoot, request.transactionId), { recursive: true, mode: 0o700 });
+                chmodSync(join(request.quarantineRoot, request.transactionId), 0o700);
+                writeFileSync(join(request.quarantineRoot, "replacement-sentinel"), "foreign");
+              }
+              return Reflect.apply(implementation, implementations, args);
+            };
+          },
+        });
+      }
+    }
+    const { fsCapture, staleIdentity: _staleIdentity, callbackThrows: _callbackThrows, ...coreRequest } = request;
+    const pending = withExistingQuarantineRun({
+      ...coreRequest,
+      writersStopped: true,
+      ...(source === undefined ? {} : { fsApi: source }),
+    }, async (handoff) => {
       callbackInvoked += 1;
       observed = {
         handoff: shape(handoff),
@@ -474,8 +517,65 @@ try {
         manifestGeneration: shape(handoff.manifestGeneration),
         fsApi: shape(handoff.fsApi),
       };
+      afterFs = handoff.fsApi;
+      if (request.callbackThrows === true) throw new RangeError("callback failure");
     });
-    process.stdout.write(JSON.stringify({ ok: true, callbackInvoked, observed }));
+    if (source !== undefined) {
+      for (const method of ${JSON.stringify(FS_METHODS)}) {
+        Object.defineProperty(source, method, {
+          enumerable: true,
+          configurable: true,
+          value() { throw new Error("late filesystem mutation reached"); },
+        });
+      }
+    }
+    let captured;
+    try { await pending; } catch (error) { captured = error; }
+    if (captured !== undefined) {
+      try { await afterFs?.lstat(request.repoRoot); } catch (error) {
+        revoked = /inactive/u.test(error?.message ?? "");
+      }
+      process.stdout.write(JSON.stringify({
+        ok: false,
+        callbackInvoked,
+        staleIdentity,
+        getters,
+        calls,
+        wrongReceiver,
+        revoked,
+        error: errorShape(captured),
+      }));
+      process.exit(0);
+    }
+    try { await afterFs.lstat(request.repoRoot); } catch (error) {
+      revoked = /inactive/u.test(error?.message ?? "");
+    }
+    process.stdout.write(JSON.stringify({ ok: true, callbackInvoked, observed, getters, calls, wrongReceiver, revoked, staleIdentity }));
+  } else if (operation === "core-restore-contract") {
+    const restoreId = "restore-123e4567-e89b-42d3-a456-426614174000";
+    const { restoreState, ...restoreRequest } = request;
+    const append = async (capability, event, payload) => withJournalLock({ capability }, (heldLock) =>
+      appendJournalRecord({ capability, heldLock, event, payload }),
+    );
+    await withQuarantineRunCapability({ ...restoreRequest, writersStopped: true }, async (capability) => {
+      await append(capability, "RESTORE_PREPARED", {
+        restoreId,
+        activeGenerated: [
+          { id: "generated-next", inventory: null },
+          { id: "generated-node-modules", inventory: null },
+        ],
+      });
+      if (restoreState !== "RESTORE_PREPARED") await append(capability, "RESTORING", {});
+      if (restoreState === "RECOVERY_REQUIRED" || restoreState === "RESTORE_ROLLING_BACK") {
+        await append(capability, "RECOVERY_REQUIRED", { entryIds: [] });
+      }
+      if (restoreState === "RESTORE_ROLLING_BACK") {
+        await append(capability, "RESTORE_ROLLING_BACK", {});
+      }
+    });
+    let callbackInvoked = 0;
+    await withExistingQuarantineRun({ ...restoreRequest, writersStopped: true }, async () => { callbackInvoked += 1; });
+    process.stdout.write(JSON.stringify({ ok: true, callbackInvoked }));
   } else if (operation === "apply-stop-after-layout") {
     const phases = [];
     let captured;

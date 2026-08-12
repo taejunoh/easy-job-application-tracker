@@ -134,6 +134,9 @@ async function readPointer(capability) {
 
 async function validateExistingRun(capability, options, fsApi) {
   const replayed = await replayJournal({ capability });
+  if (replayed.truncatedTail) {
+    throw new Error("existing quarantine journal has a torn tail");
+  }
   const prepared = replayed.records.find((record) => record.event === "PREPARED");
   if (prepared === undefined || prepared.payload.transactionId !== options.transactionId) {
     throw new Error("PREPARED journal provenance is invalid");
