@@ -738,7 +738,10 @@ and manifest primitives: replay the durable QUARANTINED journal, call the
 approved validation implementation once to append VALIDATED and publish its
 generation, then remove only the disposable fixture's current pointer before
 the retry. The retry supplies a different `validatedAt` and must reuse the
-tip-named generation and stored metadata.
+tip-named generation and stored metadata; with `current` absent, its public
+fault hook receives exactly the three pointer phases
+`after-pointer-temporary-sync`, `after-pointer-rename`, and
+`after-pointer-root-sync`, in that order.
 
 The validation RED test then calls the public transaction operation on the same
 prepared fixture and asserts the closed result and exact 96-hour deadline:
@@ -755,7 +758,7 @@ const pointerBytesBefore = beforeEvidence.result?.pointerBytes;
 const removePointer = invokeQuarantineWorker("core-contract", { options: validationOptions, removeCurrentPointer: true });
 expect(removePointer.ok).toBe(true);
 const phases: string[] = [];
-const retry = await markQuarantineValidated({ ...validationOptions, validatedAt: "2026-08-10T12:00:00.000Z", faultHook: (phase) => { phases.push(phase); expect(["after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync", "before-lock-cleanup"]).toContain(phase); } });
+const retry = await markQuarantineValidated({ ...validationOptions, validatedAt: "2026-08-10T12:00:00.000Z", faultHook: (phase) => { phases.push(phase); expect(["after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync"]).toContain(phase); } });
 expect(retry.validatedAt).toBe(validated.validatedAt);
 expect(retry.deleteAfter).toBe(validated.deleteAfter);
 expect(retry.manifestSha256).toBe(validated.manifestSha256);
@@ -763,7 +766,7 @@ const afterEvidence = invokeQuarantineWorker("core-contract", { options: validat
 expect(afterEvidence.ok).toBe(true);
 expect(afterEvidence.result?.generationDirectoryEntries).toEqual(generationEntriesBefore);
 expect(afterEvidence.result?.pointerBytes).toBe(pointerBytesBefore);
-expect(phases).toEqual(["after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync", "before-lock-cleanup"]);
+expect(phases).toEqual(["after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync"]);
 expect(phases.some((phase) => phase.includes("inventory") || phase.includes("generation") || phase.includes("journal"))).toBe(false);
 ```
 
@@ -910,14 +913,17 @@ function appendRestored(handoff: InternalRunHandoff, faultHook?: FaultHook): Pro
 ```
 
 Both public entry points use these complete synchronous snapshots before any
-`await` or `deriveRestoreId` call. They read each input getter once, reject
-unknown keys and non-literal `writersStopped`, validate recovery action exactly,
-and return a null-prototype frozen record; later caller mutation cannot affect
-the captured values:
+`await` or `deriveRestoreId` call. They accept only plain records with
+`Object.prototype` or `null` prototype (never arrays or custom prototypes),
+read each own input getter once, reject unknown keys and non-literal
+`writersStopped`, validate recovery action exactly, preserve optional-key
+presence, and return a null-prototype frozen record; later caller mutation
+cannot affect the captured values:
 
 ```js
 function snapshotRestoreRecord(input, recovery) {
-  if (input === null || typeof input !== "object" || Array.isArray(input) || Object.getPrototypeOf(input) !== Object.prototype) throw new Error("invalid restore options");
+  const prototype = input === null || typeof input !== "object" ? undefined : Object.getPrototypeOf(input);
+  if (input === null || typeof input !== "object" || Array.isArray(input) || (prototype !== Object.prototype && prototype !== null)) throw new Error("invalid restore options");
   const allowed = new Set(["repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi", "faultHook", ...(recovery ? ["action"] : [])]);
   const ownKeys = Reflect.ownKeys(input);
   if (ownKeys.some((key) => typeof key !== "string" || !allowed.has(key))) throw new Error("invalid restore options");
@@ -927,11 +933,15 @@ function snapshotRestoreRecord(input, recovery) {
   const quarantineRoot = input.quarantineRoot;
   const transactionId = input.transactionId;
   const writersStopped = input.writersStopped;
-  const fsApi = Object.prototype.hasOwnProperty.call(input, "fsApi") ? input.fsApi : undefined;
-  const faultHook = Object.prototype.hasOwnProperty.call(input, "faultHook") ? input.faultHook : undefined;
+  const hasFsApi = Object.prototype.hasOwnProperty.call(input, "fsApi");
+  const hasFaultHook = Object.prototype.hasOwnProperty.call(input, "faultHook");
+  const fsApi = hasFsApi ? input.fsApi : undefined;
+  const faultHook = hasFaultHook ? input.faultHook : undefined;
   if (typeof repoRoot !== "string" || typeof quarantineRoot !== "string" || typeof transactionId !== "string" || writersStopped !== true || (faultHook !== undefined && typeof faultHook !== "function")) throw new Error("invalid restore options");
   const snapshot = Object.create(null);
-  Object.assign(snapshot, { repoRoot, quarantineRoot, transactionId, writersStopped, fsApi, faultHook });
+  Object.assign(snapshot, { repoRoot, quarantineRoot, transactionId, writersStopped });
+  if (hasFsApi) snapshot.fsApi = fsApi;
+  if (hasFaultHook) snapshot.faultHook = faultHook;
   if (recovery) {
     const action = input.action;
     if (action !== "resume" && action !== "rollback") throw new Error("invalid restore action");
@@ -947,13 +957,16 @@ function snapshotRestoreRecoveryOptions(input) { return snapshotRestoreRecord(in
 transactionId, writersStopped, fsApi?, faultHook? }`; `RestoreRecoveryOptions`
 is that same record plus `action: "resume" | "rollback"`. The snapshots retain
 the supplied `transactionId` and `faultHook` values and are private records,
-not additional public APIs.
+not additional public APIs. `pickExistingRunOptions` copies the four required
+core fields and copies `fsApi` only when the frozen snapshot owns that optional
+key; it never forwards `faultHook` or `action`, and therefore preserves absent
+optional-key behavior for both restore entry points.
 
 `ActiveGenerated` is the fixed two-record `{ id, inventory: InventorySummary | null }[]` payload; `ManifestEntry` is the closed manifest union from the original design. Both descriptions are private and are not new public APIs.
 
 Restore journal payloads stay exact: `RESTORE_PREPARED` is `{ restoreId, activeGenerated }`; `RESTORING`, `RESTORED`, and `RESTORE_ROLLING_BACK` are `{}`; `RESTORE_INTENT`, `RESTORE_ROLLBACK_INTENT`, `RESTORED_ENTRY`, and `RESTORE_ROLLED_BACK_ENTRY` are `{ id }`; `RESTORE_ABORTED_TO_QUARANTINED` and `RESTORE_ABORTED_TO_VALIDATED` are `{}`; and `INCOMPLETE_CONFLICT` is `{ conflictEntryIds }`.
 
-- [ ] **Step 1: Write restore RED tests and exact vector test.** Assert the fixed vector and prefixed grammar. Parameterize all four presence combinations for `.next` and `node_modules`; existing active roots write and fsync exactly one `restore-active` inventory, absent roots write no JSONL and are rechecked immediately before `RESTORE_PREPARED`. Assert dense bytewise-sorted `activeGenerated` records with the two fixed IDs and exact summary-or-null. Recreate an absent root or remove an inventoried root at the final presence seam and assert no `RESTORE_PREPARED`/`RESTORING` mutation. Add closed-option tests with accessor-backed `repoRoot`, `quarantineRoot`, `transactionId`, `writersStopped`, and `faultHook`: each own getter is read once, the frozen null-prototype snapshot remains unchanged after caller mutation, and invalid extra keys or non-literal writers/action values are rejected before `deriveRestoreId` or any await. Add explicit RED cases for `null`, arrays, null-prototype/custom-prototype objects, symbol keys, non-enumerable unknown keys, and inherited-only required fields; each must fail closed before any filesystem call.
+- [ ] **Step 1: Write restore RED tests and exact vector test.** Assert the fixed vector and prefixed grammar. Parameterize all four presence combinations for `.next` and `node_modules`; existing active roots write and fsync exactly one `restore-active` inventory, absent roots write no JSONL and are rechecked immediately before `RESTORE_PREPARED`. Assert dense bytewise-sorted `activeGenerated` records with the two fixed IDs and exact summary-or-null. Recreate an absent root or remove an inventoried root at the final presence seam and assert no `RESTORE_PREPARED`/`RESTORING` mutation. Add closed-option tests with accessor-backed `repoRoot`, `quarantineRoot`, `transactionId`, `writersStopped`, and `faultHook`: each own getter is read once, the frozen null-prototype snapshot remains unchanged after caller mutation, optional `fsApi`/`faultHook` keys are preserved only when supplied, and invalid extra keys or non-literal writers/action values are rejected before `deriveRestoreId` or any await. Add explicit RED cases for `null` (rejected), arrays/custom-prototype objects/symbol keys/non-enumerable unknown keys/inherited-only required fields (all rejected), and a null-prototype input (accepted and normalized); each rejection must occur before any filesystem call.
 
 ```ts
 import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
