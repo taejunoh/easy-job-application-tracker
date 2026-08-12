@@ -395,6 +395,7 @@ function applyOptions(f: Fixture, transactionId: string, createdAt: string) {
 Each row uses a stable canonical UTC `createdAt` and explicit `transactionId`; the shared `Fixture` record includes the exact `expectedCount` derived from its generated source-copy entries. Spawn once for every seam. Pre-PREPARED seams (`after-layout-sync`, `after-pre-inventories`, `after-divergent-diff:${entryId}`, and `after-prepared-generation`) rerun `quarantineWorkspace` with the same options and assert valid adoption/completion; they do not call recovery without a durable journal. After PREPARED, call `recoverQuarantine`; resume/rollback assert exact durable journal transitions, source/payload locations, inventories, and terminal state. Only conflict/precondition failures snapshot evidence immediately before recovery and compare it unchanged after failure. Use the shared `replay-run` worker operation to inspect journal evidence. The 4,097th intent is rejected before mutation and valid non-bytewise intent order is never sorted.
 
 ```ts
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createQuarantineFixture, invokeQuarantineWorker } from "../fixtures/quarantine/quarantine-test-harness";
 const fixtureRoot = createQuarantineFixture({ divergent: false });
@@ -612,7 +613,8 @@ That worker branch imports `readFileSync` and the existing `deriveRunPath`
 authority before reading those capability-derived evidence paths. It also
 imports `dirname`, `join`, `mkdirSync`, `renameSync`, and `writeFileSync` for
 the deterministic first-`lstat` replacement seam below, while retaining the
-existing `fsPromises`, `createReadStream`, `lstatSync`, and `realpathSync`
+existing `fsPromises`, `createReadStream`, `lstatSync`, `realpathSync`,
+`readdirSync`, and `rmSync`
 imports used to construct `baseFsApi`.
 The host computes `const coreUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-lifecycle-core.mjs")).href` beside the existing transaction URL and injects `${JSON.stringify(coreUrl)}` into the worker source; the generated worker never resolves this module relative to its own evaluated `import.meta.url`.
 
@@ -676,7 +678,9 @@ function replaceActualRunIdentity(runRootPath) {
     const generationPath = deriveRunPath(handoff.capability, { purpose: "manifest-generation", id: handoff.manifestGeneration.manifestSha256 });
     const readOptional = (path) => { try { return readFileSync(path).toString("base64"); } catch (error) { if (error.code === "ENOENT") return null; throw error; } };
     const evidenceBefore = [readFileSync(journalPath).toString("base64"), readOptional(pointerPath), readFileSync(generationPath).toString("base64")];
-    const result = { handoffKeys: Object.keys(handoff), handoffFrozen: Object.isFrozen(handoff), prototype: Object.getPrototypeOf(handoff) === null ? "null" : "other", descriptors: Object.fromEntries(Object.keys(handoff).map((key) => [key, Object.getOwnPropertyDescriptor(handoff, key)])), manifestGenerationKeys: Object.keys(handoff.manifestGeneration), evidenceBefore };
+    const generationDirectoryEntries = readdirSync(dirname(generationPath)).sort();
+    const pointerBytes = readOptional(pointerPath);
+    const result = { handoffKeys: Object.keys(handoff), handoffFrozen: Object.isFrozen(handoff), prototype: Object.getPrototypeOf(handoff) === null ? "null" : "other", descriptors: Object.fromEntries(Object.keys(handoff).map((key) => [key, Object.getOwnPropertyDescriptor(handoff, key)])), manifestGenerationKeys: Object.keys(handoff.manifestGeneration), generationDirectoryEntries, pointerBytes, evidenceBefore };
     return { result, evidencePaths: [journalPath, pointerPath, generationPath] };
   });
   if (request.mutateSourceAfterCapture) for (const name of FS_METHODS) {
@@ -684,8 +688,11 @@ function replaceActualRunIdentity(runRootPath) {
     if (!Reflect.set(mutable.source, name, poison)) Reflect.defineProperty(mutable.source, name, { configurable: true, enumerable: true, writable: true, value: poison });
   }
   const settled = await pending;
+  if (request.removeCurrentPointer) rmSync(settled.evidencePaths[1], { force: true });
   const evidenceAfter = settled.evidencePaths.map((path) => { try { return readFileSync(path).toString("base64"); } catch (error) { if (error.code === "ENOENT") return null; throw error; } });
-  process.stdout.write(JSON.stringify({ ok: true, result: { ...settled.result.result, evidenceAfter, calls: mutable.calls, getterReads: mutable.getterReads, wrongReceiver: mutable.wrongReceiver, callbackInvoked } }) + "\n");
+  const generationDirectoryEntriesAfter = readdirSync(dirname(settled.evidencePaths[2])).sort();
+  const pointerBytesAfter = (() => { try { return readFileSync(settled.evidencePaths[1]).toString("base64"); } catch (error) { if (error.code === "ENOENT") return null; throw error; } })();
+  process.stdout.write(JSON.stringify({ ok: true, result: { ...settled.result.result, evidenceAfter, generationDirectoryEntriesAfter, pointerBytesAfter, calls: mutable.calls, getterReads: mutable.getterReads, wrongReceiver: mutable.wrongReceiver, callbackInvoked } }) + "\n");
 }
 ```
 
@@ -719,7 +726,7 @@ The named export is the sole exception to the private boundary: direct internal 
 - [ ] **Step 4: Run the validation RED suite.** Add validation tests now, before the validation implementation: seed QUARANTINED from a PREPARED ledger generation; regenerate `.next` and `node_modules`; assert clean Git status, exact root/HEAD, no source copies, two independent inventories per generated ID, matching summaries, and no numbered basename. Capture journal, pointer, and payload bytes before failures for changed HEAD/root, residue, missing root, inventory drift, stale lock, another transaction, wrong PREPARED generation, and path-bearing pointer; assert byte identity after each failure. Add VALIDATED retry with a different supplied `validatedAt`, missing-pointer activation-pending, and fatal present malformed/foreign/path-bearing/mismatched pointers.
 
 ```ts
-import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
+import { prepareQuarantinedFixture, invokeQuarantineWorker } from "../fixtures/quarantine/quarantine-test-harness";
 import { markQuarantineValidated } from "../../scripts/quarantine-transaction.mjs";
 const prepared = await prepareQuarantinedFixture({ regenerate: true });
 const validated = await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, validatedAt: "2026-08-09T12:00:00.000Z", writersStopped: true });
@@ -740,13 +747,24 @@ prepared fixture and asserts the closed result and exact 96-hour deadline:
 const validated = await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, validatedAt: "2026-08-09T12:00:00.000Z", writersStopped: true });
 expect(validated).toMatchObject({ transactionId: prepared.transactionId, status: "VALIDATED", deletionRequiresConfirmation: true });
 expect(new Date(validated.deleteAfter).getTime() - new Date(validated.validatedAt).getTime()).toBe(96 * 60 * 60 * 1000);
+const validationOptions = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+const beforeEvidence = invokeQuarantineWorker("core-contract", { options: validationOptions });
+expect(beforeEvidence.ok).toBe(true);
+const generationEntriesBefore = beforeEvidence.result?.generationDirectoryEntries;
+const pointerBytesBefore = beforeEvidence.result?.pointerBytes;
+const removePointer = invokeQuarantineWorker("core-contract", { options: validationOptions, removeCurrentPointer: true });
+expect(removePointer.ok).toBe(true);
 const phases: string[] = [];
-const retry = await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, validatedAt: "2026-08-10T12:00:00.000Z", writersStopped: true, faultHook: (phase) => { phases.push(phase); expect(["after-inventory:validation-pass-1:generated-next", "after-inventory:validation-pass-1:generated-node-modules", "after-inventory:validation-pass-2:generated-next", "after-inventory:validation-pass-2:generated-node-modules", "after-validated-generation", "after-event:VALIDATED", "after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync", "before-lock-cleanup"]).toContain(phase); } });
+const retry = await markQuarantineValidated({ ...validationOptions, validatedAt: "2026-08-10T12:00:00.000Z", faultHook: (phase) => { phases.push(phase); expect(["after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync", "before-lock-cleanup"]).toContain(phase); } });
 expect(retry.validatedAt).toBe(validated.validatedAt);
 expect(retry.deleteAfter).toBe(validated.deleteAfter);
-expect(phases).not.toContain("after-generation-directory-sync");
-expect(phases).not.toContain("after-journal-sync");
-expect(phases).not.toContain("after-quarantine-root-sync");
+expect(retry.manifestSha256).toBe(validated.manifestSha256);
+const afterEvidence = invokeQuarantineWorker("core-contract", { options: validationOptions });
+expect(afterEvidence.ok).toBe(true);
+expect(afterEvidence.result?.generationDirectoryEntries).toEqual(generationEntriesBefore);
+expect(afterEvidence.result?.pointerBytes).toBe(pointerBytesBefore);
+expect(phases).toEqual(["after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync", "before-lock-cleanup"]);
+expect(phases.some((phase) => phase.includes("inventory") || phase.includes("generation") || phase.includes("journal"))).toBe(false);
 ```
 
 - [ ] **Step 5: Run validation RED.**
@@ -899,15 +917,18 @@ the captured values:
 
 ```js
 function snapshotRestoreRecord(input, recovery) {
-  if (!input || typeof input !== "object") throw new Error("invalid restore options");
+  if (input === null || typeof input !== "object" || Array.isArray(input) || Object.getPrototypeOf(input) !== Object.prototype) throw new Error("invalid restore options");
   const allowed = new Set(["repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi", "faultHook", ...(recovery ? ["action"] : [])]);
-  for (const key of Object.keys(input)) if (!allowed.has(key)) throw new Error("invalid restore options");
+  const ownKeys = Reflect.ownKeys(input);
+  if (ownKeys.some((key) => typeof key !== "string" || !allowed.has(key))) throw new Error("invalid restore options");
+  for (const key of ["repoRoot", "quarantineRoot", "transactionId", "writersStopped"]) if (!Object.prototype.hasOwnProperty.call(input, key)) throw new Error("invalid restore options");
+  if (recovery && !Object.prototype.hasOwnProperty.call(input, "action")) throw new Error("invalid restore action");
   const repoRoot = input.repoRoot;
   const quarantineRoot = input.quarantineRoot;
   const transactionId = input.transactionId;
   const writersStopped = input.writersStopped;
-  const fsApi = input.fsApi;
-  const faultHook = input.faultHook;
+  const fsApi = Object.prototype.hasOwnProperty.call(input, "fsApi") ? input.fsApi : undefined;
+  const faultHook = Object.prototype.hasOwnProperty.call(input, "faultHook") ? input.faultHook : undefined;
   if (typeof repoRoot !== "string" || typeof quarantineRoot !== "string" || typeof transactionId !== "string" || writersStopped !== true || (faultHook !== undefined && typeof faultHook !== "function")) throw new Error("invalid restore options");
   const snapshot = Object.create(null);
   Object.assign(snapshot, { repoRoot, quarantineRoot, transactionId, writersStopped, fsApi, faultHook });
@@ -932,7 +953,7 @@ not additional public APIs.
 
 Restore journal payloads stay exact: `RESTORE_PREPARED` is `{ restoreId, activeGenerated }`; `RESTORING`, `RESTORED`, and `RESTORE_ROLLING_BACK` are `{}`; `RESTORE_INTENT`, `RESTORE_ROLLBACK_INTENT`, `RESTORED_ENTRY`, and `RESTORE_ROLLED_BACK_ENTRY` are `{ id }`; `RESTORE_ABORTED_TO_QUARANTINED` and `RESTORE_ABORTED_TO_VALIDATED` are `{}`; and `INCOMPLETE_CONFLICT` is `{ conflictEntryIds }`.
 
-- [ ] **Step 1: Write restore RED tests and exact vector test.** Assert the fixed vector and prefixed grammar. Parameterize all four presence combinations for `.next` and `node_modules`; existing active roots write and fsync exactly one `restore-active` inventory, absent roots write no JSONL and are rechecked immediately before `RESTORE_PREPARED`. Assert dense bytewise-sorted `activeGenerated` records with the two fixed IDs and exact summary-or-null. Recreate an absent root or remove an inventoried root at the final presence seam and assert no `RESTORE_PREPARED`/`RESTORING` mutation. Add closed-option tests with accessor-backed `repoRoot`, `quarantineRoot`, `transactionId`, `writersStopped`, and `faultHook`: each getter is read once, the frozen null-prototype snapshot remains unchanged after caller mutation, and invalid extra keys or non-literal writers/action values are rejected before `deriveRestoreId` or any await.
+- [ ] **Step 1: Write restore RED tests and exact vector test.** Assert the fixed vector and prefixed grammar. Parameterize all four presence combinations for `.next` and `node_modules`; existing active roots write and fsync exactly one `restore-active` inventory, absent roots write no JSONL and are rechecked immediately before `RESTORE_PREPARED`. Assert dense bytewise-sorted `activeGenerated` records with the two fixed IDs and exact summary-or-null. Recreate an absent root or remove an inventoried root at the final presence seam and assert no `RESTORE_PREPARED`/`RESTORING` mutation. Add closed-option tests with accessor-backed `repoRoot`, `quarantineRoot`, `transactionId`, `writersStopped`, and `faultHook`: each own getter is read once, the frozen null-prototype snapshot remains unchanged after caller mutation, and invalid extra keys or non-literal writers/action values are rejected before `deriveRestoreId` or any await. Add explicit RED cases for `null`, arrays, null-prototype/custom-prototype objects, symbol keys, non-enumerable unknown keys, and inherited-only required fields; each must fail closed before any filesystem call.
 
 ```ts
 import { prepareQuarantinedFixture } from "../fixtures/quarantine/quarantine-test-harness";
