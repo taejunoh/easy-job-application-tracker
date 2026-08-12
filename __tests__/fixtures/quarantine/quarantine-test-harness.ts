@@ -692,7 +692,10 @@ try {
     process.stdout.write(JSON.stringify({ ok: true, callbackInvoked }));
   } else if (operation === "core-restore-matrix") {
     const restoreId = "restore-123e4567-e89b-42d3-a456-426614174000";
-    const { row, preState, corruption, ancestorSwap, descendantSwap, copyPath, ...restoreRequest } = request;
+    const {
+      row, preState, corruption, ancestorSwap, descendantSwap, treeSwapPhase, sourceSwapPhase, copyPath,
+      ...restoreRequest
+    } = request;
     const append = async (capability, event, payload) => withJournalLock({ capability }, (heldLock) =>
       appendJournalRecord({ capability, heldLock, event, payload }),
     );
@@ -852,9 +855,15 @@ try {
     });
     let error;
     let externalReads = 0;
+    let externalDirReads = 0;
+    let heldDirReads = 0;
+    let externalFileReads = 0;
+    let verifiedDirectoryHandleCloses = 0;
+    let heldDirStreamCloses = 0;
+    let verifiedFileCloses = 0;
     let foreignSentinel;
     let coreFs;
-    if (ancestorSwap !== undefined || descendantSwap !== undefined) {
+    if (ancestorSwap !== undefined || descendantSwap !== undefined || treeSwapPhase !== undefined || sourceSwapPhase !== undefined) {
       const nested = join(request.repoRoot, "nested");
       const foreign = join(request.quarantineRoot, ancestorSwap === undefined ? "foreign-descendant" : "foreign-ancestor");
       mkdirSync(foreign, { recursive: true, mode: 0o700 });
@@ -868,6 +877,32 @@ try {
         ? join(request.quarantineRoot, request.transactionId, "payload/generated/.next/nested")
         : join(request.quarantineRoot, request.transactionId, "payload/generated/.next/build");
       let descendantReads = 0;
+      const tree = join(request.quarantineRoot, request.transactionId, "payload/generated/.next");
+      const source = join(request.quarantineRoot, request.transactionId, "payload/source-copies/copy-0001");
+      let treeSwapped = false;
+      let sourceSwapped = false;
+      const refreshEvidenceAfterAttack = () => {
+        beforeEndpoints = JSON.stringify(Object.fromEntries(Object.entries(endpointPaths).map(([key, value]) => [key, existsSync(value) ? lstatSync(value).ino : null])));
+        beforeEvidence = restoreEvidenceSnapshot({
+          runRoot: join(request.quarantineRoot, request.transactionId),
+          pointer: join(request.quarantineRoot, "current"),
+          endpointPaths,
+        });
+      };
+      const swapTree = () => {
+        if (treeSwapped) return;
+        renameSync(tree, tree + ".held-original");
+        symlinkSync(foreign, tree);
+        treeSwapped = true;
+        refreshEvidenceAfterAttack();
+      };
+      const swapSource = () => {
+        if (sourceSwapped) return;
+        renameSync(source, source + ".held-original");
+        symlinkSync(foreignSentinel, source);
+        sourceSwapped = true;
+        refreshEvidenceAfterAttack();
+      };
       coreFs.lstat = async function (path, ...args) {
         if (typeof path === "string" && path.startsWith(foreign)) externalReads += 1;
         if (path === nested && ++nestedReads === ancestorSwap) {
@@ -875,6 +910,7 @@ try {
           symlinkSync(foreign, nested);
         }
         const result = await Reflect.apply(originalLstat, implementations, [path, ...args]);
+        if (path === source && sourceSwapPhase === "after-lstat-before-open") swapSource();
         if (path === descendant && ++descendantReads === 1) {
           renameSync(descendant, descendant + ".original");
           symlinkSync(descendantSwap === "directory" ? foreign : foreignSentinel, descendant);
@@ -889,9 +925,53 @@ try {
       };
       for (const method of ["realpath", "readdir", "opendir", "open", "readlink", "createReadStream"]) {
         const original = coreFs[method];
-        coreFs[method] = function (path, ...args) {
+        if (method === "createReadStream") {
+          coreFs[method] = function (path, ...args) {
+            if (typeof path === "string" && path.startsWith(foreign)) externalReads += 1;
+            if (path === source && sourceSwapped) externalFileReads += 1;
+            return Reflect.apply(original, implementations, [path, ...args]);
+          };
+          continue;
+        }
+        coreFs[method] = async function (path, ...args) {
           if (typeof path === "string" && path.startsWith(foreign)) externalReads += 1;
-          return Reflect.apply(original, implementations, [path, ...args]);
+          const result = await Reflect.apply(original, implementations, [path, ...args]);
+          if (method === "realpath" && path === tree && treeSwapPhase === "after-post-check") swapTree();
+          if (method === "open" && path === tree && treeSwapPhase === "after-open-before-opendir") swapTree();
+          if (method === "open" && path === source && sourceSwapPhase === "after-open-before-read") swapSource();
+          if (method === "open" && (path === tree || path === source)) {
+            return new Proxy(result, {
+              get(target, property) {
+                const value = Reflect.get(target, property, target);
+                if (property === "close") return async (...closeArgs) => {
+                  if (path === tree) verifiedDirectoryHandleCloses += 1;
+                  else verifiedFileCloses += 1;
+                  return Reflect.apply(value, target, closeArgs);
+                };
+                return typeof value === "function" ? value.bind(target) : value;
+              },
+            });
+          }
+          const openedForeignDir = method === "opendir" && (path !== tree || treeSwapped);
+          if (method === "opendir" && path === tree && treeSwapPhase === "after-opendir-before-check") swapTree();
+          if (method === "opendir" && (path === tree || path.startsWith(foreign))) {
+            return new Proxy(result, {
+              get(target, property) {
+                const value = Reflect.get(target, property, target);
+                if (property === "read") return async (...readArgs) => {
+                  if (openedForeignDir) externalDirReads += 1;
+                  else heldDirReads += 1;
+                  return Reflect.apply(value, target, readArgs);
+                };
+                if (property === "close") return async (...closeArgs) => {
+                  if (path === tree) heldDirStreamCloses += 1;
+                  return Reflect.apply(value, target, closeArgs);
+                };
+                return typeof value === "function" ? value.bind(target) : value;
+              },
+            });
+          }
+          return result;
         };
       }
     }
@@ -915,6 +995,12 @@ try {
       endpointsStable: beforeEndpoints === afterEndpoints,
       evidenceStable: beforeEvidence === restoreEvidenceSnapshot({ runRoot, pointer, endpointPaths }),
       externalReads,
+      externalDirReads,
+      heldDirReads,
+      externalFileReads,
+      verifiedDirectoryHandleCloses,
+      heldDirStreamCloses,
+      verifiedFileCloses,
       foreignIntact: foreignSentinel === undefined || readFileSync(foreignSentinel, "utf8") === "foreign",
       error: error === undefined ? undefined : errorShape(error),
     }));

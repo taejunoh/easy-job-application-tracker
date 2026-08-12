@@ -6,7 +6,7 @@ import {
   readManifestGeneration,
 } from "./quarantine-manifest.mjs";
 import { replayJournal } from "./quarantine-journal.mjs";
-import { hashFileStream, internalSummarizeInventoryDirectory } from "./quarantine-inventory.mjs";
+import { summarizeInventoryDirectory, hashVerifiedRegularFile } from "./quarantine-inventory-reader.mjs";
 import { captureRunFsSource, getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
 
@@ -222,7 +222,7 @@ async function optionalStat(path, fsApi) {
 async function privateTreeSummary(root, fsApi) {
   const rootStat = await optionalStat(root, fsApi);
   if (rootStat === null) return null;
-  return internalSummarizeInventoryDirectory(root, { fsApi });
+  return summarizeInventoryDirectory(root, { fsApi });
 }
 
 function sameSummary(expected, observed) {
@@ -239,7 +239,7 @@ async function verifySourceEndpoint(path, entry, expectedPresent, fsApi) {
   if (stat === null || stat.isSymbolicLink() || !stat.isFile() || modeOf(stat) !== entry.mode || stat.size !== entry.size) {
     throw new Error("restore source endpoint is invalid");
   }
-  const hashed = await hashFileStream(path, { fsApi });
+  const hashed = await hashVerifiedRegularFile(path, stat, fsApi);
   if (hashed.bytes !== entry.size || hashed.sha256 !== entry.sha256) {
     throw new Error("restore source endpoint content is invalid");
   }

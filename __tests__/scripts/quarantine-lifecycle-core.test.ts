@@ -26,9 +26,9 @@ describe("quarantine lifecycle core", () => {
     expect(publicExports.exports).not.toContain("withExistingQuarantineRun");
     expect(publicExports.runtimeExports).not.toContain("withExistingQuarantineRun");
     expect(publicExports.legacyExports).not.toContain("withExistingQuarantineRun");
-    expect(publicExports.exports).not.toContain("internalSummarizeInventoryDirectory");
-    expect(publicExports.runtimeExports).not.toContain("internalSummarizeInventoryDirectory");
-    expect(publicExports.legacyExports).not.toContain("internalSummarizeInventoryDirectory");
+    expect(publicExports.exports).not.toContain("summarizeInventoryDirectory");
+    expect(publicExports.runtimeExports).not.toContain("summarizeInventoryDirectory");
+    expect(publicExports.legacyExports).not.toContain("summarizeInventoryDirectory");
   });
 
   it("publishes one immutable VALIDATED generation and reuses it on retry", () => {
@@ -623,6 +623,61 @@ describe("quarantine lifecycle core", () => {
         expect(result).toEqual(expect.objectContaining({
           ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true,
           evidenceStable: true, externalReads: 0, foreignIntact: true,
+        }));
+      } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+    },
+  );
+
+  it.each([
+    "after-open-before-opendir",
+    "after-opendir-before-check",
+    "after-post-check",
+  ])("rejects a generated directory swap at %s without reading the foreign Dir", (treeSwapPhase) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("core-restore-matrix", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        row: "intent-pre",
+        preState: "QUARANTINED",
+        treeSwapPhase,
+      }, {}, 30_000) as unknown as {
+        ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean;
+        evidenceStable: boolean; externalReads: number; foreignIntact: boolean; externalDirReads: number; heldDirReads: number;
+        verifiedDirectoryHandleCloses: number; heldDirStreamCloses: number;
+      };
+      expect(result).toEqual(expect.objectContaining({
+        ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true,
+        evidenceStable: true, externalReads: 0, externalDirReads: 0, foreignIntact: true,
+        verifiedDirectoryHandleCloses: 1,
+        heldDirStreamCloses: 1,
+      }));
+      expect(result.heldDirReads).toBe(treeSwapPhase === "after-post-check" ? 2 : 0);
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  });
+
+  it.each(["after-lstat-before-open", "after-open-before-read"])(
+    "rejects a source file swap at %s without reading foreign bytes",
+    (sourceSwapPhase) => {
+      const prepared = prepareQuarantinedFixture();
+      try {
+        const result = invokeQuarantineWorker("core-restore-matrix", {
+          repoRoot: prepared.fixture.repoRoot,
+          quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId,
+          row: "source-pre",
+          preState: "QUARANTINED",
+          sourceSwapPhase,
+        }, {}, 30_000) as unknown as {
+          ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean;
+          evidenceStable: boolean; externalReads: number; foreignIntact: boolean; externalFileReads: number;
+          verifiedFileCloses: number;
+        };
+        expect(result).toEqual(expect.objectContaining({
+          ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true,
+          evidenceStable: true, externalReads: 0, externalFileReads: 0, foreignIntact: true,
+          verifiedFileCloses: sourceSwapPhase === "after-lstat-before-open" ? 0 : 1,
         }));
       } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
     },

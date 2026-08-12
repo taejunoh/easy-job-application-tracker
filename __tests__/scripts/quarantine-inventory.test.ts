@@ -19,6 +19,9 @@ import { pathToFileURL } from "node:url";
 const inventoryUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-inventory.mjs"),
 ).href;
+const readerUrl = pathToFileURL(
+  join(__dirname, "../../scripts/quarantine-inventory-reader.mjs"),
+).href;
 const capabilityUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-run-capability.mjs"),
 ).href;
@@ -68,6 +71,7 @@ function publicationId(entryId: string, phase: string) {
 function runWorker(request: Record<string, unknown>): WorkerResult {
   const source = `
 import * as inventory from ${JSON.stringify(inventoryUrl)};
+import * as reader from ${JSON.stringify(readerUrl)};
 import {
   deriveRunPath,
   withQuarantineRunCapability,
@@ -819,7 +823,7 @@ try {
   } else if (request.operation === "read-only-summary") {
     let failure;
     try {
-      result = await inventory.internalSummarizeInventoryDirectory(request.root, { fsApi: baseFsApi });
+      result = await reader.summarizeInventoryDirectory(request.root, { fsApi: baseFsApi });
     } catch (error) {
       failure = error.message;
     }
@@ -845,6 +849,13 @@ try {
         let yielded = false;
         return {
           async close() {},
+          async read() {
+            if (!yielded && (request.variant === "oversize" || level < depth)) {
+              yielded = true;
+              return { name: request.variant === "oversize" ? "x".repeat(256) : "d" };
+            }
+            return null;
+          },
           [Symbol.asyncIterator]() { return this; },
           async next() {
             if (!yielded && (request.variant === "oversize" || level < depth)) {
@@ -855,11 +866,12 @@ try {
           },
         };
       },
+      realpath: async (path) => path,
       readlink: async () => { calls.readlink += 1; return ""; },
     };
     let failure;
     let summary;
-    try { summary = await inventory.internalSummarizeInventoryDirectory(root, { fsApi }); } catch (error) { failure = error.message; }
+    try { summary = await reader.summarizeInventoryDirectory(root, { fsApi }); } catch (error) { failure = error.message; }
     result = { summary, failure, calls };
   } else if (request.operation === "hash") {
     let handles = 0;
@@ -1298,12 +1310,11 @@ describe("bounded quarantine inventory", () => {
     });
   });
 
-  it("keeps the inventory facade at six public exports plus one explicitly internal reader", () => {
+  it("keeps the inventory public surface at exactly six exports", () => {
     expect(runWorker({ operation: "public-exports" }).result).toEqual([
       "compareInventorySummary",
       "fsyncTree",
       "hashFileStream",
-      "internalSummarizeInventoryDirectory",
       "parseInventoryRecord",
       "parseInventorySummary",
       "writeInventoryJsonl",
