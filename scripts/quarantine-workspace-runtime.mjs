@@ -1921,6 +1921,7 @@ function buildApplyLedger(replayed, manifest) {
   const completed = new Set();
   const rollbackIntents = new Set();
   const rollbackCompleted = new Set();
+  let rollbackPending = null;
   let completionIndex = 0;
   for (const record of replayed.records) {
     if (record.event === "MOVE_INTENT") {
@@ -1942,9 +1943,13 @@ function buildApplyLedger(replayed, manifest) {
     ) {
       fail("ERR_INTEGRITY");
     } else if (record.event === "ROLLBACK_INTENT") {
+      if (rollbackPending !== null || rollbackCompleted.has(record.payload.id)) fail("ERR_INTEGRITY");
       rollbackIntents.add(record.payload.id);
+      rollbackPending = record.payload.id;
     } else if (record.event === "ROLLED_BACK_ENTRY") {
+      if (rollbackPending !== record.payload.id) fail("ERR_INTEGRITY");
       rollbackCompleted.add(record.payload.id);
+      rollbackPending = null;
     }
   }
   if (
@@ -1960,6 +1965,7 @@ function buildApplyLedger(replayed, manifest) {
     intentIds: Object.freeze(intents.map((entry) => entry.id)),
     rollbackIntents,
     rollbackCompleted,
+    rollbackPending,
   });
 }
 
@@ -2248,7 +2254,14 @@ async function resumeApplyFromLedger({ capability, heldLock, ledger, manifest, o
   return recoveryResult(options.transactionId, "QUARANTINED", "resume", reconciledEntries);
 }
 
-async function rollbackApplyFromLedger({ capability, heldLock, ledger, manifest, options }) {
+async function rollbackApplyFromLedger({
+  capability,
+  heldLock,
+  ledger,
+  manifest,
+  options,
+  isRollingBack,
+}) {
   const fsApi = getRunFsContext(capability);
   const classifications = new Map();
   const conflicts = [];
@@ -2273,26 +2286,32 @@ async function rollbackApplyFromLedger({ capability, heldLock, ledger, manifest,
     });
     return recoveryConflict(options.transactionId, "rollback", conflicts);
   }
-  await appendRecoveryEvent({
-    capability,
-    heldLock,
-    event: "ROLLING_BACK",
-    payload: {},
-    faultHook: options.faultHook,
-    phase: "after-event:ROLLING_BACK",
-  });
-  let reconciledEntries = 0;
-  for (const entry of [...ledger.intents].reverse()) {
-    const endpoint = classifications.get(entry.id);
-    if (ledger.rollbackCompleted.has(entry.id)) continue;
+  if (!isRollingBack) {
     await appendRecoveryEvent({
       capability,
       heldLock,
-      event: "ROLLBACK_INTENT",
-      payload: { id: entry.id },
+      event: "ROLLING_BACK",
+      payload: {},
       faultHook: options.faultHook,
-      phase: `after-event:ROLLBACK_INTENT:${entry.id}`,
+      phase: "after-event:ROLLING_BACK",
     });
+  }
+  let reconciledEntries = 0;
+  let rollbackPending = ledger.rollbackPending;
+  for (const entry of [...ledger.intents].reverse()) {
+    const endpoint = classifications.get(entry.id);
+    if (ledger.rollbackCompleted.has(entry.id)) continue;
+    if (rollbackPending !== entry.id) {
+      if (rollbackPending !== null || ledger.rollbackIntents.has(entry.id)) fail("ERR_INTEGRITY");
+      await appendRecoveryEvent({
+        capability,
+        heldLock,
+        event: "ROLLBACK_INTENT",
+        payload: { id: entry.id },
+        faultHook: options.faultHook,
+        phase: `after-event:ROLLBACK_INTENT:${entry.id}`,
+      });
+    }
     if (endpoint.payloadStat !== null) {
       await guardedRecoveryRename({
         capability,
@@ -2314,6 +2333,7 @@ async function rollbackApplyFromLedger({ capability, heldLock, ledger, manifest,
       faultHook: options.faultHook,
       phase: `after-event:ROLLED_BACK_ENTRY:${entry.id}`,
     });
+    rollbackPending = null;
   }
   await appendRecoveryEvent({
     capability,
@@ -2355,7 +2375,7 @@ async function recoverApplyOnCapability({ capability, options }) {
     const replayed = await replayJournal({ capability });
     const manifest = await readRecoveryManifest({ capability, options, replayed });
     const ledger = buildApplyLedger(replayed, manifest);
-    if (replayed.state !== "RECOVERY_REQUIRED") {
+    if (replayed.state !== "RECOVERY_REQUIRED" && replayed.state !== "ROLLING_BACK") {
       if (
         replayed.state !== "PREPARED" &&
         replayed.state !== "MOVING" &&
@@ -2373,7 +2393,14 @@ async function recoverApplyOnCapability({ capability, options }) {
     }
     return options.action === "resume"
       ? resumeApplyFromLedger({ capability, heldLock, ledger, manifest, options })
-      : rollbackApplyFromLedger({ capability, heldLock, ledger, manifest, options });
+      : rollbackApplyFromLedger({
+        capability,
+        heldLock,
+        ledger,
+        manifest,
+        options,
+        isRollingBack: replayed.state === "ROLLING_BACK",
+      });
   });
 }
 

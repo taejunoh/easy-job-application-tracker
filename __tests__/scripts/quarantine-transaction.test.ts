@@ -1805,6 +1805,9 @@ describe("quarantine transaction Slice 1", () => {
   ] as const)("classifies rename EXDEV only after fresh evidence checks (%s)", (variant, code) => {
     const f = createQuarantineFixture();
     bases.push(f.base);
+    const source = join(f.repoRoot, ".next");
+    const destination = join(f.quarantineRoot, `tx-exdev-${variant}`, "payload/generated/.next");
+    const sourceBefore = lstatSync(source);
     const worker = invokeQuarantineWorker("apply-rename-exdev", {
       repoRoot: f.repoRoot,
       quarantineRoot: f.quarantineRoot,
@@ -1824,6 +1827,11 @@ describe("quarantine transaction Slice 1", () => {
         : "Quarantine evidence failed integrity validation.",
     );
     expect(worker.unlinkCalls).toBe(0);
+    if (code === "ERR_EXDEV") {
+      const sourceAfter = lstatSync(source);
+      expect([sourceAfter.dev, sourceAfter.ino]).toEqual([sourceBefore.dev, sourceBefore.ino]);
+      expect(existsSync(destination)).toBe(false);
+    }
   });
 
   it.each([
