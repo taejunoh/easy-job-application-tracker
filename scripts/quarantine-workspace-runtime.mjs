@@ -2200,6 +2200,10 @@ async function rollbackApplyFromLedger({ capability, heldLock, ledger, manifest,
 
 async function recoverApplyOnCapability({ capability, options }) {
   const initial = await replayJournal({ capability });
+  // Recovery is a reconciliation operation, not journal repair. A torn tail is
+  // evidence of an interrupted append and must remain untouched for explicit
+  // operator investigation.
+  if (initial.truncatedTail) fail("ERR_INTEGRITY");
   if (initial.state === "QUARANTINED" && options.action === "resume") {
     return recoveryResult(options.transactionId, "QUARANTINED", "resume", 0);
   }

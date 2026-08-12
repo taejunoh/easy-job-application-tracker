@@ -1,9 +1,20 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,6 +24,50 @@ import { pathToFileURL } from "node:url";
 const transactionUrl = pathToFileURL(
   join(__dirname, "../../../scripts/quarantine-transaction.mjs"),
 ).href;
+const runtimeUrl = pathToFileURL(
+  join(__dirname, "../../../scripts/quarantine-workspace-runtime.mjs"),
+).href;
+const capabilityUrl = pathToFileURL(
+  join(__dirname, "../../../scripts/quarantine-run-capability.mjs"),
+).href;
+const journalUrl = pathToFileURL(
+  join(__dirname, "../../../scripts/quarantine-journal.mjs"),
+).href;
+const fsContextUrl = pathToFileURL(
+  join(__dirname, "../../../scripts/quarantine-run-fs-context.mjs"),
+).href;
+const legacyFacadeUrl = pathToFileURL(
+  join(__dirname, "../../../scripts/quarantine-numbered-copies-support.mjs"),
+).href;
+
+export const FS_METHODS = [
+  "lstat",
+  "realpath",
+  "mkdir",
+  "open",
+  "readdir",
+  "rm",
+  "rename",
+  "unlink",
+  "link",
+  "opendir",
+  "readlink",
+  "createReadStream",
+  "lstatSync",
+  "realpathSync",
+] as const;
+
+export const LAYOUT_RELATIVES = [
+  "", "manifests", "inventories", "inventories/pre", "inventories/moved-pass-1",
+  "inventories/moved-pass-2", "inventories/restore-active",
+  "inventories/validation-pass-1", "inventories/validation-pass-2",
+  "inventories/work", "payload", "payload/source-copies", "payload/generated",
+  "rollback", "rollback/regenerated-before-restore", "conflicts", "divergent-diffs",
+] as const;
+
+export const STATUS_RECORD_LIMIT = 1024 * 1024;
+export const HISTORY_FRAME_LIMIT = 4096;
+export const HISTORY_OID_BODY_LIMIT = 64;
 
 export type Fixture = {
   base: string;
@@ -26,7 +81,7 @@ export type Fixture = {
   copyPath?: string;
 };
 
-function git(repoRoot: string, ...args: string[]) {
+export function git(repoRoot: string, ...args: string[]) {
   return execFileSync("git", args, {
     cwd: repoRoot,
     encoding: "utf8",
@@ -34,9 +89,71 @@ function git(repoRoot: string, ...args: string[]) {
   }).trim();
 }
 
-function privateDirectory(path: string) {
+export function privateDirectory(path: string) {
   mkdirSync(path, { recursive: true, mode: 0o700 });
   chmodSync(path, 0o700);
+}
+
+export function listLockResidue(path: string, relative = ""): string[] {
+  const output: string[] = [];
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    const entryRelative = relative === "" ? entry.name : `${relative}/${entry.name}`;
+    if (entry.name.endsWith(".lock")) output.push(entryRelative);
+    if (entry.isDirectory()) output.push(...listLockResidue(join(path, entry.name), entryRelative));
+  }
+  return output.sort();
+}
+
+export function installGitOutputOverride(
+  f: Fixture,
+  label: string,
+  expectedArgs: string,
+  output: Buffer,
+) {
+  const bin = join(f.base, `git-override-${label}`);
+  privateDirectory(bin);
+  const payload = join(bin, "payload.bin");
+  writeFileSync(payload, output);
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\nif [ "$*" = ${JSON.stringify(expectedArgs)} ]; then exec /bin/cat ${JSON.stringify(payload)}; fi\nexec ${JSON.stringify(realGit)} "$@"\n`,
+    { mode: 0o700 },
+  );
+  chmodSync(join(bin, "git"), 0o700);
+  return `${bin}:${process.env.PATH ?? ""}`;
+}
+
+export function installGitDiffOverride(
+  f: Fixture,
+  label: string,
+  stdout: Buffer,
+  { stderr = Buffer.alloc(0), exit = 1, signal, sentinel }: {
+    stderr?: Buffer;
+    exit?: number;
+    signal?: string;
+    sentinel?: string;
+  } = {},
+) {
+  const bin = join(f.base, `git-diff-override-${label}`);
+  privateDirectory(bin);
+  const stdoutPath = join(bin, "stdout.bin");
+  const stderrPath = join(bin, "stderr.bin");
+  writeFileSync(stdoutPath, stdout);
+  writeFileSync(stderrPath, stderr);
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const expected = [
+    "-c", "core.fsmonitor=false", "-c", "core.quotePath=true", "diff", "--no-index",
+    "--binary", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv",
+    "--src-prefix=a/", "--dst-prefix=b/", "--", f.canonicalPath!, f.copyPath!,
+  ].join(" ");
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\nif [ "$*" = ${JSON.stringify(expected)} ]; then ${sentinel === undefined ? "" : `printf invoked > ${JSON.stringify(sentinel)}; `}/bin/cat ${JSON.stringify(stdoutPath)}; /bin/cat ${JSON.stringify(stderrPath)} >&2; ${signal === undefined ? `exit ${exit}` : `kill -${signal} $$; exit 99`}; fi\nexec ${JSON.stringify(realGit)} "$@"\n`,
+    { mode: 0o700 },
+  );
+  chmodSync(join(bin, "git"), 0o700);
+  return `${bin}:${process.env.PATH ?? ""}`;
 }
 
 export function createQuarantineFixture({
@@ -44,11 +161,6 @@ export function createQuarantineFixture({
   repoName = "repo",
   canonicalPath = "notes.txt",
   copyPath = "notes 2.txt",
-}: {
-  divergent?: boolean;
-  repoName?: string;
-  canonicalPath?: string;
-  copyPath?: string;
 } = {}): Fixture {
   const base = mkdtempSync(join(tmpdir(), "quarantine-transaction-"));
   const repoRoot = join(base, repoName);
@@ -75,51 +187,1533 @@ export function createQuarantineFixture({
   privateDirectory(join(repoRoot, "node_modules"));
   writeFileSync(join(repoRoot, ".next", "build"), "ignored");
   writeFileSync(join(repoRoot, "node_modules", "package"), "ignored");
-  const expectedCount = spawnSync("git", ["status", "--porcelain=v1", "-z"], {
-    cwd: repoRoot,
-  }).stdout.toString("utf8").split("\0").filter(Boolean).length;
+  const sourceCopyEntries = Object.freeze([copyPath]);
   return {
     base: realpathSync(base),
     repoRoot: realpathSync(repoRoot),
     quarantineRoot: realpathSync(quarantineRoot),
     branch: git(repoRoot, "symbolic-ref", "--short", "HEAD"),
     head: git(repoRoot, "rev-parse", "HEAD"),
-    expectedCount,
+    expectedCount: sourceCopyEntries.length,
     historyHead,
     canonicalPath,
     copyPath,
   };
 }
 
+export function canonicalDiff(f: Fixture) {
+  const diff = spawnSync("git", [
+    "-c", "core.fsmonitor=false",
+    "-c", "core.quotePath=true",
+    "diff", "--no-index", "--binary", "--full-index", "--no-color",
+    "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--",
+    f.canonicalPath!, f.copyPath!,
+  ], { cwd: f.repoRoot });
+  expect(diff.status).toBe(1);
+  return diff.stdout;
+}
+
+export type DescriptorShape = {
+  enumerable: boolean;
+  configurable: boolean;
+  writable: boolean;
+  callable?: boolean;
+};
+
+export type ValueShape = {
+  prototype: string;
+  keys: string[];
+  frozen: boolean;
+  extensible: boolean;
+  descriptors: Record<string, DescriptorShape>;
+  top?: ValueShape;
+  entries?: ValueShape;
+  entryShapes?: ValueShape[];
+  identityShapes?: Array<Array<ValueShape | null>>;
+  fsSource?: ValueShape;
+  fsCallable?: boolean;
+  fsStable?: boolean;
+  mutationStable?: boolean;
+};
+
+export type WorkerEntry = {
+  id: string;
+  kind: string;
+  classification?: string;
+  historyMatch?: string | null;
+};
+
+export type WorkerValue = {
+  status?: string;
+  runRoot?: string;
+  entries?: WorkerEntry[];
+  [key: string]: unknown;
+};
+
+export type WorkerError = {
+  name: string;
+  code?: string;
+  message: string;
+  ownKeys: string[];
+  descriptors: Record<string, DescriptorShape>;
+  leaksSecret: boolean;
+  prototypeIsError: boolean;
+  prototypeParentIsError: boolean;
+  prototypeOwnKeys: string[];
+  codeMutationInert: boolean;
+  [key: string]: unknown;
+};
+
+export type WorkerResult = {
+  ok: boolean;
+  exports?: string[];
+  runtimeExports?: string[];
+  legacyExports?: string[];
+  result?: WorkerValue;
+  phases?: string[];
+  reads?: number;
+  counts?: Record<string, number>;
+  wrongReceiver?: number;
+  firstCode?: string;
+  runRootOpenAttempts?: number;
+  hookCalls?: number;
+  unlinkCalls?: number;
+  injected?: boolean;
+  thrownUndefined?: boolean;
+  codeReads?: number;
+  closeGetterReads?: number;
+  closeCalls?: number;
+  closeWrongReceiver?: number;
+  active?: { callable: boolean; distinctRejected: boolean };
+  revoked?: boolean;
+  sourceFrozen?: boolean;
+  instrumentation?: {
+    renamed: string[][];
+    synced: string[];
+    snapshots: Array<{
+      phase: string;
+      renamed: string[][];
+      synced: string[];
+      lockCreates: number;
+      lockRemovals: number;
+      lockExists: boolean;
+    }>;
+    lockCreates: number;
+    lockRemovals: number;
+  };
+  maxReadLength?: number;
+  mutationCounters?: {
+    atFailure: Record<string, number>;
+    final: Record<string, number>;
+  };
+  externalOperations?: string[];
+  replayEvents?: Array<{ event: string; payload: { id?: string } }>;
+  shape?: ValueShape;
+  error?: WorkerError;
+};
+
 export function invokeQuarantineWorker(
-  operation: "exports" | "recover",
+  operation: string,
   request: Record<string, unknown>,
-) {
+  extraEnvironment: Record<string, string> = {},
+  timeout = 10_000,
+): WorkerResult {
   const source = `
 import * as transaction from ${JSON.stringify(transactionUrl)};
+import * as runtime from ${JSON.stringify(runtimeUrl)};
+import { withQuarantineRunCapability } from ${JSON.stringify(capabilityUrl)};
+import { appendJournalRecord, replayJournal, withJournalLock } from ${JSON.stringify(journalUrl)};
+import { getRunFsContext } from ${JSON.stringify(fsContextUrl)};
+import * as fsPromises from "node:fs/promises";
+import {
+  appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, realpathSync,
+  renameSync, symlinkSync, truncateSync, writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { Readable } from "node:stream";
+
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const { operation, request } = JSON.parse(input);
-try {
-  const result = operation === "exports"
-    ? { exports: Object.keys(transaction) }
-    : await transaction.recoverQuarantine(request);
-  process.stdout.write(JSON.stringify({ ok: true, result }));
-} catch (error) {
-  process.stdout.write(JSON.stringify({ ok: false, error: {
-    code: error?.code ?? null,
+
+function shape(value) {
+  const descriptors = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    descriptors[key] = {
+      enumerable: descriptor.enumerable,
+      configurable: descriptor.configurable,
+      writable: descriptor.writable,
+      callable: typeof descriptor.value === "function",
+    };
+  }
+  return {
+    prototype: Array.isArray(value) ? "array" : Object.getPrototypeOf(value) === null ? "null" : "other",
+    keys: Reflect.ownKeys(value).map(String),
+    frozen: Object.isFrozen(value),
+    extensible: Object.isExtensible(value),
+    descriptors,
+  };
+}
+
+function errorShape(error) {
+  const descriptors = {};
+  for (const key of Reflect.ownKeys(error)) {
+    if (typeof key === "string") descriptors[key] = Object.getOwnPropertyDescriptor(error, key);
+  }
+  const prototype = Object.getPrototypeOf(error);
+  const originalCode = error?.code;
+  const codeSet = Reflect.set(error, "code", "MUTATED");
+  return {
+    instanceOfError: error instanceof Error,
+    name: error?.name,
+    code: error?.code,
     message: error?.message,
-  } }));
+    ownKeys: Reflect.ownKeys(error).map(String),
+    symbolCount: Reflect.ownKeys(error).filter((key) => typeof key === "symbol").length,
+    enumerableKeys: Object.keys(error),
+    json: JSON.stringify(error),
+    frozen: Object.isFrozen(error),
+    extensible: Object.isExtensible(error),
+    descriptors: Object.fromEntries(Object.entries(descriptors).map(([key, value]) => [key, {
+      enumerable: value.enumerable,
+      configurable: value.configurable,
+      writable: value.writable,
+      valueType: typeof value.value,
+    }])),
+    leaksSecret: String(error?.stack).includes("/do/not/leak"),
+    prototypeIsError: prototype === Error.prototype,
+    prototypeParentIsError: Object.getPrototypeOf(prototype) === Error.prototype,
+    prototypeOwnKeys: Reflect.ownKeys(prototype).map(String),
+    codeMutationInert: codeSet === false && error?.code === originalCode,
+  };
+}
+
+try {
+  if (operation === "exports") {
+    const legacyFacade = await import(${JSON.stringify(legacyFacadeUrl)});
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      exports: Object.keys(transaction),
+      runtimeExports: Object.keys(runtime),
+      legacyExports: Object.keys(legacyFacade),
+    }));
+  } else if (operation === "inspect") {
+    const result = await transaction.inspectWorkspace(request);
+    const resultShape = shape(result);
+    const before = JSON.stringify(result);
+    resultShape.mutationStable = Reflect.set(result, "status", "MUTATED") === false &&
+      Reflect.set(result, "sourceCopies", -1) === false && JSON.stringify(result) === before;
+    process.stdout.write(JSON.stringify({ ok: true, result, shape: resultShape }));
+  } else if (operation === "apply") {
+    const { stopPhase, ...applyRequest } = request;
+    const phases = [];
+    const result = await transaction.quarantineWorkspace({
+      ...applyRequest,
+      faultHook(phase) {
+        phases.push(phase);
+        if (phase === stopPhase) throw new RangeError("stop at requested phase");
+      },
+    });
+    process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+  } else if (operation === "apply-stop-after-layout") {
+    const phases = [];
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...request,
+        faultHook(phase) {
+          phases.push(phase);
+          if (phase === "after-layout-sync") throw new RangeError("stop after layout");
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      phases,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-stop") {
+    const { stopPhase, ...applyRequest } = request;
+    const phases = [];
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        faultHook(phase) {
+          phases.push(phase);
+          if (phase === stopPhase) throw new RangeError("stop at requested phase");
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      phases,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "seed-prepared") {
+    const handoff = await runtime.prepareQuarantineWorkspace(request);
+    await withQuarantineRunCapability({
+      repoRoot: request.repoRoot,
+      quarantineRoot: request.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+      fsApi: handoff.fsSource,
+    }, async (capability) => {
+      await withJournalLock({ capability }, async (heldLock) => {
+        await appendJournalRecord({
+          capability,
+          heldLock,
+          event: "PREPARED",
+          payload: {
+            transactionId: request.transactionId,
+            manifestSha256: "a".repeat(64),
+          },
+        });
+      });
+    });
+    process.stdout.write(JSON.stringify({ ok: true }));
+  } else if (operation === "replay-run") {
+    let replayed;
+    await withQuarantineRunCapability({
+      repoRoot: request.repoRoot,
+      quarantineRoot: request.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+    }, async (capability) => {
+      replayed = await replayJournal({ capability });
+    });
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      result: {
+        state: replayed.state,
+        records: replayed.records.map((record) => ({
+          sequence: record.sequence,
+          event: record.event,
+          payload: record.payload,
+        })),
+      },
+    }));
+  } else if (operation === "recover") {
+    const result = await transaction.recoverQuarantine(request);
+    let replayed;
+    await withQuarantineRunCapability({
+      repoRoot: request.repoRoot,
+      quarantineRoot: request.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+    }, async (capability) => {
+      replayed = await replayJournal({ capability });
+    });
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      result,
+      replayEvents: replayed.records.map((record) => ({
+        event: record.event,
+        payload: record.payload,
+      })),
+    }));
+  } else if (operation === "apply-rename-exdev") {
+    const { variant, ...applyRequest } = request;
+    let injected = false;
+    let unlinkCalls = 0;
+    const adapter = {
+      ...fsPromises,
+      async rename(source, destination) {
+        if (!injected && source === join(request.repoRoot, ".next")) {
+          injected = true;
+          if (variant === "source-changed") {
+            await fsPromises.rename(source, source + ".changed");
+          } else if (variant === "destination-created") {
+            mkdirSync(destination, { mode: 0o700 });
+          }
+          const error = new Error("cross-device");
+          error.code = "EXDEV";
+          throw error;
+        }
+        return fsPromises.rename(source, destination);
+      },
+      async unlink(path) {
+        if (injected) unlinkCalls += 1;
+        return fsPromises.unlink(path);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      unlinkCalls,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-lock-cleanup-failure") {
+    const { failCleanupAt = 1, ...applyRequest } = request;
+    let cleanupCalls = 0;
+    const counters = {
+      renames: 0,
+      syncs: 0,
+      inventoryPublications: 0,
+      generationPublications: 0,
+      journalMutations: 0,
+    };
+    let atFailure;
+    const adapter = {
+      ...fsPromises,
+      async rename(...args) {
+        const result = await fsPromises.rename(...args);
+        counters.renames += 1;
+        return result;
+      },
+      async link(source, destination) {
+        const result = await fsPromises.link(source, destination);
+        if (destination.includes("/inventories/") && destination.endsWith(".jsonl")) {
+          counters.inventoryPublications += 1;
+        }
+        if (destination.includes("/manifests/") && destination.endsWith(".json")) {
+          counters.generationPublications += 1;
+        }
+        return result;
+      },
+      async open(path, ...args) {
+        const handle = await fsPromises.open(path, ...args);
+        if (
+          path.endsWith("/journal.log") &&
+          (args[0] === "wx+" || args[0] === "r+")
+        ) counters.journalMutations += 1;
+        return new Proxy(handle, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target);
+            if (key === "sync") return async (...syncArgs) => {
+              const result = await Reflect.apply(value, target, syncArgs);
+              counters.syncs += 1;
+              return result;
+            };
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+      async rm(path, ...args) {
+        if (path.endsWith("/journal.lock")) {
+          cleanupCalls += 1;
+        }
+        if (path.endsWith("/journal.lock") && cleanupCalls === failCleanupAt) {
+          atFailure = { ...counters };
+          throw new Error("injected lock cleanup failure");
+        }
+        return fsPromises.rm(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      mutationCounters: { atFailure, final: { ...counters } },
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-mutate-at-hook") {
+    const { mutatePhase, mutation, ...applyRequest } = request;
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        faultHook(phase) {
+          if (phase !== mutatePhase) return;
+          if (mutation === "payload") {
+            writeFileSync(join(request.quarantineRoot, request.transactionId,
+              "payload/generated/.next/build"), "mutated");
+          } else if (mutation === "source") {
+            writeFileSync(join(request.repoRoot, "notes 2.txt"), "recreated");
+          } else if (mutation === "status") {
+            writeFileSync(join(request.repoRoot, "unexpected.txt"), "unexpected");
+          }
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-temp-reappear") {
+    let replaced = false;
+    const adapter = {
+      ...fsPromises,
+      async unlink(path) {
+        await fsPromises.unlink(path);
+        if (!replaced && path.endsWith("/.copy-0001.tmp")) {
+          replaced = true;
+          writeFileSync(path, "foreign-reappeared", { mode: 0o600 });
+          chmodSync(path, 0o600);
+        }
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...request, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-temp-cleanup-seam") {
+    const { variant, ...applyRequest } = request;
+    let tempUnlinked = false;
+    let injected = false;
+    const adapter = {
+      ...fsPromises,
+      async unlink(path) {
+        const result = await fsPromises.unlink(path);
+        if (path.endsWith("/.copy-0001.tmp")) tempUnlinked = true;
+        return result;
+      },
+      async open(path, ...args) {
+        if (tempUnlinked && !injected && path.endsWith("/divergent-diffs")) {
+          injected = true;
+          if (variant === "parent-sync-failure") {
+            throw new Error("injected cleanup parent sync failure");
+          }
+          const realHandle = await fsPromises.open(path, ...args);
+          let wrapper;
+          wrapper = {
+            async sync() {
+              await realHandle.sync();
+              const final = join(path, "copy-0001.patch");
+              renameSync(final, final + ".owned");
+              writeFileSync(final, "foreign-final", { mode: 0o600 });
+              chmodSync(final, 0o600);
+            },
+            async close() { return realHandle.close(); },
+          };
+          return wrapper;
+        }
+        return fsPromises.open(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-same-inode-size-drift") {
+    const { driftAtFinalOpen, mutation, ...applyRequest } = request;
+    let finalOpens = 0;
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        if (path.endsWith("/divergent-diffs/copy-0001.patch")) {
+          finalOpens += 1;
+          if (finalOpens === driftAtFinalOpen) {
+            if (mutation === "append") appendFileSync(path, "x");
+            else truncateSync(path, Math.max(0, lstatSync(path).size - 1));
+          }
+        }
+        return fsPromises.open(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-divergent-seam-swap") {
+    const { seam, variant, ...applyRequest } = request;
+    const root = join(request.quarantineRoot, request.transactionId, "divergent-diffs");
+    const temporary = join(root, ".copy-0001.tmp");
+    const final = join(root, "copy-0001.patch");
+    let injected = false;
+    let finalLstats = 0;
+    let parentOpens = 0;
+    let temporaryUnlinked = false;
+    const swap = (path, label) => {
+      if (injected) return;
+      injected = true;
+      if (existsSync(path)) renameSync(path, path + ".owned-" + label);
+      writeFileSync(path, "foreign-" + label, { mode: 0o600 });
+      chmodSync(path, 0o600);
+    };
+    const adapter = {
+      ...fsPromises,
+      async lstat(path) {
+        if (path === final) {
+          finalLstats += 1;
+          if (seam === "before-link" && variant === "final-plus-temp" && finalLstats === 1) {
+            swap(final, seam);
+          }
+          if (seam === "after-link" && variant === "final-plus-temp" && finalLstats === 1) {
+            const stats = await fsPromises.lstat(path);
+            swap(final, seam);
+            return stats;
+          }
+        }
+        return fsPromises.lstat(path);
+      },
+      async link(source, destination) {
+        if (destination === final && seam === "before-link") swap(temporary, seam);
+        const result = await fsPromises.link(source, destination);
+        if (destination === final && seam === "after-link") swap(final, seam);
+        return result;
+      },
+      async unlink(path) {
+        const result = await fsPromises.unlink(path);
+        if (path === temporary) {
+          temporaryUnlinked = true;
+          if (seam === "cleanup-before-parent-sync") swap(final, seam);
+        }
+        return result;
+      },
+      async open(path, ...args) {
+        if (path === final && seam === "after-file-sync" && !injected) {
+          const realHandle = await fsPromises.open(path, ...args);
+          return {
+            async stat() { return realHandle.stat(); },
+            async sync() { await realHandle.sync(); swap(final, seam); },
+            async close() { return realHandle.close(); },
+          };
+        }
+        if (path === root && existsSync(final)) {
+          parentOpens += 1;
+          if (seam === "before-parent-sync" && parentOpens === 1) swap(final, seam);
+          const realHandle = await fsPromises.open(path, ...args);
+          if (
+            (seam === "after-parent-sync" && parentOpens === 1) ||
+            (seam.startsWith("cleanup-after-parent-sync") && temporaryUnlinked)
+          ) {
+            return {
+              async sync() {
+                await realHandle.sync();
+                if (seam === "cleanup-after-parent-sync-temp") swap(temporary, seam);
+                else swap(final, seam);
+              },
+              async close() { return realHandle.close(); },
+            };
+          }
+          return realHandle;
+        }
+        return fsPromises.open(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      injected,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-divergent-spawn-error") {
+    let injected = false;
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...request,
+        faultHook(phase) {
+          if (phase === "after-pre-inventories") {
+            injected = true;
+            renameSync(join(process.env.PATH, "git"), join(process.env.PATH, "git.owned"));
+          }
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      injected,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-instrumented") {
+    const renamed = [];
+    const synced = [];
+    const snapshots = [];
+    let lockCreates = 0;
+    let lockRemovals = 0;
+    const lockPath = join(request.quarantineRoot, request.transactionId, "journal.lock");
+    const adapter = {
+      ...fsPromises,
+      async rename(source, destination) {
+        const result = await fsPromises.rename(source, destination);
+        renamed.push([source, destination]);
+        return result;
+      },
+      async open(path, ...args) {
+        const handle = await fsPromises.open(path, ...args);
+        if (path === lockPath && args[0] === "wx") lockCreates += 1;
+        return new Proxy(handle, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target);
+            if (key === "sync") return async (...syncArgs) => {
+              const result = await Reflect.apply(value, target, syncArgs);
+              synced.push(path);
+              return result;
+            };
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+      async rm(path, ...args) {
+        const result = await fsPromises.rm(path, ...args);
+        if (path === lockPath) lockRemovals += 1;
+        return result;
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const phases = [];
+    const result = await transaction.quarantineWorkspace({
+      ...request,
+      fsApi: adapter,
+      faultHook(phase) {
+        phases.push(phase);
+        snapshots.push({
+          phase,
+          renamed: renamed.map((pair) => [...pair]),
+          synced: [...synced],
+          lockCreates,
+          lockRemovals,
+          lockExists: existsSync(lockPath),
+        });
+      },
+    });
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      result,
+      phases,
+      instrumentation: { renamed, synced, snapshots, lockCreates, lockRemovals },
+    }));
+  } else if (operation === "apply-virtual-cap") {
+    const { virtualSourceSize, virtualCanonicalSize, stopPhase, ...applyRequest } = request;
+    let virtual = true;
+    const adapter = {
+      ...fsPromises,
+      async lstat(path) {
+        const stats = await fsPromises.lstat(path);
+        let size;
+        if (virtual && path === join(request.repoRoot, "notes 2.txt")) size = virtualSourceSize;
+        if (virtual && path === join(request.repoRoot, "notes.txt")) size = virtualCanonicalSize;
+        if (size === undefined) return stats;
+        return new Proxy(stats, {
+          get(target, key) {
+            if (key === "size") return size;
+            const value = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const phases = [];
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        fsApi: adapter,
+        faultHook(phase) {
+          phases.push(phase);
+          if (phase === "after-layout-sync") virtual = false;
+          if (phase === stopPhase) throw new RangeError("stop at requested phase");
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      phases,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-observe-read-bound") {
+    const { stopPhase, ...applyRequest } = request;
+    const temporary = join(
+      request.quarantineRoot,
+      request.transactionId,
+      "divergent-diffs/.copy-0001.tmp",
+    );
+    const final = join(
+      request.quarantineRoot,
+      request.transactionId,
+      "divergent-diffs/copy-0001.patch",
+    );
+    let maxReadLength = 0;
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        const handle = await fsPromises.open(path, ...args);
+        if (path !== temporary && path !== final) return handle;
+        return new Proxy(handle, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target);
+            if (key === "read") return async (buffer, offset, length, position) => {
+              maxReadLength = Math.max(maxReadLength, length);
+              return value.call(target, buffer, offset, length, position);
+            };
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const phases = [];
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        fsApi: adapter,
+        faultHook(phase) {
+          phases.push(phase);
+          if (phase === stopPhase) throw new RangeError("stop at requested phase");
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      phases,
+      maxReadLength,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-endpoint-swap") {
+    const { variant, triggerPhase, targetId, sourceAncestor, externalRoot, ...applyRequest } = request;
+    const runRoot = join(request.quarantineRoot, request.transactionId);
+    const destinationParent = targetId.startsWith("generated-")
+      ? join(runRoot, "payload/generated")
+      : join(runRoot, "payload/source-copies");
+    let injected = false;
+    const externalOperations = [];
+    const resolvesExternal = (path) => {
+      if (!injected || typeof path !== "string") return false;
+      let resolved;
+      try {
+        resolved = realpathSync(path);
+      } catch {
+        try { resolved = realpathSync(dirname(path)); } catch { return false; }
+      }
+      return resolved === externalRoot || resolved.startsWith(externalRoot + "/");
+    };
+    const note = (method, ...paths) => {
+      if (paths.some(resolvesExternal)) externalOperations.push(method);
+    };
+    const adapter = {
+      ...fsPromises,
+      async rename(source, destination) {
+        note("rename", source, destination);
+        return fsPromises.rename(source, destination);
+      },
+      async link(source, destination) {
+        note("link", source, destination);
+        return fsPromises.link(source, destination);
+      },
+      async mkdir(path, ...args) {
+        note("mkdir", path);
+        return fsPromises.mkdir(path, ...args);
+      },
+      async unlink(path, ...args) {
+        note("unlink", path);
+        return fsPromises.unlink(path, ...args);
+      },
+      async rm(path, ...args) {
+        note("rm", path);
+        return fsPromises.rm(path, ...args);
+      },
+      async open(path, ...args) {
+        note("open", path);
+        return fsPromises.open(path, ...args);
+      },
+      async opendir(path, ...args) {
+        note("opendir", path);
+        return fsPromises.opendir(path, ...args);
+      },
+      async readdir(path, ...args) {
+        note("readdir", path);
+        return fsPromises.readdir(path, ...args);
+      },
+      createReadStream(path, ...args) {
+        note("createReadStream", path);
+        return createReadStream(path, ...args);
+      },
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({
+        ...applyRequest,
+        fsApi: adapter,
+        faultHook(phase) {
+          if (phase !== triggerPhase || injected) return;
+          if (variant === "source-ancestor") {
+            const moved = join(externalRoot, "source-ancestor-owned");
+            renameSync(sourceAncestor, moved);
+            symlinkSync(moved, sourceAncestor);
+          } else if (variant === "destination-before-rename") {
+            renameSync(destinationParent, destinationParent + ".owned");
+            symlinkSync(externalRoot, destinationParent);
+          } else {
+            const moved = join(externalRoot, "payload-parent-owned");
+            renameSync(destinationParent, moved);
+            symlinkSync(moved, destinationParent);
+          }
+          injected = true;
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+    let replayed;
+    await withQuarantineRunCapability({
+      repoRoot: request.repoRoot,
+      quarantineRoot: request.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+      fsApi: adapter,
+    }, async (capability) => {
+      replayed = await replayJournal({ capability });
+    });
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      injected,
+      externalOperations,
+      replayEvents: replayed.records.map(({ event, payload }) => ({ event, payload })),
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "apply-final-only-right-open-failure") {
+    const { closeFailure, ...applyRequest } = request;
+    const temporary = join(
+      request.quarantineRoot,
+      request.transactionId,
+      "divergent-diffs/.copy-0001.tmp",
+    );
+    const final = join(
+      request.quarantineRoot,
+      request.transactionId,
+      "divergent-diffs/copy-0001.patch",
+    );
+    let leftWrapped = false;
+    let closeGetterReads = 0;
+    let closeCalls = 0;
+    let closeWrongReceiver = 0;
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        if (path === final && leftWrapped) {
+          const error = new Error("injected right open failure");
+          error.code = "EACCES";
+          throw error;
+        }
+        const handle = await fsPromises.open(path, ...args);
+        if (path !== temporary || args[0] !== "r" || leftWrapped) return handle;
+        leftWrapped = true;
+        let wrapper;
+        wrapper = new Proxy(handle, {
+          get(target, key) {
+            if (key === "close") {
+              closeGetterReads += 1;
+              return async function () {
+                closeCalls += 1;
+                if (this !== wrapper) closeWrongReceiver += 1;
+                await target.close();
+                if (closeFailure) throw new Error("injected left close failure");
+              };
+            }
+            const value = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        return wrapper;
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await transaction.quarantineWorkspace({ ...applyRequest, fsApi: adapter });
+    } catch (error) {
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      closeGetterReads,
+      closeCalls,
+      closeWrongReceiver,
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "getter") {
+    let reads = 0;
+    const options = { ...request };
+    Object.defineProperty(options, "repoRoot", { enumerable: true, get() { reads += 1; return request.repoRoot; } });
+    const result = await transaction.inspectWorkspace(options);
+    process.stdout.write(JSON.stringify({ ok: true, reads, result }));
+  } else if (operation === "prepare") {
+    const phases = [];
+    const result = await runtime.prepareQuarantineWorkspace({
+      ...request,
+      faultHook(phase) { phases.push(phase); },
+    });
+    const originalStatus = result.status;
+    const originalEntries = result.entries.map((entry) => ({
+      entry,
+      id: entry.id,
+      sourceIdentity: entry.sourceIdentity,
+      sourceDev: entry.sourceIdentity.dev,
+      canonicalIdentity: entry.canonicalIdentity,
+      canonicalDev: entry.canonicalIdentity?.dev,
+    }));
+    const mutationResults = [
+      Reflect.set(result, "status", "MUTATED"),
+      Reflect.set(result.entries, 0, null),
+      Reflect.set(result.entries, "length", 0),
+      Reflect.set(result.fsSource, "lstat", null),
+    ];
+    for (const original of originalEntries) {
+      mutationResults.push(
+        Reflect.set(original.entry, "id", "mutated"),
+        Reflect.set(original.sourceIdentity, "dev", -1),
+      );
+      if (original.canonicalIdentity) {
+        mutationResults.push(Reflect.set(original.canonicalIdentity, "dev", -1));
+      }
+    }
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      result,
+      phases,
+      shape: {
+        top: shape(result),
+        entries: shape(result.entries),
+        entryShapes: result.entries.map(shape),
+        identityShapes: result.entries.map((entry) => [shape(entry.sourceIdentity), entry.canonicalIdentity ? shape(entry.canonicalIdentity) : null]),
+        fsSource: shape(result.fsSource),
+        fsCallable: Object.values(result.fsSource).every((value) => typeof value === "function"),
+        fsStable: Object.keys(result.fsSource).every((key) => result.fsSource[key] === result.fsSource[key]),
+        mutationStable: mutationResults.every((value) => value === false) &&
+          result.status === originalStatus && originalEntries.every((original, index) =>
+            result.entries[index] === original.entry && original.entry.id === original.id &&
+            original.entry.sourceIdentity === original.sourceIdentity &&
+            original.sourceIdentity.dev === original.sourceDev &&
+            original.entry.canonicalIdentity === original.canonicalIdentity &&
+            original.canonicalIdentity?.dev === original.canonicalDev),
+      },
+    }));
+  } else if (operation === "drift") {
+    let sourceReads = 0;
+    const adapter = {
+      ...fsPromises,
+      createReadStream(path, options) {
+        if (path.endsWith("notes 2.txt")) {
+          sourceReads += 1;
+          if (sourceReads === 2) writeFileSync(path, "changed between passes\\n");
+        }
+        return createReadStream(path, options);
+      },
+      lstatSync,
+      realpathSync,
+    };
+    const result = await runtime.prepareQuarantineWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "device") {
+    const adapter = {
+      ...fsPromises,
+      async lstat(path) {
+        const stats = await fsPromises.lstat(path);
+        if (path === request.quarantineRoot) {
+          return new Proxy(stats, { get(target, key, receiver) {
+            if (key === "dev") return Number(target.dev) + 1;
+            return Reflect.get(target, key, receiver);
+          } });
+        }
+        return stats;
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "invalid-source-mode") {
+    const adapter = {
+      ...fsPromises,
+      async lstat(path) {
+        const stats = await fsPromises.lstat(path);
+        if (path.endsWith("notes 2.txt")) {
+          return new Proxy(stats, { get(target, key, receiver) {
+            if (key === "mode") return Number.NaN;
+            if (["isSymbolicLink", "isFile", "isDirectory"].includes(String(key))) {
+              return Reflect.get(target, key, target).bind(target);
+            }
+            return Reflect.get(target, key, receiver);
+          } });
+        }
+        return stats;
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "root-replacement") {
+    let replaced = false;
+    const adapter = {
+      ...fsPromises,
+      createReadStream(path, options) {
+        if (!replaced && path.endsWith("notes.txt")) {
+          replaced = true;
+          renameSync(request.quarantineRoot, request.quarantineRoot + ".owned");
+          mkdirSync(request.quarantineRoot, { mode: 0o700 });
+          chmodSync(request.quarantineRoot, 0o700);
+          writeFileSync(join(request.quarantineRoot, "replacement-sentinel"), "preserve");
+        }
+        return createReadStream(path, options);
+      },
+      lstatSync,
+      realpathSync,
+    };
+    const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "generated-drift") {
+    let quarantineRealpathCalls = 0;
+    const adapter = {
+      ...fsPromises,
+      async realpath(path) {
+        if (path === request.quarantineRoot) {
+          quarantineRealpathCalls += 1;
+          if (quarantineRealpathCalls === 2) {
+            renameSync(join(request.repoRoot, ".next"), request.quarantineRoot + ".next-owned");
+            mkdirSync(join(request.repoRoot, ".next"), { mode: 0o700 });
+          }
+        }
+        return fsPromises.realpath(path);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "file-identity-drift") {
+    const { driftKind, ...runtimeRequest } = request;
+    let quarantineRealpathCalls = 0;
+    const adapter = {
+      ...fsPromises,
+      async realpath(path) {
+        if (path === request.quarantineRoot) {
+          quarantineRealpathCalls += 1;
+          if (quarantineRealpathCalls === 2) {
+            const relative = driftKind === "canonical" ? "notes.txt" : "notes 2.txt";
+            const source = join(request.repoRoot, relative);
+            renameSync(source, request.quarantineRoot + "." + driftKind + "-owned");
+            writeFileSync(source, "canonical\\n");
+          }
+        }
+        return fsPromises.realpath(path);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const result = await transaction.inspectWorkspace({ ...runtimeRequest, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "fs-capture") {
+    const implementations = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+    const counts = {};
+    let wrongReceiver = 0;
+    const adapter = {};
+    for (const method of ${JSON.stringify(FS_METHODS)}) {
+      Object.defineProperty(adapter, method, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          counts[method] = (counts[method] ?? 0) + 1;
+          const implementation = implementations[method];
+          return function (...args) {
+            if (this !== adapter) wrongReceiver += 1;
+            return Reflect.apply(implementation, implementations, args);
+          };
+        },
+      });
+    }
+    const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result, counts, wrongReceiver }));
+  } else if (operation === "missing-fs-method") {
+    const adapter = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+    delete adapter.readlink;
+    const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "fs-late-mutation") {
+    const base = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+    const adapter = {};
+    for (const method of ${JSON.stringify(FS_METHODS)}) {
+      adapter[method] = (...args) => Reflect.apply(base[method], base, args);
+    }
+    Object.defineProperty(adapter, "realpathSync", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        adapter.lstat = () => { throw new Error("late mutation reached"); };
+        return (...args) => Reflect.apply(base.realpathSync, base, args);
+      },
+    });
+    const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "virtual-files") {
+    const body = Buffer.from("canonical\\n");
+    const repositoryStats = await fsPromises.lstat(request.repoRoot);
+    const virtualPrefix = request.repoRoot + "/virtual-";
+    const virtualStats = {
+      dev: repositoryStats.dev,
+      ino: 777,
+      mode: 0o100600,
+      size: body.length,
+      isSymbolicLink: () => false,
+      isFile: () => true,
+      isDirectory: () => false,
+    };
+    const adapter = {
+      ...fsPromises,
+      async lstat(path) {
+        if (path.startsWith(virtualPrefix)) return virtualStats;
+        return fsPromises.lstat(path);
+      },
+      async realpath(path) {
+        if (path.startsWith(virtualPrefix)) return path;
+        return fsPromises.realpath(path);
+      },
+      createReadStream(path, options) {
+        if (path.startsWith(virtualPrefix)) return Readable.from([body]);
+        return createReadStream(path, options);
+      },
+      lstatSync,
+      realpathSync,
+    };
+    const result = await transaction.inspectWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "symbol") {
+    const options = { ...request };
+    options[Symbol("unknown-secret")] = true;
+    const result = await transaction.inspectWorkspace(options);
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "hook-error") {
+    const injected = new RangeError("injected hook failure");
+    const result = await runtime.prepareQuarantineWorkspace({
+      ...request,
+      faultHook() { throw injected; },
+    });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "hook-sentinel") {
+    const { variant, ...runtimeRequest } = request;
+    let hookCalls = 0;
+    let rejected = false;
+    let captured;
+    const adapter = variant === "prehook-undefined" ? {
+      ...fsPromises,
+      async readdir() { throw undefined; },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    } : undefined;
+    try {
+      await runtime.prepareQuarantineWorkspace({
+        ...runtimeRequest,
+        ...(adapter === undefined ? {} : { fsApi: adapter }),
+        faultHook() {
+          hookCalls += 1;
+          if (variant === "hook-undefined") throw undefined;
+        },
+      });
+    } catch (error) {
+      rejected = true;
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: !rejected,
+      hookCalls,
+      thrownUndefined: rejected && captured === undefined,
+      error: rejected && captured !== undefined ? errorShape(captured) : undefined,
+    }));
+  } else if (operation === "mkdir-error-code") {
+    const { variant, ...runtimeRequest } = request;
+    let codeReads = 0;
+    const mkdirError = {};
+    Object.defineProperty(mkdirError, "code", {
+      get() {
+        codeReads += 1;
+        if (variant === "throw") throw new Error("code getter failure");
+        return codeReads === 1 ? "EXDEV" : "EACCES";
+      },
+    });
+    const adapter = {
+      ...fsPromises,
+      async mkdir() { throw mkdirError; },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let rejected = false;
+    let captured;
+    try {
+      await runtime.prepareQuarantineWorkspace({ ...runtimeRequest, fsApi: adapter });
+    } catch (error) {
+      rejected = true;
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: !rejected,
+      codeReads,
+      error: rejected ? errorShape(captured) : undefined,
+    }));
+  } else if (operation === "sync-close-lifecycle") {
+    const { variant, ...runtimeRequest } = request;
+    let closeGetterReads = 0;
+    let closeCalls = 0;
+    let closeWrongReceiver = 0;
+    let wrapped = false;
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        const realHandle = await fsPromises.open(path, ...args);
+        if (wrapped) return realHandle;
+        wrapped = true;
+        let handle;
+        handle = {
+          async sync() {
+            if (variant === "sync-reject") throw new Error("sync failure");
+            return realHandle.sync();
+          },
+          get close() {
+            closeGetterReads += 1;
+            return async function () {
+              closeCalls += 1;
+              if (this !== handle) closeWrongReceiver += 1;
+              try { await realHandle.close(); } catch {}
+              if (variant === "close-reject") throw new Error("close failure");
+            };
+          },
+        };
+        return handle;
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let rejected = false;
+    let captured;
+    try {
+      await runtime.prepareQuarantineWorkspace({ ...runtimeRequest, fsApi: adapter });
+    } catch (error) {
+      rejected = true;
+      captured = error;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: !rejected,
+      closeGetterReads,
+      closeCalls,
+      closeWrongReceiver,
+      error: rejected ? errorShape(captured) : undefined,
+    }));
+  } else if (operation === "layout-retry") {
+    const { failureRelative, ...runtimeRequest } = request;
+    const runRoot = join(request.quarantineRoot, request.transactionId);
+    const target = failureRelative === "" ? runRoot : join(runRoot, failureRelative ?? "manifests");
+    const targetParent = dirname(target);
+    let targetCreated = false;
+    let failureUsed = false;
+    let runRootOpenAttempts = 0;
+    const adapter = {
+      ...fsPromises,
+      async mkdir(path, ...args) {
+        const result = await fsPromises.mkdir(path, ...args);
+        if (path === target) targetCreated = true;
+        return result;
+      },
+      async open(path, ...args) {
+        if (targetCreated && path === targetParent) {
+          runRootOpenAttempts += 1;
+          if (!failureUsed) {
+            failureUsed = true;
+            const error = new Error("injected parent sync failure");
+            error.code = "EACCES";
+            throw error;
+          }
+        }
+        return fsPromises.open(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let firstCode;
+    try {
+      await runtime.prepareQuarantineWorkspace({ ...runtimeRequest, fsApi: adapter });
+    } catch (error) {
+      firstCode = error?.code;
+    }
+    const result = await runtime.prepareQuarantineWorkspace({ ...runtimeRequest, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result, firstCode, runRootOpenAttempts }));
+  } else if (operation === "capability-handoff") {
+    const handoff = await runtime.prepareQuarantineWorkspace(request);
+    let leakedAdapter;
+    const active = await withQuarantineRunCapability({
+      repoRoot: request.repoRoot,
+      quarantineRoot: request.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+      fsApi: handoff.fsSource,
+    }, async (capability) => {
+      const bound = getRunFsContext(capability, handoff.fsSource);
+      leakedAdapter = bound;
+      await bound.lstat(request.repoRoot);
+      let distinctRejected = false;
+      try {
+        getRunFsContext(capability, { ...handoff.fsSource });
+      } catch {
+        distinctRejected = true;
+      }
+      return { callable: typeof bound.lstat === "function", distinctRejected };
+    });
+    let revoked = false;
+    try {
+      await leakedAdapter.lstat(request.repoRoot);
+    } catch {
+      revoked = true;
+    }
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      active,
+      revoked,
+      sourceFrozen: Object.isFrozen(handoff.fsSource),
+    }));
+  } else if (operation === "layout-replacement") {
+    const runRoot = join(request.quarantineRoot, request.transactionId);
+    let replaced = false;
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        if (!replaced && path === runRoot) {
+          replaced = true;
+          renameSync(runRoot, runRoot + ".owned");
+          mkdirSync(runRoot, { mode: 0o700 });
+          chmodSync(runRoot, 0o700);
+        }
+        return fsPromises.open(path, ...args);
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    const result = await runtime.prepareQuarantineWorkspace({ ...request, fsApi: adapter });
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else if (operation === "prepare-raw") {
+    const result = await runtime.prepareQuarantineWorkspace(request);
+    process.stdout.write(JSON.stringify({ ok: true, result }));
+  } else {
+    throw new Error("bad worker operation");
+  }
+} catch (error) {
+  process.stdout.write(JSON.stringify({ ok: false, error: errorShape(error) }));
 }
 `;
-  const worker = spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
     input: JSON.stringify({ operation, request }),
     encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+    timeout,
+    env: { ...process.env, ...extraEnvironment },
   });
-  if (worker.status !== 0) throw new Error(worker.stderr || "quarantine worker failed");
-  return JSON.parse(worker.stdout) as {
-    ok: boolean;
-    result?: Record<string, unknown>;
-    error?: { code: string | null; message: string };
-  };
+  if (child.error) throw child.error;
+  if (child.status !== 0) throw new Error(child.stderr || `worker exited ${child.status}`);
+  return JSON.parse(child.stdout) as WorkerResult;
+}
+
+export function invokeWithGitStdoutError(request: Record<string, unknown>): WorkerResult {
+  const source = `
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (...args) {
+  const child = Reflect.apply(originalSpawn, this, args);
+  const childArgs = args[1];
+  if (Array.isArray(childArgs) && childArgs.includes("--no-index")) {
+    child.stdout[Symbol.asyncIterator] = async function* () {
+      throw new Error("injected Git stdout stream failure");
+    };
+  }
+  return child;
+};
+syncBuiltinESMExports();
+const transaction = await import(${JSON.stringify(transactionUrl)});
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const request = JSON.parse(input);
+try {
+  await transaction.quarantineWorkspace(request);
+  process.stdout.write(JSON.stringify({ ok: true }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({
+    ok: false,
+    error: { name: error?.name, code: error?.code, message: error?.message },
+  }));
+}
+`;
+  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    input: JSON.stringify(request),
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+    timeout: 30_000,
+  });
+  if (child.error) throw child.error;
+  if (child.status !== 0) throw new Error(child.stderr || `worker exited ${child.status}`);
+  return JSON.parse(child.stdout) as WorkerResult;
 }
