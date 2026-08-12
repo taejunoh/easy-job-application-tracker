@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { invokeQuarantineWorker, prepareQuarantinedFixture, spawnLifecycleChild } from "../fixtures/quarantine/quarantine-test-harness";
@@ -158,7 +158,233 @@ function validatePriorState(prepared: ReturnType<typeof prepareQuarantinedFixtur
   if (!validated.ok) throw new Error(JSON.stringify(validated));
 }
 
+async function crashRestoreWithProof(
+  prepared: ReturnType<typeof prepareQuarantinedFixture>,
+  options: Record<string, unknown>,
+  killAt: string,
+) {
+  const trace = join(prepared.runRoot, `matrix-${killAt.replaceAll(/[^A-Za-z0-9]/gu, "-")}.log`);
+  const crashed = await spawnLifecycleChild("restoreQuarantine", options, { killAt, phaseTracePath: trace });
+  expect(crashed.signal).toBe("SIGKILL");
+  expect(readFileSync(trace, "utf8").split("\n").filter(Boolean).at(-1)).toBe(killAt);
+  const lock = join(prepared.runRoot, "journal.lock");
+  expect(lstatSync(lock).isFile()).toBe(true);
+  rmSync(lock); // This test owns only the dead child residue it just proved.
+}
+
+const GENERATED_ENDPOINT_ROWS = [
+  ["active initial (P,A)", true, "after-event:RESTORE_INTENT:generated-next", [true, true, false]],
+  ["active staged (P,R)", true, "after-active-to-rollback-rename:generated-next", [true, false, true]],
+  ["active final (A,R)", true, "after-event:RESTORED_ENTRY:generated-next", [false, true, true]],
+  ["no-active initial (P)", false, "after-event:RESTORE_INTENT:generated-next", [true, false, false]],
+  ["no-active final (A)", false, "after-event:RESTORED_ENTRY:generated-next", [false, true, false]],
+] as const;
+
+function endpointPresence(prepared: ReturnType<typeof prepareQuarantinedFixture>, restoreId: string) {
+  const paths = [
+    join(prepared.runRoot, "payload", "generated", ".next"),
+    join(prepared.fixture.repoRoot, ".next"),
+    join(prepared.runRoot, "rollback", "regenerated-before-restore", restoreId, ".next"),
+  ];
+  return paths.map((path) => existsSync(path)) as [boolean, boolean, boolean];
+}
+
+function exactResultShape(keys: string[]) {
+  return {
+    prototype: "null",
+    keys,
+    frozen: true,
+    extensible: false,
+    mutationStable: true,
+    descriptors: Object.fromEntries(keys.map((key) => [key, {
+      enumerable: true, configurable: false, writable: false, callable: false,
+    }])),
+  };
+}
+
+function durableRecoveryEvidence(prepared: ReturnType<typeof prepareQuarantinedFixture>, paths: string[]) {
+  const pointer = join(prepared.fixture.quarantineRoot, "current");
+  const manifestDirectory = join(prepared.runRoot, "manifests");
+  const endpoint = (path: string) => {
+    try {
+      const stat = lstatSync(path);
+      return {
+        dev: stat.dev, ino: stat.ino, mode: stat.mode & 0o7777,
+        type: stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" : "file",
+        link: stat.isSymbolicLink() ? readlinkSync(path) : null,
+        build: stat.isDirectory() && existsSync(join(path, "build")) ? readFileSync(join(path, "build")).toString("base64") : null,
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  };
+  return {
+    journal: readFileSync(join(prepared.runRoot, "journal.log")).toString("base64"),
+    pointer: existsSync(pointer) ? readFileSync(pointer).toString("base64") : null,
+    generations: Object.fromEntries(readdirSync(manifestDirectory).sort().map((name) => [name, readFileSync(join(manifestDirectory, name)).toString("base64")])),
+    endpoints: paths.map(endpoint),
+  };
+}
+
 describe("quarantine restore real SIGKILL recovery", () => {
+  it.each(([
+    "QUARANTINED",
+    "VALIDATED",
+  ] as const).flatMap((prior) => GENERATED_ENDPOINT_ROWS.flatMap(([row, regenerate, killAt, presence]) =>
+    (["resume", "rollback"] as const).map((action) => [prior, row, regenerate, killAt, presence, action] as const),
+  ))) (
+    "public recoverRestore handles generated P/A/R row %s from %s by %s",
+    async (prior, _row, regenerate, killAt, expectedPresence, action) => {
+      // Validation verifies a real regenerated workspace.  The no-active
+      // rows are then the legitimate post-validation absence variant, not a
+      // shortcut around validation evidence.
+      const prepared = prepareQuarantinedFixture({ regenerate: prior === "VALIDATED" ? true : regenerate });
+      try {
+        if (prior === "VALIDATED") {
+          validatePriorState(prepared);
+          if (!regenerate) {
+            rmSync(join(prepared.fixture.repoRoot, ".next"), { recursive: true, force: true });
+            rmSync(join(prepared.fixture.repoRoot, "node_modules"), { recursive: true, force: true });
+          }
+        }
+        const options = {
+          repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId, writersStopped: true,
+        };
+        await crashRestoreWithProof(prepared, options, killAt);
+        const restoreId = "restore-c3624475-87d7-4886-b0bf-68a5061663d2";
+        expect(endpointPresence(prepared, restoreId)).toEqual(expectedPresence);
+        const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action });
+        if (recovered.code !== 0) throw new Error(JSON.stringify(recovered));
+        expect(JSON.parse(recovered.stdout)).toEqual(action === "resume"
+          ? { transactionId: prepared.transactionId, restoreId, status: "RESTORED", action: "resume", reconciledEntries: 3 }
+          : { transactionId: prepared.transactionId, restoreId, status: prior, action: "rollback", reconciledEntries: 1, restoreAborted: true });
+        expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe(action === "resume"
+          ? "RESTORED"
+          : prior === "VALIDATED" ? "RESTORE_ABORTED_TO_VALIDATED" : "RESTORE_ABORTED_TO_QUARANTINED");
+      } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+    },
+    60_000,
+  );
+
+  it.each((["QUARANTINED", "VALIDATED"] as const).flatMap((prior) =>
+    (["resume", "rollback"] as const).map((action) => [prior, action] as const),
+  ))("public recoverRestore handles no-intent %s provenance by %s", async (prior, action) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      if (prior === "VALIDATED") validatePriorState(prepared);
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      await crashRestoreWithProof(prepared, options, "after-event:RESTORE_PREPARED");
+      const result = await spawnLifecycleChild("recoverRestore", { ...options, action });
+      if (result.code !== 0) throw new Error(JSON.stringify(result));
+      expect(JSON.parse(result.stdout)).toEqual(action === "resume"
+        ? { transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume", reconciledEntries: 3 }
+        : { transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: prior, action: "rollback", reconciledEntries: 0, restoreAborted: true });
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("uses endpoint role and inode, rather than equal generated bytes, for public recovery", async () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      await crashRestoreWithProof(prepared, options, "after-event:RESTORE_INTENT:generated-next");
+      const payload = join(prepared.runRoot, "payload", "generated", ".next");
+      const active = join(prepared.fixture.repoRoot, ".next");
+      expect(readFileSync(join(payload, "build"))).toEqual(readFileSync(join(active, "build")));
+      expect(lstatSync(payload).ino).not.toBe(lstatSync(active).ino);
+      const result = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
+      if (result.code !== 0) throw new Error(JSON.stringify(result));
+      expect(JSON.parse(result.stdout)).toEqual({ transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 1, restoreAborted: true });
+      expect(lstatSync(join(prepared.fixture.repoRoot, ".next")).ino).toBe(lstatSync(active).ino);
+      expect(lstatSync(join(prepared.runRoot, "payload", "generated", ".next")).ino).toBe(lstatSync(payload).ino);
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it.each([
+    ["resume", "RESTORED", ["transactionId", "restoreId", "status", "action", "reconciledEntries"]],
+    ["rollback", "QUARANTINED", ["transactionId", "restoreId", "status", "action", "reconciledEntries", "restoreAborted"]],
+  ] as const)("returns an exact immutable public %s result record", async (action, _status, keys) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      await crashRestoreWithProof(prepared, options, "after-event:RESTORE_INTENT:generated-next");
+      const observed = invokeQuarantineWorker("recover-restore-shape", { ...options, action }) as unknown as { ok: boolean; result: Record<string, unknown>; shape: ReturnType<typeof exactResultShape> };
+      expect(observed.ok).toBe(true);
+      expect(observed.result).toEqual(expect.objectContaining({ transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: _status, action }));
+      expect(observed.shape).toEqual(exactResultShape([...keys]));
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("returns an exact immutable public conflict result record", async () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      await crashRestoreWithProof(prepared, options, "after-active-to-rollback-rename:generated-next");
+      writeFileSync(join(prepared.runRoot, "rollback", "regenerated-before-restore", "restore-c3624475-87d7-4886-b0bf-68a5061663d2", ".next", "foreign"), "foreign\n");
+      const observed = invokeQuarantineWorker("recover-restore-shape", { ...options, action: "rollback" }) as unknown as { ok: boolean; result: Record<string, unknown>; shape: ReturnType<typeof exactResultShape> };
+      expect(observed.ok).toBe(true);
+      expect(observed.result).toEqual({
+        transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2",
+        status: "INCOMPLETE_CONFLICT", action: "rollback", conflictEntryIds: ["generated-next"],
+      });
+      expect(observed.shape).toEqual(exactResultShape(["transactionId", "restoreId", "status", "action", "conflictEntryIds"]));
+      const terminal = invokeQuarantineWorker("recover-restore-shape", { ...options, action: "resume" }) as unknown as { ok: boolean; result: Record<string, unknown>; shape: ReturnType<typeof exactResultShape> };
+      expect(terminal).toEqual({
+        ok: true,
+        result: {
+          transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2",
+          status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
+        },
+        shape: exactResultShape(["transactionId", "restoreId", "status", "action", "conflictEntryIds"]),
+      });
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it.each([
+    ["payload mismatch", "conflict", (payload: string, _active: string, _rollback: string) => writeFileSync(join(payload, "foreign"), "foreign\n")],
+    ["rollback missing", "conflict", (_payload: string, _active: string, rollback: string) => rmSync(rollback, { recursive: true, force: true })],
+    ["rollback mismatch", "conflict", (_payload: string, _active: string, rollback: string) => writeFileSync(join(rollback, "foreign"), "foreign\n")],
+    ["both payload and rollback mismatched", "conflict", (payload: string, _active: string, rollback: string) => {
+      writeFileSync(join(payload, "foreign"), "foreign payload\n");
+      writeFileSync(join(rollback, "foreign"), "foreign rollback\n");
+    }],
+    ["unauthorized payload symlink", "fatal", (payload: string, _active: string, _rollback: string) => {
+      rmSync(payload, { recursive: true, force: true });
+      symlinkSync("/nonexistent/foreign-generated", payload);
+    }],
+  ] as const)("handles public generated %s evidence without replacing it", async (_label, outcome, mutate) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      await crashRestoreWithProof(prepared, options, "after-active-to-rollback-rename:generated-next");
+      const restoreId = "restore-c3624475-87d7-4886-b0bf-68a5061663d2";
+      const payload = join(prepared.runRoot, "payload", "generated", ".next");
+      const active = join(prepared.fixture.repoRoot, ".next");
+      const rollback = join(prepared.runRoot, "rollback", "regenerated-before-restore", restoreId, ".next");
+      mutate(payload, active, rollback);
+      const paths = [payload, active, rollback, join(prepared.fixture.repoRoot, "node_modules")];
+      const before = durableRecoveryEvidence(prepared, paths);
+      const result = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
+      if (outcome === "conflict") {
+        if (result.code !== 0) throw new Error(JSON.stringify(result));
+        expect(JSON.parse(result.stdout)).toEqual({
+          transactionId: prepared.transactionId, restoreId, status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
+        });
+      } else expect(result.code).not.toBe(0);
+      const after = durableRecoveryEvidence(prepared, paths);
+      // The terminal conflict itself is the only durable addition.  All prior
+      // journal bytes, pointer/generation bytes, and endpoint identities stay
+      // authoritative evidence.
+      if (outcome === "conflict") {
+        expect(after.journal).not.toBe(before.journal);
+        expect(readFileSync(join(prepared.runRoot, "journal.log")).subarray(0, Buffer.from(before.journal, "base64").length).toString("base64")).toBe(before.journal);
+      } else expect(after.journal).toBe(before.journal);
+      expect(after.pointer).toBe(before.pointer);
+      expect(after.generations).toEqual(before.generations);
+      expect(after.endpoints).toEqual(before.endpoints);
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
   it.each(["payload", "active", "both"] as const)("preserves every conflicting source endpoint byte-for-byte and is idempotent: %s", async (mutation) => {
     const prepared = prepareQuarantinedFixture();
     try {
@@ -222,10 +448,22 @@ describe("quarantine restore real SIGKILL recovery", () => {
       const restored = await spawnLifecycleChild("restoreQuarantine", options);
       if (restored.code !== 0) throw new Error(JSON.stringify(restored));
       const journal = join(prepared.runRoot, "journal.log");
-      const before = readFileSync(journal);
+      const before = durableRecoveryEvidence(prepared, [
+        join(prepared.fixture.repoRoot, ".next"),
+        join(prepared.fixture.repoRoot, "node_modules"),
+        join(prepared.fixture.repoRoot, "notes 2.txt"),
+        join(prepared.runRoot, "payload", "generated", ".next"),
+        join(prepared.runRoot, "payload", "source-copies", "copy-0001"),
+      ]);
       const recovery = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
       expect(recovery.code).not.toBe(0);
-      expect(readFileSync(journal)).toEqual(before);
+      expect(durableRecoveryEvidence(prepared, [
+        join(prepared.fixture.repoRoot, ".next"),
+        join(prepared.fixture.repoRoot, "node_modules"),
+        join(prepared.fixture.repoRoot, "notes 2.txt"),
+        join(prepared.runRoot, "payload", "generated", ".next"),
+        join(prepared.runRoot, "payload", "source-copies", "copy-0001"),
+      ])).toEqual(before);
       expect(journalEvents(journal).at(-1)).toBe("RESTORED");
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });

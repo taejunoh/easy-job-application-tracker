@@ -548,6 +548,20 @@ try {
       },
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+  } else if (operation === "recover-restore-shape") {
+    // JSON serialization would erase a null prototype, frozen state, and
+    // descriptor flags.  Keep this observation in the same realm as the
+    // public recoverRestore call.
+    try {
+      const result = await restore.recoverRestore(request);
+      const resultShape = shape(result);
+      const before = JSON.stringify(result);
+      resultShape.mutationStable = Reflect.set(result, "status", "MUTATED") === false &&
+        Reflect.set(result, "restoreId", "MUTATED") === false && JSON.stringify(result) === before;
+      process.stdout.write(JSON.stringify({ ok: true, result, shape: resultShape }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, error: errorShape(error) }));
+    }
   } else if (operation === "restore") {
     const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, indeterminatePrepared, preexistingRestoreInventory, partialPublisher, publisherParentExchange, publisherCleanupFailure, publisherHardlink, publisherCapabilityExchange, oversizedRestoredTree, traceRestoreFs, ...restoreRequest } = request;
     const phases = [];
