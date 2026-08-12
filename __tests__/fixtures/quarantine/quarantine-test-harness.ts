@@ -518,11 +518,12 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "restore") {
-    const { stopPhase, interloperAtFinalPrecheck, ...restoreRequest } = request;
+    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ...restoreRequest } = request;
     const phases = [];
     try {
       let armed = false;
       let inserted = false;
+      let drifted = false;
       let fsApi;
       if (interloperAtFinalPrecheck === "source-active") {
         const target = join(request.repoRoot, "notes 2.txt");
@@ -541,6 +542,12 @@ try {
         ...(fsApi === undefined ? {} : { fsApi }),
         async faultHook(phase) {
           phases.push(phase);
+          if (!drifted && finalPresenceDrift !== undefined && phase.startsWith("after-inventory:restore-active:")) {
+            drifted = true;
+            const target = join(request.repoRoot, finalPresenceDrift === "remove-next" ? ".next" : "node_modules");
+            if (finalPresenceDrift === "remove-next") rmSync(target, { recursive: true, force: true });
+            else { mkdirSync(target, { recursive: true, mode: 0o700 }); writeFileSync(join(target, "foreign"), "foreign\\n"); }
+          }
           if (phase === "after-event:RESTORING") armed = true;
           if (phase === stopPhase) throw new RangeError("stop at requested restore phase");
         },

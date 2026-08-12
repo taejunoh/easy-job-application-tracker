@@ -1,13 +1,82 @@
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 
 import { prepareQuarantinedFixture, invokeQuarantineWorker } from "../fixtures/quarantine/quarantine-test-harness";
 
 const restoreUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-restore.mjs"),
 ).href;
+
+function journalEvents(path: string) {
+  return journalRecords(path).map((record) => record.event);
+}
+
+function journalRecords(path: string): Array<{ event: string; payload: Record<string, unknown> }> {
+  const bytes = readFileSync(path);
+  const records: Array<{ event: string; payload: Record<string, unknown> }> = [];
+  for (let offset = 0; offset < bytes.length;) {
+    const length = bytes.readUInt32BE(offset);
+    offset += 4;
+    records.push(JSON.parse(bytes.subarray(offset, offset + length).toString("utf8")));
+    offset += length;
+  }
+  return records;
+}
+
+function generationEvidence(prepared: ReturnType<typeof prepareQuarantinedFixture>) {
+  const manifests = join(prepared.runRoot, "manifests");
+  const pointer = join(prepared.fixture.quarantineRoot, "current");
+  return JSON.stringify({
+    pointer: existsSync(pointer) ? readFileSync(pointer).toString("base64") : null,
+    manifests: readdirSync(manifests).sort().map((name) => [name, readFileSync(join(manifests, name)).toString("base64")]),
+  });
+}
+
+const NORMAL_RESTORE_PHASES = [
+  "after-inventory:restore-active:generated-next",
+  "after-inventory:restore-active:generated-node-modules",
+  "after-event:RESTORE_PREPARED",
+  "after-event:RESTORING",
+  "after-event:RESTORE_INTENT:generated-next",
+  "after-active-to-rollback-rename:generated-next",
+  "after-rollback-tree-sync:generated-next",
+  "after-rollback-destination-parent-sync:generated-next",
+  "after-rollback-source-parent-sync:generated-next",
+  "after-payload-to-active-rename:generated-next",
+  "after-restored-payload-sync:generated-next",
+  "after-restore-destination-parent-sync:generated-next",
+  "after-restore-source-parent-sync:generated-next",
+  "after-event:RESTORED_ENTRY:generated-next",
+  "after-event:RESTORE_INTENT:generated-node-modules",
+  "after-active-to-rollback-rename:generated-node-modules",
+  "after-rollback-tree-sync:generated-node-modules",
+  "after-rollback-destination-parent-sync:generated-node-modules",
+  "after-rollback-source-parent-sync:generated-node-modules",
+  "after-payload-to-active-rename:generated-node-modules",
+  "after-restored-payload-sync:generated-node-modules",
+  "after-restore-destination-parent-sync:generated-node-modules",
+  "after-restore-source-parent-sync:generated-node-modules",
+  "after-event:RESTORED_ENTRY:generated-node-modules",
+  "after-event:RESTORE_INTENT:copy-0001",
+  "after-payload-to-active-rename:copy-0001",
+  "after-restored-payload-sync:copy-0001",
+  "after-restore-destination-parent-sync:copy-0001",
+  "after-restore-source-parent-sync:copy-0001",
+  "after-event:RESTORED_ENTRY:copy-0001",
+  "after-event:RESTORED",
+  "before-lock-cleanup",
+] as const;
+
+function durableEventAt(phase: string) {
+  if (phase === "after-event:RESTORE_PREPARED") return "RESTORE_PREPARED";
+  if (phase === "after-event:RESTORING") return "RESTORING";
+  if (phase.startsWith("after-event:RESTORE_INTENT:")) return "RESTORE_INTENT";
+  if (phase.startsWith("after-event:RESTORED_ENTRY:")) return "RESTORED_ENTRY";
+  if (phase === "after-event:RESTORED" || phase === "before-lock-cleanup") return "RESTORED";
+  return null;
+}
 
 describe("quarantine restore", () => {
   it("exports only restoreQuarantine", () => {
@@ -114,6 +183,33 @@ describe("quarantine restore", () => {
     }
   });
 
+  it.each(NORMAL_RESTORE_PHASES)("awaits interruption at public restore phase %s without publishing a later journal event", (stopPhase) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const beforeGeneration = generationEvidence(prepared);
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        writersStopped: true,
+        stopPhase,
+      }, {}, 20_000);
+      expect(result.ok).toBe(false);
+      const index = NORMAL_RESTORE_PHASES.indexOf(stopPhase);
+      expect(result.phases).toEqual(NORMAL_RESTORE_PHASES.slice(0, index + 1));
+      expect(generationEvidence(prepared)).toBe(beforeGeneration);
+      const durable = durableEventAt(stopPhase);
+      const events = journalEvents(join(prepared.runRoot, "journal.log"));
+      if (durable !== null) expect(events.at(-1)).toBe(durable);
+      else expect(events).not.toContain("RESTORE_PREPARED");
+      // The injected hook is awaited inside the operation; it cannot be
+      // followed by a later public phase or journal append in this attempt.
+      expect(result.phases.slice(index + 1)).toEqual([]);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     [true, true], [true, false], [false, true], [false, false],
   ])("records the exact active-generated presence matrix (%s, %s)", (nextPresent, modulesPresent) => {
@@ -138,6 +234,69 @@ describe("quarantine restore", () => {
       expect(journal).toContain("RESTORE_PREPARED");
       expect(existsSync(join(prepared.runRoot, "inventories", "restore-active", "generated-next.jsonl"))).toBe(nextPresent);
       expect(existsSync(join(prepared.runRoot, "inventories", "restore-active", "generated-node-modules.jsonl"))).toBe(modulesPresent);
+      const preparedRecord = journalRecords(join(prepared.runRoot, "journal.log"))
+        .find((record) => record.event === "RESTORE_PREPARED")!;
+      const active = preparedRecord.payload.activeGenerated as Array<{ id: string; inventory: unknown }>;
+      expect(Object.keys(active)).toEqual(["0", "1"]);
+      expect(active.map((entry) => entry.id)).toEqual(["generated-next", "generated-node-modules"]);
+      expect(active.map((entry) => entry.inventory === null)).toEqual([!nextPresent, !modulesPresent]);
+      for (const entry of active) {
+        if (entry.inventory !== null) expect(entry.inventory).toEqual(expect.objectContaining({ sha256: expect.any(String), entries: expect.any(Number), bytes: expect.any(Number) }));
+      }
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["removes an inventoried root", undefined, "remove-next"],
+    ["recreates an absent root", { regenerate: false }, "recreate-modules"],
+  ])("rejects final active presence drift before RESTORE_PREPARED: %s", (_label, fixtureOptions, finalPresenceDrift) => {
+    const prepared = prepareQuarantinedFixture(fixtureOptions ?? {});
+    try {
+      if (finalPresenceDrift === "recreate-modules") {
+        mkdirSync(join(prepared.fixture.repoRoot, ".next"), { recursive: true, mode: 0o700 });
+        writeFileSync(join(prepared.fixture.repoRoot, ".next", "build"), "regenerated\n");
+      }
+      const beforeJournal = readFileSync(join(prepared.runRoot, "journal.log"));
+      const beforeGeneration = generationEvidence(prepared);
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, finalPresenceDrift,
+      });
+      expect(result.ok).toBe(false);
+      expect(journalEvents(join(prepared.runRoot, "journal.log"))).not.toContain("RESTORE_PREPARED");
+      expect(readFileSync(join(prepared.runRoot, "journal.log")).subarray(0, beforeJournal.length)).toEqual(beforeJournal);
+      expect(generationEvidence(prepared)).toBe(beforeGeneration);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [true, true], [true, false], [false, true], [false, false],
+  ])("preserves the dense activeGenerated provenance for VALIDATED (%s, %s)", (nextPresent, modulesPresent) => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    try {
+      for (const [present, directory, file] of [[nextPresent, ".next", "build"], [modulesPresent, "node_modules", "package"]] as const) {
+        if (!present) continue;
+        mkdirSync(join(prepared.fixture.repoRoot, directory), { recursive: true, mode: 0o700 });
+        writeFileSync(join(prepared.fixture.repoRoot, directory, file), "regenerated\n");
+      }
+      const validated = invokeQuarantineWorker("mark-validated", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, validatedAt: "2026-08-11T00:00:00.000Z", writersStopped: true,
+      });
+      if (!validated.ok) throw new Error(JSON.stringify(validated));
+      const restored = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true,
+      });
+      if (!restored.ok) throw new Error(JSON.stringify(restored));
+      const active = journalRecords(join(prepared.runRoot, "journal.log"))
+        .find((record) => record.event === "RESTORE_PREPARED")!.payload.activeGenerated as Array<{ id: string; inventory: unknown }>;
+      expect(active.map((entry) => entry.id)).toEqual(["generated-next", "generated-node-modules"]);
+      expect(active.map((entry) => entry.inventory === null)).toEqual([!nextPresent, !modulesPresent]);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
