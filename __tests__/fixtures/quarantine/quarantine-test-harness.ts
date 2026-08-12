@@ -520,6 +520,7 @@ try {
   } else if (operation === "restore") {
     const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, ...restoreRequest } = request;
     const phases = [];
+    let finalPrecheckTargetReads = 0;
     try {
       let armed = false;
       let inserted = false;
@@ -556,6 +557,7 @@ try {
         };
         fsApi.lstat = async (path) => {
           const ready = interloperAtFinalPrecheck === "source-active" ? armed : generatedMoved;
+          if (ready && path === target) finalPrecheckTargetReads += 1;
           if (ready && !inserted && path === target) {
             inserted = true;
             if (interloperAtFinalPrecheck === "source-active") writeFileSync(target, "foreign interloper\\n");
@@ -592,9 +594,9 @@ try {
           if (phase === stopPhase) throw new RangeError("stop at requested restore phase");
         },
       });
-      process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads }));
     } catch (error) {
-      process.stdout.write(JSON.stringify({ ok: false, phases, error: errorShape(error) }));
+      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, error: errorShape(error) }));
     }
   } else if (operation === "restore-authority-seam") {
     const { target, ...restoreRequest } = request;

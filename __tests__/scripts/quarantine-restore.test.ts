@@ -385,6 +385,7 @@ describe("quarantine restore", () => {
         interloperAtFinalPrecheck: "source-active",
       });
       expect(result.ok).toBe(false);
+      if ((result as unknown as { finalPrecheckTargetReads?: number }).finalPrecheckTargetReads !== 1) throw new Error(JSON.stringify(result));
       expect(readFileSync(join(prepared.fixture.repoRoot, prepared.fixture.copyPath!), "utf8")).toBe("foreign interloper\n");
       expect(readFileSync(join(prepared.runRoot, "journal.log")).subarray(0, before.length)).toEqual(before);
     } finally {
@@ -403,6 +404,7 @@ describe("quarantine restore", () => {
         interloperAtFinalPrecheck: "generated-active",
       });
       expect(result.ok).toBe(false);
+      if ((result as unknown as { finalPrecheckTargetReads?: number }).finalPrecheckTargetReads !== 1) throw new Error(JSON.stringify(result));
       expect(readFileSync(join(prepared.fixture.repoRoot, ".next", "foreign"), "utf8")).toBe("foreign interloper\n");
       expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_INTENT");
     } finally {
