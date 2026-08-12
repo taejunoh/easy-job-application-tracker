@@ -353,6 +353,28 @@ describe("quarantine restore", () => {
     }
   });
 
+  it("bounds global restored-tree fsync traversal before RESTORED_ENTRY", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, oversizedRestoredTree: true,
+      }) as unknown as {
+        ok: boolean; phases: string[]; syncOpened: number; syncClosed: number; maxSyncHandles: number;
+        error?: { message?: string };
+      };
+      expect(result.ok).toBe(false);
+      expect(result.error?.message).toMatch(/sync tree exceeded fixed entry bounds/u);
+      expect(result.phases.at(-1)).toBe("after-payload-to-active-rename:generated-next");
+      expect(result.phases).not.toContain("after-event:RESTORED_ENTRY:generated-next");
+      expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_INTENT");
+      expect(result.syncOpened).toBe(result.syncClosed);
+      expect(result.maxSyncHandles).toBeLessThanOrEqual(2);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it("publishes restore-active inventories as exact 0600 files under restrictive umask", () => {
     const prepared = prepareQuarantinedFixture();
     const previousUmask = process.umask(0o777);
