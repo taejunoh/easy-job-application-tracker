@@ -25,6 +25,7 @@ import {
   canonicalDiff,
   createQuarantineFixture,
   FS_METHODS,
+  git,
   HISTORY_FRAME_LIMIT,
   HISTORY_OID_BODY_LIMIT,
   installGitDiffOverride,
