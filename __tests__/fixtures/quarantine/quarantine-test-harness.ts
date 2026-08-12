@@ -518,7 +518,7 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "restore") {
-    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, indeterminatePrepared, traceRestoreFs, ...restoreRequest } = request;
+    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, indeterminatePrepared, preexistingRestoreInventory, partialPublisher, publisherParentExchange, traceRestoreFs, ...restoreRequest } = request;
     const phases = [];
     let finalPrecheckTargetReads = 0;
     let finalInterloperPath;
@@ -530,6 +530,8 @@ try {
     let foreignOpenCalls = 0;
     let activeRootMarker;
     let activeRootInventory;
+    let publisherOwnedPath;
+    let publisherForeignSentinel;
     const fsTrace = [];
     let derivedTracePaths;
     try {
@@ -540,6 +542,10 @@ try {
       let generatedMoved = false;
       let fsApi;
       let activeRootExchanged = false;
+      if (preexistingRestoreInventory !== undefined) {
+        const path = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", preexistingRestoreInventory + ".jsonl");
+        writeFileSync(path, "foreign inventory\\n", { mode: 0o600 });
+      }
       if (indeterminatePrepared === true) {
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
         const originalOpen = fsApi.open;
@@ -552,6 +558,37 @@ try {
               if (property === "sync") return async (...syncArgs) => {
                 await Reflect.apply(value, inner, syncArgs);
                 throw new Error("injected prepared journal sync failure");
+              };
+              return typeof value === "function" ? value.bind(inner) : value;
+            },
+          });
+        };
+      }
+      if (partialPublisher === true) {
+        fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+        const originalOpen = fsApi.open;
+        fsApi.open = async (path, ...args) => {
+          const handle = await originalOpen(path, ...args);
+          if (!String(path).endsWith("/inventories/restore-active/generated-next.jsonl") || args[0] !== "wx") return handle;
+          publisherOwnedPath = path;
+          let writes = 0;
+          return new Proxy(handle, {
+            get(inner, property) {
+              const value = Reflect.get(inner, property, inner);
+              if (property === "write") return async (buffer, offset, length, position) => {
+                writes += 1;
+                if (writes === 1) {
+                  const result = await Reflect.apply(value, inner, [buffer, offset, Math.min(1, length), position]);
+                  if (publisherParentExchange === true) {
+                    const parent = dirname(path);
+                    renameSync(parent, parent + ".foreign-owned");
+                    mkdirSync(parent, { recursive: true, mode: 0o700 });
+                    publisherForeignSentinel = join(parent, "foreign-sentinel");
+                    writeFileSync(publisherForeignSentinel, "foreign");
+                  }
+                  return result;
+                }
+                throw new Error("injected partial restore-active inventory write failure");
               };
               return typeof value === "function" ? value.bind(inner) : value;
             },
@@ -733,7 +770,7 @@ try {
         const path = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl");
         activeRootInventory.bytesAfter = existsSync(path) ? readFileSync(path).toString("base64") : null;
       }
-      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, derivedTracePaths, fsTrace }));
+      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, publisherOwnedPath, publisherForeignSentinel, derivedTracePaths, fsTrace }));
     } catch (error) {
       if (publicationEvidence !== undefined) {
         publicationEvidence = publicationEvidence.map((entry) => ({
@@ -747,7 +784,7 @@ try {
         const path = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl");
         activeRootInventory.bytesAfter = existsSync(path) ? readFileSync(path).toString("base64") : null;
       }
-      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, derivedTracePaths, fsTrace, error: errorShape(error) }));
+      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, publisherOwnedPath, publisherForeignSentinel, derivedTracePaths, fsTrace, error: errorShape(error) }));
     }
   } else if (operation === "restore-parent-sync-seam") {
     const { target, timing, ...restoreRequest } = request;

@@ -273,6 +273,53 @@ describe("quarantine restore", () => {
     }
   });
 
+  it("preserves a foreign pre-existing restore-active inventory EEXIST backing", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const path = join(prepared.runRoot, "inventories", "restore-active", "generated-next.jsonl");
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, preexistingRestoreInventory: "generated-next",
+      });
+      expect(result.ok).toBe(false);
+      expect(readFileSync(path, "utf8")).toBe("foreign inventory\n");
+      expect(journalEvents(join(prepared.runRoot, "journal.log"))).not.toContain("RESTORE_PREPARED");
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("removes its partial restore-active inventory output after a write failure", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, partialPublisher: true,
+      }) as unknown as { ok: boolean; publisherOwnedPath?: string; error?: { message: string } };
+      expect(result.ok).toBe(false);
+      expect(result.error?.message).toMatch(/partial restore-active inventory write failure/u);
+      expect(existsSync(result.publisherOwnedPath!)).toBe(false);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a partial inventory behind an exchanged publisher parent", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, partialPublisher: true, publisherParentExchange: true,
+      }) as unknown as { ok: boolean; publisherOwnedPath?: string; publisherForeignSentinel?: string; error?: { message?: string } };
+      expect(result.ok).toBe(false);
+      expect(readFileSync(result.publisherForeignSentinel!, "utf8")).toBe("foreign");
+      expect(existsSync(result.publisherOwnedPath!.replace("/restore-active/", "/restore-active.foreign-owned/"))).toBe(true);
+      expect(result.error?.message).toMatch(/publish and cleanup failed/u);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("publishes restore-active inventories as exact 0600 files under restrictive umask", () => {
     const prepared = prepareQuarantinedFixture();
     const previousUmask = process.umask(0o777);
