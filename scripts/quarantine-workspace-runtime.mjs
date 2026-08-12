@@ -3141,6 +3141,9 @@ export async function markQuarantineValidated(input) {
     if (error instanceof IndeterminateJournalAppendError) {
       throw new QuarantineError("ERR_INDETERMINATE_JOURNAL_APPEND");
     }
+    if (options?.fsApi === undefined && error?.code === "ERR_PREFLIGHT") {
+      throw new QuarantineError("ERR_PREFLIGHT");
+    }
     throw publicError(error, "ERR_INTEGRITY");
   }
 }
