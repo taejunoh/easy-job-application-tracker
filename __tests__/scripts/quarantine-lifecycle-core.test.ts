@@ -26,6 +26,9 @@ describe("quarantine lifecycle core", () => {
     expect(publicExports.exports).not.toContain("withExistingQuarantineRun");
     expect(publicExports.runtimeExports).not.toContain("withExistingQuarantineRun");
     expect(publicExports.legacyExports).not.toContain("withExistingQuarantineRun");
+    expect(publicExports.exports).not.toContain("internalSummarizeInventoryDirectory");
+    expect(publicExports.runtimeExports).not.toContain("internalSummarizeInventoryDirectory");
+    expect(publicExports.legacyExports).not.toContain("internalSummarizeInventoryDirectory");
   });
 
   it("publishes one immutable VALIDATED generation and reuses it on retry", () => {
