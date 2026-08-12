@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 
@@ -76,6 +76,40 @@ describe("quarantine lifecycle core", () => {
     }
   });
 
+  it.each([
+    "after-inventory:validation-pass-1:generated-next",
+    "after-inventory:validation-pass-2:generated-next",
+    "after-inventory:validation-pass-1:generated-node-modules",
+    "after-inventory:validation-pass-2:generated-node-modules",
+    "after-validated-generation",
+    "after-event:VALIDATED",
+    "before-lock-cleanup",
+    "after-pointer-temporary-sync",
+    "after-pointer-rename",
+    "after-pointer-root-sync",
+  ])("propagates interruption at validation public phase %s without deleting evidence", (stopPhase) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const journal = join(prepared.runRoot, "journal.log");
+      const beforeJournal = readFileSync(journal);
+      const result = invokeQuarantineWorker("mark-validated", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        validatedAt: "2026-08-11T00:00:00.000Z",
+        writersStopped: true,
+        stopPhase,
+      }) as unknown as { ok: boolean; phases: string[] };
+      expect(result.ok).toBe(false);
+      expect(result.phases).toContain(stopPhase);
+      expect(readFileSync(journal).subarray(0, beforeJournal.length)).toEqual(beforeJournal);
+      expect(existsSync(prepared.runRoot)).toBe(true);
+      expect(existsSync(join(prepared.fixture.quarantineRoot, prepared.transactionId))).toBe(true);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("hands only frozen, null-prototype lifecycle evidence to the callback", () => {
     const prepared = prepareQuarantinedFixture({ regenerate: false });
     try {
@@ -104,6 +138,19 @@ describe("quarantine lifecycle core", () => {
         keys: ["manifestSha256", "state", "manifest"],
       });
       expect(result.observed.fsApi).toMatchObject({ prototype: "null", frozen: true });
+      for (const shape of [
+        result.observed.handoff,
+        result.observed.journalTip,
+        result.observed.manifestGeneration,
+      ]) {
+        for (const descriptor of Object.values(shape.descriptors)) {
+          expect(descriptor).toEqual(expect.objectContaining({
+            enumerable: true,
+            configurable: false,
+            writable: false,
+          }));
+        }
+      }
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
@@ -126,6 +173,84 @@ describe("quarantine lifecycle core", () => {
       expect(Object.values(result.getters)).toEqual(Array(14).fill(1));
       expect(result.wrongReceiver).toBe(0);
       expect(result.revoked).toBe(true);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the omitted default filesystem source only through a frozen revocable handoff", () => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    try {
+      const result = invokeQuarantineWorker("core-contract", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+      }) as unknown as {
+        ok: boolean; callbackInvoked: number; revoked: boolean;
+        observed: { fsApi: { frozen: boolean; prototype: string; descriptors: Record<string, { writable: boolean; configurable: boolean }> } };
+      };
+      expect(result).toMatchObject({ ok: true, callbackInvoked: 1, revoked: true });
+      expect(result.observed.fsApi).toMatchObject({ frozen: true, prototype: "null" });
+      for (const descriptor of Object.values(result.observed.fsApi.descriptors)) {
+        expect(descriptor).toMatchObject({ writable: false, configurable: false, callable: true });
+      }
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "malformed-json",
+    "foreign-transaction",
+    "foreign-digest",
+    "path-bearing",
+    "symlink",
+  ])("rejects a %s current pointer before callback and preserves its evidence", (variant) => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    try {
+      const pointer = join(prepared.fixture.quarantineRoot, "current");
+      if (variant === "malformed-json") writeFileSync(pointer, "{");
+      else if (variant === "foreign-transaction") writeFileSync(pointer, JSON.stringify({
+        schemaVersion: 1, transactionId: "foreign", manifestSha256: "a".repeat(64),
+      }));
+      else if (variant === "foreign-digest") writeFileSync(pointer, JSON.stringify({
+        schemaVersion: 1, transactionId: prepared.transactionId, manifestSha256: "a".repeat(64),
+      }));
+      else if (variant === "path-bearing") writeFileSync(pointer, JSON.stringify({
+        schemaVersion: 1, transactionId: prepared.transactionId, manifestSha256: "a".repeat(64), path: "/foreign",
+      }));
+      else {
+        writeFileSync(join(prepared.fixture.quarantineRoot, "pointer-sentinel"), "foreign");
+        symlinkSync(join(prepared.fixture.quarantineRoot, "pointer-sentinel"), pointer);
+      }
+      const before = readFileSync(pointer);
+      const result = invokeQuarantineWorker("core-contract", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+      }) as unknown as { ok: boolean; callbackInvoked: number };
+      expect(result).toMatchObject({ ok: false, callbackInvoked: 0 });
+      expect(readFileSync(pointer)).toEqual(before);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["missing", "corrupt"]) ("rejects a %s prepared manifest generation before callback", (variant) => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    try {
+      const manifests = join(prepared.runRoot, "manifests");
+      const generation = join(manifests, readdirSync(manifests)[0]);
+      const beforeJournal = readFileSync(join(prepared.runRoot, "journal.log"));
+      if (variant === "missing") rmSync(generation);
+      else writeFileSync(generation, "{\"foreign\":true}\n");
+      const result = invokeQuarantineWorker("core-contract", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+      }) as unknown as { ok: boolean; callbackInvoked: number };
+      expect(result).toMatchObject({ ok: false, callbackInvoked: 0 });
+      expect(readFileSync(join(prepared.runRoot, "journal.log"))).toEqual(beforeJournal);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }

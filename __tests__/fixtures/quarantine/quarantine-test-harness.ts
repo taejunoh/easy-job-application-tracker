@@ -460,12 +460,20 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "mark-validated") {
+    const { stopPhase, ...validationRequest } = request;
     const phases = [];
-    const result = await transaction.markQuarantineValidated({
-      ...request,
-      faultHook(phase) { phases.push(phase); },
-    });
-    process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+    try {
+      const result = await transaction.markQuarantineValidated({
+        ...validationRequest,
+        async faultHook(phase) {
+          phases.push(phase);
+          if (phase === stopPhase) throw new RangeError("stop at requested validation phase");
+        },
+      });
+      process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, phases, error: errorShape(error) }));
+    }
   } else if (operation === "core-contract") {
     let observed;
     let callbackInvoked = 0;
