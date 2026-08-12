@@ -580,13 +580,19 @@ async function readManifestGenerationSnapshot({
     purpose: "manifest-generation",
     id: manifestSha256,
   });
-  const snapshot = await readBoundedSnapshot(
-    path,
-    fsApi,
-    maxBytes,
-    "manifest generation",
-    manifestIntegrityFailure,
-  );
+  let snapshot;
+  try {
+    snapshot = await readBoundedSnapshot(
+      path,
+      fsApi,
+      maxBytes,
+      "manifest generation",
+      manifestIntegrityFailure,
+    );
+  } catch (error) {
+    if (error?.code === "ENOENT") throw manifestIntegrityFailure();
+    throw error;
+  }
   let manifest;
   try {
     if (digestBytes(snapshot.bytes) !== manifestSha256) {

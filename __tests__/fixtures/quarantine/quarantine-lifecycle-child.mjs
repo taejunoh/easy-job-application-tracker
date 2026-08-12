@@ -10,19 +10,21 @@ const parsed = JSON.parse(requestText);
 if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
   throw new Error("child request must be an object");
 }
-const REQUEST_KEYS = Object.freeze(["operation", "options", "killAt"]);
+const REQUEST_KEYS = Object.freeze(["operation", "options", "killAt", "hangAt"]);
 if (Reflect.ownKeys(parsed).some((key) => typeof key !== "string" || !REQUEST_KEYS.includes(key))) {
   throw new Error("unsupported quarantine child request field");
 }
 if (typeof parsed.operation !== "string" || parsed.options === null ||
     typeof parsed.options !== "object" || Array.isArray(parsed.options) ||
-    (parsed.killAt !== undefined && typeof parsed.killAt !== "string")) {
+    (parsed.killAt !== undefined && typeof parsed.killAt !== "string") ||
+    (parsed.hangAt !== undefined && typeof parsed.hangAt !== "string")) {
   throw new Error("invalid quarantine child request");
 }
 const request = Object.freeze({
   operation: parsed.operation,
   options: Object.freeze({ ...parsed.options }),
   killAt: parsed.killAt,
+  hangAt: parsed.hangAt,
 });
 
 const transaction = await import("../../../scripts/quarantine-transaction.mjs");
@@ -44,6 +46,7 @@ if (typeof operation !== "function") {
 }
 
 const killAt = request.killAt;
+const hangAt = request.hangAt;
 const options = request.options;
 const phaseTracePath = process.env.QUARANTINE_CHILD_PHASE_TRACE;
 function tracePhase(phase) {
@@ -61,6 +64,7 @@ const result = await operation({
   faultHook: async (phase) => {
     tracePhase(phase);
     if (phase === killAt) process.kill(process.pid, "SIGKILL");
+    if (phase === hangAt) await new Promise(() => setInterval(() => {}, 1_000));
   },
 });
 process.stdout.write(JSON.stringify(result));

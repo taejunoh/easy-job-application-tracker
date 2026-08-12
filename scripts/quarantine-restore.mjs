@@ -8,6 +8,7 @@ import {
   cleanupVerifiedRestoreActiveInventory,
   summarizeInventoryDirectory,
   hashVerifiedRegularFile,
+  InventoryStructuralError,
 } from "./quarantine-inventory-reader.mjs";
 import { appendJournalRecord, IndeterminateJournalAppendError, replayJournal, withJournalLock } from "./quarantine-journal.mjs";
 import { withExistingQuarantineRun } from "./quarantine-lifecycle-core.mjs";
@@ -44,6 +45,15 @@ function restoreRecoveryRequired() {
 
 function restoreRecoveryNotApplicable() {
   return new RestoreOperationError("ERR_RESTORE_RECOVERY_NOT_APPLICABLE");
+}
+
+async function replayJournalForRestore(capability) {
+  try {
+    return await replayJournal({ capability });
+  } catch (error) {
+    if (error?.code === "ERR_JOURNAL_INTEGRITY") throw restoreIntegrityFailure();
+    throw error;
+  }
 }
 
 function record(entries) {
@@ -168,7 +178,7 @@ function sameIdentity(left, right) {
     (left.mode & 0o7777) === (right.mode & 0o7777);
 }
 
-async function assertVerifiedDirectory(path, expected, fsApi, message) {
+async function assertVerifiedDirectory(path, expected, fsApi) {
   const stat = await fsApi.lstat(path);
   if (!sameIdentity(expected, stat) || stat.isSymbolicLink() || !stat.isDirectory() ||
       await fsApi.realpath(path) !== expected.canonicalRealpath) {
@@ -178,7 +188,7 @@ async function assertVerifiedDirectory(path, expected, fsApi, message) {
 
 async function assertVerifiedDirectoryChain(ancestorChain, fsApi) {
   for (const expected of ancestorChain) {
-    await assertVerifiedDirectory(expected.path, expected, fsApi, "restore sync ancestor changed");
+    await assertVerifiedDirectory(expected.path, expected, fsApi);
   }
 }
 
@@ -202,14 +212,14 @@ async function syncVerifiedDirectory(path, { fsApi, ancestorChain, expectedIdent
       throw restoreIntegrityFailure();
     }
     await assertVerifiedDirectoryChain(ancestorChain, fsApi);
-    await assertVerifiedDirectory(path, expectedIdentity, fsApi, "restore sync directory changed before sync");
+    await assertVerifiedDirectory(path, expectedIdentity, fsApi);
     await handle.sync();
     const finalHandle = await handle.stat();
     if (!sameIdentity(opened, finalHandle) || finalHandle.isSymbolicLink() || !finalHandle.isDirectory()) {
       throw restoreIntegrityFailure();
     }
     await assertVerifiedDirectoryChain(ancestorChain, fsApi);
-    await assertVerifiedDirectory(path, expectedIdentity, fsApi, "restore sync directory changed after sync");
+    await assertVerifiedDirectory(path, expectedIdentity, fsApi);
   } catch (error) {
     primary = error;
   }
@@ -304,7 +314,9 @@ async function assertPayload(capability, entry, path, fsApi, ancestorChain = Obj
   try {
     observed = await summarizeInventoryDirectory(path, { fsApi, ancestorChain });
   } catch (error) {
-    if (error?.code === "ENOENT") throw restoreIntegrityFailure();
+    if (error?.code === "ENOENT" || error instanceof InventoryStructuralError) {
+      throw restoreIntegrityFailure();
+    }
     throw error;
   }
   if (!sameSummary(entry.preMoveInventory, observed)) throw restoreIntegrityFailure();
@@ -395,13 +407,13 @@ async function assertActiveStable(handoff, active) {
       throw restoreIntegrityFailure();
     }
     if (metadata.rootIdentity === null) throw restoreIntegrityFailure();
-    await assertVerifiedDirectory(root, metadata.rootIdentity, handoff.fsApi, "active generated root changed during restore preparation");
+    await assertVerifiedDirectory(root, metadata.rootIdentity, handoff.fsApi);
     const observed = await summarizeInventoryDirectory(root, {
       fsApi: handoff.fsApi,
       ancestorChain: ancestors,
       expectedRootIdentity: metadata.rootIdentity,
     });
-    await assertVerifiedDirectory(root, metadata.rootIdentity, handoff.fsApi, "active generated root changed during restore preparation");
+    await assertVerifiedDirectory(root, metadata.rootIdentity, handoff.fsApi);
     if (!sameSummary(captured.inventory, observed)) throw restoreIntegrityFailure();
   }
 }
@@ -691,7 +703,7 @@ export async function restoreQuarantine(input) {
       throw restoreRecoveryRequired();
     }
     return withJournalLock({ capability: handoff.capability }, async (heldLock) => {
-      const replayed = await replayJournal({ capability: handoff.capability });
+      const replayed = await replayJournalForRestore(handoff.capability);
       const tip = replayed.records.at(-1);
       if (replayed.state !== handoff.journalTip.state || tip?.recordHash !== handoff.journalTip.recordHash) {
         throw restoreIntegrityFailure();
@@ -734,7 +746,7 @@ export async function recoverRestore(input) {
 
 async function recoverRestoreWithHandoff(options, handoff) {
   return withJournalLock({ capability: handoff.capability }, async (heldLock) => {
-    const replayed = await replayJournal({ capability: handoff.capability });
+    const replayed = await replayJournalForRestore(handoff.capability);
     if (replayed.truncatedTail) throw restoreIntegrityFailure();
     const tip = replayed.records.at(-1);
     if (tip?.recordHash !== handoff.journalTip.recordHash || replayed.state !== handoff.journalTip.state) {

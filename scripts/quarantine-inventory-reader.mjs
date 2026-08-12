@@ -14,6 +14,13 @@ const LIMITS = Object.freeze({
   depth: 1024,
   nameBytes: 255,
 });
+
+export class InventoryStructuralError extends Error {
+  constructor() {
+    super("read-only inventory evidence is structurally invalid");
+    Object.defineProperty(this, "code", { value: "ERR_INVENTORY_STRUCTURAL", enumerable: false });
+  }
+}
 const FILE_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
 const DIRECTORY_OPEN_FLAGS = FILE_OPEN_FLAGS | fsConstants.O_DIRECTORY;
 
@@ -177,7 +184,7 @@ export async function summarizeInventoryDirectory(root, {
   assertAbsolutePath(root, "read-only inventory root");
   const rootStat = await fsApi.lstat(root);
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    throw new Error("restore tree endpoint is unsafe");
+    throw new InventoryStructuralError();
   }
   const rootRealpath = await fsApi.realpath(root);
   if (expectedRootIdentity !== undefined) {

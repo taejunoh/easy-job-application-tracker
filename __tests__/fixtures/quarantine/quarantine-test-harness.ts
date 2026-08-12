@@ -49,14 +49,25 @@ const lifecycleChildPath = fileURLToPath(pathToFileURL(
   join(__dirname, "quarantine-lifecycle-child.mjs"),
 ));
 
-function waitForLifecycleChild(child: ReturnType<typeof spawn>) {
-  return new Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }>((resolve, reject) => {
+function waitForLifecycleChild(child: ReturnType<typeof spawn>, timeoutMs: number) {
+  return new Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean }>((resolve, reject) => {
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
     child.stdout?.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
     child.stderr?.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-    child.once("error", reject);
-    child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ code, signal, stdout, stderr, timedOut });
+    });
   });
 }
 
@@ -64,17 +75,19 @@ function waitForLifecycleChild(child: ReturnType<typeof spawn>) {
 export function spawnLifecycleChild(
   operation: string,
   options: Record<string, unknown>,
-  { killAt, phaseTracePath }: { killAt?: string; phaseTracePath?: string } = {},
+  {
+    killAt, hangAt, phaseTracePath, timeoutMs = 15_000,
+  }: { killAt?: string; hangAt?: string; phaseTracePath?: string; timeoutMs?: number } = {},
 ) {
   const child = spawn(process.execPath, [lifecycleChildPath], {
     env: {
       ...process.env,
-      QUARANTINE_CHILD_REQUEST: JSON.stringify({ operation, options, killAt }),
+      QUARANTINE_CHILD_REQUEST: JSON.stringify({ operation, options, killAt, hangAt }),
       ...(phaseTracePath === undefined ? {} : { QUARANTINE_CHILD_PHASE_TRACE: phaseTracePath }),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  return waitForLifecycleChild(child);
+  return waitForLifecycleChild(child, timeoutMs);
 }
 
 export const FS_METHODS = [
