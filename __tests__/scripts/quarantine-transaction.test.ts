@@ -305,6 +305,159 @@ describe("quarantine transaction Slice 1", () => {
     }), "ERR_USAGE", "Invalid quarantine request.");
   });
 
+  it("validates terminal manifest evidence before returning VALIDATED resume", () => {
+    const f = createQuarantineFixture();
+    bases.push(f.base);
+    const transactionId = "tx-recover-validated";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: f.expectedCount,
+      transactionId,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      writersStopped: true,
+    };
+    expect(invokeQuarantineWorker("apply", request)).toMatchObject({ ok: true });
+    const runRoot = join(f.quarantineRoot, transactionId);
+    const journal = join(runRoot, "journal.log");
+    const journalBytes = readFileSync(journal);
+    const firstSize = journalBytes.readUInt32BE(0);
+    const prepared = JSON.parse(journalBytes.subarray(4, 4 + firstSize).toString("utf8"));
+    let offset = 0;
+    let previousHash = "0".repeat(64);
+    let sequence = 0;
+    while (offset < journalBytes.length) {
+      const size = journalBytes.readUInt32BE(offset);
+      const record = JSON.parse(journalBytes.subarray(offset + 4, offset + 4 + size).toString("utf8"));
+      previousHash = record.recordHash;
+      sequence = record.sequence;
+      offset += 4 + size;
+    }
+    const payload = { manifestSha256: prepared.payload.manifestSha256 };
+    const recordHash = createHash("sha256")
+      .update(JSON.stringify({ sequence: sequence + 1, previousHash, event: "VALIDATED", payload }))
+      .digest("hex");
+    const body = Buffer.from(JSON.stringify({
+      sequence: sequence + 1,
+      previousHash,
+      event: "VALIDATED",
+      payload,
+      recordHash,
+    }));
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(body.length);
+    appendFileSync(journal, Buffer.concat([length, body]));
+    expect(invokeQuarantineWorker("recover", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      transactionId,
+      action: "resume",
+      writersStopped: true,
+    }).result).toEqual({
+      transactionId,
+      status: "VALIDATED",
+      action: "resume",
+      reconciledEntries: 0,
+    });
+
+    const manifest = join(runRoot, "manifests", `${prepared.payload.manifestSha256}.json`);
+    rmSync(manifest);
+    const beforeJournal = readFileSync(journal);
+    const payloadPath = join(runRoot, "payload/source-copies/copy-0001");
+    const beforePayload = readFileSync(payloadPath);
+    expectWorkerError(invokeQuarantineWorker("recover", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      transactionId,
+      action: "resume",
+      writersStopped: true,
+    }), "ERR_INTEGRITY", "Quarantine evidence failed integrity validation.");
+    expect(readFileSync(journal)).toEqual(beforeJournal);
+    expect(readFileSync(payloadPath)).toEqual(beforePayload);
+  });
+
+  it.each([
+    ["ROLLED_BACK", "missing"],
+    ["ROLLED_BACK", "corrupt"],
+    ["INCOMPLETE_CONFLICT", "missing"],
+    ["INCOMPLETE_CONFLICT", "corrupt"],
+  ] as const)(
+    "rejects %s terminal manifest before returning %s",
+    (terminal, manifestVariant) => {
+      const f = createQuarantineFixture();
+      bases.push(f.base);
+      const transactionId = `tx-recover-terminal-${terminal.toLowerCase()}`;
+      const request = {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: f.expectedCount,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      };
+      expect(invokeQuarantineWorker("apply-stop", {
+        ...request,
+        stopPhase: "after-event:MOVE_INTENT:copy-0001",
+      }).ok).toBe(false);
+      const runRoot = join(f.quarantineRoot, transactionId);
+      const source = join(f.repoRoot, "notes 2.txt");
+      const payloadPath = join(runRoot, "payload/source-copies/copy-0001");
+      if (terminal === "ROLLED_BACK") {
+        expect(invokeQuarantineWorker("recover", {
+          repoRoot: f.repoRoot,
+          quarantineRoot: f.quarantineRoot,
+          transactionId,
+          action: "rollback",
+          writersStopped: true,
+        }).result).toEqual({
+          transactionId,
+          status: "ROLLED_BACK",
+          action: "rollback",
+          reconciledEntries: 2,
+        });
+      } else {
+        writeFileSync(payloadPath, "foreign payload\n");
+        expect(invokeQuarantineWorker("recover", {
+          repoRoot: f.repoRoot,
+          quarantineRoot: f.quarantineRoot,
+          transactionId,
+          action: "resume",
+          writersStopped: true,
+        }).result).toEqual({
+          transactionId,
+          status: "INCOMPLETE_CONFLICT",
+          action: "resume",
+          conflictEntryIds: ["copy-0001"],
+        });
+      }
+      const journal = join(runRoot, "journal.log");
+      const journalBytes = readFileSync(journal);
+      const firstSize = journalBytes.readUInt32BE(0);
+      const prepared = JSON.parse(journalBytes.subarray(4, 4 + firstSize).toString("utf8"));
+      const manifest = join(runRoot, "manifests", `${prepared.payload.manifestSha256}.json`);
+      if (manifestVariant === "missing") rmSync(manifest);
+      else writeFileSync(manifest, "corrupt terminal manifest\n");
+      const beforeJournal = readFileSync(journal);
+      const beforeManifest = manifestVariant === "missing" ? null : readFileSync(manifest);
+      const beforeEvidence = [source, payloadPath].filter(existsSync)
+        .map((path) => [path, readFileSync(path)] as const);
+      expectWorkerError(invokeQuarantineWorker("recover", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        transactionId,
+        action: terminal === "ROLLED_BACK" ? "rollback" : "resume",
+        writersStopped: true,
+      }), "ERR_INTEGRITY", "Quarantine evidence failed integrity validation.");
+      expect(readFileSync(journal)).toEqual(beforeJournal);
+      if (beforeManifest !== null) expect(readFileSync(manifest)).toEqual(beforeManifest);
+      for (const [path, bytes] of beforeEvidence) expect(readFileSync(path)).toEqual(bytes);
+    },
+  );
+
   it.each(["torn-frame", "wrong-record-digest", "stale-lock", "missing-manifest"] as const)(
     "rejects %s recovery evidence before any recovery mutation",
     (variant) => {

@@ -2204,6 +2204,12 @@ async function recoverApplyOnCapability({ capability, options }) {
   // evidence of an interrupted append and must remain untouched for explicit
   // operator investigation.
   if (initial.truncatedTail) fail("ERR_INTEGRITY");
+  // Terminal shortcuts are safe only after the immutable recovery evidence has
+  // been authenticated. This performs no append or filesystem mutation.
+  buildApplyLedger(
+    initial,
+    await readRecoveryManifest({ capability, options, replayed: initial }),
+  );
   if (initial.state === "QUARANTINED" && options.action === "resume") {
     return recoveryResult(options.transactionId, "QUARANTINED", "resume", 0);
   }
