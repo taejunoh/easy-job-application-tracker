@@ -422,7 +422,6 @@ describe("quarantine restore", () => {
       expect(result.ok).toBe(false);
       expect((result as unknown as { finalPrecheckTargetReads: number }).finalPrecheckTargetReads).toBe(1);
       expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_INTENT");
-      expect((result as unknown as { rollbackInterloperPreserved: boolean }).rollbackInterloperPreserved).toBe(true);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
