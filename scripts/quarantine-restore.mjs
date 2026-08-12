@@ -511,8 +511,11 @@ async function classifyRecoveryEntry({ handoff, ledger, entry }) {
   if (entry.kind === "source-copy") {
     const p = pStat !== null && await sourceMatches(payload, entry, fsApi);
     const a = aStat !== null && await sourceMatches(active, entry, fsApi, ancestors);
-    if (p && !a) return Object.freeze({ id: entry.id, state: "initial" });
-    if (!p && a) return Object.freeze({ id: entry.id, state: "final" });
+    // A non-matching endpoint is concurrent evidence, not an absent endpoint.
+    // `sourceMatches` intentionally returns false for both; retain the lstat
+    // distinction so recovery persists a conflict before any rename attempt.
+    if (p && aStat === null) return Object.freeze({ id: entry.id, state: "initial" });
+    if (pStat === null && a) return Object.freeze({ id: entry.id, state: "final" });
     if (pStat === null && aStat === null) return Object.freeze({ id: entry.id, state: "missing" });
     return Object.freeze({ id: entry.id, state: "conflict" });
   }
