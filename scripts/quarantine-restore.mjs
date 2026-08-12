@@ -11,7 +11,7 @@ import {
 } from "./quarantine-inventory-reader.mjs";
 import { appendJournalRecord, IndeterminateJournalAppendError, replayJournal, withJournalLock } from "./quarantine-journal.mjs";
 import { withExistingQuarantineRun } from "./quarantine-lifecycle-core.mjs";
-import { markRestoreRecoveryCallback } from "./quarantine-lifecycle-recovery-context.mjs";
+import { withRestoreRecoveryRun } from "./quarantine-lifecycle-recovery-run.mjs";
 import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
 import { deriveRunPath, revalidateRunCapability } from "./quarantine-run-capability.mjs";
 
@@ -331,7 +331,7 @@ async function captureActiveGenerated(handoff, faultHook, publications, { replac
     const published = await publishVerifiedRestoreActiveInventory({
       capability: handoff.capability, entryId: id, snapshot: heldSnapshot, replaceExisting,
     });
-    publications.push(published.publication);
+    if (published.publication.reused !== true) publications.push(published.publication);
     await invokeHook(faultHook, `after-inventory:restore-active:${id}`);
     active.push(activeRecord(id, published.summary, ancestors, heldSnapshot.rootIdentity));
   }
@@ -665,16 +665,12 @@ export async function restoreQuarantine(input) {
       if (replayed.state !== handoff.journalTip.state || tip?.recordHash !== handoff.journalTip.recordHash) {
         throw new Error("restore journal changed before mutation");
       }
-      // Fresh runs fail closed on an inventory EEXIST.  Reuse is permitted
-      // only after this durable run itself terminated a prior restore, and
-      // the publisher separately verifies the old publication bytes.
-      const reuseRestoreActiveInventory = replayed.records.some((record) =>
-        record.event === "RESTORE_ABORTED_TO_QUARANTINED" || record.event === "RESTORE_ABORTED_TO_VALIDATED",
-      );
       const publications = [];
       let activeGenerated;
       try {
-        activeGenerated = await captureActiveGenerated(handoff, options.faultHook, publications, { replaceExisting: reuseRestoreActiveInventory });
+        // Exact, held-reader validation makes an interrupted pre-prepare
+        // publication safely reusable; mismatched/foreign EEXIST stays fatal.
+        activeGenerated = await captureActiveGenerated(handoff, options.faultHook, publications, { replaceExisting: true });
         await assertActiveStable(handoff, activeGenerated);
         await append(heldLock, handoff.capability, "RESTORE_PREPARED", { restoreId, activeGenerated });
       } catch (error) {
@@ -705,7 +701,7 @@ export async function recoverRestore(input) {
     ["transactionId", options.transactionId], ["writersStopped", true],
     ...(Object.hasOwn(options, "fsApi") ? [["fsApi", options.fsApi]] : []),
   ]);
-  return withExistingQuarantineRun(existing, markRestoreRecoveryCallback(async (handoff) => withJournalLock({ capability: handoff.capability }, async (heldLock) => {
+  return withRestoreRecoveryRun(existing, async (handoff) => withJournalLock({ capability: handoff.capability }, async (heldLock) => {
     const replayed = await replayJournal({ capability: handoff.capability });
     if (replayed.truncatedTail) throw new Error("restore recovery journal has a torn tail");
     const tip = replayed.records.at(-1);
@@ -727,7 +723,6 @@ export async function recoverRestore(input) {
     const pendingRollback = ledger.rollbackIntentIds.length === rollbackCompleted.size ? null : ledger.rollbackIntentIds.at(-1);
     const inspected = [];
     for (const entry of entries) {
-      if (options.action === "resume" && completed.has(entry.id)) continue;
       if (options.action === "rollback" && (!intents.includes(entry.id) || rollbackCompleted.has(entry.id))) continue;
       inspected.push(await classifyRecoveryEntry({ handoff, ledger, entry }));
     }
@@ -779,5 +774,5 @@ export async function recoverRestore(input) {
     await invokeHook(options.faultHook, prior === "VALIDATED" ? "after-event:RESTORE_ABORTED_TO_VALIDATED" : "after-event:RESTORE_ABORTED_TO_QUARANTINED");
     await invokeHook(options.faultHook, "before-lock-cleanup");
     return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", prior], ["action", "rollback"], ["reconciledEntries", intents.length], ["restoreAborted", true]]);
-  })));
+  }));
 }

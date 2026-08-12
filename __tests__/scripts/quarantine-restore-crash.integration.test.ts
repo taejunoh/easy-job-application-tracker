@@ -189,6 +189,20 @@ function endpointPresence(prepared: ReturnType<typeof prepareQuarantinedFixture>
   return paths.map((path) => existsSync(path)) as [boolean, boolean, boolean];
 }
 
+function endpointIdentity(path: string) {
+  if (!existsSync(path)) return null;
+  const stat = lstatSync(path);
+  return { dev: stat.dev, ino: stat.ino, type: stat.isDirectory() ? "directory" : "file" };
+}
+
+function generatedEndpointPaths(prepared: ReturnType<typeof prepareQuarantinedFixture>, restoreId: string) {
+  return [
+    join(prepared.runRoot, "payload", "generated", ".next"),
+    join(prepared.fixture.repoRoot, ".next"),
+    join(prepared.runRoot, "rollback", "regenerated-before-restore", restoreId, ".next"),
+  ] as const;
+}
+
 function exactResultShape(keys: string[]) {
   return {
     prototype: "null",
@@ -254,7 +268,9 @@ describe("quarantine restore real SIGKILL recovery", () => {
         };
         await crashRestoreWithProof(prepared, options, killAt);
         const restoreId = "restore-c3624475-87d7-4886-b0bf-68a5061663d2";
+        const [payload, active, rollback] = generatedEndpointPaths(prepared, restoreId);
         expect(endpointPresence(prepared, restoreId)).toEqual(expectedPresence);
+        const before = [endpointIdentity(payload), endpointIdentity(active), endpointIdentity(rollback)];
         const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action });
         if (recovered.code !== 0) throw new Error(JSON.stringify(recovered));
         expect(JSON.parse(recovered.stdout)).toEqual(action === "resume"
@@ -263,6 +279,12 @@ describe("quarantine restore real SIGKILL recovery", () => {
         expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe(action === "resume"
           ? "RESTORED"
           : prior === "VALIDATED" ? "RESTORE_ABORTED_TO_VALIDATED" : "RESTORE_ABORTED_TO_QUARANTINED");
+        const after = [endpointIdentity(payload), endpointIdentity(active), endpointIdentity(rollback)];
+        const original = before[0] ?? before[1];
+        const generated = regenerate ? (before[2] ?? before[1]) : null;
+        expect(after).toEqual(action === "resume"
+          ? [null, original, generated]
+          : [original, generated, null]);
       } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
     },
     60_000,
@@ -313,6 +335,29 @@ describe("quarantine restore real SIGKILL recovery", () => {
       expect(observed.ok).toBe(true);
       expect(observed.result).toEqual(expect.objectContaining({ transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: _status, action }));
       expect(observed.shape).toEqual(exactResultShape([...keys]));
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("classifies a completed entry before public resume and preserves a foreign replacement", async () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      await crashRestoreWithProof(prepared, options, "after-event:RESTORED_ENTRY:generated-next");
+      const active = join(prepared.fixture.repoRoot, ".next");
+      writeFileSync(join(active, "foreign"), "foreign completed endpoint\n");
+      const paths = [join(prepared.runRoot, "payload", "generated", ".next"), active];
+      const before = durableRecoveryEvidence(prepared, paths);
+      const result = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
+      if (result.code !== 0) throw new Error(JSON.stringify(result));
+      expect(JSON.parse(result.stdout)).toEqual({
+        transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2",
+        status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
+      });
+      const after = durableRecoveryEvidence(prepared, paths);
+      expect(after.endpoints).toEqual(before.endpoints);
+      expect(after.pointer).toBe(before.pointer);
+      expect(after.generations).toEqual(before.generations);
+      expect(readFileSync(join(active, "foreign"), "utf8")).toBe("foreign completed endpoint\n");
     } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
   }, 60_000);
 
@@ -592,9 +637,16 @@ describe("quarantine restore real SIGKILL recovery", () => {
     }
   }, 600_000);
 
-  it.each(RECOVERY_ROLLBACK_PHASES)("continues every reverse recovery seam after SIGKILL: %s", async (killAt) => {
+  it.each((["QUARANTINED", "VALIDATED"] as const).flatMap((prior) =>
+    RECOVERY_ROLLBACK_PHASES.map((killAt) => [prior,
+      prior === "VALIDATED" && killAt === "after-event:RESTORE_ABORTED_TO_QUARANTINED"
+        ? "after-event:RESTORE_ABORTED_TO_VALIDATED"
+        : killAt,
+    ] as const),
+  ))("continues every reverse recovery seam after SIGKILL from %s: %s", async (prior, killAt) => {
     const prepared = prepareQuarantinedFixture();
     try {
+      if (prior === "VALIDATED") validatePriorState(prepared);
       const options = {
         repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
         transactionId: prepared.transactionId, writersStopped: true,
@@ -604,10 +656,17 @@ describe("quarantine restore real SIGKILL recovery", () => {
       });
       expect(initial.signal).toBe("SIGKILL");
       rmSync(join(prepared.runRoot, "journal.lock"));
-      const index = RECOVERY_ROLLBACK_PHASES.indexOf(killAt);
+      const phaseForIndex = prior === "VALIDATED" && killAt === "after-event:RESTORE_ABORTED_TO_VALIDATED"
+        ? "after-event:RESTORE_ABORTED_TO_QUARANTINED"
+        : killAt;
+      const index = RECOVERY_ROLLBACK_PHASES.indexOf(phaseForIndex);
       const { release } = await killThenReleaseFixtureLock(
         "recoverRestore", { ...options, action: "rollback" }, prepared.runRoot, killAt,
-        RECOVERY_ROLLBACK_PHASES.slice(0, index + 1),
+        RECOVERY_ROLLBACK_PHASES.slice(0, index + 1).map((phase) =>
+          prior === "VALIDATED" && phase === "after-event:RESTORE_ABORTED_TO_QUARANTINED"
+            ? "after-event:RESTORE_ABORTED_TO_VALIDATED"
+            : phase,
+        ),
       );
       const journal = join(prepared.runRoot, "journal.log");
       const beforeStaleRetry = readFileSync(journal);
@@ -616,13 +675,13 @@ describe("quarantine restore real SIGKILL recovery", () => {
       expect(readFileSync(journal)).toEqual(beforeStaleRetry);
       release();
       const rolledBack = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
-      if (killAt === "after-event:RESTORE_ABORTED_TO_QUARANTINED" || killAt === "before-lock-cleanup") {
+      if (killAt === `after-event:${prior === "VALIDATED" ? "RESTORE_ABORTED_TO_VALIDATED" : "RESTORE_ABORTED_TO_QUARANTINED"}` || killAt === "before-lock-cleanup") {
         expect(rolledBack.code).not.toBe(0);
       } else {
         if (rolledBack.code !== 0) throw new Error(JSON.stringify(rolledBack));
-        expect(JSON.parse(rolledBack.stdout)).toMatchObject({ status: "QUARANTINED", action: "rollback", restoreAborted: true });
+        expect(JSON.parse(rolledBack.stdout)).toMatchObject({ status: prior, action: "rollback", restoreAborted: true });
       }
-      expect(journalEvents(journal).at(-1)).toBe("RESTORE_ABORTED_TO_QUARANTINED");
+      expect(journalEvents(journal).at(-1)).toBe(prior === "VALIDATED" ? "RESTORE_ABORTED_TO_VALIDATED" : "RESTORE_ABORTED_TO_QUARANTINED");
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
@@ -669,6 +728,27 @@ describe("quarantine restore real SIGKILL recovery", () => {
     },
     600_000,
   );
+
+  it.each((["QUARANTINED", "VALIDATED"] as const).flatMap((prior) =>
+    NORMAL_RESTORE_PHASES.slice(0, 2).map((killAt) => [prior, killAt] as const),
+  ))("restarts after the real pre-prepare inventory SIGKILL from %s: %s", async (prior, killAt) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      if (prior === "VALIDATED") validatePriorState(prepared);
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      const { release } = await killThenReleaseFixtureLock("restoreQuarantine", options, prepared.runRoot, killAt,
+        NORMAL_RESTORE_PHASES.slice(0, NORMAL_RESTORE_PHASES.indexOf(killAt) + 1));
+      const journal = join(prepared.runRoot, "journal.log");
+      const before = readFileSync(journal);
+      const stale = await spawnLifecycleChild("restoreQuarantine", options);
+      expect(stale.code).not.toBe(0);
+      expect(readFileSync(journal)).toEqual(before);
+      release();
+      const restarted = await spawnLifecycleChild("restoreQuarantine", options);
+      if (restarted.code !== 0) throw new Error(JSON.stringify(restarted));
+      expect(JSON.parse(restarted.stdout)).toMatchObject({ status: "RESTORED" });
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
 
   it("resumes a durable restore intent only after fixture-owned stale lock cleanup", async () => {
     const prepared = prepareQuarantinedFixture();
@@ -813,8 +893,15 @@ describe("quarantine restore real SIGKILL recovery", () => {
       if (firstAbort.code !== 0) throw new Error(JSON.stringify(firstAbort));
       expect(JSON.parse(firstAbort.stdout)).toEqual({ transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 3, restoreAborted: true });
       validatePriorState(prepared);
+      const oldInventory = join(prepared.runRoot, "inventories", "restore-active", "generated-next.jsonl");
+      const oldInventoryIdentity = lstatSync(oldInventory).ino;
+      const oldInventoryBytes = readFileSync(oldInventory);
       const secondEpochCrash = await spawnLifecycleChild("restoreQuarantine", options, { killAt: "after-event:RESTORE_INTENT:copy-0001" });
       if (secondEpochCrash.signal !== "SIGKILL") throw new Error(JSON.stringify(secondEpochCrash));
+      // The exact durable publication was reused; no close→unlink→rewrite
+      // window exists in the second epoch.
+      expect(lstatSync(oldInventory).ino).toBe(oldInventoryIdentity);
+      expect(readFileSync(oldInventory)).toEqual(oldInventoryBytes);
       rmSync(join(prepared.runRoot, "journal.lock"));
       const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action });
       if (recovered.code !== 0) throw new Error(JSON.stringify(recovered));

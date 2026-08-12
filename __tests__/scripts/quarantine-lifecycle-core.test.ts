@@ -13,6 +13,9 @@ import {
 const coreUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-lifecycle-core.mjs"),
 ).href;
+const removedRecoveryContextUrl = pathToFileURL(
+  join(__dirname, "../../scripts/quarantine-lifecycle-recovery-context.mjs"),
+).href;
 
 describe("quarantine lifecycle core", () => {
   it("keeps its single private entry point closed", async () => {
@@ -29,6 +32,14 @@ describe("quarantine lifecycle core", () => {
     expect(publicExports.exports).not.toContain("summarizeInventoryDirectory");
     expect(publicExports.runtimeExports).not.toContain("summarizeInventoryDirectory");
     expect(publicExports.legacyExports).not.toContain("summarizeInventoryDirectory");
+  });
+
+  it("does not expose a callback brand that can relax generic recovery validation", () => {
+    const attempt = execFileSync(process.execPath, ["--input-type=module", "--eval", `
+      try { await import(${JSON.stringify(removedRecoveryContextUrl)}); process.stdout.write("imported"); }
+      catch { process.stdout.write("missing"); }
+    `], { encoding: "utf8" }).trim();
+    expect(attempt).toBe("missing");
   });
 
   it("publishes one immutable VALIDATED generation and reuses it on retry", () => {

@@ -295,7 +295,7 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
   const readExactExisting = async () => {
     let existingHandle;
     let primary;
-    let matches = false;
+    let identity = null;
     try {
       const expected = await fsApi.lstat(path);
       if (expected.isSymbolicLink() || !expected.isFile() || modeOf(expected) !== 0o600 || expected.nlink !== 1) {
@@ -315,10 +315,12 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
       const final = await existingHandle.stat();
       assertIdentity(opened, final, "isFile", "existing restore-active inventory");
       await assertPathMatchesHandle(path, opened, "isFile", fsApi);
-      matches = Buffer.compare(observed, expectedExistingBytes) === 0;
+      identity = Buffer.compare(observed, expectedExistingBytes) === 0
+        ? Object.freeze({ dev: opened.dev, ino: opened.ino, mode: modeOf(opened), nlink: opened.nlink, type: "file" })
+        : null;
     } catch (error) { primary = error; }
     await closeAll(undefined, existingHandle, primary);
-    return matches;
+    return identity;
   };
   let handle;
   let ownedIdentity;
@@ -340,10 +342,15 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
       handle = await fsApi.open(path, "wx", 0o600);
     } catch (error) {
       if (!replaceExisting || error?.code !== "EEXIST") throw error;
-      if (!await readExactExisting()) throw new Error("existing restore-active inventory is not a prior restore publication");
-      await fsApi.unlink(path);
-      await revalidateRunCapability(capability, { purpose: "inventory", id: entryId, phase: "restore-active", boundary: "before-mutation" });
-      handle = await fsApi.open(path, "wx", 0o600);
+      const existingIdentity = await readExactExisting();
+      if (existingIdentity === null) throw new Error("existing restore-active inventory is not a prior restore publication");
+      // Do not close-check-unlink-rewrite a durable prior publication: even
+      // a fully validated pathname can be exchanged after its reader closes.
+      // Its exact bytes are already the snapshot required for this epoch.
+      return Object.freeze({
+        summary: snapshot.summary,
+        publication: Object.freeze({ path, entryId, identity: existingIdentity, parentIdentity, reused: true }),
+      });
     }
     await handle.chmod(0o600);
     const opened = await handle.stat();
