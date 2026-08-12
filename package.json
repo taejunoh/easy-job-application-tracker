@@ -19,6 +19,7 @@
     "check:audit": "node scripts/check-audit.mjs",
     "check:production": "node scripts/check-production-stats.mjs",
     "check:startup-env": "node scripts/verify-invalid-startup.mjs",
+    "cleanup:quarantine": "node scripts/quarantine-numbered-copies.mjs",
     "screenshots": "node scripts/screenshots.mjs",
     "screenshots:setup": "node scripts/screenshots.mjs --setup-only"
   },
