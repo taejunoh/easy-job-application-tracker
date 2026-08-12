@@ -306,7 +306,13 @@ async function assertPayload(capability, entry, path, fsApi, ancestorChain = Obj
     if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o7777) !== entry.mode || stat.size !== entry.size) {
       throw restoreIntegrityFailure();
     }
-    const hash = await hashVerifiedRegularFile(path, stat, fsApi, ancestorChain);
+    let hash;
+    try {
+      hash = await hashVerifiedRegularFile(path, stat, fsApi, ancestorChain);
+    } catch (error) {
+      if (error instanceof InventoryStructuralError) throw restoreIntegrityFailure();
+      throw error;
+    }
     if (hash.sha256 !== entry.sha256 || hash.bytes !== entry.size) throw restoreIntegrityFailure();
     return;
   }

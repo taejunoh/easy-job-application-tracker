@@ -825,20 +825,30 @@ try {
     try {
       result = await reader.summarizeInventoryDirectory(request.root, { fsApi: baseFsApi });
     } catch (error) {
-      failure = error.message;
+      failure = { message: error.message, code: error?.code };
     }
     result = { summary: result, failure };
   } else if (request.operation === "read-only-virtual-bounds") {
     const root = "/virtual-root";
     const depth = request.depth ?? 0;
     const levelOf = (path) => path === root ? 0 : path.slice(root.length + 1).split("/").length;
-    const directoryStat = (path) => ({
-      dev: 1, ino: levelOf(path) + 1, mode: 0o40700, size: 0,
+    const directoryStat = (path, ino = levelOf(path) + 1) => ({
+      dev: 1, ino, mode: 0o40700, size: 0,
       isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false,
+    });
+    const unsupportedStat = () => ({
+      dev: 1, ino: 99, mode: 0o60700, size: 0,
+      isSymbolicLink: () => false, isDirectory: () => false, isFile: () => false,
     });
     const calls = { lstat: 0, open: 0, opendir: 0, readlink: 0 };
     const fsApi = {
-      lstat: async (path) => { calls.lstat += 1; return directoryStat(path); },
+      lstat: async (path) => {
+        calls.lstat += 1;
+        if (request.variant === "adapter") throw new Error("injected adapter fault");
+        if (request.variant === "unsupported" && path === root + "/special") return unsupportedStat();
+        if (request.variant === "identity" && path === root && calls.lstat >= 2) return directoryStat(path, 99);
+        return directoryStat(path);
+      },
       open: async (path) => {
         calls.open += 1;
         return { stat: async () => directoryStat(path), close: async () => {}, createReadStream: () => { throw new Error("file read unexpected"); } };
@@ -850,17 +860,17 @@ try {
         return {
           async close() {},
           async read() {
-            if (!yielded && (request.variant === "oversize" || level < depth)) {
+            if (!yielded && (request.variant === "oversize" || request.variant === "unsupported" || level < depth)) {
               yielded = true;
-              return { name: request.variant === "oversize" ? "x".repeat(256) : "d" };
+              return { name: request.variant === "oversize" ? "x".repeat(256) : request.variant === "unsupported" ? "special" : "d" };
             }
             return null;
           },
           [Symbol.asyncIterator]() { return this; },
           async next() {
-            if (!yielded && (request.variant === "oversize" || level < depth)) {
+            if (!yielded && (request.variant === "oversize" || request.variant === "unsupported" || level < depth)) {
               yielded = true;
-              return { done: false, value: { name: request.variant === "oversize" ? "x".repeat(256) : "d" } };
+              return { done: false, value: { name: request.variant === "oversize" ? "x".repeat(256) : request.variant === "unsupported" ? "special" : "d" } };
             }
             return { done: true };
           },
@@ -871,7 +881,11 @@ try {
     };
     let failure;
     let summary;
-    try { summary = await reader.summarizeInventoryDirectory(root, { fsApi }); } catch (error) { failure = error.message; }
+    try {
+      summary = await reader.summarizeInventoryDirectory(root, { fsApi });
+    } catch (error) {
+      failure = { message: error.message, code: error?.code };
+    }
     result = { summary, failure, calls };
   } else if (request.operation === "hash") {
     let handles = 0;
@@ -1327,9 +1341,12 @@ describe("bounded quarantine inventory", () => {
       privateDirectory(boundedRoot);
       for (let index = 0; index < 4_097; index += 1) writeFileSync(join(boundedRoot, `entry-${index}`), "x");
       const result = runWorker({ operation: "read-only-summary", root: boundedRoot }).result as {
-        summary?: unknown; failure?: string;
-      };
-      expect(result).toEqual({ summary: undefined, failure: expect.stringMatching(/fixed (record|traversal) bounds/i) });
+      summary?: unknown; failure?: { message: string; code?: string };
+    };
+      expect(result).toEqual({ summary: undefined, failure: {
+        message: expect.any(String),
+        code: "ERR_INVENTORY_STRUCTURAL",
+      } });
       expect(readdirSync(join(quarantineRoot, transactionId, "inventories/work"))).toEqual([]);
     } finally { rmSync(boundedRoot, { recursive: true, force: true }); }
   });
@@ -1337,13 +1354,24 @@ describe("bounded quarantine inventory", () => {
   it.each([
     ["oversize", 0, /name exceeds fixed bounds/i],
     ["depth", 1_025, /path depth exceeds fixed bounds/i],
-  ])("rejects read-only %s bounds before any mutation", (variant, depth, error) => {
+    ["unsupported", 0, /unsupported endpoint/i],
+    ["identity", 0, /identity changed/i],
+  ])("rejects read-only %s bounds before any mutation", (variant, depth) => {
     const result = runWorker({ operation: "read-only-virtual-bounds", variant, depth }).result as {
-      summary?: unknown; failure?: string; calls: Record<string, number>;
+      summary?: unknown; failure?: { message: string; code?: string }; calls: Record<string, number>;
     };
     expect(result.summary).toBeUndefined();
-    expect(result.failure).toMatch(error);
+    expect(result.failure?.message).toBe("read-only inventory evidence is structurally invalid");
+    expect(result.failure?.code).toBe("ERR_INVENTORY_STRUCTURAL");
     expect(result.calls.readlink).toBe(0);
+  });
+
+  it("keeps an injected read-only adapter failure untyped", () => {
+    const result = runWorker({ operation: "read-only-virtual-bounds", variant: "adapter", depth: 0 }).result as {
+      summary?: unknown; failure?: { message: string; code?: string };
+    };
+    expect(result.summary).toBeUndefined();
+    expect(result.failure).toEqual({ message: "injected adapter fault", code: undefined });
   });
 
   it.each(["write", "fsync"])(

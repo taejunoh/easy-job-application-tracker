@@ -396,6 +396,28 @@ describe("quarantine cleanup CLI", () => {
     expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
+  it.each([
+    ["regular file", (payload: string) => {
+      rmSync(payload, { recursive: true });
+      writeFileSync(payload, "not a generated directory\n");
+    }],
+    ["nested symlink", (payload: string) => symlinkSync("build", join(payload, "unexpected-link"))],
+  ])("classifies a generated payload %s as integrity failure", (_caseName, mutate) => {
+    const prepared = prepareQuarantinedFixture();
+    bases.push(prepared.fixture.base);
+    mutate(join(prepared.runRoot, "payload", "generated", ".next"));
+
+    const result = run([
+      "restore", "--repo-root", prepared.fixture.repoRoot, "--quarantine-root", prepared.fixture.quarantineRoot,
+      "--transaction-id", prepared.transactionId, "--writers-stopped",
+    ]);
+
+    expectSpawned(result);
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+  });
+
   it("classifies tampered lifecycle evidence as integrity failure", () => {
     const prepared = prepareQuarantinedFixture();
     bases.push(prepared.fixture.base);
