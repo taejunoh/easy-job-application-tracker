@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import {
@@ -17,6 +18,7 @@ const OPTION_KEYS = Object.freeze([
 const REQUIRED_KEYS = Object.freeze(["repoRoot", "quarantineRoot", "transactionId", "writersStopped"]);
 const GENERATED_IDS = Object.freeze(["generated-next", "generated-node-modules"]);
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
+const DIRECTORY_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY;
 const activeMetadata = new WeakMap();
 
 function record(entries) {
@@ -88,17 +90,6 @@ async function optionalStat(path, fsApi) {
   }
 }
 
-async function syncDirectory(path, fsApi) {
-  const handle = await fsApi.open(path, "r");
-  let primary;
-  try { await handle.sync(); } catch (error) { primary = error; }
-  try { await handle.close(); } catch (error) {
-    if (primary !== undefined) throw new AggregateError([primary, error], "directory sync and close failed");
-    throw error;
-  }
-  if (primary !== undefined) throw primary;
-}
-
 function workspacePath(repoRoot, entry) {
   return join(repoRoot, ...entry.relativePath.split("/"));
 }
@@ -141,6 +132,60 @@ function sameIdentity(left, right) {
     (left.mode & 0o7777) === (right.mode & 0o7777);
 }
 
+async function assertVerifiedDirectory(path, expected, fsApi, message) {
+  const stat = await fsApi.lstat(path);
+  if (!sameIdentity(expected, stat) || stat.isSymbolicLink() || !stat.isDirectory() ||
+      await fsApi.realpath(path) !== expected.canonicalRealpath) {
+    throw new Error(message);
+  }
+}
+
+async function assertVerifiedDirectoryChain(ancestorChain, fsApi) {
+  for (const expected of ancestorChain) {
+    await assertVerifiedDirectory(expected.path, expected, fsApi, "restore sync ancestor changed");
+  }
+}
+
+function workspaceParentBinding(ancestors, path) {
+  const index = ancestors.findIndex((ancestor) => ancestor.path === path);
+  if (index < 0) throw new Error("restore workspace parent identity is unavailable");
+  return Object.freeze({
+    expectedIdentity: ancestors[index],
+    ancestorChain: Object.freeze(ancestors.slice(0, index)),
+  });
+}
+
+async function syncVerifiedDirectory(path, { fsApi, ancestorChain, expectedIdentity }) {
+  let handle;
+  let primary;
+  try {
+    await assertVerifiedDirectoryChain(ancestorChain, fsApi);
+    handle = await fsApi.open(path, DIRECTORY_OPEN_FLAGS);
+    const opened = await handle.stat();
+    if (!sameIdentity(expectedIdentity, opened) || opened.isSymbolicLink() || !opened.isDirectory()) {
+      throw new Error("restore sync directory handle identity changed");
+    }
+    await assertVerifiedDirectoryChain(ancestorChain, fsApi);
+    await assertVerifiedDirectory(path, expectedIdentity, fsApi, "restore sync directory changed before sync");
+    await handle.sync();
+    const finalHandle = await handle.stat();
+    if (!sameIdentity(opened, finalHandle) || finalHandle.isSymbolicLink() || !finalHandle.isDirectory()) {
+      throw new Error("restore sync directory handle changed");
+    }
+    await assertVerifiedDirectoryChain(ancestorChain, fsApi);
+    await assertVerifiedDirectory(path, expectedIdentity, fsApi, "restore sync directory changed after sync");
+  } catch (error) {
+    primary = error;
+  }
+  try {
+    if (handle !== undefined) await handle.close();
+  } catch (error) {
+    if (primary !== undefined) throw new AggregateError([primary, error], "verified directory sync and close failed");
+    throw error;
+  }
+  if (primary !== undefined) throw primary;
+}
+
 async function capturePrivateParent(path, fsApi) {
   const stat = await fsApi.lstat(path);
   const realPath = await fsApi.realpath(path);
@@ -159,6 +204,10 @@ async function assertPrivateParent(expected, fsApi) {
       await fsApi.realpath(expected.path) !== expected.path) {
     throw new Error("restore private parent changed");
   }
+}
+
+function privateParentChain(parent) {
+  return Object.freeze([parent]);
 }
 
 async function assertMissing(path, fsApi) {
@@ -198,19 +247,26 @@ async function guardedRestoreRename({
   await after(destinationStat);
 }
 
-async function assertPayload(capability, entry, path, fsApi, ancestors = Object.freeze([])) {
+async function assertPayload(capability, entry, path, fsApi, ancestorChain = Object.freeze([])) {
   await revalidateRunCapability(capability, { purpose: "payload", id: entry.id, boundary: "before-mutation" });
   if (entry.kind === "source-copy") {
     const stat = await fsApi.lstat(path);
     if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o7777) !== entry.mode || stat.size !== entry.size) {
       throw new Error("restore payload source is invalid");
     }
-    const hash = await hashVerifiedRegularFile(path, stat, fsApi, ancestors);
+    const hash = await hashVerifiedRegularFile(path, stat, fsApi, ancestorChain);
     if (hash.sha256 !== entry.sha256 || hash.bytes !== entry.size) throw new Error("restore payload content changed");
     return;
   }
-  const observed = await summarizeInventoryDirectory(path, { fsApi, ancestorChain: ancestors });
+  const observed = await summarizeInventoryDirectory(path, { fsApi, ancestorChain });
   if (!sameSummary(entry.preMoveInventory, observed)) throw new Error("restore payload inventory changed");
+}
+
+async function assertPrivatePayload(capability, entry, path, fsApi, parent) {
+  const ancestorChain = privateParentChain(parent);
+  await assertPrivateParent(parent, fsApi);
+  await assertPayload(capability, entry, path, fsApi, ancestorChain);
+  await assertPrivateParent(parent, fsApi);
 }
 
 async function assertRestoredEndpoint(entry, path, fsApi, ancestors) {
@@ -290,20 +346,20 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
   const payload = deriveRunPath(handoff.capability, { purpose: "payload", id: entry.id });
   const active = workspacePath(handoff.repoRoot, entry);
   const ancestors = await captureAncestors(handoff.repoRoot, active, fsApi);
+  const workspaceParent = workspaceParentBinding(ancestors, dirname(active));
   const payloadParent = await capturePrivateParent(dirname(payload), fsApi);
   await append(heldLock, handoff.capability, "RESTORE_INTENT", { id: entry.id });
   await invokeHook(faultHook, `after-event:RESTORE_INTENT:${entry.id}`);
 
-  await assertPayload(handoff.capability, entry, payload, fsApi);
+  await assertPrivatePayload(handoff.capability, entry, payload, fsApi, payloadParent);
   await assertAncestors(ancestors, fsApi);
   if (entry.kind === "source-copy") {
     let restoredIdentity;
     await guardedRestoreRename({
       capability: handoff.capability, pathRequest: { purpose: "payload", id: entry.id }, source: payload, destination: active, fsApi,
       before: async () => {
-        await assertPrivateParent(payloadParent, fsApi);
         await assertAncestors(ancestors, fsApi);
-        await assertPayload(handoff.capability, entry, payload, fsApi);
+        await assertPrivatePayload(handoff.capability, entry, payload, fsApi, payloadParent);
       },
       after: async (destinationStat) => {
         restoredIdentity = await captureVerifiedSyncIdentity(active, destinationStat, fsApi);
@@ -316,10 +372,11 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
     await revalidateRunCapability(handoff.capability, { purpose: "payload", id: entry.id, boundary: "after-sync" });
     await assertRestoredEndpoint(entry, active, fsApi, ancestors);
     await assertAncestors(ancestors, fsApi);
-    await syncDirectory(dirname(active), fsApi);
+    await syncVerifiedDirectory(dirname(active), { fsApi, ...workspaceParent });
     await invokeHook(faultHook, `after-restore-destination-parent-sync:${entry.id}`);
-    await assertPrivateParent(payloadParent, fsApi);
-    await syncDirectory(payloadParent.path, fsApi);
+    await syncVerifiedDirectory(payloadParent.path, {
+      fsApi, ancestorChain: Object.freeze([]), expectedIdentity: payloadParent,
+    });
     await invokeHook(faultHook, `after-restore-source-parent-sync:${entry.id}`);
   } else {
     const captured = activeGenerated.find((candidate) => candidate.id === entry.id);
@@ -345,18 +402,21 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
         after: async (destinationStat) => {
           rollbackIdentity = await captureVerifiedSyncIdentity(rollback, destinationStat, fsApi);
           await assertPrivateParent(rollbackParent, fsApi);
-          const observed = await summarizeInventoryDirectory(rollback, { fsApi });
+          const observed = await summarizeInventoryDirectory(rollback, {
+            fsApi, ancestorChain: privateParentChain(rollbackParent),
+          });
+          await assertPrivateParent(rollbackParent, fsApi);
           if (!sameSummary(captured.inventory, observed)) throw new Error("rollback generated root changed");
         },
       });
       await invokeHook(faultHook, `after-active-to-rollback-rename:${entry.id}`);
       await fsyncVerifiedTree(rollback, { fsApi, ancestorChain: Object.freeze([rollbackParent]), rootIdentity: rollbackIdentity });
       await invokeHook(faultHook, `after-rollback-tree-sync:${entry.id}`);
-      await assertPrivateParent(rollbackParent, fsApi);
-      await syncDirectory(rollbackParent.path, fsApi);
+      await syncVerifiedDirectory(rollbackParent.path, {
+        fsApi, ancestorChain: Object.freeze([]), expectedIdentity: rollbackParent,
+      });
       await invokeHook(faultHook, `after-rollback-destination-parent-sync:${entry.id}`);
-      await assertAncestors(ancestors, fsApi);
-      await syncDirectory(dirname(active), fsApi);
+      await syncVerifiedDirectory(dirname(active), { fsApi, ...workspaceParent });
       await invokeHook(faultHook, `after-rollback-source-parent-sync:${entry.id}`);
     } else {
       await assertAncestors(ancestors, fsApi);
@@ -366,9 +426,8 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
     await guardedRestoreRename({
       capability: handoff.capability, pathRequest: { purpose: "payload", id: entry.id }, source: payload, destination: active, fsApi,
       before: async () => {
-        await assertPrivateParent(payloadParent, fsApi);
         await assertAncestors(ancestors, fsApi);
-        await assertPayload(handoff.capability, entry, payload, fsApi);
+        await assertPrivatePayload(handoff.capability, entry, payload, fsApi, payloadParent);
       },
       after: async (destinationStat) => {
         restoredIdentity = await captureVerifiedSyncIdentity(active, destinationStat, fsApi);
@@ -381,10 +440,11 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
     await revalidateRunCapability(handoff.capability, { purpose: "payload", id: entry.id, boundary: "after-sync" });
     await assertRestoredEndpoint(entry, active, fsApi, ancestors);
     await assertAncestors(ancestors, fsApi);
-    await syncDirectory(dirname(active), fsApi);
+    await syncVerifiedDirectory(dirname(active), { fsApi, ...workspaceParent });
     await invokeHook(faultHook, `after-restore-destination-parent-sync:${entry.id}`);
-    await assertPrivateParent(payloadParent, fsApi);
-    await syncDirectory(payloadParent.path, fsApi);
+    await syncVerifiedDirectory(payloadParent.path, {
+      fsApi, ancestorChain: Object.freeze([]), expectedIdentity: payloadParent,
+    });
     await invokeHook(faultHook, `after-restore-source-parent-sync:${entry.id}`);
   }
   await append(heldLock, handoff.capability, "RESTORED_ENTRY", { id: entry.id });

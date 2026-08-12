@@ -539,4 +539,54 @@ describe("quarantine restore", () => {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    ["workspace", "before-open"], ["workspace", "after-open"],
+    ["payload", "before-open"], ["payload", "after-open"],
+    ["rollback", "before-open"], ["rollback", "after-open"],
+  ])("does not sync a replaced %s parent at %s", (target, timing) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore-parent-sync-seam", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, target, timing,
+      }) as unknown as {
+        ok: boolean; injected: boolean; foreignSync: number; foreignIntact: boolean;
+        closeCalls: number; evidenceStable: boolean; error?: { message: string };
+      };
+      expect(result.ok).toBe(false);
+      expect(result.injected).toBe(true);
+      expect(result.foreignSync).toBe(0);
+      expect(result.foreignIntact).toBe(true);
+      expect(result.closeCalls).toBe(1);
+      expect(result.evidenceStable).toBe(true);
+      expect(result.error?.message).toMatch(/ancestor|identity|changed|unsafe/u);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["source", "before-read"], ["source", "after-open"],
+    ["generated", "before-read"], ["generated", "after-open"],
+  ])("does not read a replaced private %s payload parent at %s", (target, timing) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore-private-reader-seam", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, target, timing,
+      }) as unknown as {
+        ok: boolean; injected: boolean; externalReads: number; foreignIntact: boolean;
+        evidenceStable: boolean; error?: { message: string };
+      };
+      expect(result.ok).toBe(false);
+      expect(result.injected).toBe(true);
+      expect(result.externalReads).toBe(0);
+      expect(result.foreignIntact).toBe(true);
+      expect(result.evidenceStable).toBe(true);
+      expect(result.error?.message).toMatch(/ancestor|identity|changed|unsafe/u);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
 });

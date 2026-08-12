@@ -691,6 +691,164 @@ try {
       }
       process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, derivedTracePaths, fsTrace, error: errorShape(error) }));
     }
+  } else if (operation === "restore-parent-sync-seam") {
+    const { target, timing, ...restoreRequest } = request;
+    const restoreId = "restore-c3624475-87d7-4886-b0bf-68a5061663d2";
+    const targetPath = target === "workspace"
+      ? request.repoRoot
+      : target === "payload"
+        ? join(request.quarantineRoot, request.transactionId, "payload", "source-copies")
+        : join(request.quarantineRoot, request.transactionId, "rollback", "regenerated-before-restore", restoreId);
+    let armed = false;
+    let injected = false;
+    let sentinel;
+    let foreignSync = 0;
+    let closeCalls = 0;
+    let beforeEvidence;
+    const snapshot = () => JSON.stringify([
+      treeSnapshot(join(request.quarantineRoot, request.transactionId)), treeSnapshot(request.repoRoot), treeSnapshot(targetPath),
+    ]);
+    const replaceParent = () => {
+      if (injected) return;
+      renameSync(targetPath, targetPath + ".sync-held-original");
+      mkdirSync(targetPath, { recursive: true, mode: 0o700 });
+      sentinel = join(targetPath, "foreign-sentinel");
+      writeFileSync(sentinel, "foreign");
+      injected = true;
+      beforeEvidence = snapshot();
+    };
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        const shouldInject = armed && !injected && path === targetPath;
+        if (shouldInject && timing === "before-open") replaceParent();
+        const openedForeign = injected && path === targetPath;
+        const handle = await fsPromises.open(path, ...args);
+        if (shouldInject && timing === "after-open") replaceParent();
+        if (path !== targetPath) return handle;
+        return new Proxy(handle, {
+          get(inner, property) {
+            const value = Reflect.get(inner, property, inner);
+            if (property === "sync") return async (...syncArgs) => {
+              if (openedForeign) foreignSync += 1;
+              return Reflect.apply(value, inner, syncArgs);
+            };
+            if (property === "close") return async (...closeArgs) => {
+              if (shouldInject) closeCalls += 1;
+              return Reflect.apply(value, inner, closeArgs);
+            };
+            return typeof value === "function" ? value.bind(inner) : value;
+          },
+        });
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await restore.restoreQuarantine({
+        ...restoreRequest,
+        fsApi: adapter,
+        async faultHook(phase) {
+          if (target === "workspace" && phase === "after-restored-payload-sync:copy-0001") armed = true;
+          if (target === "payload" && phase === "after-restore-destination-parent-sync:copy-0001") armed = true;
+          if (target === "rollback" && phase === "after-rollback-tree-sync:generated-next") armed = true;
+        },
+      });
+    } catch (error) { captured = error; }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      injected,
+      foreignSync,
+      foreignIntact: sentinel !== undefined && readFileSync(sentinel, "utf8") === "foreign",
+      closeCalls,
+      evidenceStable: beforeEvidence !== undefined && beforeEvidence === snapshot(),
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
+  } else if (operation === "restore-private-reader-seam") {
+    const { target, timing, ...restoreRequest } = request;
+    const payload = target === "source"
+      ? join(request.quarantineRoot, request.transactionId, "payload", "source-copies", "copy-0001")
+      : join(request.quarantineRoot, request.transactionId, "payload", "generated", ".next");
+    const parent = dirname(payload);
+    let armed = false;
+    let injected = false;
+    let sentinel;
+    let externalReads = 0;
+    let beforeEvidence;
+    const snapshot = () => treeSnapshot(join(request.quarantineRoot, request.transactionId));
+    const replaceParent = () => {
+      if (injected) return;
+      renameSync(parent, parent + ".reader-held-original");
+      mkdirSync(parent, { recursive: true, mode: 0o700 });
+      if (target === "source") writeFileSync(payload, "foreign\\n");
+      else {
+        mkdirSync(payload, { recursive: true, mode: 0o700 });
+        writeFileSync(join(payload, "build"), "foreign\\n");
+      }
+      sentinel = join(parent, "foreign-sentinel");
+      writeFileSync(sentinel, "foreign");
+      injected = true;
+      beforeEvidence = snapshot();
+    };
+    const isPayload = (path) => path === payload || path.startsWith(payload + "/");
+    const adapter = {
+      ...fsPromises,
+      async open(path, ...args) {
+        const shouldInject = armed && !injected && path === payload;
+        if (shouldInject && timing === "before-read") replaceParent();
+        const openedForeign = injected && isPayload(path);
+        const handle = await fsPromises.open(path, ...args);
+        if (shouldInject && timing === "after-open") replaceParent();
+        return new Proxy(handle, {
+          get(inner, property) {
+            const value = Reflect.get(inner, property, inner);
+            if (property === "read") return async (...readArgs) => {
+              if (openedForeign) externalReads += 1;
+              return Reflect.apply(value, inner, readArgs);
+            };
+            return typeof value === "function" ? value.bind(inner) : value;
+          },
+        });
+      },
+      async opendir(path, ...args) {
+        const dir = await fsPromises.opendir(path, ...args);
+        const openedForeign = injected && isPayload(path);
+        return new Proxy(dir, {
+          get(inner, property) {
+            const value = Reflect.get(inner, property, inner);
+            if (property === "read") return async (...readArgs) => {
+              if (openedForeign) externalReads += 1;
+              return Reflect.apply(value, inner, readArgs);
+            };
+            return typeof value === "function" ? value.bind(inner) : value;
+          },
+        });
+      },
+      createReadStream,
+      lstatSync,
+      realpathSync,
+    };
+    let captured;
+    try {
+      await restore.restoreQuarantine({
+        ...restoreRequest,
+        fsApi: adapter,
+        async faultHook(phase) {
+          if (target === "generated" && phase === "after-event:RESTORE_INTENT:generated-next") armed = true;
+          if (target === "source" && phase === "after-event:RESTORE_INTENT:copy-0001") armed = true;
+        },
+      });
+    } catch (error) { captured = error; }
+    process.stdout.write(JSON.stringify({
+      ok: captured === undefined,
+      injected,
+      externalReads,
+      foreignIntact: sentinel !== undefined && readFileSync(sentinel, "utf8") === "foreign",
+      evidenceStable: beforeEvidence !== undefined && beforeEvidence === snapshot(),
+      error: captured === undefined ? undefined : errorShape(captured),
+    }));
   } else if (operation === "restore-authority-seam") {
     const { target, ...restoreRequest } = request;
     const generated = join(request.repoRoot, ".next");
