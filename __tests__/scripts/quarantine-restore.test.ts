@@ -356,10 +356,11 @@ describe("quarantine restore", () => {
   it("bounds global restored-tree fsync traversal before RESTORED_ENTRY", () => {
     const prepared = prepareQuarantinedFixture();
     try {
+      const startedAt = Date.now();
       const result = invokeQuarantineWorker("restore", {
         repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
         transactionId: prepared.transactionId, writersStopped: true, oversizedRestoredTree: true,
-      }) as unknown as {
+      }, {}, 60_000) as unknown as {
         ok: boolean; phases: string[]; syncOpened: number; syncClosed: number; maxSyncHandles: number;
         error?: { message?: string };
       };
@@ -370,6 +371,7 @@ describe("quarantine restore", () => {
       expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_INTENT");
       expect(result.syncOpened).toBe(result.syncClosed);
       expect(result.maxSyncHandles).toBeLessThanOrEqual(2);
+      expect(Date.now() - startedAt).toBeLessThan(60_000);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
