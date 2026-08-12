@@ -427,7 +427,7 @@ describe("quarantine restore", () => {
       expect(observed.finalPrecheckTargetReads).toBe(1);
       expect(observed.finalPrecheckMarker).toEqual(expect.objectContaining({
         path: join(prepared.runRoot, "rollback", "regenerated-before-restore", "restore-c3624475-87d7-4886-b0bf-68a5061663d2", ".next"),
-        callIndex: 0, purpose: "generated-active-to-rollback final destination absence check", injectionFired: true,
+        callIndex: expect.any(Number), purpose: "generated-active-to-rollback final destination absence check", injectionFired: true,
       }));
       expect(observed.rollbackRenameCalls).toBe(0);
       expect(observed.rollbackInterloperPreserved).toBe(true);

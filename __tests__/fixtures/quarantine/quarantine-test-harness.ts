@@ -524,6 +524,7 @@ try {
     let finalInterloperPath;
     let finalPrecheckMarker;
     let rollbackRenameCalls = 0;
+    let lstatCallIndex = 0;
     let publicationMarker;
     let publicationEvidence;
     let foreignOpenCalls = 0;
@@ -629,12 +630,14 @@ try {
           return result;
         };
         fsApi.lstat = async (path) => {
+          const callIndex = lstatCallIndex;
+          lstatCallIndex += 1;
           if (interloperAtFinalPrecheck === "generated-rollback" && !inserted && path === target) {
             inserted = true;
             finalPrecheckTargetReads += 1;
             finalInterloperPath = join(path, "foreign");
             finalPrecheckMarker = {
-              path, callIndex: finalPrecheckTargetReads - 1,
+              path, callIndex,
               purpose: "generated-active-to-rollback final destination absence check", injectionFired: true,
             };
             mkdirSync(path, { recursive: true, mode: 0o700 });
