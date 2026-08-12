@@ -1919,6 +1919,8 @@ function buildApplyLedger(replayed, manifest) {
   const entries = new Map(manifest.entries.map((entry) => [entry.id, entry]));
   const intents = [];
   const completed = new Set();
+  const rollbackIntents = new Set();
+  const rollbackCompleted = new Set();
   let completionIndex = 0;
   for (const record of replayed.records) {
     if (record.event === "MOVE_INTENT") {
@@ -1939,6 +1941,10 @@ function buildApplyLedger(replayed, manifest) {
       record.payload.manifestSha256 !== prepared.payload.manifestSha256
     ) {
       fail("ERR_INTEGRITY");
+    } else if (record.event === "ROLLBACK_INTENT") {
+      rollbackIntents.add(record.payload.id);
+    } else if (record.event === "ROLLED_BACK_ENTRY") {
+      rollbackCompleted.add(record.payload.id);
     }
   }
   if (
@@ -1952,11 +1958,18 @@ function buildApplyLedger(replayed, manifest) {
     entries,
     intents: Object.freeze(intents),
     intentIds: Object.freeze(intents.map((entry) => entry.id)),
+    rollbackIntents,
+    rollbackCompleted,
   });
 }
 
 async function appendHeldEvent({ capability, heldLock, event, payload, faultHook }) {
   return appendJournalRecord({ capability, heldLock, event, payload, faultHook });
+}
+
+async function appendRecoveryEvent({ capability, heldLock, event, payload, faultHook, phase }) {
+  await appendHeldEvent({ capability, heldLock, event, payload, faultHook });
+  await invokeApplyHook(faultHook, { rejected: false }, phase);
 }
 
 async function endpointStat(path, fsApi) {
@@ -2026,7 +2039,16 @@ async function classifyApplyEndpoint({ capability, entry, repoRoot, fsApi }) {
   return { payload, payloadObserved, payloadStat, source, sourceObserved, sourceStat };
 }
 
-async function guardedRecoveryRename({ capability, entry, repoRoot, workspace, payload, toPayload, fsApi }) {
+async function guardedRecoveryRename({
+  capability,
+  entry,
+  repoRoot,
+  workspace,
+  payload,
+  toPayload,
+  fsApi,
+  faultHook,
+}) {
   const workspaceAncestors = await captureSourceAncestors(repoRoot, workspace, fsApi);
   const payloadParent = dirname(payload);
   const payloadParentIdentity = await capturePrivateDirectory(payloadParent, fsApi);
@@ -2076,6 +2098,7 @@ async function guardedRecoveryRename({ capability, entry, repoRoot, workspace, p
     if (error?.code === "EXDEV") fail("ERR_EXDEV");
     throw error;
   }
+  if (!toPayload) await invokeApplyHook(faultHook, { rejected: false }, `after-rollback-rename:${entry.id}`);
   if (toPayload) {
     try {
       await fsyncTree({ capability, root: payload, entryId: entry.id, purpose: "payload" });
@@ -2083,12 +2106,27 @@ async function guardedRecoveryRename({ capability, entry, repoRoot, workspace, p
       fail("ERR_INTEGRITY");
     }
   }
+  if (!toPayload) await invokeApplyHook(faultHook, { rejected: false }, `after-rollback-payload-sync:${entry.id}`);
   await assertAfterRename();
   try {
     await syncDirectory(payloadParent, fsApi);
     await syncDirectory(dirname(workspace), fsApi);
   } catch {
     fail("ERR_INTEGRITY");
+  }
+  if (!toPayload) {
+    await invokeApplyHook(
+      faultHook,
+      { rejected: false },
+      `after-rollback-destination-parent-sync:${entry.id}`,
+    );
+  }
+  if (!toPayload) {
+    await invokeApplyHook(
+      faultHook,
+      { rejected: false },
+      `after-rollback-source-parent-sync:${entry.id}`,
+    );
   }
   await assertAfterRename();
 }
@@ -2139,12 +2177,13 @@ async function resumeApplyFromLedger({ capability, heldLock, ledger, manifest, o
     }
   }
   if (conflicts.length > 0) {
-    await appendHeldEvent({
+    await appendRecoveryEvent({
       capability,
       heldLock,
       event: "INCOMPLETE_CONFLICT",
       payload: { conflictEntryIds: [...conflicts].sort(byteCompare) },
       faultHook: options.faultHook,
+      phase: "after-event:INCOMPLETE_CONFLICT",
     });
     return recoveryConflict(options.transactionId, "resume", conflicts);
   }
@@ -2224,25 +2263,35 @@ async function rollbackApplyFromLedger({ capability, heldLock, ledger, manifest,
         (endpoint.sourceStat === null && endpoint.payloadStat === null)) conflicts.push(entry.id);
   }
   if (conflicts.length > 0) {
-    await appendHeldEvent({
+    await appendRecoveryEvent({
       capability,
       heldLock,
       event: "INCOMPLETE_CONFLICT",
       payload: { conflictEntryIds: [...conflicts].sort(byteCompare) },
       faultHook: options.faultHook,
+      phase: "after-event:INCOMPLETE_CONFLICT",
     });
     return recoveryConflict(options.transactionId, "rollback", conflicts);
   }
-  await appendHeldEvent({ capability, heldLock, event: "ROLLING_BACK", payload: {}, faultHook: options.faultHook });
+  await appendRecoveryEvent({
+    capability,
+    heldLock,
+    event: "ROLLING_BACK",
+    payload: {},
+    faultHook: options.faultHook,
+    phase: "after-event:ROLLING_BACK",
+  });
   let reconciledEntries = 0;
   for (const entry of [...ledger.intents].reverse()) {
     const endpoint = classifications.get(entry.id);
-    await appendHeldEvent({
+    if (ledger.rollbackCompleted.has(entry.id)) continue;
+    await appendRecoveryEvent({
       capability,
       heldLock,
       event: "ROLLBACK_INTENT",
       payload: { id: entry.id },
       faultHook: options.faultHook,
+      phase: `after-event:ROLLBACK_INTENT:${entry.id}`,
     });
     if (endpoint.payloadStat !== null) {
       await guardedRecoveryRename({
@@ -2253,18 +2302,27 @@ async function rollbackApplyFromLedger({ capability, heldLock, ledger, manifest,
         payload: endpoint.payload,
         toPayload: false,
         fsApi,
+        faultHook: options.faultHook,
       });
       reconciledEntries += 1;
     }
-    await appendHeldEvent({
+    await appendRecoveryEvent({
       capability,
       heldLock,
       event: "ROLLED_BACK_ENTRY",
       payload: { id: entry.id },
       faultHook: options.faultHook,
+      phase: `after-event:ROLLED_BACK_ENTRY:${entry.id}`,
     });
   }
-  await appendHeldEvent({ capability, heldLock, event: "ROLLED_BACK", payload: {}, faultHook: options.faultHook });
+  await appendRecoveryEvent({
+    capability,
+    heldLock,
+    event: "ROLLED_BACK",
+    payload: {},
+    faultHook: options.faultHook,
+    phase: "after-event:ROLLED_BACK",
+  });
   return recoveryResult(options.transactionId, "ROLLED_BACK", "rollback", reconciledEntries);
 }
 
@@ -2301,14 +2359,16 @@ async function recoverApplyOnCapability({ capability, options }) {
       if (
         replayed.state !== "PREPARED" &&
         replayed.state !== "MOVING" &&
-        replayed.state !== "VERIFYING"
+        replayed.state !== "VERIFYING" &&
+        replayed.state !== "ROLLING_BACK"
       ) fail("ERR_INTEGRITY");
-      await appendHeldEvent({
+      await appendRecoveryEvent({
         capability,
         heldLock,
         event: "RECOVERY_REQUIRED",
         payload: { entryIds: ledger.intentIds },
         faultHook: options.faultHook,
+        phase: "after-event:RECOVERY_REQUIRED",
       });
     }
     return options.action === "resume"
