@@ -279,11 +279,15 @@ async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, 
     const activeExpected = ledger.active.get(entry.id);
     const payloadObserved = await privateTreeSummary(payload, fsApi);
     const activeObserved = await privateTreeSummary(active, fsApi);
+    // A crash before the active->rollback rename has no per-restore parent
+    // yet.  Derive the stable rollback root first; rollback-entry deliberately
+    // requires its parent to exist and is therefore only safe after creation.
     const rollbackObserved = activeExpected === null
       ? null
-      : await privateTreeSummary(deriveRunPath(capability, {
-        purpose: "rollback-entry", id: ledger.restoreId, phase: entry.id,
-      }), fsApi);
+      : await privateTreeSummary(join(
+        deriveRunPath(capability, { purpose: "rollback", id: ledger.restoreId }),
+        entry.id === "generated-next" ? ".next" : "node_modules",
+      ), fsApi);
     const original = entry.preMoveInventory;
     const initial = sameSummary(original, payloadObserved) &&
       (activeExpected === null ? activeObserved === null : sameSummary(activeExpected, activeObserved)) &&
@@ -325,7 +329,7 @@ async function validateExistingRun(capability, options, fsApi) {
   }
   const restore = restoreProvenance(replayed);
   const restoreContext = restore.active && new Set([
-    "RESTORE_PREPARED", "RESTORING", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK",
+    "RESTORE_PREPARED", "RESTORING", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK", "INCOMPLETE_CONFLICT",
   ]).has(replayed.state);
   const provenanceState = restoreContext ? restore.state : replayed.state;
   if (provenanceState !== "QUARANTINED" && provenanceState !== "VALIDATED") {
@@ -347,15 +351,24 @@ async function validateExistingRun(capability, options, fsApi) {
   ) {
     throw new Error("quarantine lifecycle provenance does not match the live repository");
   }
-  if (restoreContext) {
+  if (restoreContext && replayed.state !== "INCOMPLETE_CONFLICT") {
     const ledger = validateRestoreLedger(replayed, manifest);
-    await verifyRestoreLocations({
-      capability,
-      repoRoot: options.repoRoot,
-      manifest,
-      ledger,
-      fsApi,
-    });
+    try {
+      await verifyRestoreLocations({
+        capability,
+        repoRoot: options.repoRoot,
+        manifest,
+        ledger,
+        fsApi,
+      });
+    } catch (error) {
+      // Recovery is the sole caller allowed to turn a durable-but-mismatched
+      // restore into INCOMPLETE_CONFLICT.  Keep structural/provenance and
+      // ancestor failures fatal; those are not location disagreements.
+      if (!/restore (?:source|generated) locations are inconsistent|restore source endpoint is invalid|restore source endpoint content is invalid/u.test(error?.message ?? "")) {
+        throw error;
+      }
+    }
   }
 
   const pointer = await readPointer(capability);

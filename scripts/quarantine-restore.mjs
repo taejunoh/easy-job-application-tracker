@@ -16,6 +16,9 @@ import { deriveRunPath, revalidateRunCapability } from "./quarantine-run-capabil
 const OPTION_KEYS = Object.freeze([
   "repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi", "faultHook",
 ]);
+const RECOVERY_OPTION_KEYS = Object.freeze([
+  "repoRoot", "quarantineRoot", "transactionId", "action", "writersStopped", "fsApi", "faultHook",
+]);
 const REQUIRED_KEYS = Object.freeze(["repoRoot", "quarantineRoot", "transactionId", "writersStopped"]);
 const GENERATED_IDS = Object.freeze(["generated-next", "generated-node-modules"]);
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
@@ -38,7 +41,8 @@ function activeRecord(id, inventory, ancestors, rootIdentity = null) {
   return value;
 }
 
-function snapshotOptions(input) {
+function snapshotOptions(input, { recovery = false } = {}) {
+  const optionKeys = recovery ? RECOVERY_OPTION_KEYS : OPTION_KEYS;
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError("restore options must be an exact record");
   }
@@ -47,11 +51,11 @@ function snapshotOptions(input) {
   }
   const keys = Reflect.ownKeys(input);
   if (
-    keys.some((key) => typeof key !== "string" || !OPTION_KEYS.includes(key)) ||
+    keys.some((key) => typeof key !== "string" || !optionKeys.includes(key)) ||
     REQUIRED_KEYS.some((key) => !keys.includes(key))
   ) throw new TypeError("restore options are invalid");
   const snapshot = Object.create(null);
-  for (const key of OPTION_KEYS) if (keys.includes(key)) snapshot[key] = input[key];
+  for (const key of optionKeys) if (keys.includes(key)) snapshot[key] = input[key];
   if (snapshot.writersStopped !== true) throw new TypeError("writers-stopped attestation must be true");
   for (const [key, value] of [["repoRoot", snapshot.repoRoot], ["quarantineRoot", snapshot.quarantineRoot]]) {
     if (typeof value !== "string" || !isAbsolute(value) || value.includes("\0") || value !== value.normalize("NFC")) {
@@ -64,6 +68,9 @@ function snapshotOptions(input) {
   ) throw new TypeError("restore transaction ID is invalid");
   if (snapshot.faultHook !== undefined && typeof snapshot.faultHook !== "function") {
     throw new TypeError("restore fault hook must be a function");
+  }
+  if (recovery && snapshot.action !== "resume" && snapshot.action !== "rollback") {
+    throw new TypeError("restore recovery action is invalid");
   }
   return Object.freeze(snapshot);
 }
@@ -93,6 +100,13 @@ async function optionalStat(path, fsApi) {
 
 function workspacePath(repoRoot, entry) {
   return join(repoRoot, ...entry.relativePath.split("/"));
+}
+
+function rollbackEntryPath(capability, restoreId, entryId) {
+  return join(
+    deriveRunPath(capability, { purpose: "rollback", id: restoreId }),
+    entryId === "generated-next" ? ".next" : "node_modules",
+  );
 }
 
 async function captureAncestors(repoRoot, endpoint, fsApi) {
@@ -469,6 +483,163 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
   await invokeHook(faultHook, `after-event:RESTORED_ENTRY:${entry.id}`);
 }
 
+async function sourceMatches(path, entry, fsApi, ancestors = Object.freeze([])) {
+  const stat = await optionalStat(path, fsApi);
+  if (stat === null) return false;
+  if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o7777) !== entry.mode || stat.size !== entry.size) return false;
+  const hashed = await hashVerifiedRegularFile(path, stat, fsApi, ancestors);
+  return hashed.sha256 === entry.sha256 && hashed.bytes === entry.size;
+}
+
+async function treeMatches(path, inventory, fsApi, ancestors = Object.freeze([])) {
+  const stat = await optionalStat(path, fsApi);
+  if (stat === null) return false;
+  if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+  return sameSummary(inventory, await summarizeInventoryDirectory(path, { fsApi, ancestorChain: ancestors }));
+}
+
+/* Classifying by durable locations is deliberate: a regenerated tree may be
+ * byte-identical to the original.  In that case the P/A/R role and ledger,
+ * rather than the digest, determine which side may be moved. */
+async function classifyRecoveryEntry({ handoff, ledger, entry }) {
+  const fsApi = handoff.fsApi;
+  const payload = deriveRunPath(handoff.capability, { purpose: "payload", id: entry.id });
+  const active = workspacePath(handoff.repoRoot, entry);
+  const ancestors = await captureAncestors(handoff.repoRoot, active, fsApi);
+  const pStat = await optionalStat(payload, fsApi);
+  const aStat = await optionalStat(active, fsApi);
+  if (entry.kind === "source-copy") {
+    const p = pStat !== null && await sourceMatches(payload, entry, fsApi);
+    const a = aStat !== null && await sourceMatches(active, entry, fsApi, ancestors);
+    if (p && !a) return Object.freeze({ id: entry.id, state: "initial" });
+    if (!p && a) return Object.freeze({ id: entry.id, state: "final" });
+    if (pStat === null && aStat === null) return Object.freeze({ id: entry.id, state: "missing" });
+    return Object.freeze({ id: entry.id, state: "conflict" });
+  }
+  const rollback = rollbackEntryPath(handoff.capability, ledger.restoreId, entry.id);
+  const rStat = await optionalStat(rollback, fsApi);
+  const original = entry.preMoveInventory;
+  const generated = ledger.active.get(entry.id);
+  const p = pStat !== null && await treeMatches(payload, original, fsApi);
+  const aOriginal = aStat !== null && await treeMatches(active, original, fsApi, ancestors);
+  const aGenerated = generated !== null && aStat !== null && await treeMatches(active, generated, fsApi, ancestors);
+  const rGenerated = generated !== null && rStat !== null && await treeMatches(rollback, generated, fsApi);
+  if (generated === null) {
+    if (p && aStat === null && rStat === null) return Object.freeze({ id: entry.id, state: "initial" });
+    if (pStat === null && aOriginal && rStat === null) return Object.freeze({ id: entry.id, state: "final" });
+    if (pStat === null && aStat === null && rStat === null) return Object.freeze({ id: entry.id, state: "missing" });
+    return Object.freeze({ id: entry.id, state: "conflict" });
+  }
+  if (p && aGenerated && rStat === null) return Object.freeze({ id: entry.id, state: "initial" });
+  if (p && aStat === null && rGenerated) return Object.freeze({ id: entry.id, state: "staged" });
+  if (pStat === null && aOriginal && rGenerated) return Object.freeze({ id: entry.id, state: "final" });
+  if (pStat === null && aStat === null && rStat === null) return Object.freeze({ id: entry.id, state: "missing" });
+  return Object.freeze({ id: entry.id, state: "conflict" });
+}
+
+async function moveRecoveryEndpoint({ handoff, entry, source, destination, sourceExpected, sourceInventory, sourceAncestors, destinationAncestors, destinationParent, sourceParent, hook, phases }) {
+  const fsApi = handoff.fsApi;
+  let identity;
+  await guardedRestoreRename({
+    capability: handoff.capability, pathRequest: { purpose: "payload", id: entry.id }, source, destination, fsApi,
+    before: async () => {
+      if (destinationAncestors !== undefined) await assertAncestors(destinationAncestors, fsApi);
+      if (sourceExpected === "original") {
+        if (entry.kind === "source-copy") {
+          if (!await sourceMatches(source, entry, fsApi, sourceAncestors ?? Object.freeze([]))) throw new Error("restore recovery original changed");
+        } else if (!await treeMatches(source, entry.preMoveInventory, fsApi, sourceAncestors ?? Object.freeze([]))) throw new Error("restore recovery original changed");
+      } else if (sourceExpected === "generated" &&
+          !await treeMatches(source, sourceInventory, fsApi, sourceAncestors ?? Object.freeze([]))) {
+        throw new Error("restore recovery regenerated tree changed");
+      }
+    },
+    after: async (stat) => { identity = await captureVerifiedSyncIdentity(destination, stat, fsApi); },
+  });
+  await invokeHook(hook, phases.rename);
+  await fsyncVerifiedTree(destination, { fsApi, ancestorChain: destinationAncestors ?? Object.freeze([]), rootIdentity: identity });
+  await invokeHook(hook, phases.sync);
+  await syncVerifiedDirectory(destinationParent.path, { fsApi, ...destinationParent });
+  await invokeHook(hook, phases.destinationParent);
+  if (sourceParent !== undefined) {
+    await syncVerifiedDirectory(sourceParent.path, { fsApi, ...sourceParent });
+    await invokeHook(hook, phases.sourceParent);
+  }
+}
+
+async function forwardRecoveryEntry({ handoff, heldLock, ledger, entry, state, faultHook }) {
+  const fsApi = handoff.fsApi;
+  const payload = deriveRunPath(handoff.capability, { purpose: "payload", id: entry.id });
+  const active = workspacePath(handoff.repoRoot, entry);
+  const ancestors = await captureAncestors(handoff.repoRoot, active, fsApi);
+  const activeParent = workspaceParentBinding(ancestors, dirname(active));
+  const payloadParentIdentity = await capturePrivateParent(dirname(payload), fsApi);
+  const payloadParent = { path: payloadParentIdentity.path, ancestorChain: Object.freeze([]), expectedIdentity: payloadParentIdentity };
+  if (!ledger.intents.includes(entry.id)) {
+    await append(heldLock, handoff.capability, "RESTORE_INTENT", { id: entry.id });
+    await invokeHook(faultHook, `after-event:RESTORE_INTENT:${entry.id}`);
+  }
+  if (state === "initial" && entry.kind === "generated-root" && ledger.active.get(entry.id) !== null) {
+    const rollback = rollbackEntryPath(handoff.capability, ledger.restoreId, entry.id);
+    await fsApi.mkdir(dirname(rollback), { recursive: true, mode: 0o700 });
+    const rollbackIdentity = await capturePrivateParent(dirname(rollback), fsApi);
+    await moveRecoveryEndpoint({ handoff, entry, source: active, destination: rollback, sourceExpected: "generated", sourceInventory: ledger.active.get(entry.id), sourceAncestors: ancestors, destinationAncestors: Object.freeze([rollbackIdentity]), destinationParent: { path: rollbackIdentity.path, ancestorChain: Object.freeze([]), expectedIdentity: rollbackIdentity }, sourceParent: { path: dirname(active), ...activeParent }, hook: faultHook, phases: {
+      rename: `after-active-to-rollback-rename:${entry.id}`, sync: `after-rollback-tree-sync:${entry.id}`,
+      destinationParent: `after-rollback-destination-parent-sync:${entry.id}`, sourceParent: `after-rollback-source-parent-sync:${entry.id}`,
+    } });
+    state = "staged";
+  }
+  if (state === "initial" || state === "staged") {
+    await moveRecoveryEndpoint({ handoff, entry, source: payload, destination: active, sourceExpected: "original", sourceAncestors: Object.freeze([payloadParentIdentity]), destinationAncestors: ancestors, destinationParent: { path: dirname(active), ...activeParent }, sourceParent: payloadParent, hook: faultHook, phases: {
+      rename: `after-payload-to-active-rename:${entry.id}`, sync: `after-restored-payload-sync:${entry.id}`,
+      destinationParent: `after-restore-destination-parent-sync:${entry.id}`, sourceParent: `after-restore-source-parent-sync:${entry.id}`,
+    } });
+  }
+  await append(heldLock, handoff.capability, "RESTORED_ENTRY", { id: entry.id });
+  await invokeHook(faultHook, `after-event:RESTORED_ENTRY:${entry.id}`);
+}
+
+async function rollbackRecoveryEntry({ handoff, heldLock, ledger, entry, state, faultHook, rollbackIntentRecorded = false }) {
+  const fsApi = handoff.fsApi;
+  const payload = deriveRunPath(handoff.capability, { purpose: "payload", id: entry.id });
+  const active = workspacePath(handoff.repoRoot, entry);
+  const ancestors = await captureAncestors(handoff.repoRoot, active, fsApi);
+  const activeParent = workspaceParentBinding(ancestors, dirname(active));
+  const payloadIdentity = await capturePrivateParent(dirname(payload), fsApi);
+  const payloadParent = { path: payloadIdentity.path, ancestorChain: Object.freeze([]), expectedIdentity: payloadIdentity };
+  if (!rollbackIntentRecorded) {
+    await append(heldLock, handoff.capability, "RESTORE_ROLLBACK_INTENT", { id: entry.id });
+    await invokeHook(faultHook, `after-event:RESTORE_ROLLBACK_INTENT:${entry.id}`);
+  }
+  if (state === "final") {
+    await moveRecoveryEndpoint({ handoff, entry, source: active, destination: payload, sourceExpected: "original", sourceAncestors: ancestors, destinationAncestors: Object.freeze([]), destinationParent: payloadParent, sourceParent: { path: dirname(active), ...activeParent }, hook: faultHook, phases: {
+      rename: `after-original-active-to-payload-rename:${entry.id}`, sync: `after-original-payload-sync:${entry.id}`,
+      destinationParent: `after-original-payload-parent-sync:${entry.id}`, sourceParent: `after-original-active-parent-sync:${entry.id}`,
+    } });
+    state = "staged";
+  }
+  if (entry.kind === "generated-root" && ledger.active.get(entry.id) !== null && state === "staged") {
+    const rollback = rollbackEntryPath(handoff.capability, ledger.restoreId, entry.id);
+    const rollbackIdentity = await capturePrivateParent(dirname(rollback), fsApi);
+    let identity;
+    await guardedRestoreRename({ capability: handoff.capability, pathRequest: { purpose: "rollback-entry", id: ledger.restoreId, phase: entry.id }, source: rollback, destination: active, fsApi,
+      before: async () => {
+        await assertPrivateParent(rollbackIdentity, fsApi);
+        if (!await treeMatches(rollback, ledger.active.get(entry.id), fsApi, privateParentChain(rollbackIdentity))) throw new Error("restore recovery regenerated rollback changed");
+        await assertAncestors(ancestors, fsApi);
+      }, after: async (stat) => { identity = await captureVerifiedSyncIdentity(active, stat, fsApi); },
+    });
+    await invokeHook(faultHook, `after-regenerated-rollback-to-active-rename:${entry.id}`);
+    await fsyncVerifiedTree(active, { fsApi, ancestorChain: ancestors, rootIdentity: identity });
+    await invokeHook(faultHook, `after-regenerated-active-tree-sync:${entry.id}`);
+    await syncVerifiedDirectory(dirname(active), { fsApi, ...activeParent });
+    await invokeHook(faultHook, `after-regenerated-active-parent-sync:${entry.id}`);
+    await syncVerifiedDirectory(rollbackIdentity.path, { fsApi, ancestorChain: Object.freeze([]), expectedIdentity: rollbackIdentity });
+    await invokeHook(faultHook, `after-regenerated-rollback-parent-sync:${entry.id}`);
+  }
+  await append(heldLock, handoff.capability, "RESTORE_ROLLED_BACK_ENTRY", { id: entry.id });
+  await invokeHook(faultHook, `after-event:RESTORE_ROLLED_BACK_ENTRY:${entry.id}`);
+}
+
 export async function restoreQuarantine(input) {
   const options = snapshotOptions(input);
   // This must precede capability derivation and every await so later caller
@@ -514,4 +685,97 @@ export async function restoreQuarantine(input) {
       ]);
     });
   });
+}
+
+export async function recoverRestore(input) {
+  const options = snapshotOptions(input, { recovery: true });
+  const restoreId = deriveRestoreId(options.transactionId);
+  const existing = record([
+    ["repoRoot", options.repoRoot], ["quarantineRoot", options.quarantineRoot],
+    ["transactionId", options.transactionId], ["writersStopped", true],
+    ...(Object.hasOwn(options, "fsApi") ? [["fsApi", options.fsApi]] : []),
+  ]);
+  return withExistingQuarantineRun(existing, async (handoff) => withJournalLock({ capability: handoff.capability }, async (heldLock) => {
+    const replayed = await replayJournal({ capability: handoff.capability });
+    if (replayed.truncatedTail) throw new Error("restore recovery journal has a torn tail");
+    const tip = replayed.records.at(-1);
+    if (tip?.recordHash !== handoff.journalTip.recordHash || replayed.state !== handoff.journalTip.state) {
+      throw new Error("restore journal changed before recovery mutation");
+    }
+    const prepared = replayed.records.findLast((entry) => entry.event === "RESTORE_PREPARED");
+    if (prepared?.payload.restoreId !== restoreId) throw new Error("restore recovery ID does not match transaction");
+    if (replayed.state === "INCOMPLETE_CONFLICT") {
+      const conflict = replayed.records.at(-1)?.payload.conflictEntryIds;
+      return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "INCOMPLETE_CONFLICT"], ["action", options.action], ["conflictEntryIds", Object.freeze([...conflict])]]);
+    }
+    if (replayed.state === "RESTORED") throw new Error("completed restore cannot be undone");
+    if (!new Set(["RESTORE_PREPARED", "RESTORING", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK"]).has(replayed.state)) {
+      throw new Error("restore recovery requires an in-progress restore");
+    }
+    const entries = handoff.manifestGeneration.manifest.entries;
+    const intents = replayed.records.filter((entry) => entry.event === "RESTORE_INTENT").map((entry) => entry.payload.id);
+    const completed = new Set(replayed.records.filter((entry) => entry.event === "RESTORED_ENTRY").map((entry) => entry.payload.id));
+    const rollbackIntents = replayed.records.filter((entry) => entry.event === "RESTORE_ROLLBACK_INTENT").map((entry) => entry.payload.id);
+    const rollbackCompleted = new Set(replayed.records.filter((entry) => entry.event === "RESTORE_ROLLED_BACK_ENTRY").map((entry) => entry.payload.id));
+    const pendingRollback = rollbackIntents.length === rollbackCompleted.size ? null : rollbackIntents.at(-1);
+    const ledger = Object.freeze({
+      restoreId,
+      active: new Map(prepared.payload.activeGenerated.map((entry) => [entry.id, entry.inventory])),
+      intents: Object.freeze(intents), completed, rollbackCompleted,
+    });
+    const inspected = [];
+    for (const entry of entries) {
+      if (options.action === "resume" && completed.has(entry.id)) continue;
+      if (options.action === "rollback" && (!intents.includes(entry.id) || rollbackCompleted.has(entry.id))) continue;
+      inspected.push(await classifyRecoveryEntry({ handoff, ledger, entry }));
+    }
+    const missing = inspected.filter((entry) => entry.state === "missing");
+    if (missing.length > 0) throw new Error("restore recovery evidence is missing");
+    const conflicts = inspected.filter((entry) => entry.state === "conflict").map((entry) => entry.id).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+    if (conflicts.length > 0) {
+      if (replayed.state !== "RECOVERY_REQUIRED") {
+        await append(heldLock, handoff.capability, "RECOVERY_REQUIRED", { entryIds: Object.freeze(intents) });
+        await invokeHook(options.faultHook, "after-event:RECOVERY_REQUIRED");
+      }
+      await append(heldLock, handoff.capability, "INCOMPLETE_CONFLICT", { conflictEntryIds: conflicts });
+      await invokeHook(options.faultHook, "after-event:INCOMPLETE_CONFLICT");
+      return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "INCOMPLETE_CONFLICT"], ["action", options.action], ["conflictEntryIds", Object.freeze(conflicts)]]);
+    }
+    if (options.action === "resume") {
+      if (replayed.state === "RESTORE_ROLLING_BACK") throw new Error("restore rollback is already in progress");
+      if (replayed.state !== "RECOVERY_REQUIRED") {
+        await append(heldLock, handoff.capability, "RECOVERY_REQUIRED", { entryIds: Object.freeze(intents) });
+        await invokeHook(options.faultHook, "after-event:RECOVERY_REQUIRED");
+      }
+      await append(heldLock, handoff.capability, "RESTORING", {});
+      await invokeHook(options.faultHook, "after-event:RESTORING");
+      const states = new Map(inspected.map((entry) => [entry.id, entry.state]));
+      for (const entry of entries) {
+        if (completed.has(entry.id)) continue;
+        await forwardRecoveryEntry({ handoff, heldLock, ledger, entry, state: states.get(entry.id) ?? "initial", faultHook: options.faultHook });
+      }
+      await append(heldLock, handoff.capability, "RESTORED", {});
+      await invokeHook(options.faultHook, "after-event:RESTORED");
+      await invokeHook(options.faultHook, "before-lock-cleanup");
+      return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "RESTORED"], ["action", "resume"], ["reconciledEntries", entries.length]]);
+    }
+    if (replayed.state !== "RESTORE_ROLLING_BACK") {
+      if (replayed.state !== "RECOVERY_REQUIRED") {
+        await append(heldLock, handoff.capability, "RECOVERY_REQUIRED", { entryIds: Object.freeze(intents) });
+        await invokeHook(options.faultHook, "after-event:RECOVERY_REQUIRED");
+      }
+      await append(heldLock, handoff.capability, "RESTORE_ROLLING_BACK", {});
+      await invokeHook(options.faultHook, "after-event:RESTORE_ROLLING_BACK");
+    }
+    const states = new Map(inspected.map((entry) => [entry.id, entry.state]));
+    for (const entry of [...entries].reverse()) {
+      if (!intents.includes(entry.id) || rollbackCompleted.has(entry.id)) continue;
+      await rollbackRecoveryEntry({ handoff, heldLock, ledger, entry, state: states.get(entry.id) ?? "initial", faultHook: options.faultHook, rollbackIntentRecorded: pendingRollback === entry.id });
+    }
+    const prior = handoff.journalTip.state === "VALIDATED" || replayed.records.slice(0, replayed.records.findIndex((entry) => entry.event === "RESTORE_PREPARED")).at(-1)?.event === "VALIDATED" ? "VALIDATED" : "QUARANTINED";
+    await append(heldLock, handoff.capability, prior === "VALIDATED" ? "RESTORE_ABORTED_TO_VALIDATED" : "RESTORE_ABORTED_TO_QUARANTINED", {});
+    await invokeHook(options.faultHook, prior === "VALIDATED" ? "after-event:RESTORE_ABORTED_TO_VALIDATED" : "after-event:RESTORE_ABORTED_TO_QUARANTINED");
+    await invokeHook(options.faultHook, "before-lock-cleanup");
+    return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", prior], ["action", "rollback"], ["reconciledEntries", intents.length], ["restoreAborted", true]]);
+  }));
 }

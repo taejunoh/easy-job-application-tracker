@@ -31,10 +31,13 @@ const transactionOperations = Object.freeze({
   recoverQuarantine: transaction.recoverQuarantine,
 });
 const restoreOperations = Object.freeze(["restoreQuarantine", "recoverRestore"]);
+const restore = restoreOperations.includes(request.operation)
+  ? await import("../../../scripts/quarantine-restore.mjs")
+  : null;
 const operation = Object.hasOwn(transactionOperations, request.operation)
   ? transactionOperations[request.operation]
   : restoreOperations.includes(request.operation)
-    ? (await import("../../../scripts/quarantine-numbered-copies-support.mjs"))[request.operation]
+    ? restore[request.operation]
     : undefined;
 if (typeof operation !== "function") {
   throw new Error("unsupported quarantine child operation");

@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const transactionUrl = pathToFileURL(
   join(__dirname, "../../../scripts/quarantine-transaction.mjs"),
@@ -45,6 +45,37 @@ const restoreUrl = pathToFileURL(
 const legacyFacadeUrl = pathToFileURL(
   join(__dirname, "../../../scripts/quarantine-numbered-copies-support.mjs"),
 ).href;
+const lifecycleChildPath = fileURLToPath(pathToFileURL(
+  join(__dirname, "quarantine-lifecycle-child.mjs"),
+));
+
+function waitForLifecycleChild(child: ReturnType<typeof spawn>) {
+  return new Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr?.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+}
+
+/** Runs the real ESM lifecycle child, preserving SIGKILL and stale-lock proof. */
+export function spawnLifecycleChild(
+  operation: string,
+  options: Record<string, unknown>,
+  { killAt, phaseTracePath }: { killAt?: string; phaseTracePath?: string } = {},
+) {
+  const child = spawn(process.execPath, [lifecycleChildPath], {
+    env: {
+      ...process.env,
+      QUARANTINE_CHILD_REQUEST: JSON.stringify({ operation, options, killAt }),
+      ...(phaseTracePath === undefined ? {} : { QUARANTINE_CHILD_PHASE_TRACE: phaseTracePath }),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return waitForLifecycleChild(child);
+}
 
 export const FS_METHODS = [
   "lstat",

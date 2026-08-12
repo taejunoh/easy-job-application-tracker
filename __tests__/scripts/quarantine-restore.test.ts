@@ -84,12 +84,12 @@ const EXPECTED_DURABLE_TIP = (() => {
 })();
 
 describe("quarantine restore", () => {
-  it("exports only restoreQuarantine", () => {
+  it("exports the restore and recovery entrypoints", () => {
     const exports = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
       const module = await import(${JSON.stringify(restoreUrl)});
       process.stdout.write(JSON.stringify(Object.keys(module)));
     `], { encoding: "utf8" }));
-    expect(exports).toEqual(["restoreQuarantine"]);
+    expect(exports).toEqual(["recoverRestore", "restoreQuarantine"]);
   });
 
   it("closes option records before filesystem authority and reads each supplied getter once", async () => {
@@ -139,6 +139,28 @@ describe("quarantine restore", () => {
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
+  });
+
+  it("closes recovery inputs synchronously and requires an exact action", () => {
+    const output = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+      const { recoverRestore } = await import(${JSON.stringify(restoreUrl)});
+      const reads = {}; const input = Object.create(null);
+      for (const [key, value] of Object.entries({ repoRoot: "/r", quarantineRoot: "/q", transactionId: "tx", action: "resume", writersStopped: true })) {
+        Object.defineProperty(input, key, { enumerable: true, get() { reads[key] = (reads[key] ?? 0) + 1; return value; } });
+      }
+      const errors = [];
+      for (const value of [
+        { repoRoot: "/r", quarantineRoot: "/q", transactionId: "tx", writersStopped: true },
+        { repoRoot: "/r", quarantineRoot: "/q", transactionId: "tx", action: "continue", writersStopped: true },
+        { repoRoot: "/r", quarantineRoot: "/q", transactionId: "tx", action: "resume", writersStopped: true, extra: true },
+      ]) try { await recoverRestore(value); } catch (error) { errors.push(error.message); }
+      try { await recoverRestore(input); } catch { /* files are intentionally absent after input closure */ }
+      process.stdout.write(JSON.stringify({ reads, errors }));
+    `], { encoding: "utf8" }));
+    expect(output.reads).toEqual({ repoRoot: 1, quarantineRoot: 1, transactionId: 1, action: 1, writersStopped: 1 });
+    expect(output.errors).toEqual([
+      expect.stringMatching(/action/u), expect.stringMatching(/action/u), expect.stringMatching(/invalid/u),
+    ]);
   });
 
   it("restores the deterministic transaction namespace in manifest order", () => {
