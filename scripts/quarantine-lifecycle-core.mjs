@@ -317,7 +317,7 @@ async function readPointer(capability) {
   }
 }
 
-async function validateExistingRun(capability, options, fsApi) {
+async function validateExistingRun(capability, options, fsApi, { allowRestoreLocationConflict = false } = {}) {
   const repository = await repositoryEvidence(options.repoRoot, fsApi);
   const replayed = await replayJournal({ capability });
   if (replayed.truncatedTail) {
@@ -362,10 +362,12 @@ async function validateExistingRun(capability, options, fsApi) {
         fsApi,
       });
     } catch (error) {
-      // Recovery is the sole caller allowed to turn a durable-but-mismatched
-      // restore into INCOMPLETE_CONFLICT.  Keep structural/provenance and
-      // ancestor failures fatal; those are not location disagreements.
-      if (!/restore (?:source|generated) locations are inconsistent|restore source endpoint is invalid|restore source endpoint content is invalid/u.test(error?.message ?? "")) {
+      // Only recovery may inspect a durable-but-mismatched restore and turn it
+      // into INCOMPLETE_CONFLICT.  Generic lifecycle callers retain the
+      // fail-closed validation boundary; structural/provenance and ancestor
+      // failures are always fatal.
+      if (!allowRestoreLocationConflict ||
+          !/restore (?:source|generated) locations are inconsistent|restore source endpoint is invalid|restore source endpoint content is invalid/u.test(error?.message ?? "")) {
         throw error;
       }
     }
@@ -413,9 +415,13 @@ function sameSnapshot(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-export async function withExistingQuarantineRun(options, callback) {
+export async function withExistingQuarantineRun(options, callback, recovery = Object.freeze({})) {
   const input = snapshotOptions(options);
   if (typeof callback !== "function") throw new TypeError("existing quarantine run callback must be a function");
+  if (recovery === null || typeof recovery !== "object" || Array.isArray(recovery) ||
+      (recovery.allowRestoreLocationConflict !== undefined && recovery.allowRestoreLocationConflict !== true)) {
+    throw new TypeError("existing quarantine recovery options are invalid");
+  }
   const source = captureRunFsSource(input.fsApi);
   return withQuarantineRunCapability({
     repoRoot: input.repoRoot,
@@ -425,11 +431,11 @@ export async function withExistingQuarantineRun(options, callback) {
     fsApi: source,
   }, async (capability) => {
     const fsApi = getRunFsContext(capability, source);
-    const validated = await validateExistingRun(capability, input, fsApi);
+    const validated = await validateExistingRun(capability, input, fsApi, recovery);
     // Re-read every mutable evidence boundary immediately before capability
     // handoff.  This is cooperative TOCTOU detection; all reads still use the
     // exact adapter captured synchronously above.
-    const stable = await validateExistingRun(capability, input, fsApi);
+    const stable = await validateExistingRun(capability, input, fsApi, recovery);
     if (
       !sameSnapshot(validated.repository, stable.repository) ||
       !sameSnapshot(validated.journalTip, stable.journalTip) ||

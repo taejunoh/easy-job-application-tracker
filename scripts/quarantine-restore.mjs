@@ -780,5 +780,5 @@ export async function recoverRestore(input) {
     await invokeHook(options.faultHook, prior === "VALIDATED" ? "after-event:RESTORE_ABORTED_TO_VALIDATED" : "after-event:RESTORE_ABORTED_TO_QUARANTINED");
     await invokeHook(options.faultHook, "before-lock-cleanup");
     return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", prior], ["action", "rollback"], ["reconciledEntries", intents.length], ["restoreAborted", true]]);
-  }));
+  }), Object.freeze({ allowRestoreLocationConflict: true }));
 }
