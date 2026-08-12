@@ -432,24 +432,6 @@ describe("quarantine restore real SIGKILL recovery", () => {
     600_000,
   );
 
-  it.each([
-    "after-active-to-rollback-rename:generated-next",
-    "after-payload-to-active-rename:generated-next",
-    "after-payload-to-active-rename:copy-0001",
-  ])("continues a SIGKILL at %s", async (killAt) => {
-    const prepared = prepareQuarantinedFixture();
-    try {
-      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
-      expect((await spawnLifecycleChild("restoreQuarantine", options, { killAt })).signal).toBe("SIGKILL");
-      rmSync(join(prepared.runRoot, "journal.lock"));
-      const continued = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
-      if (continued.code !== 0) throw new Error(JSON.stringify(continued));
-      expect(JSON.parse(continued.stdout)).toMatchObject({ status: "RESTORED", action: "resume", reconciledEntries: 3 });
-    } finally {
-      rmSync(prepared.fixture.base, { recursive: true, force: true });
-    }
-  }, 60_000);
-
   it("resumes a durable restore intent only after fixture-owned stale lock cleanup", async () => {
     const prepared = prepareQuarantinedFixture();
     try {
@@ -541,5 +523,44 @@ describe("quarantine restore real SIGKILL recovery", () => {
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
+  }, 60_000);
+
+  it.each(["QUARANTINED", "VALIDATED"] as const)("persists a no-intent recovery before the first generated restore intent after SIGKILL from %s", async (prior) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      if (prior === "VALIDATED") validatePriorState(prepared);
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      expect((await spawnLifecycleChild("restoreQuarantine", options, { killAt: "after-event:RESTORE_PREPARED" })).signal).toBe("SIGKILL");
+      rmSync(join(prepared.runRoot, "journal.lock"));
+      const { release } = await killThenReleaseFixtureLock(
+        "recoverRestore", { ...options, action: "resume" }, prepared.runRoot,
+        "after-event:RESTORE_INTENT:generated-next",
+        ["after-event:RECOVERY_REQUIRED", "after-event:RESTORING", "after-event:RESTORE_INTENT:generated-next"],
+      );
+      release();
+      const resumed = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
+      if (resumed.code !== 0) throw new Error(JSON.stringify(resumed));
+      expect(JSON.parse(resumed.stdout)).toEqual(expect.objectContaining({ status: "RESTORED", action: "resume", reconciledEntries: 3 }));
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it.each(["QUARANTINED", "VALIDATED"] as const)("leaves a durable terminal conflict after a real SIGKILL from %s", async (prior) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      if (prior === "VALIDATED") validatePriorState(prepared);
+      const options = { repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true };
+      expect((await spawnLifecycleChild("restoreQuarantine", options, { killAt: "after-event:RESTORE_INTENT:copy-0001" })).signal).toBe("SIGKILL");
+      writeFileSync(join(prepared.runRoot, "payload", "source-copies", "copy-0001"), "foreign\n");
+      rmSync(join(prepared.runRoot, "journal.lock"));
+      const { release } = await killThenReleaseFixtureLock(
+        "recoverRestore", { ...options, action: "resume" }, prepared.runRoot,
+        "after-event:INCOMPLETE_CONFLICT",
+        ["after-event:RECOVERY_REQUIRED", "after-event:INCOMPLETE_CONFLICT"],
+      );
+      release();
+      const conflict = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
+      if (conflict.code !== 0) throw new Error(JSON.stringify(conflict));
+      expect(JSON.parse(conflict.stdout)).toEqual(expect.objectContaining({ status: "INCOMPLETE_CONFLICT", action: "rollback", conflictEntryIds: ["copy-0001"] }));
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
   }, 60_000);
 });
