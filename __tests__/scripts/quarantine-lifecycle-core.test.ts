@@ -321,4 +321,20 @@ describe("quarantine lifecycle core", () => {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
   });
+
+  it("accepts the durable pre-rename row after a forward restore intent", () => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    try {
+      const result = invokeQuarantineWorker("core-restore-contract", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        restoreState: "RESTORING",
+        restoreIntent: true,
+      }) as unknown as { ok: boolean; callbackInvoked: number };
+      expect(result).toEqual({ ok: true, callbackInvoked: 1 });
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
 });

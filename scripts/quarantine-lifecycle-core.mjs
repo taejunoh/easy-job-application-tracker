@@ -4,7 +4,7 @@ import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import {
   link, lstat, mkdir, open, opendir, readdir, readlink, realpath, rename, rm, unlink,
 } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import {
   readCurrentManifestPointer,
@@ -188,16 +188,63 @@ function validateRestoreLedger(replayed, manifest) {
     .filter((record) => record.event === "RESTORED_ENTRY").map((record) => record.payload.id);
   const rollbackCompleted = replayed.records.slice(preparedIndex + 1)
     .filter((record) => record.event === "RESTORE_ROLLED_BACK_ENTRY").map((record) => record.payload.id);
+  const expectedCompleted = intents.slice(0, completed.length);
+  if (completed.some((id, index) => id !== expectedCompleted[index])) {
+    throw new Error("restore completion order does not match restore intent order");
+  }
+  const expectedRollbackCompleted = rollbackIntents.slice(0, rollbackCompleted.length);
+  if (rollbackCompleted.some((id, index) => id !== expectedRollbackCompleted[index])) {
+    throw new Error("restore rollback completion order does not match rollback intent order");
+  }
   return Object.freeze({
     restoreId: prepared.payload.restoreId,
     active: new Map(active.map((entry) => [entry.id, entry.inventory])),
     intents: Object.freeze(intents),
     completed: new Set(completed),
+    rollbackIntents: new Set(rollbackIntents),
     rollbackCompleted: new Set(rollbackCompleted),
   });
 }
 
 function modeOf(stat) { return stat.mode & 0o7777; }
+
+async function captureWorkspaceAncestors(repoRoot, endpoint, fsApi) {
+  const relativeEndpoint = relative(repoRoot, endpoint);
+  if (
+    relativeEndpoint === "" || relativeEndpoint === ".." ||
+    relativeEndpoint.startsWith(`..${sep}`) || isAbsolute(relativeEndpoint)
+  ) throw new Error("restore workspace endpoint escapes repository");
+  const paths = [repoRoot];
+  let current = repoRoot;
+  for (const component of relativeEndpoint.split(sep).slice(0, -1)) {
+    current = join(current, component);
+    paths.push(current);
+  }
+  const identities = [];
+  for (const path of paths) {
+    const stat = await fsApi.lstat(path);
+    const resolved = await fsApi.realpath(path);
+    if (stat.isSymbolicLink() || !stat.isDirectory() || resolved !== path) {
+      throw new Error("restore workspace ancestor is unsafe");
+    }
+    if (path !== repoRoot && !resolved.startsWith(`${repoRoot}${sep}`)) {
+      throw new Error("restore workspace ancestor escapes repository");
+    }
+    identities.push({ path, dev: stat.dev, ino: stat.ino, mode: modeOf(stat) });
+  }
+  return identities;
+}
+
+async function assertWorkspaceAncestors(identities, fsApi) {
+  for (const expected of identities) {
+    const stat = await fsApi.lstat(expected.path);
+    const resolved = await fsApi.realpath(expected.path);
+    if (
+      stat.isSymbolicLink() || !stat.isDirectory() || resolved !== expected.path ||
+      stat.dev !== expected.dev || stat.ino !== expected.ino || modeOf(stat) !== expected.mode
+    ) throw new Error("restore workspace ancestor changed");
+  }
+}
 
 async function optionalStat(path, fsApi) {
   try { return await fsApi.lstat(path); } catch (error) {
@@ -263,13 +310,28 @@ async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, 
   const intended = new Set(ledger.intents);
   for (const entry of manifest.entries) {
     const completed = ledger.completed.has(entry.id);
+    const rollbackPending = ledger.rollbackIntents.has(entry.id) && !ledger.rollbackCompleted.has(entry.id);
     const rolledBack = ledger.rollbackCompleted.has(entry.id);
     const forward = intended.has(entry.id) && !rolledBack;
     const payload = deriveRunPath(capability, { purpose: "payload", id: entry.id });
     const active = join(repoRoot, ...entry.relativePath.split("/"));
+    const ancestors = await captureWorkspaceAncestors(repoRoot, active, fsApi);
     if (entry.kind === "source-copy") {
-      await verifySourceEndpoint(payload, entry, !forward || !completed, fsApi);
-      await verifySourceEndpoint(active, entry, forward && completed, fsApi);
+      const payloadStat = await optionalStat(payload, fsApi);
+      const activeStat = await optionalStat(active, fsApi);
+      const payloadPresent = payloadStat !== null;
+      const activePresent = activeStat !== null;
+      const legal = (!forward || rolledBack)
+        ? payloadPresent && !activePresent
+        : rollbackPending
+          ? (payloadPresent && !activePresent) || (!payloadPresent && activePresent)
+          : !completed
+            ? (payloadPresent && !activePresent) || (!payloadPresent && activePresent)
+            : !payloadPresent && activePresent;
+      if (!legal) throw new Error("restore source locations are inconsistent with its ledger state");
+      await verifySourceEndpoint(payload, entry, payloadPresent, fsApi);
+      await verifySourceEndpoint(active, entry, activePresent, fsApi);
+      await assertWorkspaceAncestors(ancestors, fsApi);
       continue;
     }
     const activeExpected = ledger.active.get(entry.id);
@@ -281,23 +343,22 @@ async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, 
         purpose: "rollback-entry", id: ledger.restoreId, phase: entry.id,
       }), fsApi);
     const original = entry.preMoveInventory;
-    if (!forward || rolledBack) {
-      if (!sameSummary(original, payloadObserved) ||
-          (activeExpected === null ? activeObserved !== null : !sameSummary(activeExpected, activeObserved)) ||
-          rollbackObserved !== null) {
-        throw new Error("restore initial location evidence is invalid");
-      }
-    } else if (!completed) {
-      if (!sameSummary(original, payloadObserved) || activeObserved !== null ||
-          (activeExpected === null ? rollbackObserved !== null : !sameSummary(activeExpected, rollbackObserved))) {
-        throw new Error("restore in-progress location evidence is invalid");
-      }
-    } else if (
-      payloadObserved !== null || !sameSummary(original, activeObserved) ||
-      (activeExpected === null ? rollbackObserved !== null : !sameSummary(activeExpected, rollbackObserved))
-    ) {
-      throw new Error("restore completed location evidence is invalid");
-    }
+    const initial = sameSummary(original, payloadObserved) &&
+      (activeExpected === null ? activeObserved === null : sameSummary(activeExpected, activeObserved)) &&
+      rollbackObserved === null;
+    const staging = sameSummary(original, payloadObserved) && activeObserved === null &&
+      (activeExpected === null ? rollbackObserved === null : sameSummary(activeExpected, rollbackObserved));
+    const final = payloadObserved === null && sameSummary(original, activeObserved) &&
+      (activeExpected === null ? rollbackObserved === null : sameSummary(activeExpected, rollbackObserved));
+    const legal = (!forward || rolledBack)
+      ? initial
+      : rollbackPending
+        ? initial || staging || final
+        : !completed
+          ? initial || staging || final
+          : final;
+    if (!legal) throw new Error("restore generated locations are inconsistent with its ledger state");
+    await assertWorkspaceAncestors(ancestors, fsApi);
   }
 }
 

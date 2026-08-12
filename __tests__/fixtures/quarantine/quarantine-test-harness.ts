@@ -562,7 +562,7 @@ try {
     process.stdout.write(JSON.stringify({ ok: true, callbackInvoked, observed, getters, calls, wrongReceiver, revoked, staleIdentity }));
   } else if (operation === "core-restore-contract") {
     const restoreId = "restore-123e4567-e89b-42d3-a456-426614174000";
-    const { restoreState, ...restoreRequest } = request;
+    const { restoreState, restoreIntent, ...restoreRequest } = request;
     const append = async (capability, event, payload) => withJournalLock({ capability }, (heldLock) =>
       appendJournalRecord({ capability, heldLock, event, payload }),
     );
@@ -575,8 +575,9 @@ try {
         ],
       });
       if (restoreState !== "RESTORE_PREPARED") await append(capability, "RESTORING", {});
+      if (restoreIntent === true) await append(capability, "RESTORE_INTENT", { id: "generated-next" });
       if (restoreState === "RECOVERY_REQUIRED" || restoreState === "RESTORE_ROLLING_BACK") {
-        await append(capability, "RECOVERY_REQUIRED", { entryIds: [] });
+        await append(capability, "RECOVERY_REQUIRED", { entryIds: restoreIntent ? ["generated-next"] : [] });
       }
       if (restoreState === "RESTORE_ROLLING_BACK") {
         await append(capability, "RESTORE_ROLLING_BACK", {});
