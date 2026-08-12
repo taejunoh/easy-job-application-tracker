@@ -420,8 +420,22 @@ describe("quarantine restore", () => {
         transactionId: prepared.transactionId, writersStopped: true, interloperAtFinalPrecheck: "generated-rollback",
       });
       expect(result.ok).toBe(false);
-      expect((result as unknown as { finalPrecheckTargetReads: number }).finalPrecheckTargetReads).toBe(1);
+      const observed = result as unknown as {
+        finalPrecheckTargetReads: number; rollbackRenameCalls: number; rollbackInterloperPreserved: boolean;
+        phases: string[]; finalPrecheckMarker?: { path: string; callIndex: number; purpose: string; injectionFired: boolean };
+      };
+      expect(observed.finalPrecheckTargetReads).toBe(1);
+      expect(observed.finalPrecheckMarker).toEqual(expect.objectContaining({
+        path: join(prepared.runRoot, "rollback", "regenerated-before-restore", "restore-c3624475-87d7-4886-b0bf-68a5061663d2", ".next"),
+        callIndex: 0, purpose: "generated-active-to-rollback final destination absence check", injectionFired: true,
+      }));
+      expect(observed.rollbackRenameCalls).toBe(0);
+      expect(observed.rollbackInterloperPreserved).toBe(true);
       expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_INTENT");
+      expect(observed.phases).toEqual([
+        "after-inventory:restore-active:generated-next", "after-inventory:restore-active:generated-node-modules",
+        "after-event:RESTORE_PREPARED", "after-event:RESTORING", "after-event:RESTORE_INTENT:generated-next",
+      ]);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
@@ -440,6 +454,38 @@ describe("quarantine restore", () => {
       expect(readFileSync(join(prepared.fixture.repoRoot, "foreign-sentinel"), "utf8")).toBe("foreign");
       expect(readFileSync(join(prepared.runRoot, "journal.log"))).toEqual(before);
       expect(generationEvidence(prepared)).toBe(generation);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a byte-identical foreign repository only after active inventory publication is durable", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, ancestorExchangeAt: "post-publication",
+      }) as unknown as {
+        ok: boolean; phases: string[]; foreignOpenCalls: number;
+        publicationMarker?: { parentSyncs: number; publicationComplete: boolean };
+        publicationEvidence?: Array<{ id: string; bytesAtBarrier: string; bytesAfter: string }>;
+      };
+      expect(result.ok).toBe(false);
+      expect(result.publicationMarker).toEqual({
+        inventoryParent: join(prepared.runRoot, "inventories", "restore-active"), parentSyncs: 2, publicationComplete: true,
+      });
+      expect(result.publicationEvidence).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: "generated-next", bytesAtBarrier: expect.any(String), bytesAfter: expect.any(String) }),
+        expect.objectContaining({ id: "generated-node-modules", bytesAtBarrier: expect.any(String), bytesAfter: expect.any(String) }),
+      ]));
+      for (const inventory of result.publicationEvidence ?? []) {
+        expect(inventory.bytesAtBarrier).not.toBe("");
+        expect(inventory.bytesAfter).toBe(inventory.bytesAtBarrier);
+      }
+      expect(result.phases).toEqual(["after-inventory:restore-active:generated-next"]);
+      expect(journalEvents(join(prepared.runRoot, "journal.log"))).not.toContain("RESTORE_PREPARED");
+      expect(readFileSync(join(prepared.fixture.repoRoot, "foreign-sentinel"), "utf8")).toBe("foreign");
+      expect(result.foreignOpenCalls).toBe(0);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }

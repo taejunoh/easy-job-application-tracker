@@ -518,10 +518,17 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "restore") {
-    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, ...restoreRequest } = request;
+    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, traceRestoreFs, ...restoreRequest } = request;
     const phases = [];
     let finalPrecheckTargetReads = 0;
     let finalInterloperPath;
+    let finalPrecheckMarker;
+    let rollbackRenameCalls = 0;
+    let publicationMarker;
+    let publicationEvidence;
+    let foreignOpenCalls = 0;
+    const fsTrace = [];
+    let derivedTracePaths;
     try {
       let armed = false;
       let inserted = false;
@@ -529,11 +536,45 @@ try {
       let exchanged = false;
       let generatedMoved = false;
       let fsApi;
-      if (ancestorExchangeAt === "before-publication") {
+      if (traceRestoreFs === true) {
+        fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+        for (const method of ["lstat", "open", "rename"]) {
+          const original = fsApi[method];
+          fsApi[method] = async (...args) => {
+            fsTrace.push({
+              callIndex: fsTrace.length,
+              method,
+              args: args.map((value) => typeof value === "string"
+                ? { stringBase64: Buffer.from(value, "utf8").toString("base64") }
+                : { value: String(value) }),
+            });
+            return Reflect.apply(original, fsApi, args);
+          };
+        }
+        await withQuarantineRunCapability({ ...restoreRequest, writersStopped: true, fsApi }, async (capability) => {
+          const restoreId = "restore-c3624475-87d7-4886-b0bf-68a5061663d2";
+          derivedTracePaths = {
+            rollbackGeneratedNext: join(deriveRunPath(capability, {
+              purpose: "rollback", id: restoreId,
+            }), ".next"),
+            restoreActiveGeneratedNext: deriveRunPath(capability, {
+              purpose: "inventory", id: "generated-next", phase: "restore-active",
+            }),
+            restoreActiveGeneratedModules: deriveRunPath(capability, {
+              purpose: "inventory", id: "generated-node-modules", phase: "restore-active",
+            }),
+          };
+        });
+        fsTrace.length = 0;
+      }
+      if (ancestorExchangeAt === "before-publication" || ancestorExchangeAt === "post-publication") {
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
         const originalOpen = fsApi.open;
         fsApi.open = async (path, ...args) => {
-          if (!exchanged && typeof path === "string" && path.endsWith("/inventories/restore-active/generated-next.jsonl")) {
+          if (ancestorExchangeAt === "post-publication" && exchanged && typeof path === "string" && path.startsWith(request.repoRoot)) {
+            foreignOpenCalls += 1;
+          }
+          if (ancestorExchangeAt === "before-publication" && !exchanged && typeof path === "string" && path.endsWith("/inventories/restore-active/generated-next.jsonl")) {
             exchanged = true;
             renameSync(request.repoRoot, request.repoRoot + ".original");
             mkdirSync(request.repoRoot, { recursive: true, mode: 0o700 });
@@ -543,25 +584,59 @@ try {
             writeFileSync(join(request.repoRoot, "node_modules", "package"), "ignored");
             writeFileSync(join(request.repoRoot, "foreign-sentinel"), "foreign");
           }
-          return originalOpen(path, ...args);
+          const handle = await originalOpen(path, ...args);
+          const inventoryParent = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active");
+          if (ancestorExchangeAt !== "post-publication" || path !== inventoryParent || args[0] !== "r") return handle;
+          const originalSync = handle.sync.bind(handle);
+          handle.sync = async (...syncArgs) => {
+            const synced = await originalSync(...syncArgs);
+            publicationMarker ??= { inventoryParent, parentSyncs: 0, publicationComplete: false };
+            publicationMarker.parentSyncs += 1;
+            if (publicationMarker.parentSyncs === 2 && !exchanged) {
+              publicationMarker.publicationComplete = true;
+              publicationEvidence = ["generated-next", "generated-node-modules"].map((id) => {
+                const inventory = join(inventoryParent, id + ".jsonl");
+                return { id, bytesAtBarrier: readFileSync(inventory).toString("base64") };
+              });
+              exchanged = true;
+              renameSync(request.repoRoot, request.repoRoot + ".original");
+              mkdirSync(request.repoRoot, { recursive: true, mode: 0o700 });
+              mkdirSync(join(request.repoRoot, ".next"), { recursive: true, mode: 0o700 });
+              mkdirSync(join(request.repoRoot, "node_modules"), { recursive: true, mode: 0o700 });
+              writeFileSync(join(request.repoRoot, ".next", "build"), "ignored");
+              writeFileSync(join(request.repoRoot, "node_modules", "package"), "ignored");
+              writeFileSync(join(request.repoRoot, "foreign-sentinel"), "foreign");
+            }
+            return synced;
+          };
+          return handle;
         };
       }
       if (["source-active", "generated-active", "generated-rollback"].includes(interloperAtFinalPrecheck)) {
-        const target = join(request.repoRoot, interloperAtFinalPrecheck === "source-active" ? "notes 2.txt" : ".next");
+        const restoreId = "restore-c3624475-87d7-4886-b0bf-68a5061663d2";
+        const target = interloperAtFinalPrecheck === "source-active"
+          ? join(request.repoRoot, "notes 2.txt")
+          : interloperAtFinalPrecheck === "generated-active"
+            ? join(request.repoRoot, ".next")
+            : join(request.quarantineRoot, request.transactionId, "rollback", "regenerated-before-restore", restoreId, ".next");
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
         const originalLstat = fsApi.lstat;
         const originalRename = fsApi.rename;
         fsApi.rename = async (source, destination) => {
+          if (interloperAtFinalPrecheck === "generated-rollback" && destination === target) rollbackRenameCalls += 1;
           const result = await originalRename(source, destination);
-          if (source === target) generatedMoved = true;
+          if (source === join(request.repoRoot, ".next")) generatedMoved = true;
           return result;
         };
         fsApi.lstat = async (path) => {
-          if (interloperAtFinalPrecheck === "generated-rollback" && !inserted && typeof path === "string" &&
-              path.includes("/rollback/") && path.endsWith("/generated-next")) {
+          if (interloperAtFinalPrecheck === "generated-rollback" && !inserted && path === target) {
             inserted = true;
             finalPrecheckTargetReads += 1;
             finalInterloperPath = join(path, "foreign");
+            finalPrecheckMarker = {
+              path, callIndex: finalPrecheckTargetReads - 1,
+              purpose: "generated-active-to-rollback final destination absence check", injectionFired: true,
+            };
             mkdirSync(path, { recursive: true, mode: 0o700 });
             writeFileSync(finalInterloperPath, "foreign interloper\\n");
           }
@@ -603,9 +678,15 @@ try {
           if (phase === stopPhase) throw new RangeError("stop at requested restore phase");
         },
       });
-      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath) }));
+      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, derivedTracePaths, fsTrace }));
     } catch (error) {
-      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), error: errorShape(error) }));
+      if (publicationEvidence !== undefined) {
+        publicationEvidence = publicationEvidence.map((entry) => ({
+          ...entry,
+          bytesAfter: readFileSync(join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", entry.id + ".jsonl")).toString("base64"),
+        }));
+      }
+      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, derivedTracePaths, fsTrace, error: errorShape(error) }));
     }
   } else if (operation === "restore-authority-seam") {
     const { target, ...restoreRequest } = request;
