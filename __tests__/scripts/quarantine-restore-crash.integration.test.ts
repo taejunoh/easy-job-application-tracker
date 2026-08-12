@@ -80,6 +80,20 @@ const NORMAL_RESTORE_PHASES = [
   "after-event:RESTORED_ENTRY:copy-0001",
   "after-event:RESTORED",
   "before-lock-cleanup",
+] as const;
+
+const RECOVERY_RESUME_PHASES = [
+  "after-event:RECOVERY_REQUIRED",
+  "after-event:RESTORING",
+  "after-active-to-rollback-rename:generated-next",
+  "after-rollback-tree-sync:generated-next",
+  "after-rollback-destination-parent-sync:generated-next",
+  "after-rollback-source-parent-sync:generated-next",
+  "after-payload-to-active-rename:generated-next",
+  "after-restored-payload-sync:generated-next",
+  "after-restore-destination-parent-sync:generated-next",
+  "after-restore-source-parent-sync:generated-next",
+  "after-event:RESTORED_ENTRY:generated-next",
   "after-event:RESTORE_INTENT:generated-node-modules",
   "after-active-to-rollback-rename:generated-node-modules",
   "after-rollback-tree-sync:generated-node-modules",
@@ -98,20 +112,6 @@ const NORMAL_RESTORE_PHASES = [
   "after-event:RESTORED_ENTRY:copy-0001",
   "after-event:RESTORED",
   "before-lock-cleanup",
-] as const;
-
-const RECOVERY_RESUME_PHASES = [
-  "after-event:RECOVERY_REQUIRED",
-  "after-event:RESTORING",
-  "after-active-to-rollback-rename:generated-next",
-  "after-rollback-tree-sync:generated-next",
-  "after-rollback-destination-parent-sync:generated-next",
-  "after-rollback-source-parent-sync:generated-next",
-  "after-payload-to-active-rename:generated-next",
-  "after-restored-payload-sync:generated-next",
-  "after-restore-destination-parent-sync:generated-next",
-  "after-restore-source-parent-sync:generated-next",
-  "after-event:RESTORED_ENTRY:generated-next",
 ] as const;
 
 const RECOVERY_ROLLBACK_PHASES = [
