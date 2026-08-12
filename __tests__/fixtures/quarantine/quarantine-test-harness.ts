@@ -500,7 +500,45 @@ try {
       },
     }));
   } else if (operation === "recover") {
-    const result = await transaction.recoverQuarantine(request);
+    const { fsMutation, ...recoveryRequest } = request;
+    let getterReads = 0;
+    let wrongReceiver = 0;
+    let recoveryOptions = recoveryRequest;
+    let result;
+    if (fsMutation !== undefined) {
+      const source = {
+        ...fsPromises,
+        createReadStream,
+        lstatSync,
+        realpathSync,
+      };
+      const originalLstat = source.lstat;
+      if (fsMutation === "getter") {
+        Object.defineProperty(source, "lstat", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            getterReads += 1;
+            return originalLstat;
+          },
+        });
+      } else if (fsMutation === "receiver") {
+        source.lstat = function (...args) {
+          if (this !== source) wrongReceiver += 1;
+          return Reflect.apply(originalLstat, this, args);
+        };
+      }
+      recoveryOptions = { ...recoveryRequest, fsApi: source };
+      const pending = transaction.recoverQuarantine(recoveryOptions);
+      Object.defineProperty(source, "lstat", {
+        configurable: true,
+        enumerable: true,
+        value: async () => { throw new Error("late source mutation"); },
+      });
+      result = await pending;
+    } else {
+      result = await transaction.recoverQuarantine(recoveryOptions);
+    }
     let replayed;
     await withQuarantineRunCapability({
       repoRoot: request.repoRoot,
@@ -513,6 +551,8 @@ try {
     process.stdout.write(JSON.stringify({
       ok: true,
       result,
+      getterReads,
+      wrongReceiver,
       replayEvents: replayed.records.map((record) => ({
         event: record.event,
         payload: record.payload,

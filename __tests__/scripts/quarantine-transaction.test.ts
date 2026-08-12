@@ -363,6 +363,42 @@ describe("quarantine transaction Slice 1", () => {
     },
   );
 
+  it.each(["getter", "receiver", "method"] as const)(
+    "keeps the captured supplied filesystem authority after %s mutation",
+    (fsMutation) => {
+      const f = createQuarantineFixture();
+      bases.push(f.base);
+      const transactionId = `tx-captured-source-${fsMutation}`;
+      const request = {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        expectedBranch: f.branch,
+        expectedHead: f.head,
+        expectedCount: f.expectedCount,
+        transactionId,
+        createdAt: "2026-07-16T00:00:00.000Z",
+        writersStopped: true,
+      };
+      expect(invokeQuarantineWorker("apply-stop", {
+        ...request,
+        stopPhase: "after-event:MOVE_INTENT:copy-0001",
+      }).ok).toBe(false);
+
+      const recovered = invokeQuarantineWorker("recover", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        transactionId,
+        action: "resume",
+        writersStopped: true,
+        fsMutation,
+      });
+
+      expect(recovered.result).toMatchObject({ status: "QUARANTINED", action: "resume" });
+      expect(recovered.wrongReceiver).toBe(0);
+      expect(recovered.getterReads).toBe(fsMutation === "getter" ? 1 : 0);
+    },
+  );
+
   const bases: string[] = [];
 
   afterEach(() => {
