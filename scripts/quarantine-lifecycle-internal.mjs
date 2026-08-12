@@ -18,6 +18,17 @@ const OPTION_KEYS = Object.freeze([
 const RECOVERY_OPTION_KEYS = Object.freeze([...OPTION_KEYS, "action", "faultHook"]);
 const restoreRecoveryStorage = new AsyncLocalStorage();
 
+class LifecycleIntegrityError extends Error {
+  constructor(message) {
+    super(message);
+    Object.defineProperty(this, "code", { value: "ERR_INTEGRITY", enumerable: false });
+  }
+}
+
+function lifecycleIntegrityError(message) {
+  return new LifecycleIntegrityError(message);
+}
+
 function frozenRecord(entries) {
   const result = Object.create(null);
   for (const [key, value] of entries) {
@@ -68,7 +79,7 @@ function gitEvidence(repoRoot) {
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(head)) {
-    throw new Error("repository HEAD is invalid");
+    throw lifecycleIntegrityError("repository HEAD is invalid");
   }
   return { topLevel, head };
 }
@@ -80,14 +91,14 @@ function sameIdentity(left, right) {
 async function repositoryEvidence(repoRoot, fsApi) {
   const before = await fsApi.lstat(repoRoot);
   if (before.isSymbolicLink() || !before.isDirectory()) {
-    throw new Error("repository root identity is invalid");
+    throw lifecycleIntegrityError("repository root identity is invalid");
   }
   const realPath = await fsApi.realpath(repoRoot);
-  if (realPath !== repoRoot) throw new Error("repository root is not canonical");
+  if (realPath !== repoRoot) throw lifecycleIntegrityError("repository root is not canonical");
   const git = gitEvidence(repoRoot);
-  if (git.topLevel !== repoRoot) throw new Error("repository root is not the Git top level");
+  if (git.topLevel !== repoRoot) throw lifecycleIntegrityError("repository root is not the Git top level");
   const after = await fsApi.lstat(repoRoot);
-  if (!sameIdentity(before, after)) throw new Error("repository root identity changed");
+  if (!sameIdentity(before, after)) throw lifecycleIntegrityError("repository root identity changed");
   return frozenRecord([
     ["dev", before.dev],
     ["ino", before.ino],
@@ -98,7 +109,7 @@ async function repositoryEvidence(repoRoot, fsApi) {
 
 function journalTip(replayed) {
   const record = replayed.records.at(-1);
-  if (record === undefined || replayed.state === null) throw new Error("quarantine journal is empty");
+  if (record === undefined || replayed.state === null) throw lifecycleIntegrityError("quarantine journal is empty");
   return frozenRecord([
     ["sequence", record.sequence],
     ["recordHash", record.recordHash],
@@ -137,7 +148,7 @@ async function captureWorkspaceAncestors(repoRoot, endpoint, fsApi) {
   if (
     relativeEndpoint === "" || relativeEndpoint === ".." ||
     relativeEndpoint.startsWith(`..${sep}`) || isAbsolute(relativeEndpoint)
-  ) throw new Error("restore workspace endpoint escapes repository");
+  ) throw lifecycleIntegrityError("restore workspace endpoint escapes repository");
   const paths = [repoRoot];
   let current = repoRoot;
   for (const component of relativeEndpoint.split(sep).slice(0, -1)) {
@@ -149,10 +160,10 @@ async function captureWorkspaceAncestors(repoRoot, endpoint, fsApi) {
     const stat = await fsApi.lstat(path);
     const resolved = await fsApi.realpath(path);
     if (stat.isSymbolicLink() || !stat.isDirectory() || resolved !== path) {
-      throw new Error("restore workspace ancestor is unsafe");
+      throw lifecycleIntegrityError("restore workspace ancestor is unsafe");
     }
     if (path !== repoRoot && !resolved.startsWith(`${repoRoot}${sep}`)) {
-      throw new Error("restore workspace ancestor escapes repository");
+      throw lifecycleIntegrityError("restore workspace ancestor escapes repository");
     }
     identities.push(Object.freeze({
       path, dev: stat.dev, ino: stat.ino, mode: modeOf(stat),
@@ -169,7 +180,7 @@ async function assertWorkspaceAncestors(identities, fsApi) {
     if (
       stat.isSymbolicLink() || !stat.isDirectory() || resolved !== expected.canonicalRealpath ||
       stat.dev !== expected.dev || stat.ino !== expected.ino || modeOf(stat) !== expected.mode
-    ) throw new Error("restore workspace ancestor changed");
+    ) throw lifecycleIntegrityError("restore workspace ancestor changed");
   }
 }
 
@@ -194,15 +205,15 @@ function sameSummary(expected, observed) {
 async function verifySourceEndpoint(path, entry, expectedPresent, fsApi, ancestorChain = Object.freeze([])) {
   const stat = await optionalStat(path, fsApi);
   if (!expectedPresent) {
-    if (stat !== null) throw new Error("restore source endpoint should be absent");
+    if (stat !== null) throw lifecycleIntegrityError("restore source endpoint should be absent");
     return;
   }
   if (stat === null || stat.isSymbolicLink() || !stat.isFile() || modeOf(stat) !== entry.mode || stat.size !== entry.size) {
-    throw new Error("restore source endpoint is invalid");
+    throw lifecycleIntegrityError("restore source endpoint is invalid");
   }
   const hashed = await hashVerifiedRegularFile(path, stat, fsApi, ancestorChain);
   if (hashed.bytes !== entry.size || hashed.sha256 !== entry.sha256) {
-    throw new Error("restore source endpoint content is invalid");
+    throw lifecycleIntegrityError("restore source endpoint content is invalid");
   }
 }
 
@@ -228,7 +239,7 @@ async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, 
           : !completed
             ? (payloadPresent && !activePresent) || (!payloadPresent && activePresent)
             : !payloadPresent && activePresent;
-      if (!legal) throw new Error("restore source locations are inconsistent with its ledger state");
+      if (!legal) throw lifecycleIntegrityError("restore source locations are inconsistent with its ledger state");
       await verifySourceEndpoint(payload, entry, payloadPresent, fsApi);
       await verifySourceEndpoint(active, entry, activePresent, fsApi, ancestors);
       await assertWorkspaceAncestors(ancestors, fsApi);
@@ -261,7 +272,7 @@ async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, 
         : !completed
           ? initial || staging || final
           : final;
-    if (!legal) throw new Error("restore generated locations are inconsistent with its ledger state");
+    if (!legal) throw lifecycleIntegrityError("restore generated locations are inconsistent with its ledger state");
     await assertWorkspaceAncestors(ancestors, fsApi);
   }
 }
@@ -277,13 +288,18 @@ async function readPointer(capability) {
 
 async function validateExistingRun(capability, options, fsApi, { allowRestoreLocationConflict = false } = {}) {
   const repository = await repositoryEvidence(options.repoRoot, fsApi);
-  const replayed = await replayJournal({ capability });
+  let replayed;
+  try {
+    replayed = await replayJournal({ capability });
+  } catch {
+    throw lifecycleIntegrityError("existing quarantine journal cannot be replayed");
+  }
   if (replayed.truncatedTail) {
-    throw new Error("existing quarantine journal has a torn tail");
+    throw lifecycleIntegrityError("existing quarantine journal has a torn tail");
   }
   const prepared = replayed.records.find((record) => record.event === "PREPARED");
   if (prepared === undefined || prepared.payload.transactionId !== options.transactionId) {
-    throw new Error("PREPARED journal provenance is invalid");
+    throw lifecycleIntegrityError("PREPARED journal provenance is invalid");
   }
   const restore = restoreProvenance(replayed);
   const restoreContext = restore.active && new Set([
@@ -291,13 +307,13 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
   ]).has(replayed.state);
   const provenanceState = restoreContext ? restore.state : replayed.state;
   if (provenanceState !== "QUARANTINED" && provenanceState !== "VALIDATED") {
-    throw new Error("quarantine run is not in an existing lifecycle state");
+    throw lifecycleIntegrityError("quarantine run is not in an existing lifecycle state");
   }
   const validated = provenanceState === "VALIDATED";
   const validatedRecord = validated
     ? [...replayed.records].reverse().find((record) => record.event === "VALIDATED")
     : undefined;
-  if (validated && validatedRecord === undefined) throw new Error("VALIDATED provenance is missing");
+  if (validated && validatedRecord === undefined) throw lifecycleIntegrityError("VALIDATED provenance is missing");
   const manifestSha256 = validated ? validatedRecord.payload.manifestSha256 : prepared.payload.manifestSha256;
   const manifest = await readManifestGeneration({ capability, manifestSha256 });
   const expectedManifestState = validated ? "VALIDATED" : "PREPARED";
@@ -307,7 +323,7 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
     manifest.state !== expectedManifestState ||
     manifest.head !== repository.head
   ) {
-    throw new Error("quarantine lifecycle provenance does not match the live repository");
+    throw lifecycleIntegrityError("quarantine lifecycle provenance does not match the live repository");
   }
   if (restoreContext && replayed.state !== "INCOMPLETE_CONFLICT") {
     const ledger = buildRestoreLedger(replayed, manifest);
@@ -333,11 +349,11 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
 
   const pointer = await readPointer(capability);
   if (!validated && pointer !== null) {
-    throw new Error("QUARANTINED runs must not have an active manifest pointer");
+    throw lifecycleIntegrityError("QUARANTINED runs must not have an active manifest pointer");
   }
   if (validated && pointer !== null &&
       (pointer.transactionId !== options.transactionId || pointer.manifestSha256 !== manifestSha256)) {
-    throw new Error("current manifest pointer does not match validated provenance");
+    throw lifecycleIntegrityError("current manifest pointer does not match validated provenance");
   }
   if (validated) {
     const expectedDeleteAfter = new Date(
@@ -349,7 +365,7 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
       manifest.deletionStatus !== "retained" ||
       manifest.deleteAfter !== expectedDeleteAfter
     ) {
-      throw new Error("VALIDATED retention evidence is invalid");
+      throw lifecycleIntegrityError("VALIDATED retention evidence is invalid");
     }
   }
 
@@ -395,7 +411,7 @@ async function enterExistingRun(input, { recovery, callback }) {
       !sameSnapshot(validated.manifestGeneration, stable.manifestGeneration) ||
       !sameSnapshot(validated.pointer, stable.pointer)
     ) {
-      throw new Error("quarantine lifecycle evidence changed before callback");
+      throw lifecycleIntegrityError("quarantine lifecycle evidence changed before callback");
     }
     const handoff = frozenRecord([
       ["capability", capability],

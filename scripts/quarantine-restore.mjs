@@ -27,6 +27,21 @@ const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 const DIRECTORY_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY;
 const activeMetadata = new WeakMap();
 
+class RestoreOperationError extends Error {
+  constructor(code) {
+    super(code);
+    Object.defineProperty(this, "code", { value: code, enumerable: false });
+  }
+}
+
+function restoreIntegrityFailure() {
+  return new RestoreOperationError("ERR_INTEGRITY");
+}
+
+function restoreRecoveryRequired() {
+  return new RestoreOperationError("ERR_RECOVERY_REQUIRED");
+}
+
 function record(entries) {
   const value = Object.create(null);
   for (const [key, entry] of entries) {
@@ -267,16 +282,22 @@ async function guardedRestoreRename({
 async function assertPayload(capability, entry, path, fsApi, ancestorChain = Object.freeze([])) {
   await revalidateRunCapability(capability, { purpose: "payload", id: entry.id, boundary: "before-mutation" });
   if (entry.kind === "source-copy") {
-    const stat = await fsApi.lstat(path);
+    let stat;
+    try {
+      stat = await fsApi.lstat(path);
+    } catch (error) {
+      if (error?.code === "ENOENT") throw restoreIntegrityFailure();
+      throw error;
+    }
     if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o7777) !== entry.mode || stat.size !== entry.size) {
-      throw new Error("restore payload source is invalid");
+      throw restoreIntegrityFailure();
     }
     const hash = await hashVerifiedRegularFile(path, stat, fsApi, ancestorChain);
-    if (hash.sha256 !== entry.sha256 || hash.bytes !== entry.size) throw new Error("restore payload content changed");
+    if (hash.sha256 !== entry.sha256 || hash.bytes !== entry.size) throw restoreIntegrityFailure();
     return;
   }
   const observed = await summarizeInventoryDirectory(path, { fsApi, ancestorChain });
-  if (!sameSummary(entry.preMoveInventory, observed)) throw new Error("restore payload inventory changed");
+  if (!sameSummary(entry.preMoveInventory, observed)) throw restoreIntegrityFailure();
 }
 
 async function assertPrivatePayload(capability, entry, path, fsApi, parent) {
@@ -657,7 +678,7 @@ export async function restoreQuarantine(input) {
   ]);
   return withExistingQuarantineRun(existing, async (handoff) => {
     if (handoff.journalTip.state !== "QUARANTINED" && handoff.journalTip.state !== "VALIDATED") {
-      throw new Error("restore is already in progress; explicit recovery is required");
+      throw restoreRecoveryRequired();
     }
     return withJournalLock({ capability: handoff.capability }, async (heldLock) => {
       const replayed = await replayJournal({ capability: handoff.capability });
