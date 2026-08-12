@@ -298,7 +298,7 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
     try {
       await cleanupVerifiedRestoreActiveInventory({
         capability,
-        publication: Object.freeze({ path, identity: ownedIdentity, parentIdentity }),
+        publication: Object.freeze({ path, entryId, identity: ownedIdentity, parentIdentity }),
       });
     } catch (cleanupError) {
       throw new AggregateError([error, cleanupError], "restore-active inventory publish and cleanup failed");
@@ -359,12 +359,13 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
   }
   return Object.freeze({
     summary: snapshot.summary,
-    publication: Object.freeze({ path, identity: ownedIdentity, parentIdentity }),
+    publication: Object.freeze({ path, entryId, identity: ownedIdentity, parentIdentity }),
   });
 }
 
 export async function cleanupVerifiedRestoreActiveInventory({ capability, publication }) {
-  if (publication === null || typeof publication !== "object" || typeof publication.path !== "string") {
+  if (publication === null || typeof publication !== "object" || typeof publication.path !== "string" ||
+      typeof publication.entryId !== "string") {
     throw new TypeError("restore-active inventory publication is invalid");
   }
   const fsApi = getRunFsContext(capability);
@@ -381,11 +382,17 @@ export async function cleanupVerifiedRestoreActiveInventory({ capability, public
   if (stat.isSymbolicLink() || !stat.isFile() || !sameIdentity(expectedFile, stat) || modeOf(stat) !== 0o600 || stat.nlink !== 1) {
     throw new Error("restore-active inventory cleanup ownership changed");
   }
+  await revalidateRunCapability(capability, {
+    purpose: "inventory", id: publication.entryId, phase: "restore-active", boundary: "before-mutation",
+  });
   await fsApi.unlink(publication.path);
   const directory = await fsApi.open(parent, DIRECTORY_OPEN_FLAGS);
   let primary;
   try { await directory.sync(); } catch (error) { primary = error; }
   await closeAll(undefined, directory, primary);
+  await revalidateRunCapability(capability, {
+    purpose: "inventory", id: publication.entryId, phase: "restore-active", boundary: "after-sync",
+  });
 }
 
 /* Internal restore authority.  Each pathname is rebound to an O_NOFOLLOW

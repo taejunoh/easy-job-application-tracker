@@ -393,7 +393,7 @@ import { withExistingQuarantineRun } from ${JSON.stringify(lifecycleCoreUrl)};
 import { writeInventoryJsonl } from ${JSON.stringify(pathToFileURL(join(__dirname, "../../../scripts/quarantine-inventory.mjs")).href)};
 import * as fsPromises from "node:fs/promises";
 import {
-  appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync,
+  appendFileSync, chmodSync, createReadStream, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync,
   renameSync, symlinkSync, truncateSync, writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -518,7 +518,7 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "restore") {
-    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, indeterminatePrepared, preexistingRestoreInventory, partialPublisher, publisherParentExchange, publisherCleanupFailure, oversizedRestoredTree, traceRestoreFs, ...restoreRequest } = request;
+    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, indeterminatePrepared, preexistingRestoreInventory, partialPublisher, publisherParentExchange, publisherCleanupFailure, publisherHardlink, publisherCapabilityExchange, oversizedRestoredTree, traceRestoreFs, ...restoreRequest } = request;
     const phases = [];
     let finalPrecheckTargetReads = 0;
     let finalInterloperPath;
@@ -531,7 +531,12 @@ try {
     let activeRootMarker;
     let activeRootInventory;
     let publisherOwnedPath;
+    let publisherHardlinkPath;
     let publisherForeignSentinel;
+    let publisherCapabilityForeignSentinel;
+    let publisherCapabilityExchangeFired = false;
+    let publisherUnlinkCalls = 0;
+    let publisherCleanupParentSyncs = 0;
     let syncHandles = 0;
     let maxSyncHandles = 0;
     let syncOpened = 0;
@@ -575,13 +580,50 @@ try {
       if (partialPublisher === true) {
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
         const originalOpen = fsApi.open;
+        const originalLstat = fsApi.lstat;
+        let partialWriteFailed = false;
+        let cleanupOwnedEntryChecked = false;
+        const cleanupParent = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active");
+        const capabilityRoot = publisherCapabilityExchange?.startsWith("quarantine-")
+          ? request.quarantineRoot
+          : join(request.quarantineRoot, request.transactionId);
+        const exchangeCapability = () => {
+          if (publisherCapabilityExchangeFired) return;
+          renameSync(capabilityRoot, capabilityRoot + ".foreign-capability");
+          mkdirSync(capabilityRoot, { recursive: true, mode: 0o700 });
+          publisherCapabilityForeignSentinel = join(capabilityRoot, "foreign-capability-sentinel");
+          writeFileSync(publisherCapabilityForeignSentinel, "foreign capability");
+          publisherCapabilityExchangeFired = true;
+        };
+        fsApi.lstat = async (path, ...args) => {
+          if (partialWriteFailed && cleanupOwnedEntryChecked &&
+              (publisherCapabilityExchange === "run-before" || publisherCapabilityExchange === "quarantine-before") &&
+              path === capabilityRoot) exchangeCapability();
+          const stat = await originalLstat(path, ...args);
+          if (partialWriteFailed && path === publisherOwnedPath) cleanupOwnedEntryChecked = true;
+          return stat;
+        };
         fsApi.open = async (path, ...args) => {
           const handle = await originalOpen(path, ...args);
-          if (publisherCleanupFailure === "sync" && path === join(request.quarantineRoot, request.transactionId, "inventories", "restore-active")) {
+          if (publisherCleanupFailure === "sync" && path === cleanupParent) {
             return new Proxy(handle, {
               get(inner, property) {
                 const value = Reflect.get(inner, property, inner);
-                if (property === "sync") return async () => { throw new Error("injected restore-active cleanup parent sync failure"); };
+                if (property === "sync") return async () => { publisherCleanupParentSyncs += 1; throw new Error("injected restore-active cleanup parent sync failure"); };
+                return typeof value === "function" ? value.bind(inner) : value;
+              },
+            });
+          }
+          if (path === cleanupParent) {
+            return new Proxy(handle, {
+              get(inner, property) {
+                const value = Reflect.get(inner, property, inner);
+                if (property === "sync") return async (...syncArgs) => {
+                  publisherCleanupParentSyncs += 1;
+                  const result = await Reflect.apply(value, inner, syncArgs);
+                  if (publisherCapabilityExchange === "run-after" || publisherCapabilityExchange === "quarantine-after") exchangeCapability();
+                  return result;
+                };
                 return typeof value === "function" ? value.bind(inner) : value;
               },
             });
@@ -596,6 +638,10 @@ try {
                 writes += 1;
                 if (writes === 1) {
                   const result = await Reflect.apply(value, inner, [buffer, offset, Math.min(1, length), position]);
+                  if (publisherHardlink === true) {
+                    publisherHardlinkPath = path + ".hardlink";
+                    linkSync(path, publisherHardlinkPath);
+                  }
                   if (publisherParentExchange === true) {
                     const parent = dirname(path);
                     renameSync(parent, parent + ".foreign-owned");
@@ -605,6 +651,7 @@ try {
                   }
                   return result;
                 }
+                partialWriteFailed = true;
                 throw new Error("injected partial restore-active inventory write failure");
               };
               return typeof value === "function" ? value.bind(inner) : value;
@@ -614,7 +661,14 @@ try {
         if (publisherCleanupFailure === "unlink") {
           const originalUnlink = fsApi.unlink;
           fsApi.unlink = async (path, ...args) => {
+            if (path === publisherOwnedPath) publisherUnlinkCalls += 1;
             if (path === publisherOwnedPath) throw new Error("injected restore-active cleanup unlink failure");
+            return originalUnlink(path, ...args);
+          };
+        } else {
+          const originalUnlink = fsApi.unlink;
+          fsApi.unlink = async (path, ...args) => {
+            if (path === publisherOwnedPath) publisherUnlinkCalls += 1;
             return originalUnlink(path, ...args);
           };
         }
@@ -824,7 +878,7 @@ try {
         const path = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl");
         activeRootInventory.bytesAfter = existsSync(path) ? readFileSync(path).toString("base64") : null;
       }
-      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, publisherOwnedPath, publisherForeignSentinel, syncOpened, syncClosed, maxSyncHandles, derivedTracePaths, fsTrace }));
+      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, publisherOwnedPath, publisherHardlinkPath, publisherForeignSentinel, publisherCapabilityForeignSentinel, publisherCapabilityExchangeFired, publisherUnlinkCalls, publisherCleanupParentSyncs, syncOpened, syncClosed, maxSyncHandles, derivedTracePaths, fsTrace }));
     } catch (error) {
       if (publicationEvidence !== undefined) {
         publicationEvidence = publicationEvidence.map((entry) => ({
@@ -838,7 +892,7 @@ try {
         const path = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl");
         activeRootInventory.bytesAfter = existsSync(path) ? readFileSync(path).toString("base64") : null;
       }
-      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, publisherOwnedPath, publisherForeignSentinel, syncOpened, syncClosed, maxSyncHandles, derivedTracePaths, fsTrace, error: errorShape(error) }));
+      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, publisherOwnedPath, publisherHardlinkPath, publisherForeignSentinel, publisherCapabilityForeignSentinel, publisherCapabilityExchangeFired, publisherUnlinkCalls, publisherCleanupParentSyncs, syncOpened, syncClosed, maxSyncHandles, derivedTracePaths, fsTrace, error: errorShape(error) }));
     }
   } else if (operation === "restore-parent-sync-seam") {
     const { target, timing, ...restoreRequest } = request;

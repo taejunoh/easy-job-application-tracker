@@ -322,6 +322,65 @@ describe("quarantine restore", () => {
     }
   });
 
+  it("preserves a hard-linked partial inventory without unlinking or syncing its parent", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, partialPublisher: true, publisherHardlink: true,
+      }) as unknown as {
+        ok: boolean; publisherOwnedPath?: string; publisherHardlinkPath?: string;
+        publisherUnlinkCalls?: number; publisherCleanupParentSyncs?: number; error?: { message?: string };
+      };
+      expect(result.ok).toBe(false);
+      expect(result.error?.message).toBe("restore-active inventory publish and cleanup failed");
+      expect(existsSync(result.publisherOwnedPath!)).toBe(true);
+      expect(existsSync(result.publisherHardlinkPath!)).toBe(true);
+      expect(lstatSync(result.publisherOwnedPath!).nlink).toBe(2);
+      expect(lstatSync(result.publisherHardlinkPath!).nlink).toBe(2);
+      expect(result.publisherUnlinkCalls).toBe(0);
+      expect(result.publisherCleanupParentSyncs).toBe(0);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["run-before", 0, 0],
+    ["quarantine-before", 0, 0],
+    ["run-after", 1, 1],
+    ["quarantine-after", 1, 1],
+  ])("revalidates the %s capability boundary while cleaning a partial inventory", (publisherCapabilityExchange, expectedUnlinks, expectedParentSyncs) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, partialPublisher: true, publisherCapabilityExchange,
+      }) as unknown as {
+        ok: boolean; publisherCapabilityExchangeFired?: boolean; publisherCapabilityForeignSentinel?: string;
+        publisherOwnedPath?: string; publisherUnlinkCalls?: number; publisherCleanupParentSyncs?: number;
+        error?: { message?: string };
+      };
+      expect(result.ok).toBe(false);
+      expect(result.publisherCapabilityExchangeFired).toBe(true);
+      expect(readFileSync(result.publisherCapabilityForeignSentinel!, "utf8")).toBe("foreign capability");
+      expect(result.publisherUnlinkCalls).toBe(expectedUnlinks);
+      expect(result.publisherCleanupParentSyncs).toBe(expectedParentSyncs);
+      expect(result.error?.message).toBe("restore-active inventory publish and cleanup failed");
+      const capabilityRoot = publisherCapabilityExchange.startsWith("quarantine-")
+        ? prepared.fixture.quarantineRoot
+        : prepared.runRoot;
+      const preservedRunRoot = publisherCapabilityExchange.startsWith("quarantine-")
+        ? join(`${prepared.fixture.quarantineRoot}.foreign-capability`, prepared.transactionId)
+        : `${prepared.runRoot}.foreign-capability`;
+      expect(journalEvents(join(preservedRunRoot, "journal.log")).at(-1)).toBe("QUARANTINED");
+      const preservedOwnedPath = `${capabilityRoot}.foreign-capability${result.publisherOwnedPath!.slice(capabilityRoot.length)}`;
+      expect(existsSync(preservedOwnedPath)).toBe(expectedUnlinks === 0);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("preserves a partial inventory behind an exchanged publisher parent", () => {
     const prepared = prepareQuarantinedFixture();
     try {
