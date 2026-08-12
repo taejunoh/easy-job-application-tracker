@@ -291,6 +291,35 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
     throw new Error("restore-active inventory parent is unsafe");
   }
   const parentIdentity = frozenDirectoryIdentity(parent, parentStat, parentRealpath);
+  const expectedExistingBytes = Buffer.from(snapshot.records.map((record) => `${JSON.stringify(record)}\n`).join(""));
+  const readExactExisting = async () => {
+    let existingHandle;
+    let primary;
+    let matches = false;
+    try {
+      const expected = await fsApi.lstat(path);
+      if (expected.isSymbolicLink() || !expected.isFile() || modeOf(expected) !== 0o600 || expected.nlink !== 1) {
+        throw new Error("existing restore-active inventory is unsafe");
+      }
+      if (expected.size !== expectedExistingBytes.length) return false;
+      existingHandle = await fsApi.open(path, FILE_OPEN_FLAGS);
+      const opened = await existingHandle.stat();
+      assertIdentity(expected, opened, "isFile", "existing restore-active inventory");
+      const observed = Buffer.allocUnsafe(expectedExistingBytes.length);
+      let offset = 0;
+      while (offset < observed.length) {
+        const read = await existingHandle.read(observed, offset, observed.length - offset, offset);
+        if (read.bytesRead === 0) throw new Error("existing restore-active inventory changed while being read");
+        offset += read.bytesRead;
+      }
+      const final = await existingHandle.stat();
+      assertIdentity(opened, final, "isFile", "existing restore-active inventory");
+      await assertPathMatchesHandle(path, opened, "isFile", fsApi);
+      matches = Buffer.compare(observed, expectedExistingBytes) === 0;
+    } catch (error) { primary = error; }
+    await closeAll(undefined, existingHandle, primary);
+    return matches;
+  };
   let handle;
   let ownedIdentity;
   const cleanupOwned = async (error) => {
@@ -311,10 +340,7 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
       handle = await fsApi.open(path, "wx", 0o600);
     } catch (error) {
       if (!replaceExisting || error?.code !== "EEXIST") throw error;
-      const existing = await fsApi.lstat(path);
-      if (existing.isSymbolicLink() || !existing.isFile() || modeOf(existing) !== 0o600 || existing.nlink !== 1) {
-        throw new Error("existing restore-active inventory is unsafe");
-      }
+      if (!await readExactExisting()) throw new Error("existing restore-active inventory is not a prior restore publication");
       await fsApi.unlink(path);
       await revalidateRunCapability(capability, { purpose: "inventory", id: entryId, phase: "restore-active", boundary: "before-mutation" });
       handle = await fsApi.open(path, "wx", 0o600);

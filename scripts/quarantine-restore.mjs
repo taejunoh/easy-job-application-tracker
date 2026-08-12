@@ -665,10 +665,16 @@ export async function restoreQuarantine(input) {
       if (replayed.state !== handoff.journalTip.state || tip?.recordHash !== handoff.journalTip.recordHash) {
         throw new Error("restore journal changed before mutation");
       }
+      // Fresh runs fail closed on an inventory EEXIST.  Reuse is permitted
+      // only after this durable run itself terminated a prior restore, and
+      // the publisher separately verifies the old publication bytes.
+      const reuseRestoreActiveInventory = replayed.records.some((record) =>
+        record.event === "RESTORE_ABORTED_TO_QUARANTINED" || record.event === "RESTORE_ABORTED_TO_VALIDATED",
+      );
       const publications = [];
       let activeGenerated;
       try {
-        activeGenerated = await captureActiveGenerated(handoff, options.faultHook, publications, { replaceExisting: true });
+        activeGenerated = await captureActiveGenerated(handoff, options.faultHook, publications, { replaceExisting: reuseRestoreActiveInventory });
         await assertActiveStable(handoff, activeGenerated);
         await append(heldLock, handoff.capability, "RESTORE_PREPARED", { restoreId, activeGenerated });
       } catch (error) {
