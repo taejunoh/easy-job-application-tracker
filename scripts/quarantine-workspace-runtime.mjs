@@ -2111,23 +2111,43 @@ async function guardedRecoveryRename({
     } catch {
       fail("ERR_INTEGRITY");
     }
+  } else {
+    try {
+      // The restored workspace endpoint is the rollback destination. Its data
+      // must be durable before publishing the payload-sync recovery seam.
+      await syncDirectory(expectedDestination, fsApi);
+    } catch {
+      fail("ERR_INTEGRITY");
+    }
+    await invokeApplyHook(faultHook, { rejected: false }, `after-rollback-payload-sync:${entry.id}`);
   }
-  if (!toPayload) await invokeApplyHook(faultHook, { rejected: false }, `after-rollback-payload-sync:${entry.id}`);
   await assertAfterRename();
-  try {
-    await syncDirectory(payloadParent, fsApi);
-    await syncDirectory(dirname(workspace), fsApi);
-  } catch {
-    fail("ERR_INTEGRITY");
-  }
-  if (!toPayload) {
+  if (toPayload) {
+    try {
+      await syncDirectory(payloadParent, fsApi);
+      await syncDirectory(dirname(workspace), fsApi);
+    } catch {
+      fail("ERR_INTEGRITY");
+    }
+  } else {
+    try {
+      // The restored workspace parent is the rollback destination parent.
+      await syncDirectory(dirname(expectedDestination), fsApi);
+    } catch {
+      fail("ERR_INTEGRITY");
+    }
     await invokeApplyHook(
       faultHook,
       { rejected: false },
       `after-rollback-destination-parent-sync:${entry.id}`,
     );
-  }
-  if (!toPayload) {
+    await assertAfterRename();
+    try {
+      // The quarantine payload parent is the rollback source parent.
+      await syncDirectory(dirname(expectedSource), fsApi);
+    } catch {
+      fail("ERR_INTEGRITY");
+    }
     await invokeApplyHook(
       faultHook,
       { rejected: false },

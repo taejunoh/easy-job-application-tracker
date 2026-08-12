@@ -776,6 +776,108 @@ describe("quarantine transaction Slice 1", () => {
     }));
   });
 
+  it("runs each rollback durability hook immediately after its corresponding sync", () => {
+    const f = createQuarantineFixture();
+    bases.push(f.base);
+    const transactionId = "tx-rollback-durability-order";
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: f.expectedCount,
+      transactionId,
+      createdAt: "2026-07-17T00:00:05.000Z",
+      writersStopped: true,
+    };
+    expect(invokeQuarantineWorker("apply-stop", {
+      ...request,
+      stopPhase: "after-rename:copy-0001",
+    }).ok).toBe(false);
+
+    const transactionUrl = pathToFileURL(
+      join(__dirname, "../../scripts/quarantine-transaction.mjs"),
+    ).href;
+    const payload = join(f.quarantineRoot, transactionId, "payload/source-copies/copy-0001");
+    const workspace = join(f.repoRoot, "notes 2.txt");
+    const source = `
+import { createReadStream, lstatSync, realpathSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import { dirname } from "node:path";
+import { recoverQuarantine } from ${JSON.stringify(transactionUrl)};
+const request = ${JSON.stringify({
+  repoRoot: f.repoRoot,
+  quarantineRoot: f.quarantineRoot,
+  transactionId,
+  action: "rollback",
+  writersStopped: true,
+})};
+const workspace = ${JSON.stringify(workspace)};
+const payload = ${JSON.stringify(payload)};
+const labels = new Map([
+  [workspace, "payload"],
+  [dirname(workspace), "destination-parent"],
+  [dirname(payload), "source-parent"],
+]);
+const events = [];
+let tracing = false;
+const fsApi = {
+  ...fsPromises,
+  async open(path, ...args) {
+    const handle = await fsPromises.open(path, ...args);
+    const label = tracing && args[0] === "r" ? labels.get(path) : undefined;
+    if (label === undefined) return handle;
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === "sync") return async () => {
+          const result = await target.sync();
+          events.push("sync:" + label);
+          return result;
+        };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  },
+  createReadStream,
+  lstatSync,
+  realpathSync,
+};
+let failure;
+try {
+  await recoverQuarantine({
+    ...request,
+    fsApi,
+    faultHook(phase) {
+      if (phase === "after-rollback-rename:copy-0001") tracing = true;
+      if (!phase.endsWith(":copy-0001")) return;
+      if (phase.startsWith("after-rollback-")) events.push("hook:" + phase.slice(15, -10));
+      if (phase === "after-rollback-source-parent-sync:copy-0001") throw new Error("stop trace");
+    },
+  });
+} catch (error) {
+  failure = error.message;
+}
+process.stdout.write(JSON.stringify({ failure, events }));
+`;
+    const traced = spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+      encoding: "utf8",
+    });
+    expect(traced.status).toBe(0);
+    expect(JSON.parse(traced.stdout)).toEqual({
+      failure: "Quarantine evidence failed integrity validation.",
+      events: [
+        "hook:rename",
+        "sync:payload",
+        "hook:payload-sync",
+        "sync:destination-parent",
+        "hook:destination-parent-sync",
+        "sync:source-parent",
+        "hook:source-parent-sync",
+      ],
+    });
+  });
+
   const bases: string[] = [];
 
   afterEach(() => {
