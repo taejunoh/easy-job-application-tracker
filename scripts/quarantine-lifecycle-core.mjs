@@ -9,6 +9,8 @@ import { replayJournal } from "./quarantine-journal.mjs";
 import { summarizeInventoryDirectory, hashVerifiedRegularFile } from "./quarantine-inventory-reader.mjs";
 import { captureRunFsSource, getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
+import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
+import { isRestoreRecoveryCallback } from "./quarantine-lifecycle-recovery-context.mjs";
 
 const OPTION_KEYS = Object.freeze([
   "repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi",
@@ -117,59 +119,6 @@ function restoreProvenance(replayed) {
     }
   }
   return { active: restoreActive, state: restored };
-}
-
-function validateRestoreLedger(replayed, manifest) {
-  const preparedIndex = replayed.records.findLastIndex((record) => record.event === "RESTORE_PREPARED");
-  if (preparedIndex < 0) throw new Error("restore lifecycle provenance is missing");
-  const prepared = replayed.records[preparedIndex];
-  if (typeof prepared.payload.restoreId !== "string" || !prepared.payload.restoreId.startsWith("restore-")) {
-    throw new Error("restore lifecycle ID is invalid");
-  }
-  const active = prepared.payload.activeGenerated;
-  const generatedIds = manifest.entries
-    .filter((entry) => entry.kind === "generated-root")
-    .map((entry) => entry.id);
-  if (
-    !Array.isArray(active) || active.length !== generatedIds.length ||
-    active.some((entry, index) => entry.id !== generatedIds[index])
-  ) {
-    throw new Error("restore active-generated provenance does not match the manifest");
-  }
-  const orderedIds = manifest.entries.map((entry) => entry.id);
-  const intents = replayed.records.slice(preparedIndex + 1)
-    .filter((record) => record.event === "RESTORE_INTENT")
-    .map((record) => record.payload.id);
-  if (intents.some((id, index) => id !== orderedIds[index])) {
-    throw new Error("restore intent order does not match manifest provenance");
-  }
-  const rollbackIntents = replayed.records.slice(preparedIndex + 1)
-    .filter((record) => record.event === "RESTORE_ROLLBACK_INTENT")
-    .map((record) => record.payload.id);
-  const expectedRollback = [...intents].reverse();
-  if (rollbackIntents.some((id, index) => id !== expectedRollback[index])) {
-    throw new Error("restore rollback intent order does not match restore provenance");
-  }
-  const completed = replayed.records.slice(preparedIndex + 1)
-    .filter((record) => record.event === "RESTORED_ENTRY").map((record) => record.payload.id);
-  const rollbackCompleted = replayed.records.slice(preparedIndex + 1)
-    .filter((record) => record.event === "RESTORE_ROLLED_BACK_ENTRY").map((record) => record.payload.id);
-  const expectedCompleted = intents.slice(0, completed.length);
-  if (completed.some((id, index) => id !== expectedCompleted[index])) {
-    throw new Error("restore completion order does not match restore intent order");
-  }
-  const expectedRollbackCompleted = rollbackIntents.slice(0, rollbackCompleted.length);
-  if (rollbackCompleted.some((id, index) => id !== expectedRollbackCompleted[index])) {
-    throw new Error("restore rollback completion order does not match rollback intent order");
-  }
-  return Object.freeze({
-    restoreId: prepared.payload.restoreId,
-    active: new Map(active.map((entry) => [entry.id, entry.inventory])),
-    intents: Object.freeze(intents),
-    completed: new Set(completed),
-    rollbackIntents: new Set(rollbackIntents),
-    rollbackCompleted: new Set(rollbackCompleted),
-  });
 }
 
 function modeOf(stat) { return stat.mode & 0o7777; }
@@ -352,7 +301,7 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
     throw new Error("quarantine lifecycle provenance does not match the live repository");
   }
   if (restoreContext && replayed.state !== "INCOMPLETE_CONFLICT") {
-    const ledger = validateRestoreLedger(replayed, manifest);
+    const ledger = buildRestoreLedger(replayed, manifest);
     try {
       await verifyRestoreLocations({
         capability,
@@ -415,13 +364,10 @@ function sameSnapshot(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-export async function withExistingQuarantineRun(options, callback, recovery = Object.freeze({})) {
+export async function withExistingQuarantineRun(options, callback) {
   const input = snapshotOptions(options);
   if (typeof callback !== "function") throw new TypeError("existing quarantine run callback must be a function");
-  if (recovery === null || typeof recovery !== "object" || Array.isArray(recovery) ||
-      (recovery.allowRestoreLocationConflict !== undefined && recovery.allowRestoreLocationConflict !== true)) {
-    throw new TypeError("existing quarantine recovery options are invalid");
-  }
+  const recovery = Object.freeze({ allowRestoreLocationConflict: isRestoreRecoveryCallback(callback) });
   const source = captureRunFsSource(input.fsApi);
   return withQuarantineRunCapability({
     repoRoot: input.repoRoot,

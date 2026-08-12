@@ -18,10 +18,10 @@ describe("quarantine lifecycle core", () => {
   it("keeps its single private entry point closed", async () => {
     const core = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
       const core = await import(${JSON.stringify(coreUrl)});
-      process.stdout.write(JSON.stringify(Object.keys(core)));
+      process.stdout.write(JSON.stringify({ keys: Object.keys(core), arity: core.withExistingQuarantineRun.length }));
     `], { encoding: "utf8" }));
 
-    expect(core).toEqual(["withExistingQuarantineRun"]);
+    expect(core).toEqual({ keys: ["withExistingQuarantineRun"], arity: 2 });
     const publicExports = invokeQuarantineWorker("exports", {});
     expect(publicExports.exports).not.toContain("withExistingQuarantineRun");
     expect(publicExports.runtimeExports).not.toContain("withExistingQuarantineRun");

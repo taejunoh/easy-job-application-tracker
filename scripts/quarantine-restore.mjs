@@ -11,6 +11,8 @@ import {
 } from "./quarantine-inventory-reader.mjs";
 import { appendJournalRecord, IndeterminateJournalAppendError, replayJournal, withJournalLock } from "./quarantine-journal.mjs";
 import { withExistingQuarantineRun } from "./quarantine-lifecycle-core.mjs";
+import { markRestoreRecoveryCallback } from "./quarantine-lifecycle-recovery-context.mjs";
+import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
 import { deriveRunPath, revalidateRunCapability } from "./quarantine-run-capability.mjs";
 
 const OPTION_KEYS = Object.freeze([
@@ -692,21 +694,20 @@ export async function restoreQuarantine(input) {
 
 export async function recoverRestore(input) {
   const options = snapshotOptions(input, { recovery: true });
-  const restoreId = deriveRestoreId(options.transactionId);
   const existing = record([
     ["repoRoot", options.repoRoot], ["quarantineRoot", options.quarantineRoot],
     ["transactionId", options.transactionId], ["writersStopped", true],
     ...(Object.hasOwn(options, "fsApi") ? [["fsApi", options.fsApi]] : []),
   ]);
-  return withExistingQuarantineRun(existing, async (handoff) => withJournalLock({ capability: handoff.capability }, async (heldLock) => {
+  return withExistingQuarantineRun(existing, markRestoreRecoveryCallback(async (handoff) => withJournalLock({ capability: handoff.capability }, async (heldLock) => {
     const replayed = await replayJournal({ capability: handoff.capability });
     if (replayed.truncatedTail) throw new Error("restore recovery journal has a torn tail");
     const tip = replayed.records.at(-1);
     if (tip?.recordHash !== handoff.journalTip.recordHash || replayed.state !== handoff.journalTip.state) {
       throw new Error("restore journal changed before recovery mutation");
     }
-    const prepared = replayed.records.findLast((entry) => entry.event === "RESTORE_PREPARED");
-    if (prepared?.payload.restoreId !== restoreId) throw new Error("restore recovery ID does not match transaction");
+    const ledger = buildRestoreLedger(replayed, handoff.manifestGeneration.manifest);
+    const restoreId = ledger.restoreId;
     if (replayed.state === "INCOMPLETE_CONFLICT") {
       const conflict = replayed.records.at(-1)?.payload.conflictEntryIds;
       return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "INCOMPLETE_CONFLICT"], ["action", options.action], ["conflictEntryIds", Object.freeze([...conflict])]]);
@@ -716,16 +717,8 @@ export async function recoverRestore(input) {
       throw new Error("restore recovery requires an in-progress restore");
     }
     const entries = handoff.manifestGeneration.manifest.entries;
-    const intents = replayed.records.filter((entry) => entry.event === "RESTORE_INTENT").map((entry) => entry.payload.id);
-    const completed = new Set(replayed.records.filter((entry) => entry.event === "RESTORED_ENTRY").map((entry) => entry.payload.id));
-    const rollbackIntents = replayed.records.filter((entry) => entry.event === "RESTORE_ROLLBACK_INTENT").map((entry) => entry.payload.id);
-    const rollbackCompleted = new Set(replayed.records.filter((entry) => entry.event === "RESTORE_ROLLED_BACK_ENTRY").map((entry) => entry.payload.id));
-    const pendingRollback = rollbackIntents.length === rollbackCompleted.size ? null : rollbackIntents.at(-1);
-    const ledger = Object.freeze({
-      restoreId,
-      active: new Map(prepared.payload.activeGenerated.map((entry) => [entry.id, entry.inventory])),
-      intents: Object.freeze(intents), completed, rollbackCompleted,
-    });
+    const { intents, completed, rollbackCompleted } = ledger;
+    const pendingRollback = ledger.rollbackIntentIds.length === rollbackCompleted.size ? null : ledger.rollbackIntentIds.at(-1);
     const inspected = [];
     for (const entry of entries) {
       if (options.action === "resume" && completed.has(entry.id)) continue;
@@ -775,10 +768,10 @@ export async function recoverRestore(input) {
       if (!intents.includes(entry.id) || rollbackCompleted.has(entry.id)) continue;
       await rollbackRecoveryEntry({ handoff, heldLock, ledger, entry, state: states.get(entry.id) ?? "initial", faultHook: options.faultHook, rollbackIntentRecorded: pendingRollback === entry.id });
     }
-    const prior = handoff.journalTip.state === "VALIDATED" || replayed.records.slice(0, replayed.records.findIndex((entry) => entry.event === "RESTORE_PREPARED")).at(-1)?.event === "VALIDATED" ? "VALIDATED" : "QUARANTINED";
+    const prior = ledger.preRestoreState;
     await append(heldLock, handoff.capability, prior === "VALIDATED" ? "RESTORE_ABORTED_TO_VALIDATED" : "RESTORE_ABORTED_TO_QUARANTINED", {});
     await invokeHook(options.faultHook, prior === "VALIDATED" ? "after-event:RESTORE_ABORTED_TO_VALIDATED" : "after-event:RESTORE_ABORTED_TO_QUARANTINED");
     await invokeHook(options.faultHook, "before-lock-cleanup");
     return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", prior], ["action", "rollback"], ["reconciledEntries", intents.length], ["restoreAborted", true]]);
-  }), Object.freeze({ allowRestoreLocationConflict: true }));
+  })));
 }
