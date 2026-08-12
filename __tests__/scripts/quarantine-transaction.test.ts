@@ -886,7 +886,13 @@ process.stdout.write(JSON.stringify({ failure, events }));
 
   it("exposes the completed atomic apply and recovery API only at the Slice 2 surfaces", async () => {
     const exports = invokeQuarantineWorker("exports", {});
-    expect(exports.exports).toEqual(["inspectWorkspace", "quarantineWorkspace", "recoverQuarantine"]);
+    expect(exports.exports).toEqual([
+      "inspectWorkspace",
+      "markQuarantineValidated",
+      "quarantineWorkspace",
+      "recoverQuarantine",
+    ]);
+    expect(exports.exports).not.toContain("withExistingQuarantineRun");
     expect(exports.runtimeExports).toEqual([
       "inspectWorkspace",
       "prepareQuarantineWorkspace",

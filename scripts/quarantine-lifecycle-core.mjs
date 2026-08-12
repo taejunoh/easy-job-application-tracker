@@ -77,7 +77,12 @@ function captureFsSource(candidate) {
   return frozenRecord(entries);
 }
 
-function gitHead(repoRoot) {
+function gitEvidence(repoRoot) {
+  const topLevel = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
   const head = execFileSync("git", ["rev-parse", "HEAD"], {
     cwd: repoRoot,
     encoding: "utf8",
@@ -86,7 +91,30 @@ function gitHead(repoRoot) {
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(head)) {
     throw new Error("repository HEAD is invalid");
   }
-  return head;
+  return { topLevel, head };
+}
+
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function repositoryEvidence(repoRoot, fsApi) {
+  const before = await fsApi.lstat(repoRoot);
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new Error("repository root identity is invalid");
+  }
+  const realPath = await fsApi.realpath(repoRoot);
+  if (realPath !== repoRoot) throw new Error("repository root is not canonical");
+  const git = gitEvidence(repoRoot);
+  if (git.topLevel !== repoRoot) throw new Error("repository root is not the Git top level");
+  const after = await fsApi.lstat(repoRoot);
+  if (!sameIdentity(before, after)) throw new Error("repository root identity changed");
+  return frozenRecord([
+    ["dev", before.dev],
+    ["ino", before.ino],
+    ["realPath", realPath],
+    ["head", git.head],
+  ]);
 }
 
 function journalTip(replayed) {
@@ -133,6 +161,7 @@ async function readPointer(capability) {
 }
 
 async function validateExistingRun(capability, options, fsApi) {
+  const repository = await repositoryEvidence(options.repoRoot, fsApi);
   const replayed = await replayJournal({ capability });
   if (replayed.truncatedTail) {
     throw new Error("existing quarantine journal has a torn tail");
@@ -161,7 +190,7 @@ async function validateExistingRun(capability, options, fsApi) {
     manifest.transactionId !== options.transactionId ||
     manifest.repositoryRoot !== options.repoRoot ||
     manifest.state !== expectedManifestState ||
-    manifest.head !== gitHead(options.repoRoot)
+    manifest.head !== repository.head
   ) {
     throw new Error("quarantine lifecycle provenance does not match the live repository");
   }
@@ -174,10 +203,24 @@ async function validateExistingRun(capability, options, fsApi) {
       (pointer.transactionId !== options.transactionId || pointer.manifestSha256 !== manifestSha256)) {
     throw new Error("current manifest pointer does not match validated provenance");
   }
+  if (validated) {
+    const expectedDeleteAfter = new Date(
+      Date.parse(manifest.validatedAt) + (4 * 24 * 60 * 60 * 1000),
+    ).toISOString();
+    if (
+      manifest.retentionDays !== 4 ||
+      manifest.deletionRequiresConfirmation !== true ||
+      manifest.deletionStatus !== "retained" ||
+      manifest.deleteAfter !== expectedDeleteAfter
+    ) {
+      throw new Error("VALIDATED retention evidence is invalid");
+    }
+  }
 
   const journalPath = deriveRunPath(capability, { purpose: "journal" });
   const runRoot = dirname(journalPath);
   return frozenRecord([
+    ["repository", repository],
     ["runRoot", runRoot],
     ["head", manifest.head],
     ["journalTip", journalTip(replayed)],
@@ -186,7 +229,12 @@ async function validateExistingRun(capability, options, fsApi) {
       ["state", manifest.state],
       ["manifest", manifest],
     ])],
+    ["pointer", pointer],
   ]);
+}
+
+function sameSnapshot(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 export async function withExistingQuarantineRun(options, callback) {
@@ -202,6 +250,18 @@ export async function withExistingQuarantineRun(options, callback) {
   }, async (capability) => {
     const fsApi = getRunFsContext(capability, source);
     const validated = await validateExistingRun(capability, input, fsApi);
+    // Re-read every mutable evidence boundary immediately before capability
+    // handoff.  This is cooperative TOCTOU detection; all reads still use the
+    // exact adapter captured synchronously above.
+    const stable = await validateExistingRun(capability, input, fsApi);
+    if (
+      !sameSnapshot(validated.repository, stable.repository) ||
+      !sameSnapshot(validated.journalTip, stable.journalTip) ||
+      !sameSnapshot(validated.manifestGeneration, stable.manifestGeneration) ||
+      !sameSnapshot(validated.pointer, stable.pointer)
+    ) {
+      throw new Error("quarantine lifecycle evidence changed before callback");
+    }
     const handoff = frozenRecord([
       ["capability", capability],
       ["repoRoot", input.repoRoot],
