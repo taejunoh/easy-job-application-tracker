@@ -336,7 +336,14 @@ async function assertActiveStable(handoff, active) {
     if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) {
       throw new Error("active generated root disappeared during restore preparation");
     }
-    const observed = await summarizeInventoryDirectory(root, { fsApi: handoff.fsApi, ancestorChain: ancestors });
+    if (metadata.rootIdentity === null) throw new Error("active generated root identity is unavailable");
+    await assertVerifiedDirectory(root, metadata.rootIdentity, handoff.fsApi, "active generated root changed during restore preparation");
+    const observed = await summarizeInventoryDirectory(root, {
+      fsApi: handoff.fsApi,
+      ancestorChain: ancestors,
+      expectedRootIdentity: metadata.rootIdentity,
+    });
+    await assertVerifiedDirectory(root, metadata.rootIdentity, handoff.fsApi, "active generated root changed during restore preparation");
     if (!sameSummary(captured.inventory, observed)) throw new Error("active generated root changed during restore preparation");
   }
 }

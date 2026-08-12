@@ -171,13 +171,22 @@ async function readVerifiedLink(path, expected, ancestorChain, fsApi) {
   return linkTarget;
 }
 
-export async function summarizeInventoryDirectory(root, { fsApi, ancestorChain = Object.freeze([]), snapshot = false }) {
+export async function summarizeInventoryDirectory(root, {
+  fsApi, ancestorChain = Object.freeze([]), snapshot = false, expectedRootIdentity = undefined,
+}) {
   assertAbsolutePath(root, "read-only inventory root");
   const rootStat = await fsApi.lstat(root);
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
     throw new Error("restore tree endpoint is unsafe");
   }
-  const rootIdentity = frozenDirectoryIdentity(root, rootStat, await fsApi.realpath(root));
+  const rootRealpath = await fsApi.realpath(root);
+  if (expectedRootIdentity !== undefined) {
+    assertIdentity(expectedRootIdentity, rootStat, "isDirectory", "restore tree root");
+    if (rootRealpath !== expectedRootIdentity.canonicalRealpath) {
+      throw new Error("restore tree root pathname identity changed");
+    }
+  }
+  const rootIdentity = frozenDirectoryIdentity(root, rootStat, rootRealpath);
   const records = [];
   const pending = [{
     absolutePath: root, relativePath: "", depth: 0, root: true,

@@ -489,6 +489,46 @@ describe("quarantine restore", () => {
     }
   });
 
+  it.each([
+    ["generated-next", ".next"],
+    ["generated-node-modules", "node_modules"],
+  ])("rejects a byte-identical %s root replacement after its restore-active inventory publication", (id, rootName) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const beforeJournal = readFileSync(join(prepared.runRoot, "journal.log"));
+      const beforeGeneration = generationEvidence(prepared);
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, activeRootExchangeAt: id,
+      }) as unknown as {
+        ok: boolean; phases: string[]; foreignOpenCalls: number;
+        activeRootMarker?: { id: string; phase: string; before: { ino: number }; after: { ino: number } };
+        activeRootInventory?: { bytesAtBarrier: string; bytesAfter: string };
+      };
+      expect(result.ok).toBe(false);
+      expect(result.activeRootMarker).toEqual(expect.objectContaining({
+        id, phase: `after-inventory:restore-active:${id}`,
+        before: expect.objectContaining({ ino: expect.any(Number) }),
+        after: expect.objectContaining({ ino: expect.any(Number) }),
+      }));
+      expect(result.activeRootMarker?.before.ino).not.toBe(result.activeRootMarker?.after.ino);
+      expect(result.activeRootInventory).toEqual(expect.objectContaining({
+        bytesAtBarrier: expect.any(String), bytesAfter: expect.any(String),
+      }));
+      expect(result.activeRootInventory?.bytesAfter).toBe(result.activeRootInventory?.bytesAtBarrier);
+      expect(result.phases).toEqual([
+        "after-inventory:restore-active:generated-next", "after-inventory:restore-active:generated-node-modules",
+      ]);
+      expect(readFileSync(join(prepared.runRoot, "journal.log"))).toEqual(beforeJournal);
+      expect(journalEvents(join(prepared.runRoot, "journal.log"))).not.toContain("RESTORE_PREPARED");
+      expect(generationEvidence(prepared)).toBe(beforeGeneration);
+      expect(readFileSync(join(prepared.fixture.repoRoot, `.foreign-${rootName}-sentinel`), "utf8")).toBe("foreign");
+      expect(result.foreignOpenCalls).toBe(0);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a byte-identical repository exchange after verified summary and before inventory publication", () => {
     const prepared = prepareQuarantinedFixture();
     try {

@@ -518,7 +518,7 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "restore") {
-    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, traceRestoreFs, ...restoreRequest } = request;
+    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, traceRestoreFs, ...restoreRequest } = request;
     const phases = [];
     let finalPrecheckTargetReads = 0;
     let finalInterloperPath;
@@ -528,6 +528,8 @@ try {
     let publicationMarker;
     let publicationEvidence;
     let foreignOpenCalls = 0;
+    let activeRootMarker;
+    let activeRootInventory;
     const fsTrace = [];
     let derivedTracePaths;
     try {
@@ -537,6 +539,7 @@ try {
       let exchanged = false;
       let generatedMoved = false;
       let fsApi;
+      let activeRootExchanged = false;
       if (traceRestoreFs === true) {
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
         for (const method of ["lstat", "open", "rename"]) {
@@ -613,6 +616,17 @@ try {
           return handle;
         };
       }
+      if (activeRootExchangeAt !== undefined) {
+        fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+        const originalOpen = fsApi.open;
+        fsApi.open = async (path, ...args) => {
+          const root = join(request.repoRoot, activeRootExchangeAt === "generated-next" ? ".next" : "node_modules");
+          if (activeRootExchanged && typeof path === "string" && (path === root || path.startsWith(root + "/"))) {
+            foreignOpenCalls += 1;
+          }
+          return originalOpen(path, ...args);
+        };
+      }
       if (["source-active", "generated-active", "generated-rollback"].includes(interloperAtFinalPrecheck)) {
         const restoreId = "restore-c3624475-87d7-4886-b0bf-68a5061663d2";
         const target = interloperAtFinalPrecheck === "source-active"
@@ -677,11 +691,28 @@ try {
             if (finalPresenceDrift === "remove-next") rmSync(target, { recursive: true, force: true });
             else { mkdirSync(target, { recursive: true, mode: 0o700 }); writeFileSync(join(target, "foreign"), "foreign\\n"); }
           }
+          if (!activeRootExchanged && phase === "after-inventory:restore-active:" + activeRootExchangeAt) {
+            const rootName = activeRootExchangeAt === "generated-next" ? ".next" : "node_modules";
+            const root = join(request.repoRoot, rootName);
+            const before = lstatSync(root);
+            renameSync(root, root + ".active-root-original");
+            mkdirSync(root, { recursive: true, mode: 0o700 });
+            writeFileSync(join(root, rootName === ".next" ? "build" : "package"), "ignored");
+            writeFileSync(join(request.repoRoot, ".foreign-" + rootName + "-sentinel"), "foreign");
+            const inventory = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl");
+            activeRootMarker = { id: activeRootExchangeAt, phase, before: { dev: before.dev, ino: before.ino, mode: before.mode & 0o7777 }, after: (() => {
+              const stat = lstatSync(root);
+              return { dev: stat.dev, ino: stat.ino, mode: stat.mode & 0o7777 };
+            })() };
+            activeRootInventory = { bytesAtBarrier: readFileSync(inventory).toString("base64") };
+            activeRootExchanged = true;
+          }
           if (phase === "after-event:RESTORING") armed = true;
           if (phase === stopPhase) throw new RangeError("stop at requested restore phase");
         },
       });
-      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, derivedTracePaths, fsTrace }));
+      if (activeRootInventory !== undefined) activeRootInventory.bytesAfter = readFileSync(join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl")).toString("base64");
+      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, derivedTracePaths, fsTrace }));
     } catch (error) {
       if (publicationEvidence !== undefined) {
         publicationEvidence = publicationEvidence.map((entry) => ({
@@ -689,7 +720,8 @@ try {
           bytesAfter: readFileSync(join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", entry.id + ".jsonl")).toString("base64"),
         }));
       }
-      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, derivedTracePaths, fsTrace, error: errorShape(error) }));
+      if (activeRootInventory !== undefined) activeRootInventory.bytesAfter = readFileSync(join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl")).toString("base64");
+      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, derivedTracePaths, fsTrace, error: errorShape(error) }));
     }
   } else if (operation === "restore-parent-sync-seam") {
     const { target, timing, ...restoreRequest } = request;
