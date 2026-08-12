@@ -368,11 +368,13 @@ import { withExistingQuarantineRun } from ${JSON.stringify(lifecycleCoreUrl)};
 import { writeInventoryJsonl } from ${JSON.stringify(pathToFileURL(join(__dirname, "../../../scripts/quarantine-inventory.mjs")).href)};
 import * as fsPromises from "node:fs/promises";
 import {
-  appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync,
+  appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync,
   renameSync, symlinkSync, truncateSync, writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
@@ -432,6 +434,28 @@ function errorShape(error) {
   };
 }
 
+function treeSnapshot(root) {
+  const records = [];
+  const visit = (path, relative) => {
+    let stat;
+    try { stat = lstatSync(path); } catch (error) {
+      if (error?.code === "ENOENT") { records.push([relative, "absent"]); return; }
+      throw error;
+    }
+    const mode = stat.mode & 0o7777;
+    if (stat.isSymbolicLink()) records.push([relative, "symlink", mode, readlinkSync(path)]);
+    else if (stat.isFile()) records.push([relative, "file", mode, stat.size, createHash("sha256").update(readFileSync(path)).digest("hex")]);
+    else if (stat.isDirectory()) {
+      records.push([relative, "directory", mode]);
+      for (const name of readdirSync(path).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
+        visit(join(path, name), relative === "" ? name : relative + "/" + name);
+      }
+    } else records.push([relative, "other", mode]);
+  };
+  visit(root, "");
+  return JSON.stringify(records);
+}
+
 try {
   if (operation === "exports") {
     const legacyFacade = await import(${JSON.stringify(legacyFacadeUrl)});
@@ -485,7 +509,9 @@ try {
     let afterFs;
     let staleIdentity = false;
     let journalReads = 0;
-    if (request.fsCapture === true || request.staleIdentity === true || request.mutateJournalBeforeCallback === true) {
+    let boundaryJournalReads = 0;
+    let repoBoundaryReads = 0;
+    if (request.fsCapture === true || request.staleIdentity === true || request.mutateJournalBeforeCallback === true || request.callbackBoundary === "repo-swap" || request.callbackBoundary === "head-advance") {
       const implementations = { ...fsPromises, createReadStream, lstatSync, realpathSync };
       source = {};
       for (const method of ${JSON.stringify(FS_METHODS)}) {
@@ -515,6 +541,20 @@ try {
                 args[0] === join(request.quarantineRoot, request.transactionId, "journal.log") &&
                 ++journalReads === 2
               ) appendFileSync(args[0], Buffer.from([0, 0, 0]));
+              if (
+                method === "lstat" && request.callbackBoundary !== undefined &&
+                args[0] === request.repoRoot && ++repoBoundaryReads === 3
+              ) {
+                if (request.callbackBoundary === "repo-swap") {
+                  renameSync(request.repoRoot, request.repoRoot + ".original");
+                  mkdirSync(request.repoRoot, { recursive: true, mode: 0o700 });
+                  writeFileSync(join(request.repoRoot, "foreign-sentinel"), "foreign");
+                } else {
+                  writeFileSync(join(request.repoRoot, "advance.txt"), "advance\\n");
+                  execFileSync("git", ["add", "advance.txt"], { cwd: request.repoRoot });
+                  execFileSync("git", ["commit", "-m", "advance"], { cwd: request.repoRoot });
+                }
+              }
               return Reflect.apply(implementation, implementations, args);
             };
           },
@@ -523,7 +563,7 @@ try {
     }
     const {
       fsCapture, staleIdentity: _staleIdentity, callbackThrows: _callbackThrows,
-      mutateJournalBeforeCallback: _mutateJournalBeforeCallback, ...coreRequest
+      mutateJournalBeforeCallback: _mutateJournalBeforeCallback, callbackBoundary: _callbackBoundary, ...coreRequest
     } = request;
     const pending = withExistingQuarantineRun({
       ...coreRequest,
@@ -563,6 +603,7 @@ try {
         calls,
         wrongReceiver,
         revoked,
+        boundarySentinel: request.callbackBoundary !== "repo-swap" || readFileSync(join(request.repoRoot, "foreign-sentinel"), "utf8") === "foreign",
         error: errorShape(captured),
       }));
       process.exit(0);
@@ -626,6 +667,7 @@ try {
     let beforePointer;
     let beforeEndpoints;
     let endpointPaths;
+    let beforeEvidence;
     await withQuarantineRunCapability({ ...restoreRequest, writersStopped: true }, async (capability) => {
       const payload = Object.fromEntries([...generated, sourceId].map((id) => [id, deriveRunPath(capability, { purpose: "payload", id })]));
       mkdirSync(join(request.quarantineRoot, request.transactionId, "rollback", "regenerated-before-restore", restoreId), {
@@ -640,6 +682,8 @@ try {
         "generated-node-modules": join(request.repoRoot, "node_modules"),
         [sourceId]: join(request.repoRoot, copyPath ?? "notes 2.txt"),
       };
+      const manifestPath = join(request.quarantineRoot, request.transactionId, "manifests", readdirSync(join(request.quarantineRoot, request.transactionId, "manifests"))[0]);
+      const manifestOrder = JSON.parse(readFileSync(manifestPath, "utf8")).entries.map((entry) => entry.id);
       endpointPaths = { ...payload, ...workspace, ...rollback };
       for (const id of generated) rmSync(workspace[id], { recursive: true, force: true });
       const active = !String(row).startsWith("no-active") && !String(row).startsWith("source");
@@ -704,10 +748,14 @@ try {
         }
       } else if (row === "source-pre" || row === "source-mid" || row === "source-post" || row === "source-rollback-pre" || row === "source-rollback-post") {
         await append(capability, "RESTORING", {});
-        // The journal schema requires every RESTORE_INTENT to be a manifest-order
-        // prefix.  A source-copy seam is therefore reached only after the two
-        // generated entries have completed their own forward move.
-        for (const id of generated) {
+        const sourceIndex = manifestOrder.indexOf(sourceId);
+        const prefix = manifestOrder.slice(0, sourceIndex);
+        // The journal schema requires a manifest-order prefix; derive it from
+        // the durable generation rather than assuming generated roots precede
+        // the numbered copy.
+        if (corruption === "out-of-order-intent") await intent("generated-next");
+        for (const id of prefix) {
+          if (!generated.includes(id)) throw new Error("unexpected source prefix fixture");
           await intent(id);
           renameSync(payload[id], workspace[id]);
           await completed(id);
@@ -718,7 +766,7 @@ try {
           if (row !== "source-mid") await completed(sourceId);
         }
         if (row === "source-rollback-pre" || row === "source-rollback-post") {
-          await append(capability, "RECOVERY_REQUIRED", { entryIds: [...generated, sourceId] });
+          await append(capability, "RECOVERY_REQUIRED", { entryIds: [...prefix, sourceId] });
           await append(capability, "RESTORE_ROLLING_BACK", {});
           await rollbackIntent(sourceId);
           if (row === "source-rollback-post") {
@@ -749,6 +797,7 @@ try {
       const pointer = join(request.quarantineRoot, "current");
       beforePointer = existsSync(pointer) ? readFileSync(pointer) : null;
       beforeEndpoints = JSON.stringify(Object.fromEntries(Object.entries(endpointPaths).map(([key, value]) => [key, existsSync(value) ? lstatSync(value).ino : null])));
+      beforeEvidence = treeSnapshot(join(request.quarantineRoot, request.transactionId));
     });
     let error;
     let externalReads = 0;
@@ -798,6 +847,7 @@ try {
       durableStable: Buffer.compare(beforeJournal, afterJournal) === 0 &&
         ((beforePointer === null && afterPointer === null) || (beforePointer !== null && afterPointer !== null && Buffer.compare(beforePointer, afterPointer) === 0)),
       endpointsStable: beforeEndpoints === afterEndpoints,
+      evidenceStable: beforeEvidence === treeSnapshot(runRoot),
       externalReads,
       foreignIntact: foreignSentinel === undefined || readFileSync(foreignSentinel, "utf8") === "foreign",
       error: error === undefined ? undefined : errorShape(error),

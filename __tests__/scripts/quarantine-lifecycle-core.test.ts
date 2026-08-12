@@ -413,6 +413,25 @@ describe("quarantine lifecycle core", () => {
     }
   });
 
+  it.each(["repo-swap", "head-advance"]) (
+    "rejects callback-boundary %s evidence drift without invoking the callback",
+    (callbackBoundary) => {
+      const prepared = prepareQuarantinedFixture({ regenerate: false });
+      try {
+        const before = readFileSync(join(prepared.runRoot, "journal.log"));
+        const result = invokeQuarantineWorker("core-contract", {
+          repoRoot: prepared.fixture.repoRoot,
+          quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId,
+          callbackBoundary,
+        }) as unknown as { ok: boolean; callbackInvoked: number; boundarySentinel?: boolean };
+        expect(result).toMatchObject({ ok: false, callbackInvoked: 0 });
+        if (callbackBoundary === "repo-swap") expect(result.boundarySentinel).toBe(true);
+        expect(readFileSync(join(prepared.runRoot, "journal.log"))).toEqual(before);
+      } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+    },
+  );
+
   it.each([
     ["QUARANTINED", false], ["VALIDATED", true],
   ] as const)("accepts %s provenance across each durable restore context", (preState, regenerate) => {
@@ -518,8 +537,8 @@ describe("quarantine lifecycle core", () => {
         row,
         preState: "VALIDATED",
         corruption,
-      }, {}, 30_000) as unknown as { ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean };
-      expect(result).toEqual(expect.objectContaining({ ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true }));
+      }, {}, 30_000) as unknown as { ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean; evidenceStable: boolean };
+      expect(result).toEqual(expect.objectContaining({ ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true, evidenceStable: true }));
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
@@ -551,5 +570,43 @@ describe("quarantine lifecycle core", () => {
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
+  });
+
+  it.each(["source-pre", "source-rollback-pre"]) (
+    "derives the Q/V source restore prefix from a durable copy-before-generated manifest for %s",
+    (row) => {
+      const copyPath = ".alpha 2.txt";
+      for (const preState of ["QUARANTINED", "VALIDATED"] as const) {
+        const prepared = prepareQuarantinedFixture({ canonicalPath: ".alpha.txt", copyPath, regenerate: preState === "VALIDATED" });
+        try {
+          const result = invokeQuarantineWorker("core-restore-matrix", {
+            repoRoot: prepared.fixture.repoRoot,
+            quarantineRoot: prepared.fixture.quarantineRoot,
+            transactionId: prepared.transactionId,
+            row,
+            preState,
+            copyPath,
+          }, {}, 30_000) as unknown as { ok: boolean; callbackInvoked: number };
+          expect(result).toMatchObject({ ok: true, callbackInvoked: 1 });
+        } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+      }
+    },
+  );
+
+  it("rejects a forged generated-first source intent when the durable manifest orders the copy first", () => {
+    const copyPath = ".alpha 2.txt";
+    const prepared = prepareQuarantinedFixture({ canonicalPath: ".alpha.txt", copyPath });
+    try {
+      const result = invokeQuarantineWorker("core-restore-matrix", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        row: "source-pre",
+        preState: "QUARANTINED",
+        copyPath,
+        corruption: "out-of-order-intent",
+      }, {}, 30_000) as unknown as { ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean; evidenceStable: boolean };
+      expect(result).toMatchObject({ ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true, evidenceStable: true });
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
   });
 });

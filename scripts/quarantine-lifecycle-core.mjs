@@ -1,9 +1,5 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, lstatSync, realpathSync } from "node:fs";
-import {
-  link, lstat, mkdir, open, opendir, readdir, readlink, realpath, rename, rm, unlink,
-} from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import {
@@ -12,17 +8,9 @@ import {
 } from "./quarantine-manifest.mjs";
 import { replayJournal } from "./quarantine-journal.mjs";
 import { hashFileStream } from "./quarantine-inventory.mjs";
-import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
+import { captureRunFsSource, getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
 
-const METHODS = Object.freeze([
-  "lstat", "realpath", "mkdir", "open", "readdir", "rm", "rename", "unlink", "link",
-  "opendir", "readlink", "createReadStream", "lstatSync", "realpathSync",
-]);
-const DEFAULT_FS = Object.freeze({
-  lstat, realpath, mkdir, open, readdir, rm, rename, unlink, link, opendir, readlink,
-  createReadStream, lstatSync, realpathSync,
-});
 const OPTION_KEYS = Object.freeze([
   "repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi",
 ]);
@@ -56,27 +44,6 @@ function snapshotOptions(input) {
     throw new TypeError("writers-stopped attestation must be true");
   }
   return Object.freeze(result);
-}
-
-/* Capture before the first await.  The captured record is deliberately the
- * source passed to the capability boundary: a later caller mutation can never
- * change either the receiver or implementation used by this lifecycle. */
-function captureFsSource(candidate) {
-  const original = candidate === undefined ? DEFAULT_FS : candidate;
-  if (original === null || typeof original !== "object" || Array.isArray(original)) {
-    throw new TypeError("filesystem adapter must be a plain object");
-  }
-  const prototype = Object.getPrototypeOf(original);
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw new TypeError("filesystem adapter must be a plain object");
-  }
-  const entries = [];
-  for (const name of METHODS) {
-    const method = original[name];
-    if (typeof method !== "function") throw new TypeError(`filesystem adapter must provide ${name}`);
-    entries.push([name, (...args) => Reflect.apply(method, original, args)]);
-  }
-  return frozenRecord(entries);
 }
 
 function gitEvidence(repoRoot) {
@@ -461,7 +428,7 @@ function sameSnapshot(left, right) {
 export async function withExistingQuarantineRun(options, callback) {
   const input = snapshotOptions(options);
   if (typeof callback !== "function") throw new TypeError("existing quarantine run callback must be a function");
-  const source = captureFsSource(input.fsApi);
+  const source = captureRunFsSource(input.fsApi);
   return withQuarantineRunCapability({
     repoRoot: input.repoRoot,
     quarantineRoot: input.quarantineRoot,

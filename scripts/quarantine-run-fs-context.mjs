@@ -52,6 +52,17 @@ const DEFAULT_SOURCE = Object.freeze({
 });
 
 const contexts = new WeakMap();
+const capturedSources = new WeakSet();
+
+function frozenRecord(entries) {
+  const result = Object.create(null);
+  for (const [key, value] of entries) {
+    Object.defineProperty(result, key, {
+      value, enumerable: true, configurable: false, writable: false,
+    });
+  }
+  return Object.freeze(result);
+}
 
 function assertObject(value, label) {
   if (value === null || (typeof value !== "object" && typeof value !== "function")) {
@@ -67,6 +78,25 @@ function assertPlainObject(value, label) {
   if (prototype !== Object.prototype && prototype !== null) {
     throw new TypeError(`${label} must be a plain object`);
   }
+}
+
+/* This is the sole adapter-source authority.  Capture is synchronous so a
+ * caller cannot replace a getter-backed method after lifecycle entry, and the
+ * wrapper deliberately retains the original receiver. */
+export function captureRunFsSource(candidate) {
+  const source = candidate === undefined ? DEFAULT_SOURCE : candidate;
+  assertPlainObject(source, "filesystem adapter");
+  const entries = [];
+  for (const methodName of REQUIRED_METHODS) {
+    const implementation = source[methodName];
+    if (typeof implementation !== "function") {
+      throw new TypeError(`filesystem adapter must provide ${methodName}`);
+    }
+    entries.push([methodName, (...args) => Reflect.apply(implementation, source, args)]);
+  }
+  const captured = frozenRecord(entries);
+  capturedSources.add(captured);
+  return captured;
 }
 
 function normalizeSource(source, lifecycle) {
@@ -92,10 +122,11 @@ export function bindRunFsContext(capability, source = DEFAULT_SOURCE) {
   if (contexts.has(capability)) {
     throw new TypeError("quarantine run filesystem context is already bound");
   }
+  const captured = capturedSources.has(source) ? source : captureRunFsSource(source);
   const lifecycle = { active: true };
   const context = {
     source,
-    adapter: normalizeSource(source, lifecycle),
+    adapter: normalizeSource(captured, lifecycle),
     lifecycle,
   };
   contexts.set(capability, context);
