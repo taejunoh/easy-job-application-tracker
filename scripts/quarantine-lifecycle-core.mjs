@@ -196,7 +196,10 @@ async function captureWorkspaceAncestors(repoRoot, endpoint, fsApi) {
     if (path !== repoRoot && !resolved.startsWith(`${repoRoot}${sep}`)) {
       throw new Error("restore workspace ancestor escapes repository");
     }
-    identities.push({ path, dev: stat.dev, ino: stat.ino, mode: modeOf(stat) });
+    identities.push(Object.freeze({
+      path, dev: stat.dev, ino: stat.ino, mode: modeOf(stat),
+      type: "directory", canonicalRealpath: resolved,
+    }));
   }
   return identities;
 }
@@ -206,7 +209,7 @@ async function assertWorkspaceAncestors(identities, fsApi) {
     const stat = await fsApi.lstat(expected.path);
     const resolved = await fsApi.realpath(expected.path);
     if (
-      stat.isSymbolicLink() || !stat.isDirectory() || resolved !== expected.path ||
+      stat.isSymbolicLink() || !stat.isDirectory() || resolved !== expected.canonicalRealpath ||
       stat.dev !== expected.dev || stat.ino !== expected.ino || modeOf(stat) !== expected.mode
     ) throw new Error("restore workspace ancestor changed");
   }
@@ -230,7 +233,7 @@ function sameSummary(expected, observed) {
     expected.sha256 === observed.sha256 && expected.entries === observed.entries && expected.bytes === observed.bytes;
 }
 
-async function verifySourceEndpoint(path, entry, expectedPresent, fsApi) {
+async function verifySourceEndpoint(path, entry, expectedPresent, fsApi, ancestorChain = Object.freeze([])) {
   const stat = await optionalStat(path, fsApi);
   if (!expectedPresent) {
     if (stat !== null) throw new Error("restore source endpoint should be absent");
@@ -239,7 +242,7 @@ async function verifySourceEndpoint(path, entry, expectedPresent, fsApi) {
   if (stat === null || stat.isSymbolicLink() || !stat.isFile() || modeOf(stat) !== entry.mode || stat.size !== entry.size) {
     throw new Error("restore source endpoint is invalid");
   }
-  const hashed = await hashVerifiedRegularFile(path, stat, fsApi);
+  const hashed = await hashVerifiedRegularFile(path, stat, fsApi, ancestorChain);
   if (hashed.bytes !== entry.size || hashed.sha256 !== entry.sha256) {
     throw new Error("restore source endpoint content is invalid");
   }
@@ -269,7 +272,7 @@ async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, 
             : !payloadPresent && activePresent;
       if (!legal) throw new Error("restore source locations are inconsistent with its ledger state");
       await verifySourceEndpoint(payload, entry, payloadPresent, fsApi);
-      await verifySourceEndpoint(active, entry, activePresent, fsApi);
+      await verifySourceEndpoint(active, entry, activePresent, fsApi, ancestors);
       await assertWorkspaceAncestors(ancestors, fsApi);
       continue;
     }

@@ -693,7 +693,8 @@ try {
   } else if (operation === "core-restore-matrix") {
     const restoreId = "restore-123e4567-e89b-42d3-a456-426614174000";
     const {
-      row, preState, corruption, ancestorSwap, descendantSwap, treeSwapPhase, sourceSwapPhase, copyPath,
+      row, preState, corruption, ancestorSwap, descendantSwap, treeSwapPhase, sourceSwapPhase,
+      queuedAncestorSwapPhase, sourceAncestorSwapPhase, copyPath,
       ...restoreRequest
     } = request;
     const append = async (capability, event, payload) => withJournalLock({ capability }, (heldLock) =>
@@ -858,17 +859,23 @@ try {
     let externalDirReads = 0;
     let heldDirReads = 0;
     let externalFileReads = 0;
+    let heldChildFileReads = 0;
+    let heldSourceFileReads = 0;
     let verifiedDirectoryHandleCloses = 0;
     let heldDirStreamCloses = 0;
     let verifiedFileCloses = 0;
+    let verifiedChildFileCloses = 0;
     let foreignSentinel;
     let coreFs;
-    if (ancestorSwap !== undefined || descendantSwap !== undefined || treeSwapPhase !== undefined || sourceSwapPhase !== undefined) {
+    if (ancestorSwap !== undefined || descendantSwap !== undefined || treeSwapPhase !== undefined || sourceSwapPhase !== undefined ||
+        queuedAncestorSwapPhase !== undefined || sourceAncestorSwapPhase !== undefined) {
       const nested = join(request.repoRoot, "nested");
       const foreign = join(request.quarantineRoot, ancestorSwap === undefined ? "foreign-descendant" : "foreign-ancestor");
       mkdirSync(foreign, { recursive: true, mode: 0o700 });
       foreignSentinel = join(foreign, "sentinel");
       writeFileSync(foreignSentinel, "foreign");
+      if (queuedAncestorSwapPhase !== undefined) writeFileSync(join(foreign, "build"), "foreign-build\\n");
+      if (sourceAncestorSwapPhase !== undefined) writeFileSync(join(foreign, "notes 2.txt"), "foreign-source\\n");
       const implementations = { ...fsPromises, createReadStream, lstatSync, realpathSync };
       coreFs = { ...implementations };
       const originalLstat = coreFs.lstat;
@@ -879,8 +886,15 @@ try {
       let descendantReads = 0;
       const tree = join(request.quarantineRoot, request.transactionId, "payload/generated/.next");
       const source = join(request.quarantineRoot, request.transactionId, "payload/source-copies/copy-0001");
+      const queuedParent = join(tree, "nested");
+      const queuedChild = join(queuedParent, "build");
+      const activeSource = join(request.repoRoot, ...(copyPath ?? "notes 2.txt").split("/"));
+      const sourceParent = dirname(activeSource);
       let treeSwapped = false;
+      let treeHandleOpened = false;
       let sourceSwapped = false;
+      let queuedParentSwapped = false;
+      let sourceParentSwapped = false;
       const refreshEvidenceAfterAttack = () => {
         beforeEndpoints = JSON.stringify(Object.fromEntries(Object.entries(endpointPaths).map(([key, value]) => [key, existsSync(value) ? lstatSync(value).ino : null])));
         beforeEvidence = restoreEvidenceSnapshot({
@@ -903,8 +917,25 @@ try {
         sourceSwapped = true;
         refreshEvidenceAfterAttack();
       };
+      const swapQueuedParent = () => {
+        if (queuedParentSwapped) return;
+        renameSync(queuedParent, queuedParent + ".held-original");
+        symlinkSync(foreign, queuedParent);
+        queuedParentSwapped = true;
+        refreshEvidenceAfterAttack();
+      };
+      const swapSourceParent = () => {
+        if (sourceParentSwapped) return;
+        renameSync(sourceParent, sourceParent + ".held-original");
+        symlinkSync(foreign, sourceParent);
+        sourceParentSwapped = true;
+        refreshEvidenceAfterAttack();
+      };
+      let sourceParentReads = 0;
       coreFs.lstat = async function (path, ...args) {
         if (typeof path === "string" && path.startsWith(foreign)) externalReads += 1;
+        if (path === queuedChild && queuedAncestorSwapPhase === "before-child-lstat") swapQueuedParent();
+        if (path === sourceParent && ++sourceParentReads === 2 && sourceAncestorSwapPhase === "before-source-open") swapSourceParent();
         if (path === nested && ++nestedReads === ancestorSwap) {
           renameSync(nested, nested + ".original");
           symlinkSync(foreign, nested);
@@ -936,17 +967,26 @@ try {
         coreFs[method] = async function (path, ...args) {
           if (typeof path === "string" && path.startsWith(foreign)) externalReads += 1;
           const result = await Reflect.apply(original, implementations, [path, ...args]);
-          if (method === "realpath" && path === tree && treeSwapPhase === "after-post-check") swapTree();
+          if (method === "realpath" && path === tree && treeHandleOpened && treeSwapPhase === "after-post-check") swapTree();
+          if (method === "open" && path === tree) treeHandleOpened = true;
           if (method === "open" && path === tree && treeSwapPhase === "after-open-before-opendir") swapTree();
           if (method === "open" && path === source && sourceSwapPhase === "after-open-before-read") swapSource();
-          if (method === "open" && (path === tree || path === source)) {
+          if (method === "open" && path === queuedChild && queuedAncestorSwapPhase === "after-child-open-before-read") swapQueuedParent();
+          if (method === "open" && path === activeSource && sourceAncestorSwapPhase === "after-source-open-before-read") swapSourceParent();
+          if (method === "open" && (path === tree || path === source || path === queuedChild || path === activeSource)) {
             return new Proxy(result, {
               get(target, property) {
                 const value = Reflect.get(target, property, target);
                 if (property === "close") return async (...closeArgs) => {
                   if (path === tree) verifiedDirectoryHandleCloses += 1;
+                  else if (path === queuedChild) verifiedChildFileCloses += 1;
                   else verifiedFileCloses += 1;
                   return Reflect.apply(value, target, closeArgs);
+                };
+                if (property === "read") return async (...readArgs) => {
+                  if (path === queuedChild) heldChildFileReads += 1;
+                  if (path === activeSource) heldSourceFileReads += 1;
+                  return Reflect.apply(value, target, readArgs);
                 };
                 return typeof value === "function" ? value.bind(target) : value;
               },
@@ -998,9 +1038,12 @@ try {
       externalDirReads,
       heldDirReads,
       externalFileReads,
+      heldChildFileReads,
+      heldSourceFileReads,
       verifiedDirectoryHandleCloses,
       heldDirStreamCloses,
       verifiedFileCloses,
+      verifiedChildFileCloses,
       foreignIntact: foreignSentinel === undefined || readFileSync(foreignSentinel, "utf8") === "foreign",
       error: error === undefined ? undefined : errorShape(error),
     }));

@@ -683,6 +683,62 @@ describe("quarantine lifecycle core", () => {
     },
   );
 
+  it.each(["before-child-lstat", "after-child-open-before-read"])(
+    "rejects a queued generated child when its closed parent is swapped at %s",
+    (queuedAncestorSwapPhase) => {
+      const prepared = prepareQuarantinedFixture({ generatedNestedDirectory: true });
+      try {
+        const result = invokeQuarantineWorker("core-restore-matrix", {
+          repoRoot: prepared.fixture.repoRoot,
+          quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId,
+          row: "intent-pre",
+          preState: "QUARANTINED",
+          queuedAncestorSwapPhase,
+        }, {}, 30_000) as unknown as {
+          ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean;
+          evidenceStable: boolean; externalReads: number; externalFileReads: number; heldChildFileReads: number;
+          foreignIntact: boolean; verifiedChildFileCloses: number;
+        };
+        expect(result).toEqual(expect.objectContaining({
+          ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true,
+          evidenceStable: true, externalReads: 0, externalFileReads: 0, heldChildFileReads: 0,
+          foreignIntact: true,
+          verifiedChildFileCloses: queuedAncestorSwapPhase === "before-child-lstat" ? 0 : 1,
+        }));
+      } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+    },
+  );
+
+  it.each(["before-source-open", "after-source-open-before-read"])(
+    "rejects a nested source copy ancestor swap at %s before source bytes are read",
+    (sourceAncestorSwapPhase) => {
+      const copyPath = "nested/notes 2.txt";
+      const prepared = prepareQuarantinedFixture({ canonicalPath: "nested/notes.txt", copyPath });
+      try {
+        const result = invokeQuarantineWorker("core-restore-matrix", {
+          repoRoot: prepared.fixture.repoRoot,
+          quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId,
+          row: "source-post",
+          preState: "QUARANTINED",
+          copyPath,
+          sourceAncestorSwapPhase,
+        }, {}, 30_000) as unknown as {
+          ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean;
+          evidenceStable: boolean; externalReads: number; externalFileReads: number; heldSourceFileReads: number;
+          foreignIntact: boolean; verifiedFileCloses: number;
+        };
+        expect(result).toEqual(expect.objectContaining({
+          ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true,
+          evidenceStable: true, externalReads: 0, externalFileReads: 0, heldSourceFileReads: 0,
+          foreignIntact: true,
+          verifiedFileCloses: sourceAncestorSwapPhase === "before-source-open" ? 0 : 1,
+        }));
+      } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+    },
+  );
+
   it.each(["source-pre", "source-rollback-pre"]) (
     "derives the Q/V source restore prefix from a durable copy-before-generated manifest for %s",
     (row) => {
