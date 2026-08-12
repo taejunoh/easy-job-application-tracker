@@ -69,14 +69,19 @@ const NORMAL_RESTORE_PHASES = [
   "before-lock-cleanup",
 ] as const;
 
-function durableEventAt(phase: string) {
-  if (phase === "after-event:RESTORE_PREPARED") return "RESTORE_PREPARED";
-  if (phase === "after-event:RESTORING") return "RESTORING";
-  if (phase.startsWith("after-event:RESTORE_INTENT:")) return "RESTORE_INTENT";
-  if (phase.startsWith("after-event:RESTORED_ENTRY:")) return "RESTORED_ENTRY";
-  if (phase === "after-event:RESTORED" || phase === "before-lock-cleanup") return "RESTORED";
-  return null;
-}
+const EXPECTED_DURABLE_TIP = (() => {
+  let current = "QUARANTINED";
+  const result: Record<string, string> = {};
+  for (const phase of NORMAL_RESTORE_PHASES) {
+    if (phase === "after-event:RESTORE_PREPARED") current = "RESTORE_PREPARED";
+    else if (phase === "after-event:RESTORING") current = "RESTORING";
+    else if (phase.startsWith("after-event:RESTORE_INTENT:")) current = "RESTORE_INTENT";
+    else if (phase.startsWith("after-event:RESTORED_ENTRY:")) current = "RESTORED_ENTRY";
+    else if (phase === "after-event:RESTORED") current = "RESTORED";
+    result[phase] = current;
+  }
+  return Object.freeze(result) as Record<(typeof NORMAL_RESTORE_PHASES)[number], string>;
+})();
 
 describe("quarantine restore", () => {
   it("exports only restoreQuarantine", () => {
@@ -211,10 +216,9 @@ describe("quarantine restore", () => {
       const index = NORMAL_RESTORE_PHASES.indexOf(stopPhase);
       expect(result.phases).toEqual(NORMAL_RESTORE_PHASES.slice(0, index + 1));
       expect(generationEvidence(prepared)).toBe(beforeGeneration);
-      const durable = durableEventAt(stopPhase);
+      const durable = EXPECTED_DURABLE_TIP[stopPhase];
       const events = journalEvents(join(prepared.runRoot, "journal.log"));
-      if (durable !== null) expect(events.at(-1)).toBe(durable);
-      else expect(events).not.toContain("RESTORE_PREPARED");
+      expect(events.at(-1)).toBe(durable);
       // The injected hook is awaited inside the operation; it cannot be
       // followed by a later public phase or journal append in this attempt.
       expect(result.phases.slice(index + 1)).toEqual([]);
@@ -383,6 +387,24 @@ describe("quarantine restore", () => {
       expect(result.ok).toBe(false);
       expect(readFileSync(join(prepared.fixture.repoRoot, prepared.fixture.copyPath!), "utf8")).toBe("foreign interloper\n");
       expect(readFileSync(join(prepared.runRoot, "journal.log")).subarray(0, before.length)).toEqual(before);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a byte-identical foreign repository ancestor exchanged after active inventory publication", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const before = readFileSync(join(prepared.runRoot, "journal.log"));
+      const generation = generationEvidence(prepared);
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, ancestorExchangeAt: "after-inventory",
+      });
+      expect(result.ok).toBe(false);
+      expect(readFileSync(join(prepared.fixture.repoRoot, "foreign-sentinel"), "utf8")).toBe("foreign");
+      expect(readFileSync(join(prepared.runRoot, "journal.log"))).toEqual(before);
+      expect(generationEvidence(prepared)).toBe(generation);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }

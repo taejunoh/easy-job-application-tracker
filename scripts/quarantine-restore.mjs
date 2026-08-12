@@ -18,6 +18,7 @@ const OPTION_KEYS = Object.freeze([
 const REQUIRED_KEYS = Object.freeze(["repoRoot", "quarantineRoot", "transactionId", "writersStopped"]);
 const GENERATED_IDS = Object.freeze(["generated-next", "generated-node-modules"]);
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
+const activeMetadata = new WeakMap();
 
 function record(entries) {
   const value = Object.create(null);
@@ -27,6 +28,12 @@ function record(entries) {
     });
   }
   return Object.freeze(value);
+}
+
+function activeRecord(id, inventory, ancestors, rootIdentity = null) {
+  const value = record([["id", id], ["inventory", inventory]]);
+  activeMetadata.set(value, Object.freeze({ ancestors, rootIdentity }));
+  return value;
 }
 
 function snapshotOptions(input) {
@@ -222,7 +229,7 @@ async function captureActiveGenerated(handoff, faultHook) {
     const ancestors = await captureAncestors(handoff.repoRoot, root, handoff.fsApi);
     const stat = await optionalStat(root, handoff.fsApi);
     if (stat === null) {
-      active.push(record([["id", id], ["inventory", null]]));
+      active.push(activeRecord(id, null, ancestors));
       continue;
     }
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("active generated root is unsafe");
@@ -235,7 +242,7 @@ async function captureActiveGenerated(handoff, faultHook) {
       capability: handoff.capability, entryId: id, snapshot: heldSnapshot,
     });
     await invokeHook(faultHook, `after-inventory:restore-active:${id}`);
-    active.push(record([["id", id], ["inventory", inventory]]));
+    active.push(activeRecord(id, inventory, ancestors, heldSnapshot.rootIdentity));
   }
   return Object.freeze(active);
 }
@@ -244,7 +251,10 @@ async function assertActiveStable(handoff, active) {
   for (const captured of active) {
     const entry = handoff.manifestGeneration.manifest.entries.find((candidate) => candidate.id === captured.id);
     const root = workspacePath(handoff.repoRoot, entry);
-    const ancestors = await captureAncestors(handoff.repoRoot, root, handoff.fsApi);
+    const metadata = activeMetadata.get(captured);
+    if (metadata === undefined) throw new Error("restore active evidence metadata is unavailable");
+    const ancestors = metadata.ancestors;
+    await assertAncestors(ancestors, handoff.fsApi);
     const stat = await optionalStat(root, handoff.fsApi);
     if (captured.inventory === null) {
       if (stat !== null) throw new Error("absent active generated root appeared during restore preparation");

@@ -518,12 +518,13 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "restore") {
-    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ...restoreRequest } = request;
+    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, ...restoreRequest } = request;
     const phases = [];
     try {
       let armed = false;
       let inserted = false;
       let drifted = false;
+      let exchanged = false;
       let fsApi;
       if (interloperAtFinalPrecheck === "source-active") {
         const target = join(request.repoRoot, "notes 2.txt");
@@ -542,6 +543,16 @@ try {
         ...(fsApi === undefined ? {} : { fsApi }),
         async faultHook(phase) {
           phases.push(phase);
+          if (!exchanged && ancestorExchangeAt === "after-inventory" && phase === "after-inventory:restore-active:generated-next") {
+            exchanged = true;
+            renameSync(request.repoRoot, request.repoRoot + ".original");
+            mkdirSync(request.repoRoot, { recursive: true, mode: 0o700 });
+            mkdirSync(join(request.repoRoot, ".next"), { recursive: true, mode: 0o700 });
+            mkdirSync(join(request.repoRoot, "node_modules"), { recursive: true, mode: 0o700 });
+            writeFileSync(join(request.repoRoot, ".next", "build"), "ignored");
+            writeFileSync(join(request.repoRoot, "node_modules", "package"), "ignored");
+            writeFileSync(join(request.repoRoot, "foreign-sentinel"), "foreign");
+          }
           if (!drifted && finalPresenceDrift !== undefined && phase.startsWith("after-inventory:restore-active:")) {
             drifted = true;
             const target = join(request.repoRoot, finalPresenceDrift === "remove-next" ? ".next" : "node_modules");
