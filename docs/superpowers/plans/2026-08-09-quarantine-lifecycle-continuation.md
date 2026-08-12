@@ -180,7 +180,6 @@ repositories.
 
 - Modify: `scripts/quarantine-workspace-runtime.mjs:1222-2403` (`prepareWorkspaceCore`, `appendEvent`, `quarantineWorkspace`, and private recovery helpers)
 - Modify: `scripts/quarantine-transaction.mjs:1-4` to re-export `recoverQuarantine`
-- Modify: `scripts/quarantine-run-fs-context.mjs:20-123` if the existing source-capture helper is moved there without semantic change
 - Modify: `scripts/quarantine-journal.mjs:497-723` (`validateTransition`, replay semantic validation, exact event payload parsers)
 - Modify: `__tests__/scripts/quarantine-transaction.test.ts:1722-5001`
 - Modify: `__tests__/scripts/quarantine-journal.test.ts:1-4644`
@@ -469,7 +468,7 @@ The closed options object contains exactly those five keys, with `fsApi` optiona
 }
 ```
 
-The handoff exists only during the internal callback; it is not returned by the public operation, exported, serialized, or stored after callback settlement. `journalTip` contains exact `sequence`, `recordHash`, `event`, `state`, and closed `payload`. `manifestGeneration` contains only the validated journal-named digest, state, and closed manifest value needed by the internal caller. `fsApi` is the bound frozen adapter, not a caller-mutated source.
+The handoff exists only during the internal callback; it is not returned by the public operation, exported, serialized, or stored after callback settlement. `journalTip` contains exact `sequence`, `recordHash`, `event`, `state`, and closed `payload`. `manifestGeneration` contains exactly the frozen keys `["manifestSha256", "state", "manifest"]` (the validated journal-named digest, state, and closed manifest value) needed by the internal caller; `manifestSha256` is present both in this record and in the enclosing handoff's generation evidence. `fsApi` is the bound frozen adapter, not a caller-mutated source.
 
 This core is used only by `markQuarantineValidated`, `restoreQuarantine`, and `recoverRestore`; Slice 3 `recoverQuarantine` remains runtime/transaction-owned and never consumes this core. The private module assertion is exactly `Object.keys(await import("../../scripts/quarantine-lifecycle-core.mjs")) === ["withExistingQuarantineRun"]`; transaction, runtime, restore, facade, package, CLI, and public-result assertions are all negative for that name.
 
@@ -509,7 +508,7 @@ Its only public validation phases are
 must use the existing manifest, inventory, journal, and capability authorities;
 they do not become exports.
 
-- [ ] **Step 1: Write private-core RED tests before implementation.** Import `createQuarantineFixture` and `invokeQuarantineWorker` from `__tests__/fixtures/quarantine/quarantine-test-harness.ts`; that test-only helper owns the moved `Fixture` type, URL/constants/import setup, exact current `fixture` body, exact current `invoke` body, and explicit `core-contract`/`replay-run` worker branches. Assert the exact handoff key set/prototypes/descriptors/frozen state and callback-only lifetime. Cover supplied adapter capture and omitted default adapter capture before the first await; adapter identity mutation, wrong receiver, and method replacement after capture; forged capability; stale run identity; changed quarantine root or repository HEAD; torn or changed journal; wrong, missing, or corrupt journal-named generation; interrupted pointer publication; symlink/foreign replacement; and no journal, pointer, or payload mutation on every precondition failure.
+- [ ] **Step 1: Write private-core RED tests and add the core-contract branch.** Import `createQuarantineFixture` and `invokeQuarantineWorker` from `__tests__/fixtures/quarantine/quarantine-test-harness.ts`; that test-only helper owns the moved `Fixture` type, URL/constants/import setup, exact current `fixture` body, exact current `invoke` body, and existing `replay-run` worker branch. In this step, add the `core-contract` branch alongside the RED assertions below. Assert the exact handoff key set/prototypes/descriptors/frozen state and callback-only lifetime. Cover supplied adapter capture and omitted default adapter capture before the first await; adapter identity mutation, wrong receiver, and method replacement after capture; forged capability; stale run identity; changed quarantine root or repository HEAD; torn or changed journal; wrong, missing, or corrupt journal-named generation; interrupted pointer publication; symlink/foreign replacement; and no journal, pointer, or payload mutation on every precondition failure.
 
 ```ts
 const prepared = await prepareQuarantinedFixture();
@@ -522,17 +521,35 @@ expect(result.result?.handoffFrozen).toBe(true);
 expect(result.result?.prototype).toBe("null");
 expect(result.result?.descriptors).toEqual(expect.any(Object));
 expect(result.result?.evidenceBefore).toEqual(result.result?.evidenceAfter);
+expect(result.result?.wrongReceiver).toBe(0);
+expect(result.result?.callbackInvoked).toBe(true);
+expect(result.result?.getterReads).toEqual(Object.fromEntries([
+  "lstat", "realpath", "mkdir", "open", "readdir", "rm", "rename", "unlink",
+  "link", "opendir", "readlink", "createReadStream", "lstatSync", "realpathSync",
+].map((name) => [name, 1])));
 ```
 
 The worker branch for `operation === "core-contract"` mutates every captured
-source method/getter after synchronous capture and returns only JSON-safe
-observations; it never returns the capability or handoff.
+source method/getter after synchronous capture through non-throwing
+`Reflect.set`/`Reflect.defineProperty` attempts and returns only JSON-safe
+observations; it never returns the capability or handoff. The returned
+`getterReads` map must contain exactly one read for every method, `wrongReceiver`
+must remain zero, and the poison replacements must never be reached by the
+captured implementations.
 
-The separate stale test prepares a second fixture, snapshots its exact journal,
-current-pointer (including absence), and manifest-generation bytes, then sets
-`replaceRunIdentity: true` and invokes the worker with the same nested
-`options`. It expects `ok === false`, no callback/result, and byte-identical
-known evidence after failure; it never expects handoff keys on stale input.
+The separate stale test prepares a second fixture and snapshots its exact
+journal, current-pointer (including absence), and manifest-generation bytes.
+The worker's first `lstat` call is a synchronous barrier: it receives the
+capability-derived run-root path, moves that run root and its containing
+quarantine root to deterministic `.original` siblings, installs foreign roots
+with a sentinel, and only then invokes the underlying `lstat`; this is the
+`replaceRunIdentity: true` path and does not race the pending operation. The
+pending core call is created before this barrier, and the replacement runs
+before the underlying filesystem promise is created.
+The test expects `ok === false`, no callback/result, and compares every snapshotted
+byte with the corresponding file under the deterministic `.original` roots;
+foreign sentinels remain untouched. It never expects handoff keys on stale
+input.
 
 Add state-specific tests: QUARANTINED obtains baseline digest/generation from PREPARED and requires manifest state PREPARED; it does not require a QUARANTINED tip payload or QUARANTINED generation. VALIDATED obtains the digest/generation and stored retention metadata from the VALIDATED tip. Add pointer tests that distinguish missing activation-pending from present malformed, foreign, path-bearing, or mismatched fatal pointers.
 
@@ -566,7 +583,11 @@ bytes read from exact capability-derived fixture evidence paths. It never
 returns the capability or handoff. The worker also keeps the existing
 `recoverQuarantine` and `replay-run` branches; preparation remains host-only.
 That worker branch imports `readFileSync` and the existing `deriveRunPath`
-authority before reading those capability-derived evidence paths.
+authority before reading those capability-derived evidence paths. It also
+imports `dirname`, `join`, `mkdirSync`, `renameSync`, and `writeFileSync` for
+the deterministic first-`lstat` replacement seam below, while retaining the
+existing `fsPromises`, `createReadStream`, `lstatSync`, and `realpathSync`
+imports used to construct `baseFsApi`.
 The host computes `const coreUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-lifecycle-core.mjs")).href` beside the existing transaction URL and injects `${JSON.stringify(coreUrl)}` into the worker source; the generated worker never resolves this module relative to its own evaluated `import.meta.url`.
 
 ```js
@@ -575,17 +596,56 @@ const FS_METHODS = Object.freeze([
   "link", "opendir", "readlink", "createReadStream", "lstatSync", "realpathSync",
 ]);
 const baseFsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
-function makeMutableFsSource() {
+function makeMutableFsSource({ beforeFirstAwait } = {}) {
   const source = Object.create(null);
   const calls = Object.fromEntries(FS_METHODS.map((name) => [name, 0]));
+  const getterReads = Object.fromEntries(FS_METHODS.map((name) => [name, 0]));
   let wrongReceiver = 0;
-  for (const name of FS_METHODS) source[name] = function (...args) { if (this !== source) wrongReceiver += 1; calls[name] += 1; return Reflect.apply(baseFsApi[name], baseFsApi, args); };
-  return { source, calls, get wrongReceiver() { return wrongReceiver; } };
+  for (const name of FS_METHODS) Object.defineProperty(source, name, {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterReads[name] += 1;
+      const implementation = baseFsApi[name];
+      return function (...args) {
+        if (this !== source) wrongReceiver += 1;
+        calls[name] += 1;
+        if (beforeFirstAwait) {
+          const handled = beforeFirstAwait(name, args);
+          if (handled) beforeFirstAwait = undefined;
+        }
+        return Reflect.apply(implementation, baseFsApi, args);
+      };
+    },
+  });
+  return { source, calls, getterReads, get wrongReceiver() { return wrongReceiver; } };
+}
+function replaceActualRunIdentity(runRootPath) {
+  const quarantineRootPath = dirname(runRootPath);
+  const originalRunRootPath = `${runRootPath}.original`;
+  const originalQuarantineRootPath = `${quarantineRootPath}.original`;
+  renameSync(runRootPath, originalRunRootPath);
+  renameSync(quarantineRootPath, originalQuarantineRootPath);
+  mkdirSync(quarantineRootPath, { recursive: true, mode: 0o700 });
+  mkdirSync(runRootPath, { recursive: true, mode: 0o700 });
+  writeFileSync(join(runRootPath, "foreign-sentinel"), "foreign");
+  return { originalRunRootPath, originalQuarantineRootPath };
 }
 } else if (operation === "core-contract") {
   const { withExistingQuarantineRun } = await import(${JSON.stringify(coreUrl)});
-  const mutable = makeMutableFsSource();
+  let callbackInvoked = false;
+  const mutable = makeMutableFsSource({
+    beforeFirstAwait: (name, args) => {
+      const candidate = String(args[0] ?? "");
+      if (request.replaceRunIdentity && name === "lstat" && candidate.endsWith(`/${request.options.transactionId}`)) {
+        replaceActualRunIdentity(candidate);
+        return true;
+      }
+      return false;
+    },
+  });
   const pending = withExistingQuarantineRun({ ...request.options, fsApi: mutable.source }, async (handoff) => {
+    callbackInvoked = true;
     const journalPath = deriveRunPath(handoff.capability, { purpose: "journal" });
     const pointerPath = deriveRunPath(handoff.capability, { purpose: "current-pointer" });
     const generationPath = deriveRunPath(handoff.capability, { purpose: "manifest-generation", id: handoff.manifestGeneration.manifestSha256 });
@@ -594,10 +654,13 @@ function makeMutableFsSource() {
     const result = { handoffKeys: Object.keys(handoff), handoffFrozen: Object.isFrozen(handoff), prototype: Object.getPrototypeOf(handoff) === null ? "null" : "other", descriptors: Object.fromEntries(Object.keys(handoff).map((key) => [key, Object.getOwnPropertyDescriptor(handoff, key)])), evidenceBefore };
     return { result, evidencePaths: [journalPath, pointerPath, generationPath] };
   });
-  if (request.mutateSourceAfterCapture) for (const name of FS_METHODS) mutable.source[name] = () => { throw new Error("poison"); };
+  if (request.mutateSourceAfterCapture) for (const name of FS_METHODS) {
+    const poison = () => { throw new Error("poison"); };
+    if (!Reflect.set(mutable.source, name, poison)) Reflect.defineProperty(mutable.source, name, { configurable: true, enumerable: true, writable: true, value: poison });
+  }
   const settled = await pending;
   const evidenceAfter = settled.evidencePaths.map((path) => { try { return readFileSync(path).toString("base64"); } catch (error) { if (error.code === "ENOENT") return null; throw error; } });
-  process.stdout.write(JSON.stringify({ ok: true, result: { ...settled.result.result, evidenceAfter, calls: mutable.calls, wrongReceiver: mutable.wrongReceiver } }) + "\n");
+  process.stdout.write(JSON.stringify({ ok: true, result: { ...settled.result.result, evidenceAfter, calls: mutable.calls, getterReads: mutable.getterReads, wrongReceiver: mutable.wrongReceiver, callbackInvoked } }) + "\n");
 }
 ```
 
@@ -650,7 +713,9 @@ const validated = await markQuarantineValidated({ repoRoot: prepared.fixture.rep
 expect(validated).toMatchObject({ transactionId: prepared.transactionId, status: "VALIDATED", deletionRequiresConfirmation: true });
 expect(new Date(validated.deleteAfter).getTime() - new Date(validated.validatedAt).getTime()).toBe(96 * 60 * 60 * 1000);
 const phases: string[] = [];
-await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true, faultHook: (phase) => { phases.push(phase); expect(["after-inventory:validation-pass-1:generated-next", "after-inventory:validation-pass-1:generated-node-modules", "after-inventory:validation-pass-2:generated-next", "after-inventory:validation-pass-2:generated-node-modules", "after-validated-generation", "after-event:VALIDATED", "after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync", "before-lock-cleanup"]).toContain(phase); } });
+const retry = await markQuarantineValidated({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, validatedAt: "2026-08-10T12:00:00.000Z", writersStopped: true, faultHook: (phase) => { phases.push(phase); expect(["after-inventory:validation-pass-1:generated-next", "after-inventory:validation-pass-1:generated-node-modules", "after-inventory:validation-pass-2:generated-next", "after-inventory:validation-pass-2:generated-node-modules", "after-validated-generation", "after-event:VALIDATED", "after-pointer-temporary-sync", "after-pointer-rename", "after-pointer-root-sync", "before-lock-cleanup"]).toContain(phase); } });
+expect(retry.validatedAt).toBe(validated.validatedAt);
+expect(retry.deleteAfter).toBe(validated.deleteAfter);
 expect(phases).not.toContain("after-generation-directory-sync");
 expect(phases).not.toContain("after-journal-sync");
 expect(phases).not.toContain("after-quarantine-root-sync");
@@ -834,11 +899,11 @@ export async function restoreQuarantine(input) {
     const activeGenerated = await captureActiveGenerated(handoff, restoreId, input.faultHook);
     await appendRestorePrepared(handoff, restoreId, activeGenerated, input.faultHook);
     await appendRestoreStarted(handoff, input.faultHook);
-    for (const entry of handoff.manifestGeneration.entries) {
+    for (const entry of handoff.manifestGeneration.manifest.entries) {
       await restoreEntry({ handoff, restoreId, entry, faultHook: input.faultHook });
     }
     await appendRestored(handoff, input.faultHook);
-    return Object.freeze({ transactionId: input.transactionId, restoreId, status: "RESTORED", restoredEntries: handoff.manifestGeneration.entries.length });
+    return Object.freeze({ transactionId: input.transactionId, restoreId, status: "RESTORED", restoredEntries: handoff.manifestGeneration.manifest.entries.length });
   });
 }
 ```
@@ -944,7 +1009,7 @@ type ChildExit = { once(event: "exit", listener: (code: number | null, signal: N
 function waitForExit(child: ChildExit): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
   return new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
 }
-function spawnLifecycleChild(request: { operation: string; options: Record<string, unknown>; killAt: string }) {
+export function spawnLifecycleChild(request: { operation: string; options: Record<string, unknown>; killAt: string }) {
   const child = spawn(process.execPath, [fixturePath], { env: { ...process.env, QUARANTINE_CHILD_REQUEST: JSON.stringify(request) } });
   return waitForExit(child);
 }
