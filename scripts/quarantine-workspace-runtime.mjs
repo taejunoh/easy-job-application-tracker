@@ -40,10 +40,12 @@ import {
   writeInventoryJsonl,
 } from "./quarantine-inventory.mjs";
 import {
+  activateManifestGeneration,
   buildValidatedManifest,
   readManifestGeneration,
   writeManifestGeneration,
 } from "./quarantine-manifest.mjs";
+import { withExistingQuarantineRun } from "./quarantine-lifecycle-core.mjs";
 import {
   deriveRunPath,
   revalidateRunCapability,
@@ -2952,6 +2954,184 @@ export async function quarantineWorkspace(input) {
       throw new QuarantineError("ERR_INTEGRITY");
     }
     throw publicError(error, "ERR_INTERNAL");
+  }
+}
+
+const VALIDATION_ALLOWED = Object.freeze([
+  "repoRoot", "quarantineRoot", "transactionId", "validatedAt", "writersStopped", "fsApi", "faultHook",
+]);
+const VALIDATION_REQUIRED = Object.freeze([
+  "repoRoot", "quarantineRoot", "transactionId", "validatedAt", "writersStopped",
+]);
+
+function snapshotValidationOptions(input) {
+  const options = snapshotOptions(input, VALIDATION_ALLOWED, VALIDATION_REQUIRED);
+  validateAbsolute(options.repoRoot);
+  validateAbsolute(options.quarantineRoot);
+  validateTransactionId(options.transactionId);
+  validateCreatedAt(options.validatedAt);
+  if (options.writersStopped !== true) fail("ERR_USAGE");
+  if (options.faultHook !== undefined && typeof options.faultHook !== "function") fail("ERR_USAGE");
+  return options;
+}
+
+function validationFaultHook(hook) {
+  if (hook === undefined) return undefined;
+  const publicPhase = new Map([
+    ["after-generation-directory-sync", "after-validated-generation"],
+    ["after-journal-sync", "after-event:VALIDATED"],
+    ["before-lock-cleanup", "before-lock-cleanup"],
+    ["after-pointer-temporary-sync", "after-pointer-temporary-sync"],
+    ["after-pointer-rename", "after-pointer-rename"],
+    ["after-quarantine-root-sync", "after-pointer-root-sync"],
+  ]);
+  return async (phase) => {
+    const mapped = publicPhase.get(phase);
+    if (mapped !== undefined) await hook(mapped);
+  };
+}
+
+async function validateValidationWorkspace(handoff, options) {
+  const fsApi = handoff.fsApi;
+  let workspace;
+  try {
+    workspace = await gitSnapshot(handoff.repoRoot, snapshotGitEnvironment(), 0);
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  if (
+    workspace.topLevel !== handoff.repoRoot || workspace.head !== handoff.head ||
+    workspace.statusPaths.length !== 0
+  ) fail("ERR_INTEGRITY");
+
+  const entries = handoff.manifestGeneration.manifest.entries;
+  for (const entry of entries) {
+    if (entry.kind !== "source-copy") continue;
+    try {
+      await fsApi.lstat(workspaceEntryPath(handoff.repoRoot, entry));
+      fail("ERR_INTEGRITY");
+    } catch (error) {
+      if (error instanceof ClassifiedFailure) throw error;
+      if (error?.code !== "ENOENT") fail("ERR_INTEGRITY");
+    }
+  }
+  for (const entry of entries) {
+    if (entry.kind !== "generated-root") continue;
+    const root = workspaceEntryPath(handoff.repoRoot, entry);
+    let stat;
+    try {
+      stat = await fsApi.lstat(root);
+    } catch {
+      fail("ERR_INTEGRITY");
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) fail("ERR_INTEGRITY");
+    const first = await writeInventoryJsonl({
+      capability: handoff.capability,
+      root,
+      entryId: entry.id,
+      phase: "validation-pass-1",
+    });
+    await compareInventorySummary(entry.preMoveInventory, first);
+    if (options.faultHook !== undefined) {
+      await options.faultHook(`after-inventory:validation-pass-1:${entry.id}`);
+    }
+    const second = await writeInventoryJsonl({
+      capability: handoff.capability,
+      root,
+      entryId: entry.id,
+      phase: "validation-pass-2",
+    });
+    await compareInventorySummary(entry.preMoveInventory, second);
+    if (options.faultHook !== undefined) {
+      await options.faultHook(`after-inventory:validation-pass-2:${entry.id}`);
+    }
+  }
+}
+
+function validatedManifest(prepared, validatedAt) {
+  const deleteAfter = new Date(Date.parse(validatedAt) + (4 * 24 * 60 * 60 * 1000)).toISOString();
+  return buildValidatedManifest({
+    ...prepared,
+    state: "VALIDATED",
+    validatedAt,
+    retentionDays: 4,
+    deletionRequiresConfirmation: true,
+    deleteAfter,
+    deletionStatus: "retained",
+  });
+}
+
+function validationResult(options, manifest) {
+  return record([
+    ["transactionId", options.transactionId],
+    ["status", "VALIDATED"],
+    ["manifestSha256", manifest.manifestSha256],
+    ["validatedAt", manifest.manifest.validatedAt],
+    ["deleteAfter", manifest.manifest.deleteAfter],
+    ["deletionRequiresConfirmation", true],
+  ]);
+}
+
+export async function markQuarantineValidated(input) {
+  let options;
+  try {
+    options = snapshotValidationOptions(input);
+    return await withExistingQuarantineRun({
+      repoRoot: options.repoRoot,
+      quarantineRoot: options.quarantineRoot,
+      transactionId: options.transactionId,
+      writersStopped: options.writersStopped,
+      fsApi: options.fsApi,
+    }, async (handoff) => {
+      const prior = handoff.manifestGeneration;
+      let generation;
+      if (prior.state === "VALIDATED") {
+        generation = Object.freeze({
+          manifestSha256: prior.manifestSha256,
+          manifest: prior.manifest,
+        });
+      } else {
+        await validateValidationWorkspace(handoff, options);
+        const manifest = validatedManifest(prior.manifest, options.validatedAt);
+        generation = await writeManifestGeneration({
+          capability: handoff.capability,
+          manifest,
+          faultHook: validationFaultHook(options.faultHook),
+        });
+        generation = Object.freeze({ manifestSha256: generation.manifestSha256, manifest });
+      }
+      await activateManifestGeneration({
+        capability: handoff.capability,
+        transactionId: handoff.transactionId,
+        manifestSha256: generation.manifestSha256,
+        faultHook: validationFaultHook(options.faultHook),
+        appendValidated: async ({ manifestSha256 }) => withJournalLock(
+          { capability: handoff.capability },
+          async (heldLock) => {
+            const replayed = await replayJournal({ capability: handoff.capability });
+            const tip = replayed.records.at(-1);
+            if (replayed.state === "VALIDATED" && tip?.payload.manifestSha256 === manifestSha256) {
+              return Object.freeze({ status: "already-present", manifestSha256 });
+            }
+            if (replayed.state !== "QUARANTINED") throw new Error("validated journal state changed");
+            await appendJournalRecord({
+              capability: handoff.capability,
+              heldLock,
+              event: "VALIDATED",
+              payload: { manifestSha256 },
+              faultHook: validationFaultHook(options.faultHook),
+            });
+            return Object.freeze({ status: "appended", manifestSha256 });
+          },
+        ),
+      });
+      return validationResult(options, generation);
+    });
+  } catch (error) {
+    if (error instanceof IndeterminateJournalAppendError) {
+      throw new QuarantineError("ERR_INDETERMINATE_JOURNAL_APPEND");
+    }
+    throw publicError(error, "ERR_INTEGRITY");
   }
 }
 

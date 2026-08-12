@@ -36,6 +36,9 @@ const journalUrl = pathToFileURL(
 const fsContextUrl = pathToFileURL(
   join(__dirname, "../../../scripts/quarantine-run-fs-context.mjs"),
 ).href;
+const lifecycleCoreUrl = pathToFileURL(
+  join(__dirname, "../../../scripts/quarantine-lifecycle-core.mjs"),
+).href;
 const legacyFacadeUrl = pathToFileURL(
   join(__dirname, "../../../scripts/quarantine-numbered-copies-support.mjs"),
 ).href;
@@ -201,6 +204,41 @@ export function createQuarantineFixture({
   };
 }
 
+export function prepareQuarantinedFixture({
+  divergent = false,
+  regenerate = true,
+}: { divergent?: boolean; regenerate?: boolean } = {}) {
+  const fixture = createQuarantineFixture({ divergent });
+  const transactionId = "tx-0001";
+  const createdAt = "2026-08-11T00:00:00.000Z";
+  const applyResult = invokeQuarantineWorker("apply", {
+    repoRoot: fixture.repoRoot,
+    quarantineRoot: fixture.quarantineRoot,
+    expectedBranch: fixture.branch,
+    expectedHead: fixture.head,
+    expectedCount: fixture.expectedCount,
+    transactionId,
+    createdAt,
+    writersStopped: true,
+  });
+  if (!applyResult.ok || applyResult.result?.status !== "QUARANTINED") {
+    throw new Error("quarantine fixture could not be prepared");
+  }
+  if (regenerate) {
+    privateDirectory(join(fixture.repoRoot, ".next"));
+    privateDirectory(join(fixture.repoRoot, "node_modules"));
+    writeFileSync(join(fixture.repoRoot, ".next", "build"), "ignored");
+    writeFileSync(join(fixture.repoRoot, "node_modules", "package"), "ignored");
+  }
+  return {
+    fixture,
+    transactionId,
+    createdAt,
+    runRoot: join(fixture.quarantineRoot, transactionId),
+    applyResult,
+  };
+}
+
 export function canonicalDiff(f: Fixture) {
   const diff = spawnSync("git", [
     "-c", "core.fsmonitor=false",
@@ -324,6 +362,7 @@ import * as runtime from ${JSON.stringify(runtimeUrl)};
 import { withQuarantineRunCapability } from ${JSON.stringify(capabilityUrl)};
 import { appendJournalRecord, replayJournal, withJournalLock } from ${JSON.stringify(journalUrl)};
 import { getRunFsContext } from ${JSON.stringify(fsContextUrl)};
+import { withExistingQuarantineRun } from ${JSON.stringify(lifecycleCoreUrl)};
 import * as fsPromises from "node:fs/promises";
 import {
   appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, realpathSync,
@@ -417,6 +456,26 @@ try {
       },
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+  } else if (operation === "mark-validated") {
+    const phases = [];
+    const result = await transaction.markQuarantineValidated({
+      ...request,
+      faultHook(phase) { phases.push(phase); },
+    });
+    process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+  } else if (operation === "core-contract") {
+    let observed;
+    let callbackInvoked = 0;
+    await withExistingQuarantineRun({ ...request, writersStopped: true }, async (handoff) => {
+      callbackInvoked += 1;
+      observed = {
+        handoff: shape(handoff),
+        journalTip: shape(handoff.journalTip),
+        manifestGeneration: shape(handoff.manifestGeneration),
+        fsApi: shape(handoff.fsApi),
+      };
+    });
+    process.stdout.write(JSON.stringify({ ok: true, callbackInvoked, observed }));
   } else if (operation === "apply-stop-after-layout") {
     const phases = [];
     let captured;
