@@ -392,6 +392,24 @@ describe("quarantine restore", () => {
     }
   });
 
+  it("preserves a generated interloper observed at its final payload-to-active precheck", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        writersStopped: true,
+        interloperAtFinalPrecheck: "generated-active",
+      });
+      expect(result.ok).toBe(false);
+      expect(readFileSync(join(prepared.fixture.repoRoot, ".next", "foreign"), "utf8")).toBe("foreign interloper\n");
+      expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_INTENT");
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a byte-identical foreign repository ancestor exchanged after active inventory publication", () => {
     const prepared = prepareQuarantinedFixture();
     try {
@@ -405,6 +423,23 @@ describe("quarantine restore", () => {
       expect(readFileSync(join(prepared.fixture.repoRoot, "foreign-sentinel"), "utf8")).toBe("foreign");
       expect(readFileSync(join(prepared.runRoot, "journal.log"))).toEqual(before);
       expect(generationEvidence(prepared)).toBe(generation);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a byte-identical repository exchange after verified summary and before inventory publication", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const before = readFileSync(join(prepared.runRoot, "journal.log"));
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, ancestorExchangeAt: "before-publication",
+      });
+      expect(result.ok).toBe(false);
+      expect(readFileSync(join(prepared.fixture.repoRoot, "foreign-sentinel"), "utf8")).toBe("foreign");
+      expect(readFileSync(join(prepared.runRoot, "journal.log"))).toEqual(before);
+      expect(journalEvents(join(prepared.runRoot, "journal.log"))).not.toContain("RESTORE_PREPARED");
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }

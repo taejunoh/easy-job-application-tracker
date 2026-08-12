@@ -525,15 +525,44 @@ try {
       let inserted = false;
       let drifted = false;
       let exchanged = false;
+      let generatedMoved = false;
       let fsApi;
-      if (interloperAtFinalPrecheck === "source-active") {
-        const target = join(request.repoRoot, "notes 2.txt");
+      if (ancestorExchangeAt === "before-publication") {
+        fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+        const originalOpen = fsApi.open;
+        fsApi.open = async (path, ...args) => {
+          if (!exchanged && typeof path === "string" && path.endsWith("/inventories/restore-active/generated-next.jsonl")) {
+            exchanged = true;
+            renameSync(request.repoRoot, request.repoRoot + ".original");
+            mkdirSync(request.repoRoot, { recursive: true, mode: 0o700 });
+            mkdirSync(join(request.repoRoot, ".next"), { recursive: true, mode: 0o700 });
+            mkdirSync(join(request.repoRoot, "node_modules"), { recursive: true, mode: 0o700 });
+            writeFileSync(join(request.repoRoot, ".next", "build"), "ignored");
+            writeFileSync(join(request.repoRoot, "node_modules", "package"), "ignored");
+            writeFileSync(join(request.repoRoot, "foreign-sentinel"), "foreign");
+          }
+          return originalOpen(path, ...args);
+        };
+      }
+      if (interloperAtFinalPrecheck === "source-active" || interloperAtFinalPrecheck === "generated-active") {
+        const target = join(request.repoRoot, interloperAtFinalPrecheck === "source-active" ? "notes 2.txt" : ".next");
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
         const originalLstat = fsApi.lstat;
+        const originalRename = fsApi.rename;
+        fsApi.rename = async (source, destination) => {
+          const result = await originalRename(source, destination);
+          if (source === target) generatedMoved = true;
+          return result;
+        };
         fsApi.lstat = async (path) => {
-          if (armed && !inserted && path === target) {
+          const ready = interloperAtFinalPrecheck === "source-active" ? armed : generatedMoved;
+          if (ready && !inserted && path === target) {
             inserted = true;
-            writeFileSync(target, "foreign interloper\\n");
+            if (interloperAtFinalPrecheck === "source-active") writeFileSync(target, "foreign interloper\\n");
+            else {
+              mkdirSync(target, { recursive: true, mode: 0o700 });
+              writeFileSync(join(target, "foreign"), "foreign interloper\\n");
+            }
           }
           return originalLstat(path);
         };
