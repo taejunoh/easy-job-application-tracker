@@ -14,6 +14,7 @@ import {
 import { captureRunFsSource, getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
 import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
+import { isFixedRestoreRecoveryCallback } from "./quarantine-restore-recovery.mjs";
 
 const OPTION_KEYS = Object.freeze([
   "repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi",
@@ -203,7 +204,9 @@ async function privateTreeSummary(root, fsApi) {
   try {
     return await summarizeInventoryDirectory(root, { fsApi });
   } catch (error) {
-    if (error instanceof InventoryStructuralError) throw restoreLocationConflict();
+    if (error instanceof InventoryStructuralError) {
+      throw lifecycleIntegrityError("restore generated endpoint is structurally unsafe");
+    }
     throw error;
   }
 }
@@ -219,14 +222,20 @@ async function verifySourceEndpoint(path, entry, expectedPresent, fsApi, ancesto
     if (stat !== null) throw restoreLocationConflict();
     return;
   }
-  if (stat === null || stat.isSymbolicLink() || !stat.isFile() || modeOf(stat) !== entry.mode || stat.size !== entry.size) {
+  if (stat === null) throw restoreLocationConflict();
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw lifecycleIntegrityError("restore source endpoint is structurally unsafe");
+  }
+  if (modeOf(stat) !== entry.mode || stat.size !== entry.size) {
     throw restoreLocationConflict();
   }
   let hashed;
   try {
     hashed = await hashVerifiedRegularFile(path, stat, fsApi, ancestorChain);
   } catch (error) {
-    if (error instanceof InventoryStructuralError) throw restoreLocationConflict();
+    if (error instanceof InventoryStructuralError) {
+      throw lifecycleIntegrityError("restore source endpoint is structurally unsafe");
+    }
     throw error;
   }
   if (hashed.bytes !== entry.size || hashed.sha256 !== entry.sha256) {
@@ -306,7 +315,7 @@ async function readPointer(capability) {
   }
 }
 
-async function validateExistingRun(capability, options, fsApi) {
+async function validateExistingRun(capability, options, fsApi, { allowRestoreLocationConflict = false } = {}) {
   const repository = await repositoryEvidence(options.repoRoot, fsApi);
   let replayed;
   try {
@@ -367,7 +376,7 @@ async function validateExistingRun(capability, options, fsApi) {
         fsApi,
       });
     } catch (error) {
-      if (!(error instanceof RestoreLocationConflictError)) throw error;
+      if (!(error instanceof RestoreLocationConflictError) || !allowRestoreLocationConflict) throw error;
     }
   }
 
@@ -414,6 +423,9 @@ function sameSnapshot(left, right) {
 }
 
 async function enterExistingRun(input, callback) {
+  const recoveryValidation = Object.freeze({
+    allowRestoreLocationConflict: isFixedRestoreRecoveryCallback(callback),
+  });
   const source = captureRunFsSource(input.fsApi);
   return withQuarantineRunCapability({
     repoRoot: input.repoRoot,
@@ -423,11 +435,11 @@ async function enterExistingRun(input, callback) {
     fsApi: source,
   }, async (capability) => {
     const fsApi = getRunFsContext(capability, source);
-    const validated = await validateExistingRun(capability, input, fsApi);
+    const validated = await validateExistingRun(capability, input, fsApi, recoveryValidation);
     // Re-read every mutable evidence boundary immediately before capability
     // handoff.  This is cooperative TOCTOU detection; all reads still use the
     // exact adapter captured synchronously above.
-    const stable = await validateExistingRun(capability, input, fsApi);
+    const stable = await validateExistingRun(capability, input, fsApi, recoveryValidation);
     if (
       !sameSnapshot(validated.repository, stable.repository) ||
       !sameSnapshot(validated.journalTip, stable.journalTip) ||
