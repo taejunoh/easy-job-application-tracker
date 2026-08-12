@@ -82,6 +82,7 @@ export type Fixture = {
   historyHead?: string;
   canonicalPath?: string;
   copyPath?: string;
+  generatedNestedDirectory?: boolean;
 };
 
 export function git(repoRoot: string, ...args: string[]) {
@@ -164,6 +165,8 @@ export function createQuarantineFixture({
   repoName = "repo",
   canonicalPath = "notes.txt",
   copyPath = "notes 2.txt",
+  generatedInnerSymlink = false,
+  generatedNestedDirectory = false,
 } = {}): Fixture {
   const base = mkdtempSync(join(tmpdir(), "quarantine-transaction-"));
   const repoRoot = join(base, repoName);
@@ -190,6 +193,14 @@ export function createQuarantineFixture({
   privateDirectory(join(repoRoot, "node_modules"));
   writeFileSync(join(repoRoot, ".next", "build"), "ignored");
   writeFileSync(join(repoRoot, "node_modules", "package"), "ignored");
+  if (generatedNestedDirectory) {
+    privateDirectory(join(repoRoot, ".next", "nested"));
+    writeFileSync(join(repoRoot, ".next", "nested", "build"), "ignored");
+  }
+  if (generatedInnerSymlink) {
+    symlinkSync("build", join(repoRoot, ".next", "inner-link"));
+    symlinkSync("package", join(repoRoot, "node_modules", "inner-link"));
+  }
   const sourceCopyEntries = Object.freeze([copyPath]);
   return {
     base: realpathSync(base),
@@ -209,8 +220,10 @@ export function prepareQuarantinedFixture({
   regenerate = true,
   canonicalPath = "notes.txt",
   copyPath = "notes 2.txt",
-}: { divergent?: boolean; regenerate?: boolean; canonicalPath?: string; copyPath?: string } = {}) {
-  const fixture = createQuarantineFixture({ divergent, canonicalPath, copyPath });
+  generatedInnerSymlink = false,
+  generatedNestedDirectory = false,
+}: { divergent?: boolean; regenerate?: boolean; canonicalPath?: string; copyPath?: string; generatedInnerSymlink?: boolean; generatedNestedDirectory?: boolean } = {}) {
+  const fixture = createQuarantineFixture({ divergent, canonicalPath, copyPath, generatedInnerSymlink, generatedNestedDirectory });
   const transactionId = "tx-0001";
   const createdAt = "2026-08-11T00:00:00.000Z";
   const applyResult = invokeQuarantineWorker("apply", {
@@ -231,6 +244,14 @@ export function prepareQuarantinedFixture({
     privateDirectory(join(fixture.repoRoot, "node_modules"));
     writeFileSync(join(fixture.repoRoot, ".next", "build"), "ignored");
     writeFileSync(join(fixture.repoRoot, "node_modules", "package"), "ignored");
+    if (generatedInnerSymlink) {
+      symlinkSync("build", join(fixture.repoRoot, ".next", "inner-link"));
+      symlinkSync("package", join(fixture.repoRoot, "node_modules", "inner-link"));
+    }
+    if (generatedNestedDirectory) {
+      privateDirectory(join(fixture.repoRoot, ".next", "nested"));
+      writeFileSync(join(fixture.repoRoot, ".next", "nested", "build"), "ignored");
+    }
   }
   return {
     fixture,
@@ -671,7 +692,7 @@ try {
     process.stdout.write(JSON.stringify({ ok: true, callbackInvoked }));
   } else if (operation === "core-restore-matrix") {
     const restoreId = "restore-123e4567-e89b-42d3-a456-426614174000";
-    const { row, preState, corruption, ancestorSwap, copyPath, ...restoreRequest } = request;
+    const { row, preState, corruption, ancestorSwap, descendantSwap, copyPath, ...restoreRequest } = request;
     const append = async (capability, event, payload) => withJournalLock({ capability }, (heldLock) =>
       appendJournalRecord({ capability, heldLock, event, payload }),
     );
@@ -833,9 +854,9 @@ try {
     let externalReads = 0;
     let foreignSentinel;
     let coreFs;
-    if (ancestorSwap !== undefined) {
+    if (ancestorSwap !== undefined || descendantSwap !== undefined) {
       const nested = join(request.repoRoot, "nested");
-      const foreign = join(request.quarantineRoot, "foreign-ancestor");
+      const foreign = join(request.quarantineRoot, ancestorSwap === undefined ? "foreign-descendant" : "foreign-ancestor");
       mkdirSync(foreign, { recursive: true, mode: 0o700 });
       foreignSentinel = join(foreign, "sentinel");
       writeFileSync(foreignSentinel, "foreign");
@@ -843,15 +864,30 @@ try {
       coreFs = { ...implementations };
       const originalLstat = coreFs.lstat;
       let nestedReads = 0;
+      const descendant = descendantSwap === "directory"
+        ? join(request.quarantineRoot, request.transactionId, "payload/generated/.next/nested")
+        : join(request.quarantineRoot, request.transactionId, "payload/generated/.next/build");
+      let descendantReads = 0;
       coreFs.lstat = async function (path, ...args) {
         if (typeof path === "string" && path.startsWith(foreign)) externalReads += 1;
         if (path === nested && ++nestedReads === ancestorSwap) {
           renameSync(nested, nested + ".original");
           symlinkSync(foreign, nested);
         }
-        return Reflect.apply(originalLstat, implementations, [path, ...args]);
+        const result = await Reflect.apply(originalLstat, implementations, [path, ...args]);
+        if (path === descendant && ++descendantReads === 1) {
+          renameSync(descendant, descendant + ".original");
+          symlinkSync(descendantSwap === "directory" ? foreign : foreignSentinel, descendant);
+          beforeEndpoints = JSON.stringify(Object.fromEntries(Object.entries(endpointPaths).map(([key, value]) => [key, existsSync(value) ? lstatSync(value).ino : null])));
+          beforeEvidence = restoreEvidenceSnapshot({
+            runRoot: join(request.quarantineRoot, request.transactionId),
+            pointer: join(request.quarantineRoot, "current"),
+            endpointPaths,
+          });
+        }
+        return result;
       };
-      for (const method of ["realpath", "readdir", "createReadStream"]) {
+      for (const method of ["realpath", "readdir", "opendir", "open", "readlink", "createReadStream"]) {
         const original = coreFs[method];
         coreFs[method] = function (path, ...args) {
           if (typeof path === "string" && path.startsWith(foreign)) externalReads += 1;

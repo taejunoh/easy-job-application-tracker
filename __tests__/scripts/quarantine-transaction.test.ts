@@ -36,6 +36,7 @@ import {
   listLockResidue,
   privateDirectory,
   STATUS_RECORD_LIMIT,
+  type ValueShape,
   type WorkerResult,
 } from "../fixtures/quarantine/quarantine-test-harness";
 function expectWorkerError(result: WorkerResult, code: string, message: string) {

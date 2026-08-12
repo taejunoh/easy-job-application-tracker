@@ -7,6 +7,7 @@ import {
   invokeQuarantineWorker,
   git,
   prepareQuarantinedFixture,
+  type ValueShape,
 } from "../fixtures/quarantine/quarantine-test-harness";
 
 const coreUrl = pathToFileURL(
@@ -117,7 +118,7 @@ describe("quarantine lifecycle core", () => {
         repoRoot: prepared.fixture.repoRoot,
         quarantineRoot: prepared.fixture.quarantineRoot,
         transactionId: prepared.transactionId,
-      }) as unknown as { callbackInvoked: number; observed: Record<string, { keys: string[]; frozen: boolean; prototype: string }> };
+      }) as unknown as { callbackInvoked: number; observed: Record<string, ValueShape> };
       expect(result.callbackInvoked).toBe(1);
       expect(result.observed.handoff).toMatchObject({
         prototype: "null",
@@ -476,6 +477,26 @@ describe("quarantine lifecycle core", () => {
     }
   });
 
+  it.each(["QUARANTINED", "VALIDATED"] as const)(
+    "accepts a restore tree with canonical inner symlinks from %s provenance without following them",
+    (preState) => {
+      const prepared = prepareQuarantinedFixture({
+        regenerate: preState === "VALIDATED",
+        generatedInnerSymlink: true,
+      });
+      try {
+        const result = invokeQuarantineWorker("core-restore-matrix", {
+          repoRoot: prepared.fixture.repoRoot,
+          quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId,
+          row: "intent-pre",
+          preState,
+        }, {}, 30_000) as unknown as { ok: boolean; callbackInvoked: number; externalReads?: number };
+        expect(result).toMatchObject({ ok: true, callbackInvoked: 1, externalReads: 0 });
+      } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+    },
+  );
+
   it("accepts the durable pre-rename row after a forward restore intent", () => {
     const prepared = prepareQuarantinedFixture({ regenerate: false });
     try {
@@ -579,6 +600,30 @@ describe("quarantine lifecycle core", () => {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
   });
+
+  it.each(["file", "directory"] as const)(
+    "rejects a descendant %s swap after lstat without following the foreign target",
+    (descendantSwap) => {
+      const prepared = prepareQuarantinedFixture({ generatedNestedDirectory: descendantSwap === "directory" });
+      try {
+        const result = invokeQuarantineWorker("core-restore-matrix", {
+          repoRoot: prepared.fixture.repoRoot,
+          quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId,
+          row: "intent-pre",
+          preState: "QUARANTINED",
+          descendantSwap,
+        }, {}, 30_000) as unknown as {
+          ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean;
+          evidenceStable: boolean; externalReads: number; foreignIntact: boolean;
+        };
+        expect(result).toEqual(expect.objectContaining({
+          ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true,
+          evidenceStable: true, externalReads: 0, foreignIntact: true,
+        }));
+      } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+    },
+  );
 
   it.each(["source-pre", "source-rollback-pre"]) (
     "derives the Q/V source restore prefix from a durable copy-before-generated manifest for %s",

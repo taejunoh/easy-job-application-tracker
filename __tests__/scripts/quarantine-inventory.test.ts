@@ -816,6 +816,51 @@ try {
     }, fsApi);
   } else if (request.operation === "public-exports") {
     result = Object.keys(inventory).sort();
+  } else if (request.operation === "read-only-summary") {
+    let failure;
+    try {
+      result = await inventory.internalSummarizeInventoryDirectory(request.root, { fsApi: baseFsApi });
+    } catch (error) {
+      failure = error.message;
+    }
+    result = { summary: result, failure };
+  } else if (request.operation === "read-only-virtual-bounds") {
+    const root = "/virtual-root";
+    const depth = request.depth ?? 0;
+    const levelOf = (path) => path === root ? 0 : path.slice(root.length + 1).split("/").length;
+    const directoryStat = (path) => ({
+      dev: 1, ino: levelOf(path) + 1, mode: 0o40700, size: 0,
+      isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false,
+    });
+    const calls = { lstat: 0, open: 0, opendir: 0, readlink: 0 };
+    const fsApi = {
+      lstat: async (path) => { calls.lstat += 1; return directoryStat(path); },
+      open: async (path) => {
+        calls.open += 1;
+        return { stat: async () => directoryStat(path), close: async () => {}, createReadStream: () => { throw new Error("file read unexpected"); } };
+      },
+      opendir: async (path) => {
+        calls.opendir += 1;
+        const level = levelOf(path);
+        let yielded = false;
+        return {
+          async close() {},
+          [Symbol.asyncIterator]() { return this; },
+          async next() {
+            if (!yielded && (request.variant === "oversize" || level < depth)) {
+              yielded = true;
+              return { done: false, value: { name: request.variant === "oversize" ? "x".repeat(256) : "d" } };
+            }
+            return { done: true };
+          },
+        };
+      },
+      readlink: async () => { calls.readlink += 1; return ""; },
+    };
+    let failure;
+    let summary;
+    try { summary = await inventory.internalSummarizeInventoryDirectory(root, { fsApi }); } catch (error) { failure = error.message; }
+    result = { summary, failure, calls };
   } else if (request.operation === "hash") {
     let handles = 0;
     let maxHandles = 0;
@@ -1253,15 +1298,41 @@ describe("bounded quarantine inventory", () => {
     });
   });
 
-  it("keeps the inventory public surface at exactly six exports", () => {
+  it("keeps the inventory facade at six public exports plus one explicitly internal reader", () => {
     expect(runWorker({ operation: "public-exports" }).result).toEqual([
       "compareInventorySummary",
       "fsyncTree",
       "hashFileStream",
+      "internalSummarizeInventoryDirectory",
       "parseInventoryRecord",
       "parseInventorySummary",
       "writeInventoryJsonl",
     ]);
+  });
+
+  it("fails closed at the read-only 4097-record bound without producing inventory output", () => {
+    const boundedRoot = join(fixture, "read-only-4097");
+    try {
+      privateDirectory(boundedRoot);
+      for (let index = 0; index < 4_097; index += 1) writeFileSync(join(boundedRoot, `entry-${index}`), "x");
+      const result = runWorker({ operation: "read-only-summary", root: boundedRoot }).result as {
+        summary?: unknown; failure?: string;
+      };
+      expect(result).toEqual({ summary: undefined, failure: expect.stringMatching(/fixed (record|traversal) bounds/i) });
+      expect(readdirSync(join(quarantineRoot, transactionId, "inventories/work"))).toEqual([]);
+    } finally { rmSync(boundedRoot, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ["oversize", 0, /name exceeds fixed bounds/i],
+    ["depth", 1_025, /path depth exceeds fixed bounds/i],
+  ])("rejects read-only %s bounds before any mutation", (variant, depth, error) => {
+    const result = runWorker({ operation: "read-only-virtual-bounds", variant, depth }).result as {
+      summary?: unknown; failure?: string; calls: Record<string, number>;
+    };
+    expect(result.summary).toBeUndefined();
+    expect(result.failure).toMatch(error);
+    expect(result.calls.readlink).toBe(0);
   });
 
   it.each(["write", "fsync"])(

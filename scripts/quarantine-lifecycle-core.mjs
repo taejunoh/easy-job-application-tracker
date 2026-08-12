@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import {
@@ -7,7 +6,7 @@ import {
   readManifestGeneration,
 } from "./quarantine-manifest.mjs";
 import { replayJournal } from "./quarantine-journal.mjs";
-import { hashFileStream } from "./quarantine-inventory.mjs";
+import { hashFileStream, internalSummarizeInventoryDirectory } from "./quarantine-inventory.mjs";
 import { captureRunFsSource, getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
 
@@ -223,34 +222,7 @@ async function optionalStat(path, fsApi) {
 async function privateTreeSummary(root, fsApi) {
   const rootStat = await optionalStat(root, fsApi);
   if (rootStat === null) return null;
-  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("restore tree endpoint is unsafe");
-  const records = [];
-  let bytes = 0;
-  async function visit(path, relativePath, stat) {
-    if (stat.isSymbolicLink()) throw new Error("restore tree contains a symlink");
-    if (stat.isDirectory()) {
-      records.push({ scope: "relative", path: relativePath, type: "directory", mode: modeOf(stat), size: 0 });
-      const names = await fsApi.readdir(path);
-      for (const name of [...names].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-        const child = join(path, name);
-        await visit(child, `${relativePath}/${name}`, await fsApi.lstat(child));
-      }
-      return;
-    }
-    if (!stat.isFile()) throw new Error("restore tree contains an unsupported endpoint");
-    const hashed = await hashFileStream(path, { fsApi });
-    if (hashed.bytes !== stat.size) throw new Error("restore file changed while being read");
-    records.push({ scope: "relative", path: relativePath, type: "file", mode: modeOf(stat), size: stat.size, sha256: hashed.sha256 });
-    bytes += stat.size;
-  }
-  const names = await fsApi.readdir(root);
-  for (const name of [...names].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-    await visit(join(root, name), name, await fsApi.lstat(join(root, name)));
-  }
-  records.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
-  const digest = createHash("sha256");
-  for (const record of records) digest.update(Buffer.from(`${JSON.stringify(record)}\n`));
-  return { sha256: digest.digest("hex"), entries: records.length, bytes };
+  return internalSummarizeInventoryDirectory(root, { fsApi });
 }
 
 function sameSummary(expected, observed) {

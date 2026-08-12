@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { constants as fsConstants, createReadStream } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { dirname, isAbsolute, join } from "node:path";
@@ -20,6 +20,18 @@ const DEFAULT_LIMITS = Object.freeze({
   coordinatorReferences: MAX_WORK_REFERENCES,
 });
 const LIMIT_KEYS = Object.freeze(Object.keys(DEFAULT_LIMITS));
+// This is deliberately read-only: unlike inventory publication it cannot use
+// work-file spills, so it fails closed at the same fixed in-memory ceilings.
+const READ_ONLY_SUMMARY_LIMITS = Object.freeze({
+  records: DEFAULT_LIMITS.sortChunkRecords,
+  recordBytes: DEFAULT_LIMITS.sortChunkBytes,
+  frontier: DEFAULT_LIMITS.sortChunkRecords,
+  frontierBytes: DEFAULT_LIMITS.frontierBytes,
+  depth: DEFAULT_LIMITS.frontierRecords,
+  nameBytes: 255,
+});
+const OPEN_NOFOLLOW = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
+const OPEN_DIRECTORY_NOFOLLOW = OPEN_NOFOLLOW | fsConstants.O_DIRECTORY;
 const DEFAULT_FS_API = Object.freeze({ ...fsPromises, createReadStream });
 
 function isPlainObject(value) {
@@ -570,6 +582,180 @@ async function inventoryRecord(item, fsApi, handleMetrics) {
     };
   }
   throw new Error(`unsupported inventory entry type: ${relativePath ?? "<root>"}`);
+}
+
+function assertSameInventoryIdentity(before, after, label) {
+  if (!sameIdentity(before, after) || modeOf(before) !== modeOf(after)) {
+    throw new Error(`${label} identity changed while being summarized`);
+  }
+}
+
+async function closeReadOnlyHandle(handle, primaryError, label) {
+  try {
+    await handle.close();
+  } catch (error) {
+    if (primaryError === undefined) throw error;
+    throw new AggregateError([primaryError, error], label);
+  }
+  if (primaryError !== undefined) throw primaryError;
+}
+
+async function assertNoFollowDirectory(path, expected, fsApi) {
+  let handle;
+  let primaryError;
+  try {
+    handle = await fsApi.open(path, OPEN_DIRECTORY_NOFOLLOW);
+    const opened = await handle.stat();
+    if (opened.isSymbolicLink() || !opened.isDirectory()) {
+      throw new Error("restore tree directory handle is unsafe");
+    }
+    assertSameInventoryIdentity(expected, opened, "restore tree directory");
+  } catch (error) {
+    primaryError = error;
+  }
+  if (handle !== undefined) await closeReadOnlyHandle(handle, primaryError, "restore directory open and close both failed");
+  if (primaryError !== undefined) throw primaryError;
+}
+
+async function hashNoFollowFile(path, expected, fsApi) {
+  let handle;
+  let primaryError;
+  let result;
+  try {
+    handle = await fsApi.open(path, OPEN_NOFOLLOW);
+    const opened = await handle.stat();
+    if (opened.isSymbolicLink() || !opened.isFile()) {
+      throw new Error("restore tree file handle is unsafe");
+    }
+    assertSameInventoryIdentity(expected, opened, "restore tree file");
+    const hash = createHash("sha256");
+    let bytes = 0;
+    for await (const chunk of handle.createReadStream({ autoClose: false, highWaterMark: 64 * 1024 })) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      hash.update(buffer);
+      bytes += buffer.length;
+    }
+    if (bytes !== expected.size) throw new Error("restore tree file changed while being read");
+    result = { sha256: hash.digest("hex"), bytes };
+  } catch (error) {
+    primaryError = error;
+  }
+  if (handle !== undefined) await closeReadOnlyHandle(handle, primaryError, "restore file read and close both failed");
+  if (primaryError !== undefined) throw primaryError;
+  const after = await fsApi.lstat(path);
+  if (after.isSymbolicLink() || !after.isFile()) throw new Error("restore tree file changed while being read");
+  assertSameInventoryIdentity(expected, after, "restore tree file");
+  return result;
+}
+
+async function readNoFollowLink(path, expected, fsApi) {
+  const linkTarget = await fsApi.readlink(path);
+  const after = await fsApi.lstat(path);
+  if (!after.isSymbolicLink()) throw new Error("restore tree symlink changed while being read");
+  assertSameInventoryIdentity(expected, after, "restore tree symlink");
+  return linkTarget;
+}
+
+async function enumerateNoFollowDirectory(path, expected, fsApi, onEntry) {
+  await assertNoFollowDirectory(path, expected, fsApi);
+  const directory = await fsApi.opendir(path);
+  let primaryError;
+  try {
+    for await (const entry of directory) await onEntry(entry.name);
+  } catch (error) {
+    primaryError = error;
+  }
+  try {
+    await directory.close();
+  } catch (error) {
+    if (error?.code !== "ERR_DIR_CLOSED") {
+      if (primaryError === undefined) primaryError = error;
+      else primaryError = new AggregateError([primaryError, error], "restore directory read and close both failed");
+    }
+  }
+  if (primaryError !== undefined) throw primaryError;
+  const after = await fsApi.lstat(path);
+  if (after.isSymbolicLink() || !after.isDirectory()) throw new Error("restore tree directory changed while being read");
+  assertSameInventoryIdentity(expected, after, "restore tree directory");
+}
+
+// Internal-only consumer: lifecycle validation needs the canonical inventory
+// record format without creating work files or publishing a new inventory.
+export async function internalSummarizeInventoryDirectory(root, options = {}) {
+  assertAbsolutePath(root, "read-only inventory root");
+  const input = snapshotRecord(options, ["fsApi"], [], "read-only inventory options");
+  const fsApi = normalizeFsApi(input.fsApi, ["lstat", "open", "opendir", "readlink"]);
+  const rootStat = await fsApi.lstat(root);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error("restore tree endpoint is unsafe");
+  }
+  const records = [];
+  const pending = [{ absolutePath: root, relativePath: "", depth: 0, root: true }];
+  let pendingBytes = Buffer.byteLength(JSON.stringify(pending[0])) + 1;
+  let recordBytes = 0;
+  let bytes = 0;
+
+  const addRecord = (record, contentBytes) => {
+    const serializedBytes = Buffer.byteLength(JSON.stringify(record)) + 1;
+    if (records.length >= READ_ONLY_SUMMARY_LIMITS.records ||
+        recordBytes + serializedBytes > READ_ONLY_SUMMARY_LIMITS.recordBytes) {
+      throw new Error("read-only restore inventory exceeded fixed record bounds");
+    }
+    records.push(record);
+    recordBytes += serializedBytes;
+    bytes += contentBytes;
+  };
+  const enqueue = (item) => {
+    const serializedBytes = Buffer.byteLength(JSON.stringify(item)) + 1;
+    if (pending.length >= READ_ONLY_SUMMARY_LIMITS.frontier ||
+        pendingBytes + serializedBytes > READ_ONLY_SUMMARY_LIMITS.frontierBytes) {
+      throw new Error("read-only restore inventory exceeded fixed traversal bounds");
+    }
+    pending.push(item);
+    pendingBytes += serializedBytes;
+  };
+
+  while (pending.length > 0) {
+    const item = pending.pop();
+    pendingBytes -= Buffer.byteLength(JSON.stringify(item)) + 1;
+    const stat = await fsApi.lstat(item.absolutePath);
+    if (stat.isSymbolicLink()) {
+      if (item.root) throw new Error("restore tree endpoint is unsafe");
+      const linkTarget = await readNoFollowLink(item.absolutePath, stat, fsApi);
+      addRecord(parseInventoryRecord({
+        scope: "relative", path: item.relativePath, type: "symlink", mode: modeOf(stat),
+        size: Buffer.byteLength(linkTarget), linkTarget,
+      }), Buffer.byteLength(linkTarget));
+      continue;
+    }
+    if (stat.isFile()) {
+      if (item.root) throw new Error("restore tree endpoint is unsafe");
+      const hashed = await hashNoFollowFile(item.absolutePath, stat, fsApi);
+      addRecord(parseInventoryRecord({
+        scope: "relative", path: item.relativePath, type: "file", mode: modeOf(stat),
+        size: stat.size, sha256: hashed.sha256,
+      }), stat.size);
+      continue;
+    }
+    if (!stat.isDirectory()) throw new Error("restore tree contains an unsupported endpoint");
+    if (!item.root) addRecord(parseInventoryRecord({
+      scope: "relative", path: item.relativePath, type: "directory", mode: modeOf(stat), size: 0,
+    }), 0);
+    await enumerateNoFollowDirectory(item.absolutePath, stat, fsApi, async (name) => {
+      if (typeof name !== "string" || Buffer.byteLength(name) > READ_ONLY_SUMMARY_LIMITS.nameBytes) {
+        throw new Error("read-only restore inventory entry name exceeds fixed bounds");
+      }
+      if (item.depth + 1 > READ_ONLY_SUMMARY_LIMITS.depth) {
+        throw new Error("read-only restore inventory path depth exceeds fixed bounds");
+      }
+      const relativePath = item.relativePath ? `${item.relativePath}/${name}` : name;
+      enqueue({ absolutePath: join(item.absolutePath, name), relativePath, depth: item.depth + 1, root: false });
+    });
+  }
+  records.sort(compareRecords);
+  const digest = createHash("sha256");
+  for (const record of records) digest.update(Buffer.from(`${JSON.stringify(record)}\n`));
+  return parseInventorySummary({ sha256: digest.digest("hex"), entries: records.length, bytes });
 }
 
 function workRequest(id, boundary) {
