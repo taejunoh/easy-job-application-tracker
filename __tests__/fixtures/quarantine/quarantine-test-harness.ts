@@ -1,19 +1,10 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
-  appendFileSync,
   chmodSync,
-  existsSync,
-  linkSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   readdirSync,
   realpathSync,
-  renameSync,
-  rmSync,
-  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -392,6 +383,7 @@ export type WorkerResult = {
   closeGetterReads?: number;
   closeCalls?: number;
   closeWrongReceiver?: number;
+  getterReads?: number;
   active?: { callable: boolean; distinctRejected: boolean };
   revoked?: boolean;
   sourceFrozen?: boolean;
@@ -415,7 +407,7 @@ export type WorkerResult = {
     final: Record<string, number>;
   };
   externalOperations?: string[];
-  replayEvents?: Array<{ event: string; payload: { id?: string } }>;
+  replayEvents?: Array<{ event: string; payload: { id?: string; entryIds?: string[] } }>;
   shape?: ValueShape;
   error?: WorkerError;
 };

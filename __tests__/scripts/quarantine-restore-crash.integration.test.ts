@@ -436,14 +436,14 @@ describe("quarantine restore real SIGKILL recovery", () => {
   }, 60_000);
 
   it.each([
-    ["payload mismatch", "conflict", (payload: string, _active: string, _rollback: string) => writeFileSync(join(payload, "foreign"), "foreign\n")],
-    ["rollback missing", "conflict", (_payload: string, _active: string, rollback: string) => rmSync(rollback, { recursive: true, force: true })],
-    ["rollback mismatch", "conflict", (_payload: string, _active: string, rollback: string) => writeFileSync(join(rollback, "foreign"), "foreign\n")],
-    ["both payload and rollback mismatched", "conflict", (payload: string, _active: string, rollback: string) => {
+    ["payload mismatch", "conflict", (...[payload]: [string, string, string]) => writeFileSync(join(payload, "foreign"), "foreign\n")],
+    ["rollback missing", "conflict", (...[, , rollback]: [string, string, string]) => rmSync(rollback, { recursive: true, force: true })],
+    ["rollback mismatch", "conflict", (...[, , rollback]: [string, string, string]) => writeFileSync(join(rollback, "foreign"), "foreign\n")],
+    ["both payload and rollback mismatched", "conflict", (...[payload, , rollback]: [string, string, string]) => {
       writeFileSync(join(payload, "foreign"), "foreign payload\n");
       writeFileSync(join(rollback, "foreign"), "foreign rollback\n");
     }],
-    ["unauthorized payload symlink", "fatal", (payload: string, _active: string, _rollback: string) => {
+    ["unauthorized payload symlink", "fatal", (...[payload]: [string, string, string]) => {
       rmSync(payload, { recursive: true, force: true });
       symlinkSync("/nonexistent/foreign-generated", payload);
     }],
@@ -705,7 +705,7 @@ describe("quarantine restore real SIGKILL recovery", () => {
       });
       expect(initial.signal).toBe("SIGKILL");
       rmSync(join(prepared.runRoot, "journal.lock"));
-      const phaseForIndex = prior === "VALIDATED" && killAt === "after-event:RESTORE_ABORTED_TO_VALIDATED"
+      const phaseForIndex: typeof RECOVERY_ROLLBACK_PHASES[number] = killAt === "after-event:RESTORE_ABORTED_TO_VALIDATED"
         ? "after-event:RESTORE_ABORTED_TO_QUARANTINED"
         : killAt;
       const index = RECOVERY_ROLLBACK_PHASES.indexOf(phaseForIndex);

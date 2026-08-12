@@ -2280,7 +2280,6 @@ async function rollbackApplyFromLedger({
   capability,
   heldLock,
   ledger,
-  manifest,
   options,
   isRollingBack,
 }) {
@@ -2419,7 +2418,6 @@ async function recoverApplyOnCapability({ capability, options }) {
         capability,
         heldLock,
         ledger,
-        manifest,
         options,
         isRollingBack: replayed.state === "ROLLING_BACK",
       });
