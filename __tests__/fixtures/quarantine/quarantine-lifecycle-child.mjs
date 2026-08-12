@@ -1,4 +1,5 @@
 import process from "node:process";
+import { closeSync, fsyncSync, openSync, writeSync } from "node:fs";
 
 const requestText = process.env.QUARANTINE_CHILD_REQUEST;
 if (typeof requestText !== "string") {
@@ -41,9 +42,21 @@ if (typeof operation !== "function") {
 
 const killAt = request.killAt;
 const options = request.options;
+const phaseTracePath = process.env.QUARANTINE_CHILD_PHASE_TRACE;
+function tracePhase(phase) {
+  if (phaseTracePath === undefined) return;
+  const descriptor = openSync(phaseTracePath, "a", 0o600);
+  try {
+    writeSync(descriptor, `${phase}\n`);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
 const result = await operation({
   ...options,
   faultHook: async (phase) => {
+    tracePhase(phase);
     if (phase === killAt) process.kill(process.pid, "SIGKILL");
   },
 });

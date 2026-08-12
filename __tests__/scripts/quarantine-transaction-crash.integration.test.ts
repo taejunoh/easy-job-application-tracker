@@ -19,15 +19,36 @@ function applyOptions(f: Fixture, transactionId: string, createdAt: string) {
   };
 }
 
-function runChild(operation: string, options: Record<string, unknown>, killAt?: string) {
-  return spawnSync(process.execPath, [child], {
+const fixtureBases = new Set<string>();
+const cleanedFixtureBases = new Set<string>();
+
+function createTrackedFixture(options?: Parameters<typeof createQuarantineFixture>[0]) {
+  const fixture = createQuarantineFixture(options);
+  fixtureBases.add(fixture.base);
+  return fixture;
+}
+
+function runChild(
+  operation: string,
+  options: Record<string, unknown>,
+  killAt?: string,
+  phaseTracePath?: string,
+) {
+  const result = spawnSync(process.execPath, [child], {
     env: {
       ...process.env,
       QUARANTINE_CHILD_REQUEST: JSON.stringify({ operation, options, killAt }),
+      ...(phaseTracePath === undefined ? {} : { QUARANTINE_CHILD_PHASE_TRACE: phaseTracePath }),
     },
     encoding: "utf8",
     timeout: 30_000,
   });
+  return {
+    ...result,
+    observedPhases: phaseTracePath === undefined || !existsSync(phaseTracePath)
+      ? []
+      : readFileSync(phaseTracePath, "utf8").split("\n").filter(Boolean),
+  };
 }
 
 function lockOwnerPid(lockPath: string) {
@@ -69,8 +90,21 @@ function clearDeadFixtureLock(fixture: Fixture, transactionId: string) {
 }
 
 describe("quarantine transaction real SIGKILL recovery", () => {
+  afterEach(() => {
+    const bases = [...fixtureBases];
+    fixtureBases.clear();
+    for (const base of bases) {
+      rmSync(base, { recursive: true, force: true });
+      cleanedFixtureBases.add(base);
+    }
+  });
+
+  afterAll(() => {
+    expect([...cleanedFixtureBases].filter(existsSync)).toEqual([]);
+  });
+
   it("recovers a durable move intent after SIGKILL at RECOVERY_REQUIRED", () => {
-    const fixture = createQuarantineFixture();
+    const fixture = createTrackedFixture();
     const transactionId = "tx-real-recovery-required";
     const apply = applyOptions(fixture, transactionId, "2026-07-17T00:00:00.000Z");
 
@@ -106,7 +140,7 @@ describe("quarantine transaction real SIGKILL recovery", () => {
     "after-event:ROLLED_BACK_ENTRY:copy-0001",
     "after-event:ROLLED_BACK",
   ])("continues a rollback after SIGKILL at %s without retry mutation", (killAt) => {
-    const fixture = createQuarantineFixture();
+    const fixture = createTrackedFixture();
     const transactionId = `tx-rollback-${killAt.replace(/[^a-z0-9]/giu, "-")}`;
     const options = applyOptions(fixture, transactionId, "2026-07-17T00:00:02.000Z");
     expect(runChild("quarantineWorkspace", options, "after-rename:copy-0001").signal).toBe("SIGKILL");
@@ -141,7 +175,7 @@ describe("quarantine transaction real SIGKILL recovery", () => {
   });
 
   it("persists and returns a conflict after SIGKILL at INCOMPLETE_CONFLICT", () => {
-    const fixture = createQuarantineFixture();
+    const fixture = createTrackedFixture();
     const transactionId = "tx-conflict-crash";
     const options = applyOptions(fixture, transactionId, "2026-07-17T00:00:03.000Z");
     expect(runChild("quarantineWorkspace", options, "after-event:MOVE_INTENT:copy-0001").signal).toBe("SIGKILL");
@@ -168,7 +202,7 @@ describe("quarantine transaction real SIGKILL recovery", () => {
     "after-pre-inventories",
     "after-prepared-generation",
   ])("reruns apply after pre-PREPARED SIGKILL at %s", (killAt) => {
-    const fixture = createQuarantineFixture();
+    const fixture = createTrackedFixture();
     const options = applyOptions(fixture, `tx-pre-${killAt.slice(6, 12)}`, "2026-07-17T00:00:01.000Z");
     const crashed = runChild("quarantineWorkspace", options, killAt);
     expect(crashed.signal).toBe("SIGKILL");
@@ -193,12 +227,45 @@ describe("quarantine transaction real SIGKILL recovery", () => {
     ["after-event:QUARANTINED", "resume"],
     ["before-lock-cleanup", "resume"],
   ] as const)("reaches QUARANTINED after an apply SIGKILL at %s", (killAt, recovery) => {
-    const fixture = createQuarantineFixture({
+    const fixture = createTrackedFixture({
       divergent: killAt === "after-divergent-diff:copy-0001",
     });
     const transactionId = `tx-apply-${killAt.replace(/[^a-z0-9]/giu, "-")}`;
     const options = applyOptions(fixture, transactionId, "2026-07-17T00:00:04.000Z");
-    expect(runChild("quarantineWorkspace", options, killAt).signal).toBe("SIGKILL");
+    if (killAt === "after-divergent-diff:copy-0001") {
+      expect({
+        transactionId,
+        expectedCount: options.expectedCount,
+        copyPath: fixture.copyPath,
+      }).toEqual({
+        transactionId: "tx-apply-after-divergent-diff-copy-0001",
+        expectedCount: 1,
+        copyPath: "notes 2.txt",
+      });
+    }
+    const phaseTracePath = killAt === "after-divergent-diff:copy-0001"
+      ? join(fixture.base, "phase-trace.log")
+      : undefined;
+    const crashed = runChild("quarantineWorkspace", options, killAt, phaseTracePath);
+    if (phaseTracePath !== undefined) {
+      expect({
+        exitCode: crashed.status,
+        signal: crashed.signal,
+        stderr: crashed.stderr,
+        phases: crashed.observedPhases,
+      }).toEqual({
+        exitCode: null,
+        signal: "SIGKILL",
+        stderr: "",
+        phases: [
+          "after-layout-sync",
+          "after-pre-inventories",
+          "after-divergent-diff:copy-0001",
+        ],
+      });
+    } else {
+      expect(crashed.signal).toBe("SIGKILL");
+    }
 
     let result;
     if (recovery === "rerun") {
