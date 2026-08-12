@@ -696,13 +696,21 @@ try {
         }
       } else if (row === "source-pre" || row === "source-mid" || row === "source-post" || row === "source-rollback-pre" || row === "source-rollback-post") {
         await append(capability, "RESTORING", {});
+        // The journal schema requires every RESTORE_INTENT to be a manifest-order
+        // prefix.  A source-copy seam is therefore reached only after the two
+        // generated entries have completed their own forward move.
+        for (const id of generated) {
+          await intent(id);
+          renameSync(payload[id], workspace[id]);
+          await completed(id);
+        }
         await intent(sourceId);
         if (row !== "source-pre") {
           renameSync(payload[sourceId], workspace[sourceId]);
           if (row !== "source-mid") await completed(sourceId);
         }
         if (row === "source-rollback-pre" || row === "source-rollback-post") {
-          await append(capability, "RECOVERY_REQUIRED", { entryIds: [sourceId] });
+          await append(capability, "RECOVERY_REQUIRED", { entryIds: [...generated, sourceId] });
           await append(capability, "RESTORE_ROLLING_BACK", {});
           await rollbackIntent(sourceId);
           if (row === "source-rollback-post") {
