@@ -590,7 +590,7 @@ try {
           }
           const handle = await originalOpen(path, ...args);
           const inventoryParent = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active");
-          if (ancestorExchangeAt !== "post-publication" || path !== inventoryParent || args[0] !== "r") return handle;
+          if (ancestorExchangeAt !== "post-publication" || path !== inventoryParent) return handle;
           const originalSync = handle.sync.bind(handle);
           handle.sync = async (...syncArgs) => {
             const synced = await originalSync(...syncArgs);
@@ -711,16 +711,24 @@ try {
           if (phase === stopPhase) throw new RangeError("stop at requested restore phase");
         },
       });
-      if (activeRootInventory !== undefined) activeRootInventory.bytesAfter = readFileSync(join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl")).toString("base64");
+      if (activeRootInventory !== undefined) {
+        const path = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl");
+        activeRootInventory.bytesAfter = existsSync(path) ? readFileSync(path).toString("base64") : null;
+      }
       process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, derivedTracePaths, fsTrace }));
     } catch (error) {
       if (publicationEvidence !== undefined) {
         publicationEvidence = publicationEvidence.map((entry) => ({
           ...entry,
-          bytesAfter: readFileSync(join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", entry.id + ".jsonl")).toString("base64"),
+          bytesAfter: existsSync(join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", entry.id + ".jsonl"))
+            ? readFileSync(join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", entry.id + ".jsonl")).toString("base64")
+            : null,
         }));
       }
-      if (activeRootInventory !== undefined) activeRootInventory.bytesAfter = readFileSync(join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl")).toString("base64");
+      if (activeRootInventory !== undefined) {
+        const path = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", activeRootExchangeAt + ".jsonl");
+        activeRootInventory.bytesAfter = existsSync(path) ? readFileSync(path).toString("base64") : null;
+      }
       process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, finalPrecheckMarker, rollbackRenameCalls, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), publicationMarker, publicationEvidence, foreignOpenCalls, activeRootMarker, activeRootInventory, derivedTracePaths, fsTrace, error: errorShape(error) }));
     }
   } else if (operation === "restore-parent-sync-seam") {

@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 
 import { prepareQuarantinedFixture, invokeQuarantineWorker } from "../fixtures/quarantine/quarantine-test-harness";
 
@@ -221,8 +221,50 @@ describe("quarantine restore", () => {
       expect(events.at(-1)).toBe(durable);
       // The injected hook is awaited inside the operation; it cannot be
       // followed by a later public phase or journal append in this attempt.
-      expect(result.phases.slice(index + 1)).toEqual([]);
+      expect((result.phases ?? []).slice(index + 1)).toEqual([]);
     } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "after-inventory:restore-active:generated-next",
+    "after-inventory:restore-active:generated-node-modules",
+  ])("removes only owned pre-PREPARED active inventories after %s and permits retry", (stopPhase) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const failed = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, stopPhase,
+      });
+      expect(failed.ok).toBe(false);
+      expect(readdirSync(join(prepared.runRoot, "inventories", "restore-active"))).toEqual([]);
+      expect(journalEvents(join(prepared.runRoot, "journal.log"))).not.toContain("RESTORE_PREPARED");
+      const retried = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true,
+      });
+      expect(retried.ok).toBe(true);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes restore-active inventories as exact 0600 files under restrictive umask", () => {
+    const prepared = prepareQuarantinedFixture();
+    const previousUmask = process.umask(0o777);
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, stopPhase: "after-event:RESTORE_PREPARED",
+      });
+      expect(result.ok).toBe(false);
+      expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_PREPARED");
+      for (const id of ["generated-next", "generated-node-modules"]) {
+        expect(lstatSync(join(prepared.runRoot, "inventories", "restore-active", `${id}.jsonl`)).mode & 0o7777).toBe(0o600);
+      }
+    } finally {
+      process.umask(previousUmask);
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
   });
@@ -466,19 +508,20 @@ describe("quarantine restore", () => {
       }) as unknown as {
         ok: boolean; phases: string[]; foreignOpenCalls: number;
         publicationMarker?: { parentSyncs: number; publicationComplete: boolean };
-        publicationEvidence?: Array<{ id: string; bytesAtBarrier: string; bytesAfter: string }>;
+        publicationEvidence?: Array<{ id: string; bytesAtBarrier: string; bytesAfter: string | null }>;
       };
       expect(result.ok).toBe(false);
-      expect(result.publicationMarker).toEqual({
-        inventoryParent: join(prepared.runRoot, "inventories", "restore-active"), parentSyncs: 2, publicationComplete: true,
-      });
+      expect(result.publicationMarker).toEqual(expect.objectContaining({
+        inventoryParent: join(prepared.runRoot, "inventories", "restore-active"), publicationComplete: true,
+      }));
+      expect(result.publicationMarker?.parentSyncs).toBeGreaterThanOrEqual(2);
       expect(result.publicationEvidence).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: "generated-next", bytesAtBarrier: expect.any(String), bytesAfter: expect.any(String) }),
-        expect.objectContaining({ id: "generated-node-modules", bytesAtBarrier: expect.any(String), bytesAfter: expect.any(String) }),
+        expect.objectContaining({ id: "generated-next", bytesAtBarrier: expect.any(String), bytesAfter: null }),
+        expect.objectContaining({ id: "generated-node-modules", bytesAtBarrier: expect.any(String), bytesAfter: null }),
       ]));
       for (const inventory of result.publicationEvidence ?? []) {
         expect(inventory.bytesAtBarrier).not.toBe("");
-        expect(inventory.bytesAfter).toBe(inventory.bytesAtBarrier);
+        expect(inventory.bytesAfter).toBeNull();
       }
       expect(result.phases).toEqual(["after-inventory:restore-active:generated-next"]);
       expect(journalEvents(join(prepared.runRoot, "journal.log"))).not.toContain("RESTORE_PREPARED");
@@ -503,7 +546,7 @@ describe("quarantine restore", () => {
       }) as unknown as {
         ok: boolean; phases: string[]; foreignOpenCalls: number;
         activeRootMarker?: { id: string; phase: string; before: { ino: number }; after: { ino: number } };
-        activeRootInventory?: { bytesAtBarrier: string; bytesAfter: string };
+        activeRootInventory?: { bytesAtBarrier: string; bytesAfter: string | null };
       };
       expect(result.ok).toBe(false);
       expect(result.activeRootMarker).toEqual(expect.objectContaining({
@@ -513,9 +556,9 @@ describe("quarantine restore", () => {
       }));
       expect(result.activeRootMarker?.before.ino).not.toBe(result.activeRootMarker?.after.ino);
       expect(result.activeRootInventory).toEqual(expect.objectContaining({
-        bytesAtBarrier: expect.any(String), bytesAfter: expect.any(String),
+        bytesAtBarrier: expect.any(String), bytesAfter: null,
       }));
-      expect(result.activeRootInventory?.bytesAfter).toBe(result.activeRootInventory?.bytesAtBarrier);
+      expect(result.activeRootInventory?.bytesAfter).toBeNull();
       expect(result.phases).toEqual([
         "after-inventory:restore-active:generated-next", "after-inventory:restore-active:generated-node-modules",
       ]);

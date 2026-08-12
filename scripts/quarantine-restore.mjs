@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import {
   fsyncVerifiedTree,
   publishVerifiedRestoreActiveInventory,
+  cleanupVerifiedRestoreActiveInventory,
   summarizeInventoryDirectory,
   hashVerifiedRegularFile,
 } from "./quarantine-inventory-reader.mjs";
@@ -292,7 +293,7 @@ async function invokeHook(hook, phase) {
   if (hook !== undefined) await hook(phase);
 }
 
-async function captureActiveGenerated(handoff, faultHook) {
+async function captureActiveGenerated(handoff, faultHook, publications) {
   const active = [];
   for (const id of GENERATED_IDS) {
     const entry = handoff.manifestGeneration.manifest.entries.find((candidate) => candidate.id === id);
@@ -311,13 +312,23 @@ async function captureActiveGenerated(handoff, faultHook) {
     const heldSnapshot = await summarizeInventoryDirectory(root, {
       fsApi: handoff.fsApi, ancestorChain: ancestors, snapshot: true,
     });
-    const inventory = await publishVerifiedRestoreActiveInventory({
+    const published = await publishVerifiedRestoreActiveInventory({
       capability: handoff.capability, entryId: id, snapshot: heldSnapshot,
     });
+    publications.push(published.publication);
     await invokeHook(faultHook, `after-inventory:restore-active:${id}`);
-    active.push(activeRecord(id, inventory, ancestors, heldSnapshot.rootIdentity));
+    active.push(activeRecord(id, published.summary, ancestors, heldSnapshot.rootIdentity));
   }
   return Object.freeze(active);
+}
+
+async function cleanupRestoreActivePublications(capability, publications, primary) {
+  const cleanupErrors = [];
+  for (const publication of publications.toReversed()) {
+    try { await cleanupVerifiedRestoreActiveInventory({ capability, publication }); } catch (error) { cleanupErrors.push(error); }
+  }
+  if (cleanupErrors.length > 0) throw new AggregateError([primary, ...cleanupErrors], "restore-active inventory cleanup failed");
+  throw primary;
 }
 
 async function assertActiveStable(handoff, active) {
@@ -478,9 +489,15 @@ export async function restoreQuarantine(input) {
       if (replayed.state !== handoff.journalTip.state || tip?.recordHash !== handoff.journalTip.recordHash) {
         throw new Error("restore journal changed before mutation");
       }
-      const activeGenerated = await captureActiveGenerated(handoff, options.faultHook);
-      await assertActiveStable(handoff, activeGenerated);
-      await append(heldLock, handoff.capability, "RESTORE_PREPARED", { restoreId, activeGenerated });
+      const publications = [];
+      let activeGenerated;
+      try {
+        activeGenerated = await captureActiveGenerated(handoff, options.faultHook, publications);
+        await assertActiveStable(handoff, activeGenerated);
+        await append(heldLock, handoff.capability, "RESTORE_PREPARED", { restoreId, activeGenerated });
+      } catch (error) {
+        await cleanupRestoreActivePublications(handoff.capability, publications, error);
+      }
       await invokeHook(options.faultHook, "after-event:RESTORE_PREPARED");
       await append(heldLock, handoff.capability, "RESTORING", {});
       await invokeHook(options.faultHook, "after-event:RESTORING");

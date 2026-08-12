@@ -284,9 +284,40 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
   const chain = Object.freeze([...snapshot.ancestorChain, snapshot.rootIdentity]);
   await validateAncestorChain(chain, fsApi);
   await revalidateRunCapability(capability, { purpose: "inventory", id: entryId, phase: "restore-active", boundary: "before-mutation" });
-  const handle = await fsApi.open(path, "wx", 0o600);
+  const parent = dirname(path);
+  const parentStat = await fsApi.lstat(parent);
+  const parentRealpath = await fsApi.realpath(parent);
+  if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || parentRealpath !== parent) {
+    throw new Error("restore-active inventory parent is unsafe");
+  }
+  const parentIdentity = frozenDirectoryIdentity(parent, parentStat, parentRealpath);
+  let handle;
+  let ownedIdentity;
+  const cleanupOwned = async (error) => {
+    if (ownedIdentity === undefined) throw error;
+    try {
+      const observed = await fsApi.lstat(path);
+      if (!observed.isSymbolicLink() && observed.isFile() && sameIdentity(ownedIdentity, observed) && modeOf(observed) === 0o600) {
+        await fsApi.unlink(path);
+        const directory = await fsApi.open(parent, DIRECTORY_OPEN_FLAGS);
+        let directoryPrimary;
+        try { await directory.sync(); } catch (syncError) { directoryPrimary = syncError; }
+        await closeAll(undefined, directory, directoryPrimary);
+      } else throw new Error("restore-active inventory cleanup ownership changed");
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "restore-active inventory publish and cleanup failed");
+    }
+    throw error;
+  };
   let primary;
   try {
+    handle = await fsApi.open(path, "wx", 0o600);
+    await handle.chmod(0o600);
+    const opened = await handle.stat();
+    if (opened.isSymbolicLink() || !opened.isFile() || modeOf(opened) !== 0o600) {
+      throw new Error("restore-active inventory output is not private regular file");
+    }
+    ownedIdentity = Object.freeze({ dev: opened.dev, ino: opened.ino, mode: modeOf(opened), type: "file" });
     let position = 0;
     for (const record of snapshot.records) {
       const bytes = Buffer.from(`${JSON.stringify(record)}\n`);
@@ -302,15 +333,63 @@ export async function publishVerifiedRestoreActiveInventory({ capability, entryI
     await handle.sync();
     await validateAncestorChain(chain, fsApi);
   } catch (error) { primary = error; }
-  await closeAll(undefined, handle, primary);
-  await validateAncestorChain(chain, fsApi);
-  const directory = await fsApi.open(dirname(path), "r");
-  let directoryPrimary;
-  try { await directory.sync(); } catch (error) { directoryPrimary = error; }
-  await closeAll(undefined, directory, directoryPrimary);
-  await revalidateRunCapability(capability, { purpose: "inventory", id: entryId, phase: "restore-active", boundary: "after-sync" });
-  await validateAncestorChain(chain, fsApi);
-  return snapshot.summary;
+  try {
+    await closeAll(undefined, handle, primary);
+  } catch (error) {
+    primary = error;
+  }
+  if (primary !== undefined) {
+    await cleanupOwned(primary);
+  }
+  try {
+    await validateAncestorChain(chain, fsApi);
+    const final = await fsApi.lstat(path);
+    if (ownedIdentity === undefined || final.isSymbolicLink() || !final.isFile() ||
+        !sameIdentity(ownedIdentity, final) || modeOf(final) !== 0o600) {
+      throw new Error("restore-active inventory output changed before parent sync");
+    }
+    const directory = await fsApi.open(parent, DIRECTORY_OPEN_FLAGS);
+    let directoryPrimary;
+    try { await directory.sync(); } catch (error) { directoryPrimary = error; }
+    await closeAll(undefined, directory, directoryPrimary);
+    await revalidateRunCapability(capability, { purpose: "inventory", id: entryId, phase: "restore-active", boundary: "after-sync" });
+    await validateAncestorChain(chain, fsApi);
+    const published = await fsApi.lstat(path);
+    if (published.isSymbolicLink() || !published.isFile() || !sameIdentity(ownedIdentity, published) || modeOf(published) !== 0o600) {
+      throw new Error("restore-active inventory output changed after parent sync");
+    }
+  } catch (error) {
+    await cleanupOwned(error);
+  }
+  return Object.freeze({
+    summary: snapshot.summary,
+    publication: Object.freeze({ path, identity: ownedIdentity, parentIdentity }),
+  });
+}
+
+export async function cleanupVerifiedRestoreActiveInventory({ capability, publication }) {
+  if (publication === null || typeof publication !== "object" || typeof publication.path !== "string") {
+    throw new TypeError("restore-active inventory publication is invalid");
+  }
+  const fsApi = getRunFsContext(capability);
+  const parent = dirname(publication.path);
+  const expectedParent = publication.parentIdentity;
+  const expectedFile = publication.identity;
+  await validateAncestorChain(Object.freeze([]), fsApi);
+  const parentStat = await fsApi.lstat(parent);
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink() || !sameIdentity(expectedParent, parentStat) ||
+      modeOf(parentStat) !== expectedParent.mode || await fsApi.realpath(parent) !== expectedParent.canonicalRealpath) {
+    throw new Error("restore-active inventory cleanup parent changed");
+  }
+  const stat = await fsApi.lstat(publication.path);
+  if (stat.isSymbolicLink() || !stat.isFile() || !sameIdentity(expectedFile, stat) || modeOf(stat) !== 0o600) {
+    throw new Error("restore-active inventory cleanup ownership changed");
+  }
+  await fsApi.unlink(publication.path);
+  const directory = await fsApi.open(parent, DIRECTORY_OPEN_FLAGS);
+  let primary;
+  try { await directory.sync(); } catch (error) { primary = error; }
+  await closeAll(undefined, directory, primary);
 }
 
 /* Internal restore authority.  Each pathname is rebound to an O_NOFOLLOW
@@ -341,6 +420,45 @@ export async function fsyncVerifiedTree(root, {
     }
     await closeAll(undefined, handle, primary);
   };
+  const syncDirectory = async (path, expected, chain) => {
+    let handle;
+    let primary;
+    try {
+      await validateAncestorChain(chain, fsApi);
+      handle = await fsApi.open(path, DIRECTORY_OPEN_FLAGS);
+      const opened = await handle.stat();
+      assertIdentity(expected, opened, "isDirectory", "restore sync directory handle");
+      await validateAncestorChain(chain, fsApi);
+      await assertPathMatchesHandle(path, opened, "isDirectory", fsApi);
+      await handle.sync();
+      const final = await handle.stat();
+      assertIdentity(opened, final, "isDirectory", "restore sync directory handle");
+      await validateAncestorChain(chain, fsApi);
+      await assertPathMatchesHandle(path, opened, "isDirectory", fsApi);
+    } catch (error) { primary = error; }
+    await closeAll(undefined, handle, primary);
+  };
+  const enumerateDirectory = async (path, expected, chain) => withVerifiedDirectory(
+    path, expected, chain, fsApi,
+    async (dir, identity) => {
+      const names = [];
+      let nameBytes = 0;
+      while (true) {
+        const item = await dir.read();
+        if (item === null) break;
+        if (typeof item.name !== "string" || Buffer.byteLength(item.name) > LIMITS.nameBytes) {
+          throw new Error("restore sync directory entry is invalid");
+        }
+        if (names.length >= LIMITS.records || nameBytes + Buffer.byteLength(item.name) > LIMITS.recordBytes) {
+          throw new Error("restore sync tree exceeded fixed entry bounds");
+        }
+        names.push(item.name);
+        nameBytes += Buffer.byteLength(item.name);
+      }
+      names.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+      return Object.freeze({ identity, names: Object.freeze(names), nameBytes });
+    },
+  );
   const visit = async (path, expected, chain) => {
     const expectedFile = expected.type === undefined ? expected.isFile() : expected.type === "file";
     const expectedDirectory = expected.type === undefined ? expected.isDirectory() : expected.type === "directory";
@@ -348,29 +466,15 @@ export async function fsyncVerifiedTree(root, {
       throw new Error("restore sync endpoint is unsafe");
     }
     if (expectedFile) return syncFile(path, expected, chain);
-    return withVerifiedDirectory(path, expected, chain, fsApi, async (dir, identity, handle) => {
-      const children = [];
-      while (true) {
-        const item = await dir.read();
-        if (item === null) break;
-        if (typeof item.name !== "string" || Buffer.byteLength(item.name) > LIMITS.nameBytes) {
-          throw new Error("restore sync directory entry is invalid");
-        }
-        children.push(item.name);
-      }
-      children.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
-      const childChain = appendAncestorChain(chain, identity);
-      for (const name of children) {
-        const child = join(path, name);
-        await validateAncestorChain(childChain, fsApi);
-        const childStat = await fsApi.lstat(child);
-        await visit(child, childStat, childChain);
-      }
-      await validateAncestorChain(chain, fsApi);
-      await handle.sync();
-      await validateAncestorChain(chain, fsApi);
-      await assertPathMatchesHandle(path, identity, "isDirectory", fsApi);
-    });
+    const enumerated = await enumerateDirectory(path, expected, chain);
+    const childChain = appendAncestorChain(chain, enumerated.identity);
+    for (const name of enumerated.names) {
+      const child = join(path, name);
+      await validateAncestorChain(childChain, fsApi);
+      const childStat = await fsApi.lstat(child);
+      await visit(child, childStat, childChain);
+    }
+    await syncDirectory(path, enumerated.identity, chain);
   };
   const stat = await fsApi.lstat(root);
   if (rootIdentity !== undefined) {
