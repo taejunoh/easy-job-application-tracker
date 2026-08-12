@@ -437,7 +437,7 @@ describe("quarantine cleanup CLI", () => {
   it("keeps an injected journal adapter exception internal", () => {
     const prepared = prepareQuarantinedFixture();
     bases.push(prepared.fixture.base);
-    const restoreUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-restore.mjs")).href;
+    const restoreUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-restore-internal.mjs")).href;
     const script = `
       import { restoreQuarantine } from ${JSON.stringify(restoreUrl)};
       import * as promises from "node:fs/promises";
@@ -474,14 +474,18 @@ describe("quarantine cleanup CLI", () => {
   it("classifies journal corruption after restore handoff as integrity failure", () => {
     const prepared = prepareQuarantinedFixture();
     bases.push(prepared.fixture.base);
-    const restoreUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-restore.mjs")).href;
+    const restoreUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-restore-internal.mjs")).href;
     const loaderPath = join(prepared.fixture.base, "post-handoff-journal-loader.mjs");
     writeFileSync(loaderPath, `
       import { readFile } from "node:fs/promises";
       export async function load(url, context, nextLoad) {
         const loaded = await nextLoad(url, context);
         if (url !== ${JSON.stringify(restoreUrl)}) return loaded;
-        const source = (await readFile(new URL(url), "utf8")).replace(
+        const original = await readFile(new URL(url), "utf8");
+        if (!original.includes("const replayed = await replayJournalForRestore(handoff.capability);")) {
+          throw new Error("post-handoff journal seam is missing");
+        }
+        const source = original.replace(
           "const replayed = await replayJournalForRestore(handoff.capability);",
           "await (await import('node:fs/promises')).writeFile(join(options.quarantineRoot, options.transactionId, 'journal.log'), 'tampered'); const replayed = await replayJournalForRestore(handoff.capability);",
         );
