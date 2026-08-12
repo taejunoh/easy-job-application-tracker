@@ -288,23 +288,25 @@ describe("quarantine lifecycle core", () => {
     }
   });
 
-  it.each(["RESTORE_PREPARED", "RESTORING", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK"])(
-    "accepts durable QUARANTINED provenance through %s restore context",
-    (restoreState) => {
-      const prepared = prepareQuarantinedFixture({ regenerate: false });
+  it.each([
+    ["QUARANTINED", false], ["VALIDATED", true],
+  ] as const)("accepts %s provenance across each durable restore context", (preState, regenerate) => {
+    for (const restoreState of ["RESTORE_PREPARED", "RESTORING", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK"]) {
+      const prepared = prepareQuarantinedFixture({ regenerate });
       try {
         const result = invokeQuarantineWorker("core-restore-contract", {
           repoRoot: prepared.fixture.repoRoot,
           quarantineRoot: prepared.fixture.quarantineRoot,
           transactionId: prepared.transactionId,
           restoreState,
+          preState,
         }) as unknown as { ok: boolean; callbackInvoked: number };
         expect(result).toEqual({ ok: true, callbackInvoked: 1 });
       } finally {
         rmSync(prepared.fixture.base, { recursive: true, force: true });
       }
-    },
-  );
+    }
+  });
 
   it("rejects a restore payload whose inventory differs from the durable manifest", () => {
     const prepared = prepareQuarantinedFixture({ regenerate: false });

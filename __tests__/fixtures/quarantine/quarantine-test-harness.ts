@@ -365,7 +365,7 @@ import { getRunFsContext } from ${JSON.stringify(fsContextUrl)};
 import { withExistingQuarantineRun } from ${JSON.stringify(lifecycleCoreUrl)};
 import * as fsPromises from "node:fs/promises";
 import {
-  appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, realpathSync,
+  appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, realpathSync, rmSync,
   renameSync, symlinkSync, truncateSync, writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -562,10 +562,19 @@ try {
     process.stdout.write(JSON.stringify({ ok: true, callbackInvoked, observed, getters, calls, wrongReceiver, revoked, staleIdentity }));
   } else if (operation === "core-restore-contract") {
     const restoreId = "restore-123e4567-e89b-42d3-a456-426614174000";
-    const { restoreState, restoreIntent, ...restoreRequest } = request;
+    const { restoreState, restoreIntent, preState, ...restoreRequest } = request;
     const append = async (capability, event, payload) => withJournalLock({ capability }, (heldLock) =>
       appendJournalRecord({ capability, heldLock, event, payload }),
     );
+    if (preState === "VALIDATED") {
+      await transaction.markQuarantineValidated({
+        ...restoreRequest,
+        writersStopped: true,
+        validatedAt: "2026-08-11T00:00:00.000Z",
+      });
+      rmSync(join(request.repoRoot, ".next"), { recursive: true, force: true });
+      rmSync(join(request.repoRoot, "node_modules"), { recursive: true, force: true });
+    }
     await withQuarantineRunCapability({ ...restoreRequest, writersStopped: true }, async (capability) => {
       await append(capability, "RESTORE_PREPARED", {
         restoreId,
