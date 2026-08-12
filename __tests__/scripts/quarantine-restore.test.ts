@@ -273,6 +273,24 @@ describe("quarantine restore", () => {
     }
   });
 
+  it("preserves restore-active backing after an indeterminate RESTORE_PREPARED journal close failure", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, indeterminatePrepared: "close",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error?.name).toBe("IndeterminateJournalAppendError");
+      expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_PREPARED");
+      expect(readdirSync(join(prepared.runRoot, "inventories", "restore-active")).sort()).toEqual([
+        "generated-next.jsonl", "generated-node-modules.jsonl",
+      ]);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("preserves a foreign pre-existing restore-active inventory EEXIST backing", () => {
     const prepared = prepareQuarantinedFixture();
     try {
@@ -315,6 +333,21 @@ describe("quarantine restore", () => {
       expect(readFileSync(result.publisherForeignSentinel!, "utf8")).toBe("foreign");
       expect(existsSync(result.publisherOwnedPath!.replace("/restore-active/", "/restore-active.foreign-owned/"))).toBe(true);
       expect(result.error?.message).toMatch(/publish and cleanup failed/u);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["unlink", "sync"])("aggregates partial publisher cleanup %s failure", (publisherCleanupFailure) => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, partialPublisher: true, publisherCleanupFailure,
+      }) as unknown as { ok: boolean; publisherOwnedPath?: string; error?: { message?: string } };
+      expect(result.ok).toBe(false);
+      expect(result.error?.message).toBe("restore-active inventory publish and cleanup failed");
+      expect(existsSync(result.publisherOwnedPath!)).toBe(publisherCleanupFailure === "unlink");
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }

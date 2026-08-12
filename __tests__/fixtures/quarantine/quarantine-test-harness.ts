@@ -518,7 +518,7 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "restore") {
-    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, indeterminatePrepared, preexistingRestoreInventory, partialPublisher, publisherParentExchange, traceRestoreFs, ...restoreRequest } = request;
+    const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, activeRootExchangeAt, indeterminatePrepared, preexistingRestoreInventory, partialPublisher, publisherParentExchange, publisherCleanupFailure, traceRestoreFs, ...restoreRequest } = request;
     const phases = [];
     let finalPrecheckTargetReads = 0;
     let finalInterloperPath;
@@ -546,7 +546,7 @@ try {
         const path = join(request.quarantineRoot, request.transactionId, "inventories", "restore-active", preexistingRestoreInventory + ".jsonl");
         writeFileSync(path, "foreign inventory\\n", { mode: 0o600 });
       }
-      if (indeterminatePrepared === true) {
+      if (indeterminatePrepared === true || indeterminatePrepared === "close") {
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
         const originalOpen = fsApi.open;
         fsApi.open = async (path, ...args) => {
@@ -557,7 +557,11 @@ try {
               const value = Reflect.get(inner, property, inner);
               if (property === "sync") return async (...syncArgs) => {
                 await Reflect.apply(value, inner, syncArgs);
-                throw new Error("injected prepared journal sync failure");
+                if (indeterminatePrepared === true) throw new Error("injected prepared journal sync failure");
+              };
+              if (property === "close") return async (...closeArgs) => {
+                await Reflect.apply(value, inner, closeArgs);
+                if (indeterminatePrepared === "close") throw new Error("injected prepared journal close failure");
               };
               return typeof value === "function" ? value.bind(inner) : value;
             },
@@ -569,6 +573,15 @@ try {
         const originalOpen = fsApi.open;
         fsApi.open = async (path, ...args) => {
           const handle = await originalOpen(path, ...args);
+          if (publisherCleanupFailure === "sync" && path === join(request.quarantineRoot, request.transactionId, "inventories", "restore-active")) {
+            return new Proxy(handle, {
+              get(inner, property) {
+                const value = Reflect.get(inner, property, inner);
+                if (property === "sync") return async () => { throw new Error("injected restore-active cleanup parent sync failure"); };
+                return typeof value === "function" ? value.bind(inner) : value;
+              },
+            });
+          }
           if (!String(path).endsWith("/inventories/restore-active/generated-next.jsonl") || args[0] !== "wx") return handle;
           publisherOwnedPath = path;
           let writes = 0;
@@ -594,6 +607,13 @@ try {
             },
           });
         };
+        if (publisherCleanupFailure === "unlink") {
+          const originalUnlink = fsApi.unlink;
+          fsApi.unlink = async (path, ...args) => {
+            if (path === publisherOwnedPath) throw new Error("injected restore-active cleanup unlink failure");
+            return originalUnlink(path, ...args);
+          };
+        }
       }
       if (traceRestoreFs === true) {
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
