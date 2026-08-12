@@ -31,6 +31,17 @@ function lifecycleIntegrityError(message) {
   return new LifecycleIntegrityError(message);
 }
 
+class LifecyclePreflightError extends Error {
+  constructor(message) {
+    super(message);
+    Object.defineProperty(this, "code", { value: "ERR_PREFLIGHT", enumerable: false });
+  }
+}
+
+function lifecyclePreflightError(message) {
+  return new LifecyclePreflightError(message);
+}
+
 class RestoreLocationConflictError extends Error {
   constructor() {
     super("restore locations conflict with durable evidence");
@@ -422,26 +433,37 @@ function sameSnapshot(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function nativeExistingRunCapabilityMissing(input, callbackEntered, error) {
-  return input.fsApi === undefined && !callbackEntered &&
-    error instanceof Error && error.code === "ENOENT";
+function nativeExistingRunPreflightMissing(input, error) {
+  return input.fsApi === undefined && error?.code === "ERR_RUN_CAPABILITY_PREFLIGHT";
+}
+
+function nativeSelectedRunMissing(input, error) {
+  return input.fsApi === undefined && error?.code === "ERR_SELECTED_RUN_MISSING";
+}
+
+function nativeValidationEvidenceMissing(input, consumerCallbackEntered, error) {
+  return input.fsApi === undefined && !consumerCallbackEntered && error?.code === "ENOENT";
 }
 
 async function enterExistingRun(input, callback) {
   const recoveryValidation = Object.freeze({
     allowRestoreLocationConflict: isFixedRestoreRecoveryCallback(callback),
   });
-  const source = captureRunFsSource(input.fsApi);
-  let callbackEntered = false;
+  // Let the capability own the native default source.  A supplied adapter is
+  // still captured synchronously here, but preserving omission is necessary
+  // so its setup failures can never be mistaken for native evidence.
+  const source = input.fsApi === undefined ? undefined : captureRunFsSource(input.fsApi);
+  let consumerCallbackEntered = false;
   return withQuarantineRunCapability({
     repoRoot: input.repoRoot,
     quarantineRoot: input.quarantineRoot,
     transactionId: input.transactionId,
     writersStopped: true,
-    fsApi: source,
+    ...(source === undefined ? {} : { fsApi: source }),
   }, async (capability) => {
-    callbackEntered = true;
-    const fsApi = getRunFsContext(capability, source);
+    const fsApi = source === undefined
+      ? getRunFsContext(capability)
+      : getRunFsContext(capability, source);
     const validated = await validateExistingRun(capability, input, fsApi, recoveryValidation);
     // Re-read every mutable evidence boundary immediately before capability
     // handoff.  This is cooperative TOCTOU detection; all reads still use the
@@ -466,9 +488,14 @@ async function enterExistingRun(input, callback) {
       ["manifestGeneration", validated.manifestGeneration],
       ["fsApi", fsApi],
     ]);
+    consumerCallbackEntered = true;
     return callback(handoff);
   }).catch((error) => {
-    if (nativeExistingRunCapabilityMissing(input, callbackEntered, error)) {
+    if (nativeExistingRunPreflightMissing(input, error)) {
+      throw lifecyclePreflightError("repository or quarantine root is missing");
+    }
+    if (nativeSelectedRunMissing(input, error) ||
+        nativeValidationEvidenceMissing(input, consumerCallbackEntered, error)) {
       throw lifecycleIntegrityError("selected quarantine run evidence is missing");
     }
     throw error;

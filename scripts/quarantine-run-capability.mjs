@@ -36,6 +36,21 @@ const GENERATED_INVENTORY_PHASES = new Set([
   "validation-pass-2",
 ]);
 const BOUNDARIES = new Set(["before-mutation", "after-sync"]);
+
+// These setup codes are intentionally private to this module.  Lifecycle
+// entry needs to distinguish a caller's missing root (preflight) from the
+// selected durable run being absent (integrity), without treating adapter
+// errors as trusted filesystem evidence.
+class RunCapabilitySetupError extends Error {
+  constructor(code, message) {
+    super(message);
+    Object.defineProperty(this, "code", { value: code, enumerable: false });
+  }
+}
+
+function capabilitySetupMissing(code, message) {
+  return new RunCapabilitySetupError(code, message);
+}
 function assertPlainObject(value, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError(`${label} must be a plain object`);
@@ -472,8 +487,24 @@ export async function withQuarantineRunCapability(options, callback) {
   const capability = Object.freeze(Object.create(null));
   const fsApi = bindRunFsContext(capability, normalizedOptions.fsApi);
   try {
-    const repoStat = await fsApi.lstat(normalizedOptions.repoRoot);
-    const quarantineStat = await fsApi.lstat(normalizedOptions.quarantineRoot);
+    let repoStat;
+    try {
+      repoStat = await fsApi.lstat(normalizedOptions.repoRoot);
+    } catch (error) {
+      if (normalizedOptions.fsApi === undefined && isMissingPath(error)) {
+        throw capabilitySetupMissing("ERR_RUN_CAPABILITY_PREFLIGHT", "repository root is missing");
+      }
+      throw error;
+    }
+    let quarantineStat;
+    try {
+      quarantineStat = await fsApi.lstat(normalizedOptions.quarantineRoot);
+    } catch (error) {
+      if (normalizedOptions.fsApi === undefined && isMissingPath(error)) {
+        throw capabilitySetupMissing("ERR_RUN_CAPABILITY_PREFLIGHT", "quarantine root is missing");
+      }
+      throw error;
+    }
     assertDirectoryStat(repoStat, "repository root", false);
     assertDirectoryStat(quarantineStat, "quarantine root", true);
     const repoRealPath = await fsApi.realpath(normalizedOptions.repoRoot);
@@ -489,7 +520,15 @@ export async function withQuarantineRunCapability(options, callback) {
     }
 
     const runPath = join(quarantineRealPath, normalizedOptions.transactionId);
-    const runStat = await fsApi.lstat(runPath);
+    let runStat;
+    try {
+      runStat = await fsApi.lstat(runPath);
+    } catch (error) {
+      if (normalizedOptions.fsApi === undefined && isMissingPath(error)) {
+        throw capabilitySetupMissing("ERR_SELECTED_RUN_MISSING", "selected quarantine run is missing");
+      }
+      throw error;
+    }
     assertDirectoryStat(runStat, "quarantine run root", true);
     const runRealPath = await fsApi.realpath(runPath);
     if (

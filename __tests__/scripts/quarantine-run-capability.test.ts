@@ -191,6 +191,14 @@ async function run() {
   if (request.operation === "open") {
     return withQuarantineRunCapability(options(request.options), async () => "called");
   }
+  if (request.operation === "native-selected-run-missing") {
+    try {
+      await withQuarantineRunCapability(options(), async () => "called");
+    } catch (error) {
+      return { code: error?.code ?? null };
+    }
+    return { code: null };
+  }
   if (request.operation === "derive-many") {
     return withQuarantineRunCapability(options(), async (capability) =>
       request.requests.map((pathRequest) => deriveRunPath(capability, pathRequest))
@@ -1034,6 +1042,14 @@ describe("callback-scoped quarantine run capability", () => {
       "revalidateRunCapability",
       "withQuarantineRunCapability",
     ]);
+  });
+
+  it("signals a native missing selected run with its private setup code", () => {
+    rmSync(fixture.runRoot, { recursive: true, force: true });
+
+    expect(workerValue(invoke(fixture, { operation: "native-selected-run-missing" }))).toEqual({
+      code: "ERR_SELECTED_RUN_MISSING",
+    });
   });
 
   it.each([false, null, 1, "true"])(

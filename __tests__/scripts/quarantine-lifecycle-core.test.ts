@@ -95,6 +95,45 @@ describe("quarantine lifecycle core", () => {
     }
   });
 
+  it("classifies native selected-run disappearance during validation as integrity before consumer handoff", () => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    try {
+      const result = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+        import { createRequire, syncBuiltinESMExports } from "node:module";
+        import { rmSync } from "node:fs";
+        const require = createRequire(import.meta.url);
+        const fs = require("node:fs");
+        const runRoot = ${JSON.stringify(prepared.runRoot)};
+        const originalLstatSync = fs.lstatSync;
+        let removed = false;
+        fs.lstatSync = function(path, ...args) {
+          if (!removed && path === runRoot) {
+            removed = true;
+            rmSync(runRoot, { recursive: true, force: true });
+          }
+          return Reflect.apply(originalLstatSync, this, [path, ...args]);
+        };
+        syncBuiltinESMExports();
+        const { withExistingQuarantineRun } = await import(${JSON.stringify(coreUrl)});
+        let callbackInvoked = false;
+        let code = null;
+        try {
+          await withExistingQuarantineRun(${JSON.stringify({
+            repoRoot: prepared.fixture.repoRoot,
+            quarantineRoot: prepared.fixture.quarantineRoot,
+            transactionId: prepared.transactionId,
+            writersStopped: true,
+          })}, async () => { callbackInvoked = true; });
+        } catch (error) { code = error?.code ?? null; }
+        process.stdout.write(JSON.stringify({ callbackInvoked, code, removed }));
+      `], { encoding: "utf8" }));
+
+      expect(result).toEqual({ callbackInvoked: false, code: "ERR_INTEGRITY", removed: true });
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("publishes one immutable VALIDATED generation and reuses it on retry", () => {
     const prepared = prepareQuarantinedFixture();
     try {

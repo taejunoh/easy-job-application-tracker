@@ -122,6 +122,37 @@ describe("quarantine cleanup CLI", () => {
     );
   });
 
+  it.each([
+    ["restore", (fixture: ReturnType<typeof createQuarantineFixture>) => [
+      "restore", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot,
+      "--transaction-id", "missing-run", "--writers-stopped",
+    ]],
+    ["mark-validated", (fixture: ReturnType<typeof createQuarantineFixture>) => [
+      "mark-validated", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot,
+      "--transaction-id", "missing-run", "--writers-stopped",
+    ]],
+    ["recover", (fixture: ReturnType<typeof createQuarantineFixture>) => [
+      "recover", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot,
+      "--transaction-id", "missing-run", "--action", "resume", "--writers-stopped",
+    ]],
+  ])("classifies a missing %s root as preflight failure for %s", (command, argsFor) => {
+    for (const targetFor of [
+      (fixture: ReturnType<typeof createQuarantineFixture>) => fixture.repoRoot,
+      (fixture: ReturnType<typeof createQuarantineFixture>) => fixture.quarantineRoot,
+    ]) {
+      const fixture = createQuarantineFixture();
+      bases.push(fixture.base);
+      rmSync(targetFor(fixture), { recursive: true, force: true });
+
+      const result = run(argsFor(fixture));
+
+      expectSpawned(result);
+      expect(result.status).toBe(2);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(`{\"ok\":false,\"command\":\"${command}\",\"code\":\"ERR_PREFLIGHT\",\"message\":\"Workspace preflight failed.\"}\n`);
+    }
+  });
+
   it("flushes apply STARTING before an indeterminate journal append failure", () => {
     const fixture = createQuarantineFixture();
     bases.push(fixture.base);
