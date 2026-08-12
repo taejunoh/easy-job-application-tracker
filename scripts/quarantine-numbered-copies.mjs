@@ -141,8 +141,9 @@ async function dispatch(command) {
     let restoreResult;
     try {
       restoreResult = await recoverRestore(options);
-    } catch {
-      throw applyError;
+    } catch (restoreError) {
+      if (restoreError?.code === "ERR_RESTORE_RECOVERY_NOT_APPLICABLE") throw applyError;
+      throw restoreError;
     }
     return publicRecovery(restoreResult);
   }

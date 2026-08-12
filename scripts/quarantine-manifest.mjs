@@ -48,6 +48,17 @@ const ALL_ENTRY_KEYS = [...new Set([...SOURCE_ENTRY_KEYS, ...GENERATED_ENTRY_KEY
 const INVENTORY_KEYS = ["sha256", "entries", "bytes"];
 const POINTER_KEYS = ["schemaVersion", "transactionId", "manifestSha256"];
 
+class ManifestIntegrityError extends Error {
+  constructor() {
+    super("durable manifest evidence is invalid");
+    Object.defineProperty(this, "code", { value: "ERR_MANIFEST_INTEGRITY", enumerable: false });
+  }
+}
+
+function manifestIntegrityFailure() {
+  return new ManifestIntegrityError();
+}
+
 function isPlainObject(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -351,16 +362,16 @@ function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function assertOwnedRegularFile(stat, label) {
+function assertOwnedRegularFile(stat, label, invalidError = undefined) {
   if (stat.isSymbolicLink() || !stat.isFile()) {
-    throw new Error(`${label} must be a non-symlink regular file`);
+    throw invalidError?.() ?? new Error(`${label} must be a non-symlink regular file`);
   }
 }
 
-function assertRegularFile(stat, label) {
-  assertOwnedRegularFile(stat, label);
+function assertRegularFile(stat, label, invalidError = undefined) {
+  assertOwnedRegularFile(stat, label, invalidError);
   if ((stat.mode & 0o7777) !== 0o600) {
-    throw new Error(`${label} must have private mode 0600`);
+    throw invalidError?.() ?? new Error(`${label} must have private mode 0600`);
   }
 }
 
@@ -414,54 +425,54 @@ async function fsyncFile(path, fsApi) {
   return withHandle(handle, (opened) => opened.sync(), "file sync and close both failed");
 }
 
-async function readBoundedSnapshot(path, fsApi, maxBytes, label) {
+async function readBoundedSnapshot(path, fsApi, maxBytes, label, invalidError = undefined) {
   const before = await fsApi.lstat(path);
-  assertRegularFile(before, label);
-  if (before.size > maxBytes) throw new Error(`${label} is too large`);
+  assertRegularFile(before, label, invalidError);
+  if (before.size > maxBytes) throw invalidError?.() ?? new Error(`${label} is too large`);
   const handle = await fsApi.open(path, "r");
   return withHandle(handle, async (opened) => {
     const first = await opened.stat();
-    assertRegularFile(first, label);
+    assertRegularFile(first, label, invalidError);
     if (
       !sameIdentity(before, first) ||
       first.size !== before.size ||
       first.mode !== before.mode
     ) {
-      throw new Error(`${label} identity, size, or mode changed while being opened`);
+      throw invalidError?.() ?? new Error(`${label} identity, size, or mode changed while being opened`);
     }
-    if (first.size > maxBytes) throw new Error(`${label} is too large`);
+    if (first.size > maxBytes) throw invalidError?.() ?? new Error(`${label} is too large`);
     const bytes = Buffer.alloc(first.size);
     let offset = 0;
     while (offset < bytes.length) {
       const { bytesRead } = await opened.read(bytes, offset, bytes.length - offset, offset);
-      if (bytesRead === 0) throw new Error(`${label} ended before its recorded size`);
+      if (bytesRead === 0) throw invalidError?.() ?? new Error(`${label} ended before its recorded size`);
       offset += bytesRead;
     }
     const after = await opened.stat();
-    assertRegularFile(after, label);
+    assertRegularFile(after, label, invalidError);
     if (
       !sameIdentity(first, after) ||
       after.size !== first.size ||
       after.mode !== first.mode
     ) {
-      throw new Error(`${label} identity, size, or mode changed while being read`);
+      throw invalidError?.() ?? new Error(`${label} identity, size, or mode changed while being read`);
     }
     const finalPath = await fsApi.lstat(path);
-    assertRegularFile(finalPath, label);
+    assertRegularFile(finalPath, label, invalidError);
     if (
       !sameIdentity(before, finalPath) ||
       !sameIdentity(after, finalPath) ||
       finalPath.size !== first.size ||
       finalPath.mode !== first.mode
     ) {
-      throw new Error(`${label} pathname identity, size, or mode changed after being read`);
+      throw invalidError?.() ?? new Error(`${label} pathname identity, size, or mode changed after being read`);
     }
     return { bytes, identity: after };
   }, `${label} read and close both failed`);
 }
 
-async function readBoundedFile(path, fsApi, maxBytes, label) {
-  return (await readBoundedSnapshot(path, fsApi, maxBytes, label)).bytes;
+async function readBoundedFile(path, fsApi, maxBytes, label, invalidError = undefined) {
+  return (await readBoundedSnapshot(path, fsApi, maxBytes, label, invalidError)).bytes;
 }
 
 async function removeOwnedTemporary({
@@ -569,15 +580,27 @@ async function readManifestGenerationSnapshot({
     purpose: "manifest-generation",
     id: manifestSha256,
   });
-  const snapshot = await readBoundedSnapshot(path, fsApi, maxBytes, "manifest generation");
-  if (digestBytes(snapshot.bytes) !== manifestSha256) {
-    throw new Error("manifest generation content digest does not match its filename");
+  const snapshot = await readBoundedSnapshot(
+    path,
+    fsApi,
+    maxBytes,
+    "manifest generation",
+    manifestIntegrityFailure,
+  );
+  let manifest;
+  try {
+    if (digestBytes(snapshot.bytes) !== manifestSha256) {
+      throw manifestIntegrityFailure();
+    }
+    manifest = buildValidatedManifest(parseJson(snapshot.bytes, "manifest generation"));
+    if (!snapshot.bytes.equals(canonicalBytes(manifest))) {
+      throw manifestIntegrityFailure();
+    }
+    assertGenerationTransaction(path, manifest.transactionId);
+  } catch (error) {
+    if (error?.code === "ERR_MANIFEST_INTEGRITY") throw error;
+    throw manifestIntegrityFailure();
   }
-  const manifest = buildValidatedManifest(parseJson(snapshot.bytes, "manifest generation"));
-  if (!snapshot.bytes.equals(canonicalBytes(manifest))) {
-    throw new Error("manifest generation JSON is not canonical");
-  }
-  assertGenerationTransaction(path, manifest.transactionId);
   return {
     manifest,
     path,
@@ -938,15 +961,20 @@ export async function readCurrentManifestPointer(options) {
     4096,
   );
   const path = deriveRunPath(input.capability, { purpose: "current-pointer" });
-  const bytes = await readBoundedFile(path, fsApi, maxBytes, "current pointer");
-  const pointer = parsePointer(parseJson(bytes, "current pointer"));
-  if (!bytes.equals(canonicalBytes(pointer))) throw new Error("current pointer JSON is not canonical");
-  const generationPath = deriveRunPath(input.capability, {
-    purpose: "manifest-generation",
-    id: pointer.manifestSha256,
-  });
-  assertGenerationTransaction(generationPath, pointer.transactionId);
-  return pointer;
+  const bytes = await readBoundedFile(path, fsApi, maxBytes, "current pointer", manifestIntegrityFailure);
+  try {
+    const pointer = parsePointer(parseJson(bytes, "current pointer"));
+    if (!bytes.equals(canonicalBytes(pointer))) throw manifestIntegrityFailure();
+    const generationPath = deriveRunPath(input.capability, {
+      purpose: "manifest-generation",
+      id: pointer.manifestSha256,
+    });
+    assertGenerationTransaction(generationPath, pointer.transactionId);
+    return pointer;
+  } catch (error) {
+    if (error?.code === "ERR_MANIFEST_INTEGRITY") throw error;
+    throw manifestIntegrityFailure();
+  }
 }
 
 export async function readManifestGeneration(options) {

@@ -42,6 +42,10 @@ function restoreRecoveryRequired() {
   return new RestoreOperationError("ERR_RECOVERY_REQUIRED");
 }
 
+function restoreRecoveryNotApplicable() {
+  return new RestoreOperationError("ERR_RESTORE_RECOVERY_NOT_APPLICABLE");
+}
+
 function record(entries) {
   const value = Object.create(null);
   for (const [key, entry] of entries) {
@@ -129,7 +133,7 @@ function rollbackEntryPath(capability, restoreId, entryId) {
 async function captureAncestors(repoRoot, endpoint, fsApi) {
   const relativeEndpoint = relative(repoRoot, endpoint);
   if (relativeEndpoint === "" || relativeEndpoint === ".." || relativeEndpoint.startsWith(`..${sep}`)) {
-    throw new Error("restore endpoint escapes repository");
+    throw restoreIntegrityFailure();
   }
   const values = [];
   let current = repoRoot;
@@ -138,7 +142,7 @@ async function captureAncestors(repoRoot, endpoint, fsApi) {
     const stat = await fsApi.lstat(current);
     const realPath = await fsApi.realpath(current);
     if (stat.isSymbolicLink() || !stat.isDirectory() || realPath !== current) {
-      throw new Error("restore workspace ancestor is unsafe");
+      throw restoreIntegrityFailure();
     }
     values.push(Object.freeze({
       path: current, dev: stat.dev, ino: stat.ino, mode: stat.mode & 0o7777,
@@ -154,7 +158,7 @@ async function assertAncestors(ancestors, fsApi) {
     if (stat.isSymbolicLink() || !stat.isDirectory() || stat.dev !== expected.dev ||
         stat.ino !== expected.ino || (stat.mode & 0o7777) !== expected.mode ||
         await fsApi.realpath(expected.path) !== expected.path) {
-      throw new Error("restore workspace ancestor changed");
+      throw restoreIntegrityFailure();
     }
   }
 }
@@ -168,7 +172,7 @@ async function assertVerifiedDirectory(path, expected, fsApi, message) {
   const stat = await fsApi.lstat(path);
   if (!sameIdentity(expected, stat) || stat.isSymbolicLink() || !stat.isDirectory() ||
       await fsApi.realpath(path) !== expected.canonicalRealpath) {
-    throw new Error(message);
+    throw restoreIntegrityFailure();
   }
 }
 
@@ -180,7 +184,7 @@ async function assertVerifiedDirectoryChain(ancestorChain, fsApi) {
 
 function workspaceParentBinding(ancestors, path) {
   const index = ancestors.findIndex((ancestor) => ancestor.path === path);
-  if (index < 0) throw new Error("restore workspace parent identity is unavailable");
+  if (index < 0) throw restoreIntegrityFailure();
   return Object.freeze({
     expectedIdentity: ancestors[index],
     ancestorChain: Object.freeze(ancestors.slice(0, index)),
@@ -195,14 +199,14 @@ async function syncVerifiedDirectory(path, { fsApi, ancestorChain, expectedIdent
     handle = await fsApi.open(path, DIRECTORY_OPEN_FLAGS);
     const opened = await handle.stat();
     if (!sameIdentity(expectedIdentity, opened) || opened.isSymbolicLink() || !opened.isDirectory()) {
-      throw new Error("restore sync directory handle identity changed");
+      throw restoreIntegrityFailure();
     }
     await assertVerifiedDirectoryChain(ancestorChain, fsApi);
     await assertVerifiedDirectory(path, expectedIdentity, fsApi, "restore sync directory changed before sync");
     await handle.sync();
     const finalHandle = await handle.stat();
     if (!sameIdentity(opened, finalHandle) || finalHandle.isSymbolicLink() || !finalHandle.isDirectory()) {
-      throw new Error("restore sync directory handle changed");
+      throw restoreIntegrityFailure();
     }
     await assertVerifiedDirectoryChain(ancestorChain, fsApi);
     await assertVerifiedDirectory(path, expectedIdentity, fsApi, "restore sync directory changed after sync");
@@ -222,7 +226,7 @@ async function capturePrivateParent(path, fsApi) {
   const stat = await fsApi.lstat(path);
   const realPath = await fsApi.realpath(path);
   if (stat.isSymbolicLink() || !stat.isDirectory() || (stat.mode & 0o7777) !== 0o700 || realPath !== path) {
-    throw new Error("restore private parent is unsafe");
+    throw restoreIntegrityFailure();
   }
   return Object.freeze({
     path, dev: stat.dev, ino: stat.ino, mode: stat.mode & 0o7777,
@@ -234,7 +238,7 @@ async function assertPrivateParent(expected, fsApi) {
   const stat = await fsApi.lstat(expected.path);
   if (!sameIdentity(expected, stat) || stat.isSymbolicLink() || !stat.isDirectory() ||
       await fsApi.realpath(expected.path) !== expected.path) {
-    throw new Error("restore private parent changed");
+    throw restoreIntegrityFailure();
   }
 }
 
@@ -243,17 +247,17 @@ function privateParentChain(parent) {
 }
 
 async function assertMissing(path, fsApi) {
-  if (await optionalStat(path, fsApi) !== null) throw new Error("restore destination is not absent");
+  if (await optionalStat(path, fsApi) !== null) throw restoreIntegrityFailure();
 }
 
 async function captureVerifiedSyncIdentity(path, expected, fsApi) {
   const stat = await fsApi.lstat(path);
   if (!sameIdentity(expected, stat) || stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) {
-    throw new Error("restore sync root changed before held sync");
+    throw restoreIntegrityFailure();
   }
   if (stat.isFile()) return stat;
   const canonicalRealpath = await fsApi.realpath(path);
-  if (canonicalRealpath !== path) throw new Error("restore sync root is unsafe");
+  if (canonicalRealpath !== path) throw restoreIntegrityFailure();
   return Object.freeze({
     path, dev: stat.dev, ino: stat.ino, mode: stat.mode & 0o7777,
     type: "directory", canonicalRealpath,
@@ -273,9 +277,9 @@ async function guardedRestoreRename({
   await assertMissing(destination, fsApi);
   await fsApi.rename(source, destination);
   await revalidateRunCapability(capability, { ...pathRequest, boundary: "after-sync" });
-  if (await optionalStat(source, fsApi) !== null) throw new Error("restore rename source remains present");
+  if (await optionalStat(source, fsApi) !== null) throw restoreIntegrityFailure();
   const destinationStat = await fsApi.lstat(destination);
-  if (!sameIdentity(sourceStat, destinationStat)) throw new Error("restore rename destination changed");
+  if (!sameIdentity(sourceStat, destinationStat)) throw restoreIntegrityFailure();
   await after(destinationStat);
 }
 
@@ -296,7 +300,13 @@ async function assertPayload(capability, entry, path, fsApi, ancestorChain = Obj
     if (hash.sha256 !== entry.sha256 || hash.bytes !== entry.size) throw restoreIntegrityFailure();
     return;
   }
-  const observed = await summarizeInventoryDirectory(path, { fsApi, ancestorChain });
+  let observed;
+  try {
+    observed = await summarizeInventoryDirectory(path, { fsApi, ancestorChain });
+  } catch (error) {
+    if (error?.code === "ENOENT") throw restoreIntegrityFailure();
+    throw error;
+  }
   if (!sameSummary(entry.preMoveInventory, observed)) throw restoreIntegrityFailure();
 }
 
@@ -312,14 +322,14 @@ async function assertRestoredEndpoint(entry, path, fsApi, ancestors) {
   if (entry.kind === "source-copy") {
     const stat = await fsApi.lstat(path);
     if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o7777) !== entry.mode || stat.size !== entry.size) {
-      throw new Error("restored source endpoint is invalid");
+      throw restoreIntegrityFailure();
     }
     const hash = await hashVerifiedRegularFile(path, stat, fsApi, ancestors);
-    if (hash.sha256 !== entry.sha256 || hash.bytes !== entry.size) throw new Error("restored source endpoint changed");
+    if (hash.sha256 !== entry.sha256 || hash.bytes !== entry.size) throw restoreIntegrityFailure();
     return;
   }
   const observed = await summarizeInventoryDirectory(path, { fsApi, ancestorChain: ancestors });
-  if (!sameSummary(entry.preMoveInventory, observed)) throw new Error("restored generated endpoint changed");
+  if (!sameSummary(entry.preMoveInventory, observed)) throw restoreIntegrityFailure();
 }
 
 async function append(heldLock, capability, event, payload) {
@@ -334,7 +344,7 @@ async function captureActiveGenerated(handoff, faultHook, publications, { replac
   const active = [];
   for (const id of GENERATED_IDS) {
     const entry = handoff.manifestGeneration.manifest.entries.find((candidate) => candidate.id === id);
-    if (entry === undefined || entry.kind !== "generated-root") throw new Error("generated manifest entries are invalid");
+    if (entry === undefined || entry.kind !== "generated-root") throw restoreIntegrityFailure();
     const root = workspacePath(handoff.repoRoot, entry);
     const ancestors = await captureAncestors(handoff.repoRoot, root, handoff.fsApi);
     const stat = await optionalStat(root, handoff.fsApi);
@@ -343,7 +353,7 @@ async function captureActiveGenerated(handoff, faultHook, publications, { replac
       await invokeHook(faultHook, `after-inventory:restore-active:${id}`);
       continue;
     }
-    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("active generated root is unsafe");
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw restoreIntegrityFailure();
     // Inventory publication is capability-owned. The read-only summary is the
     // held-reader validation of the active endpoint and ancestor chain.
     const heldSnapshot = await summarizeInventoryDirectory(root, {
@@ -373,18 +383,18 @@ async function assertActiveStable(handoff, active) {
     const entry = handoff.manifestGeneration.manifest.entries.find((candidate) => candidate.id === captured.id);
     const root = workspacePath(handoff.repoRoot, entry);
     const metadata = activeMetadata.get(captured);
-    if (metadata === undefined) throw new Error("restore active evidence metadata is unavailable");
+    if (metadata === undefined) throw restoreIntegrityFailure();
     const ancestors = metadata.ancestors;
     await assertAncestors(ancestors, handoff.fsApi);
     const stat = await optionalStat(root, handoff.fsApi);
     if (captured.inventory === null) {
-      if (stat !== null) throw new Error("absent active generated root appeared during restore preparation");
+      if (stat !== null) throw restoreIntegrityFailure();
       continue;
     }
     if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) {
-      throw new Error("active generated root disappeared during restore preparation");
+      throw restoreIntegrityFailure();
     }
-    if (metadata.rootIdentity === null) throw new Error("active generated root identity is unavailable");
+    if (metadata.rootIdentity === null) throw restoreIntegrityFailure();
     await assertVerifiedDirectory(root, metadata.rootIdentity, handoff.fsApi, "active generated root changed during restore preparation");
     const observed = await summarizeInventoryDirectory(root, {
       fsApi: handoff.fsApi,
@@ -392,7 +402,7 @@ async function assertActiveStable(handoff, active) {
       expectedRootIdentity: metadata.rootIdentity,
     });
     await assertVerifiedDirectory(root, metadata.rootIdentity, handoff.fsApi, "active generated root changed during restore preparation");
-    if (!sameSummary(captured.inventory, observed)) throw new Error("active generated root changed during restore preparation");
+    if (!sameSummary(captured.inventory, observed)) throw restoreIntegrityFailure();
   }
 }
 
@@ -435,7 +445,7 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
     await invokeHook(faultHook, `after-restore-source-parent-sync:${entry.id}`);
   } else {
     const captured = activeGenerated.find((candidate) => candidate.id === entry.id);
-    if (captured === undefined) throw new Error("missing active generated evidence");
+    if (captured === undefined) throw restoreIntegrityFailure();
     if (captured.inventory !== null) {
       const rollbackRoot = deriveRunPath(handoff.capability, { purpose: "rollback", id: restoreId });
       await fsApi.mkdir(rollbackRoot, { recursive: true, mode: 0o700 });
@@ -450,9 +460,9 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
           await assertAncestors(ancestors, fsApi);
           await assertPrivateParent(rollbackParent, fsApi);
           const stat = await optionalStat(active, fsApi);
-          if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("active generated root disappeared during restore");
+          if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) throw restoreIntegrityFailure();
           const observed = await summarizeInventoryDirectory(active, { fsApi, ancestorChain: ancestors });
-          if (!sameSummary(captured.inventory, observed)) throw new Error("active generated root changed during restore");
+          if (!sameSummary(captured.inventory, observed)) throw restoreIntegrityFailure();
         },
         after: async (destinationStat) => {
           rollbackIdentity = await captureVerifiedSyncIdentity(rollback, destinationStat, fsApi);
@@ -461,7 +471,7 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
             fsApi, ancestorChain: privateParentChain(rollbackParent),
           });
           await assertPrivateParent(rollbackParent, fsApi);
-          if (!sameSummary(captured.inventory, observed)) throw new Error("rollback generated root changed");
+          if (!sameSummary(captured.inventory, observed)) throw restoreIntegrityFailure();
         },
       });
       await invokeHook(faultHook, `after-active-to-rollback-rename:${entry.id}`);
@@ -572,11 +582,11 @@ async function moveRecoveryEndpoint({ handoff, entry, source, destination, sourc
       if (destinationAncestors !== undefined) await assertAncestors(destinationAncestors, fsApi);
       if (sourceExpected === "original") {
         if (entry.kind === "source-copy") {
-          if (!await sourceMatches(source, entry, fsApi, sourceAncestors ?? Object.freeze([]))) throw new Error("restore recovery original changed");
-        } else if (!await treeMatches(source, entry.preMoveInventory, fsApi, sourceAncestors ?? Object.freeze([]))) throw new Error("restore recovery original changed");
+          if (!await sourceMatches(source, entry, fsApi, sourceAncestors ?? Object.freeze([]))) throw restoreIntegrityFailure();
+        } else if (!await treeMatches(source, entry.preMoveInventory, fsApi, sourceAncestors ?? Object.freeze([]))) throw restoreIntegrityFailure();
       } else if (sourceExpected === "generated" &&
           !await treeMatches(source, sourceInventory, fsApi, sourceAncestors ?? Object.freeze([]))) {
-        throw new Error("restore recovery regenerated tree changed");
+        throw restoreIntegrityFailure();
       }
     },
     after: async (stat) => { identity = await captureVerifiedSyncIdentity(destination, stat, fsApi); },
@@ -650,7 +660,7 @@ async function rollbackRecoveryEntry({ handoff, heldLock, ledger, entry, state, 
     await guardedRestoreRename({ capability: handoff.capability, pathRequest: { purpose: "rollback-entry", id: ledger.restoreId, phase: entry.id }, source: rollback, destination: active, fsApi,
       before: async () => {
         await assertPrivateParent(rollbackIdentity, fsApi);
-        if (!await treeMatches(rollback, ledger.active.get(entry.id), fsApi, privateParentChain(rollbackIdentity))) throw new Error("restore recovery regenerated rollback changed");
+        if (!await treeMatches(rollback, ledger.active.get(entry.id), fsApi, privateParentChain(rollbackIdentity))) throw restoreIntegrityFailure();
         await assertAncestors(ancestors, fsApi);
       }, after: async (stat) => { identity = await captureVerifiedSyncIdentity(active, stat, fsApi); },
     });
@@ -684,7 +694,7 @@ export async function restoreQuarantine(input) {
       const replayed = await replayJournal({ capability: handoff.capability });
       const tip = replayed.records.at(-1);
       if (replayed.state !== handoff.journalTip.state || tip?.recordHash !== handoff.journalTip.recordHash) {
-        throw new Error("restore journal changed before mutation");
+        throw restoreIntegrityFailure();
       }
       const publications = [];
       let activeGenerated;
@@ -725,10 +735,10 @@ export async function recoverRestore(input) {
 async function recoverRestoreWithHandoff(options, handoff) {
   return withJournalLock({ capability: handoff.capability }, async (heldLock) => {
     const replayed = await replayJournal({ capability: handoff.capability });
-    if (replayed.truncatedTail) throw new Error("restore recovery journal has a torn tail");
+    if (replayed.truncatedTail) throw restoreIntegrityFailure();
     const tip = replayed.records.at(-1);
     if (tip?.recordHash !== handoff.journalTip.recordHash || replayed.state !== handoff.journalTip.state) {
-      throw new Error("restore journal changed before recovery mutation");
+      throw restoreIntegrityFailure();
     }
     const ledger = buildRestoreLedger(replayed, handoff.manifestGeneration.manifest);
     const restoreId = ledger.restoreId;
@@ -736,9 +746,9 @@ async function recoverRestoreWithHandoff(options, handoff) {
       const conflict = replayed.records.at(-1)?.payload.conflictEntryIds;
       return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "INCOMPLETE_CONFLICT"], ["action", options.action], ["conflictEntryIds", Object.freeze([...conflict])]]);
     }
-    if (replayed.state === "RESTORED") throw new Error("completed restore cannot be undone");
+    if (replayed.state === "RESTORED") throw restoreRecoveryNotApplicable();
     if (!new Set(["RESTORE_PREPARED", "RESTORING", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK"]).has(replayed.state)) {
-      throw new Error("restore recovery requires an in-progress restore");
+      throw restoreRecoveryNotApplicable();
     }
     const entries = handoff.manifestGeneration.manifest.entries;
     const { intents, completed, rollbackCompleted } = ledger;
@@ -749,7 +759,7 @@ async function recoverRestoreWithHandoff(options, handoff) {
       inspected.push(await classifyRecoveryEntry({ handoff, ledger, entry }));
     }
     const missing = inspected.filter((entry) => entry.state === "missing");
-    if (missing.length > 0) throw new Error("restore recovery evidence is missing");
+    if (missing.length > 0) throw restoreIntegrityFailure();
     // A completed forward entry is required to remain final before a resume
     // can terminally claim RESTORED.  During rollback, however, those same
     // entries are intentionally moved back through staged/initial states;
@@ -767,7 +777,7 @@ async function recoverRestoreWithHandoff(options, handoff) {
       return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "INCOMPLETE_CONFLICT"], ["action", options.action], ["conflictEntryIds", Object.freeze(conflicts)]]);
     }
     if (options.action === "resume") {
-      if (replayed.state === "RESTORE_ROLLING_BACK") throw new Error("restore rollback is already in progress");
+      if (replayed.state === "RESTORE_ROLLING_BACK") throw restoreRecoveryRequired();
       if (replayed.state !== "RECOVERY_REQUIRED") {
         await append(heldLock, handoff.capability, "RECOVERY_REQUIRED", { entryIds: Object.freeze(intents) });
         await invokeHook(options.faultHook, "after-event:RECOVERY_REQUIRED");

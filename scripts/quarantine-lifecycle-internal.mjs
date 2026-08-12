@@ -282,6 +282,9 @@ async function readPointer(capability) {
     return await readCurrentManifestPointer({ capability });
   } catch (error) {
     if (error?.code === "ENOENT") return null;
+    if (error?.code === "ERR_MANIFEST_INTEGRITY") {
+      throw lifecycleIntegrityError("current manifest pointer is invalid");
+    }
     throw error;
   }
 }
@@ -291,8 +294,11 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
   let replayed;
   try {
     replayed = await replayJournal({ capability });
-  } catch {
-    throw lifecycleIntegrityError("existing quarantine journal cannot be replayed");
+  } catch (error) {
+    if (error?.code === "ERR_JOURNAL_INTEGRITY") {
+      throw lifecycleIntegrityError("existing quarantine journal cannot be replayed");
+    }
+    throw error;
   }
   if (replayed.truncatedTail) {
     throw lifecycleIntegrityError("existing quarantine journal has a torn tail");
@@ -315,7 +321,15 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
     : undefined;
   if (validated && validatedRecord === undefined) throw lifecycleIntegrityError("VALIDATED provenance is missing");
   const manifestSha256 = validated ? validatedRecord.payload.manifestSha256 : prepared.payload.manifestSha256;
-  const manifest = await readManifestGeneration({ capability, manifestSha256 });
+  let manifest;
+  try {
+    manifest = await readManifestGeneration({ capability, manifestSha256 });
+  } catch (error) {
+    if (error?.code === "ERR_MANIFEST_INTEGRITY") {
+      throw lifecycleIntegrityError("quarantine manifest evidence is invalid");
+    }
+    throw error;
+  }
   const expectedManifestState = validated ? "VALIDATED" : "PREPARED";
   if (
     manifest.transactionId !== options.transactionId ||

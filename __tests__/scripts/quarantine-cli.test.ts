@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 
@@ -27,6 +27,22 @@ function run(args: string[]) {
 function expectSpawned(result: ReturnType<typeof run>) {
   expect(result.error).toBeUndefined();
   expect(result.signal).toBeNull();
+}
+
+async function spawnLifecycleChildBounded(
+  ...args: Parameters<typeof spawnLifecycleChild>
+): Promise<Awaited<ReturnType<typeof spawnLifecycleChild>>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      spawnLifecycleChild(...args),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("lifecycle child exceeded 15 seconds")), 15_000);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function inspectArgs(fixture: ReturnType<typeof createQuarantineFixture>) {
@@ -187,6 +203,47 @@ describe("quarantine cleanup CLI", () => {
     expect(result.stderr).toBe("{\"ok\":false,\"command\":\"apply\",\"code\":\"ERR_INTERNAL\",\"message\":\"Unexpected quarantine failure.\"}\n");
   });
 
+  it("does not convert an unknown restore-recovery exception into apply integrity", () => {
+    const fixture = createQuarantineFixture();
+    bases.push(fixture.base);
+    const mockPath = join(fixture.base, "cli-recovery-facade.mjs");
+    const loaderPath = join(fixture.base, "cli-recovery-loader.mjs");
+    const mockUrl = pathToFileURL(mockPath).href;
+    writeFileSync(mockPath, `
+      export async function recoverQuarantine() { throw Object.freeze({ code: "ERR_INTEGRITY" }); }
+      export async function recoverRestore() { throw new Error("unexpected recovery fault"); }
+      export async function inspectWorkspace() { throw new Error("unused"); }
+      export async function quarantineWorkspace() { throw new Error("unused"); }
+      export async function markQuarantineValidated() { throw new Error("unused"); }
+      export async function restoreQuarantine() { throw new Error("unused"); }
+    `);
+    writeFileSync(loaderPath, `
+      const mockUrl = ${JSON.stringify(mockUrl)};
+      export async function resolve(specifier, context, nextResolve) {
+        if (specifier === "./quarantine-numbered-copies-support.mjs") return { url: mockUrl, shortCircuit: true };
+        return nextResolve(specifier, context);
+      }
+    `);
+    const registerLoader = `data:text/javascript,${encodeURIComponent(`
+      import { register } from "node:module";
+      import { pathToFileURL } from "node:url";
+      register(${JSON.stringify(loaderPath)}, pathToFileURL("./"));
+    `)}`;
+    const result = spawnSync(process.execPath, [
+      "--import", registerLoader, "scripts/quarantine-numbered-copies.mjs",
+      "recover", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot,
+      "--transaction-id", "tx-0001", "--action", "resume", "--writers-stopped",
+    ], {
+      cwd: join(__dirname, "../.."), encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"recover\",\"code\":\"ERR_INTERNAL\",\"message\":\"Unexpected quarantine failure.\"}\n");
+  });
+
   it("runs restore through its canonical npm form", () => {
     const prepared = prepareQuarantinedFixture();
     bases.push(prepared.fixture.base);
@@ -236,7 +293,7 @@ describe("quarantine cleanup CLI", () => {
       repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
       transactionId: prepared.transactionId, writersStopped: true,
     };
-    expect((await spawnLifecycleChild("restoreQuarantine", options, {
+    expect((await spawnLifecycleChildBounded("restoreQuarantine", options, {
       killAt: "after-event:RESTORE_PREPARED",
     })).signal).toBe("SIGKILL");
     rmSync(join(prepared.runRoot, "journal.lock"));
@@ -263,7 +320,7 @@ describe("quarantine cleanup CLI", () => {
       repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
       transactionId: prepared.transactionId, writersStopped: true,
     };
-    expect((await spawnLifecycleChild("restoreQuarantine", options, {
+    expect((await spawnLifecycleChildBounded("restoreQuarantine", options, {
       killAt: "after-event:RESTORE_INTENT:copy-0001",
     })).signal).toBe("SIGKILL");
     rmSync(join(prepared.runRoot, "journal.lock"));
@@ -301,10 +358,106 @@ describe("quarantine cleanup CLI", () => {
     expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
+  it.each([
+    ["missing generated payload", (prepared: ReturnType<typeof prepareQuarantinedFixture>) => rmSync(join(prepared.runRoot, "payload", "generated", ".next"), { recursive: true })],
+    ["tampered generated payload", (prepared: ReturnType<typeof prepareQuarantinedFixture>) => writeFileSync(join(prepared.runRoot, "payload", "generated", ".next", "build"), "tampered\n")],
+  ])("classifies restore %s as integrity failure", (_caseName, mutate) => {
+    const prepared = prepareQuarantinedFixture();
+    bases.push(prepared.fixture.base);
+    mutate(prepared);
+
+    const result = run([
+      "restore", "--repo-root", prepared.fixture.repoRoot, "--quarantine-root", prepared.fixture.quarantineRoot,
+      "--transaction-id", prepared.transactionId, "--writers-stopped",
+    ]);
+
+    expectSpawned(result);
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+  });
+
   it("classifies tampered lifecycle evidence as integrity failure", () => {
     const prepared = prepareQuarantinedFixture();
     bases.push(prepared.fixture.base);
     writeFileSync(join(prepared.runRoot, "journal.log"), "tampered");
+
+    const result = run([
+      "restore", "--repo-root", prepared.fixture.repoRoot, "--quarantine-root", prepared.fixture.quarantineRoot,
+      "--transaction-id", prepared.transactionId, "--writers-stopped",
+    ]);
+
+    expectSpawned(result);
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+  });
+
+  it("keeps an injected journal adapter exception internal", () => {
+    const prepared = prepareQuarantinedFixture();
+    bases.push(prepared.fixture.base);
+    const restoreUrl = pathToFileURL(join(__dirname, "../../scripts/quarantine-restore.mjs")).href;
+    const script = `
+      import { restoreQuarantine } from ${JSON.stringify(restoreUrl)};
+      import * as promises from "node:fs/promises";
+      import { createReadStream, lstatSync, realpathSync } from "node:fs";
+      const fsApi = { ...promises, createReadStream, lstatSync, realpathSync };
+      const open = fsApi.open;
+      fsApi.open = async (path, ...args) => {
+        if (path.endsWith("/journal.log")) throw new Error("injected adapter fault");
+        return open(path, ...args);
+      };
+      try {
+        await restoreQuarantine({ ...${JSON.stringify({
+          repoRoot: prepared.fixture.repoRoot,
+          quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId,
+          writersStopped: true,
+        })}, fsApi });
+      } catch (error) {
+        process.stdout.write(JSON.stringify({ code: error?.code ?? null }) + "\\n");
+      }
+    `;
+
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      cwd: join(__dirname, "../.."), encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toBe("{\"code\":null}\n");
+  });
+
+  it("classifies malformed manifest evidence as integrity failure", () => {
+    const prepared = prepareQuarantinedFixture();
+    bases.push(prepared.fixture.base);
+    const [manifest] = readdirSync(join(prepared.runRoot, "manifests"));
+    writeFileSync(join(prepared.runRoot, "manifests", manifest), "malformed");
+
+    const result = run([
+      "restore", "--repo-root", prepared.fixture.repoRoot, "--quarantine-root", prepared.fixture.quarantineRoot,
+      "--transaction-id", prepared.transactionId, "--writers-stopped",
+    ]);
+
+    expectSpawned(result);
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+  });
+
+  it("classifies malformed current-pointer evidence as integrity failure", () => {
+    const prepared = prepareQuarantinedFixture();
+    bases.push(prepared.fixture.base);
+    const marked = run([
+      "mark-validated", "--repo-root", prepared.fixture.repoRoot,
+      "--quarantine-root", prepared.fixture.quarantineRoot,
+      "--transaction-id", prepared.transactionId, "--writers-stopped",
+    ]);
+    expectSpawned(marked);
+    expect(marked.status).toBe(0);
+    writeFileSync(join(prepared.fixture.quarantineRoot, "current"), "malformed");
 
     const result = run([
       "restore", "--repo-root", prepared.fixture.repoRoot, "--quarantine-root", prepared.fixture.quarantineRoot,
@@ -324,7 +477,7 @@ describe("quarantine cleanup CLI", () => {
       repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
       transactionId: prepared.transactionId, writersStopped: true,
     };
-    expect((await spawnLifecycleChild("restoreQuarantine", options, {
+    expect((await spawnLifecycleChildBounded("restoreQuarantine", options, {
       killAt: "after-event:RESTORE_PREPARED",
     })).signal).toBe("SIGKILL");
     rmSync(join(prepared.runRoot, "journal.lock"));
@@ -347,7 +500,7 @@ describe("quarantine cleanup CLI", () => {
       repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
       transactionId: prepared.transactionId, writersStopped: true,
     };
-    expect((await spawnLifecycleChild("restoreQuarantine", options, {
+    expect((await spawnLifecycleChildBounded("restoreQuarantine", options, {
       killAt: "after-event:RESTORE_PREPARED",
     })).signal).toBe("SIGKILL");
     rmSync(join(prepared.runRoot, "journal.lock"));
