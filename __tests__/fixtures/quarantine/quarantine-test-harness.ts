@@ -521,6 +521,7 @@ try {
     const { stopPhase, interloperAtFinalPrecheck, finalPresenceDrift, ancestorExchangeAt, ...restoreRequest } = request;
     const phases = [];
     let finalPrecheckTargetReads = 0;
+    let finalInterloperPath;
     try {
       let armed = false;
       let inserted = false;
@@ -545,7 +546,7 @@ try {
           return originalOpen(path, ...args);
         };
       }
-      if (interloperAtFinalPrecheck === "source-active" || interloperAtFinalPrecheck === "generated-active") {
+      if (["source-active", "generated-active", "generated-rollback"].includes(interloperAtFinalPrecheck)) {
         const target = join(request.repoRoot, interloperAtFinalPrecheck === "source-active" ? "notes 2.txt" : ".next");
         fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
         const originalLstat = fsApi.lstat;
@@ -556,6 +557,14 @@ try {
           return result;
         };
         fsApi.lstat = async (path) => {
+          if (interloperAtFinalPrecheck === "generated-rollback" && !inserted && typeof path === "string" &&
+              path.includes("/rollback/") && path.endsWith("/generated-next")) {
+            inserted = true;
+            finalPrecheckTargetReads += 1;
+            finalInterloperPath = join(path, "foreign");
+            mkdirSync(path, { recursive: true, mode: 0o700 });
+            writeFileSync(finalInterloperPath, "foreign interloper\\n");
+          }
           const ready = interloperAtFinalPrecheck === "source-active" ? armed : generatedMoved;
           if (ready && path === target) finalPrecheckTargetReads += 1;
           if (ready && !inserted && path === target) {
@@ -594,9 +603,9 @@ try {
           if (phase === stopPhase) throw new RangeError("stop at requested restore phase");
         },
       });
-      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads }));
+      process.stdout.write(JSON.stringify({ ok: true, result, phases, finalPrecheckTargetReads, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath) }));
     } catch (error) {
-      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, error: errorShape(error) }));
+      process.stdout.write(JSON.stringify({ ok: false, phases, finalPrecheckTargetReads, rollbackInterloperPreserved: finalInterloperPath !== undefined && existsSync(finalInterloperPath), error: errorShape(error) }));
     }
   } else if (operation === "restore-authority-seam") {
     const { target, ...restoreRequest } = request;

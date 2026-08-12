@@ -412,6 +412,22 @@ describe("quarantine restore", () => {
     }
   });
 
+  it("preserves a generated interloper observed at the final active-to-rollback destination precheck", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true, interloperAtFinalPrecheck: "generated-rollback",
+      });
+      expect(result.ok).toBe(false);
+      expect((result as unknown as { finalPrecheckTargetReads: number }).finalPrecheckTargetReads).toBe(1);
+      expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_INTENT");
+      expect((result as unknown as { rollbackInterloperPreserved: boolean }).rollbackInterloperPreserved).toBe(true);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a byte-identical foreign repository ancestor exchanged after active inventory publication", () => {
     const prepared = prepareQuarantinedFixture();
     try {
