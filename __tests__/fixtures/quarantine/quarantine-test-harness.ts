@@ -436,24 +436,33 @@ function errorShape(error) {
 
 function treeSnapshot(root) {
   const records = [];
-  const visit = (path, relative) => {
+  const visit = (path, components) => {
     let stat;
     try { stat = lstatSync(path); } catch (error) {
-      if (error?.code === "ENOENT") { records.push([relative, "absent"]); return; }
+      if (error?.code === "ENOENT") { records.push([components, "absent"]); return; }
       throw error;
     }
     const mode = stat.mode & 0o7777;
-    if (stat.isSymbolicLink()) records.push([relative, "symlink", mode, readlinkSync(path)]);
-    else if (stat.isFile()) records.push([relative, "file", mode, stat.size, createHash("sha256").update(readFileSync(path)).digest("hex")]);
+    if (stat.isSymbolicLink()) records.push([components, "symlink", mode, readlinkSync(path, "buffer").toString("base64")]);
+    else if (stat.isFile()) records.push([components, "file", mode, stat.size, createHash("sha256").update(readFileSync(path)).digest("hex")]);
     else if (stat.isDirectory()) {
-      records.push([relative, "directory", mode]);
-      for (const name of readdirSync(path).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-        visit(join(path, name), relative === "" ? name : relative + "/" + name);
+      records.push([components, "directory", mode]);
+      for (const name of readdirSync(path, { encoding: "buffer" }).sort(Buffer.compare)) {
+        const parent = Buffer.isBuffer(path) ? path : Buffer.from(path);
+        visit(Buffer.concat([parent, Buffer.from("/"), name]), [...components, name.toString("base64")]);
       }
-    } else records.push([relative, "other", mode]);
+    } else records.push([components, "other", mode]);
   };
-  visit(root, "");
+  visit(root, []);
   return JSON.stringify(records);
+}
+
+function restoreEvidenceSnapshot({ runRoot, pointer, endpointPaths }) {
+  return JSON.stringify([
+    ["run", treeSnapshot(runRoot)],
+    ["pointer", treeSnapshot(pointer)],
+    ["endpoints", Object.entries(endpointPaths).map(([key, value]) => [key, treeSnapshot(value)])],
+  ]);
 }
 
 try {
@@ -684,7 +693,11 @@ try {
       };
       const manifestPath = join(request.quarantineRoot, request.transactionId, "manifests", readdirSync(join(request.quarantineRoot, request.transactionId, "manifests"))[0]);
       const manifestOrder = JSON.parse(readFileSync(manifestPath, "utf8")).entries.map((entry) => entry.id);
-      endpointPaths = { ...payload, ...workspace, ...rollback };
+      endpointPaths = Object.fromEntries([
+        ...Object.entries(payload).map(([id, path]) => ["P:" + id, path]),
+        ...Object.entries(workspace).map(([id, path]) => ["A:" + id, path]),
+        ...Object.entries(rollback).map(([id, path]) => ["R:" + id, path]),
+      ]);
       for (const id of generated) rmSync(workspace[id], { recursive: true, force: true });
       const active = !String(row).startsWith("no-active") && !String(row).startsWith("source");
       const activeGenerated = [];
@@ -797,7 +810,11 @@ try {
       const pointer = join(request.quarantineRoot, "current");
       beforePointer = existsSync(pointer) ? readFileSync(pointer) : null;
       beforeEndpoints = JSON.stringify(Object.fromEntries(Object.entries(endpointPaths).map(([key, value]) => [key, existsSync(value) ? lstatSync(value).ino : null])));
-      beforeEvidence = treeSnapshot(join(request.quarantineRoot, request.transactionId));
+      beforeEvidence = restoreEvidenceSnapshot({
+        runRoot: join(request.quarantineRoot, request.transactionId),
+        pointer,
+        endpointPaths,
+      });
     });
     let error;
     let externalReads = 0;
@@ -847,7 +864,7 @@ try {
       durableStable: Buffer.compare(beforeJournal, afterJournal) === 0 &&
         ((beforePointer === null && afterPointer === null) || (beforePointer !== null && afterPointer !== null && Buffer.compare(beforePointer, afterPointer) === 0)),
       endpointsStable: beforeEndpoints === afterEndpoints,
-      evidenceStable: beforeEvidence === treeSnapshot(runRoot),
+      evidenceStable: beforeEvidence === restoreEvidenceSnapshot({ runRoot, pointer, endpointPaths }),
       externalReads,
       foreignIntact: foreignSentinel === undefined || readFileSync(foreignSentinel, "utf8") === "foreign",
       error: error === undefined ? undefined : errorShape(error),
