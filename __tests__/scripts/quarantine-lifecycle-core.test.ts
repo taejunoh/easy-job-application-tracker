@@ -273,6 +273,21 @@ describe("quarantine lifecycle core", () => {
     }
   });
 
+  it("rejects journal evidence changed between initial validation and callback handoff", () => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    try {
+      const result = invokeQuarantineWorker("core-contract", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        mutateJournalBeforeCallback: true,
+      }) as unknown as { ok: boolean; callbackInvoked: number };
+      expect(result).toMatchObject({ ok: false, callbackInvoked: 0 });
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it.each(["RESTORE_PREPARED", "RESTORING", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK"])(
     "accepts durable QUARANTINED provenance through %s restore context",
     (restoreState) => {

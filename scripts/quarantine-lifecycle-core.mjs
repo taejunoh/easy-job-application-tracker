@@ -151,6 +151,39 @@ function restoreProvenance(replayed) {
   return { active: restoreActive, state: restored };
 }
 
+function validateRestoreLedger(replayed, manifest) {
+  const preparedIndex = replayed.records.findLastIndex((record) => record.event === "RESTORE_PREPARED");
+  if (preparedIndex < 0) throw new Error("restore lifecycle provenance is missing");
+  const prepared = replayed.records[preparedIndex];
+  if (typeof prepared.payload.restoreId !== "string" || !prepared.payload.restoreId.startsWith("restore-")) {
+    throw new Error("restore lifecycle ID is invalid");
+  }
+  const active = prepared.payload.activeGenerated;
+  const generatedIds = manifest.entries
+    .filter((entry) => entry.kind === "generated-root")
+    .map((entry) => entry.id);
+  if (
+    !Array.isArray(active) || active.length !== generatedIds.length ||
+    active.some((entry, index) => entry.id !== generatedIds[index])
+  ) {
+    throw new Error("restore active-generated provenance does not match the manifest");
+  }
+  const orderedIds = manifest.entries.map((entry) => entry.id);
+  const intents = replayed.records.slice(preparedIndex + 1)
+    .filter((record) => record.event === "RESTORE_INTENT")
+    .map((record) => record.payload.id);
+  if (intents.some((id, index) => id !== orderedIds[index])) {
+    throw new Error("restore intent order does not match manifest provenance");
+  }
+  const rollbackIntents = replayed.records.slice(preparedIndex + 1)
+    .filter((record) => record.event === "RESTORE_ROLLBACK_INTENT")
+    .map((record) => record.payload.id);
+  const expectedRollback = [...intents].reverse();
+  if (rollbackIntents.some((id, index) => id !== expectedRollback[index])) {
+    throw new Error("restore rollback intent order does not match restore provenance");
+  }
+}
+
 async function readPointer(capability) {
   try {
     return await readCurrentManifestPointer({ capability });
@@ -194,6 +227,7 @@ async function validateExistingRun(capability, options, fsApi) {
   ) {
     throw new Error("quarantine lifecycle provenance does not match the live repository");
   }
+  if (restoreContext) validateRestoreLedger(replayed, manifest);
 
   const pointer = await readPointer(capability);
   if (!validated && pointer !== null) {

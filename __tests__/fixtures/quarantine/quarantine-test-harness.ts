@@ -473,7 +473,8 @@ try {
     let source;
     let afterFs;
     let staleIdentity = false;
-    if (request.fsCapture === true || request.staleIdentity === true) {
+    let journalReads = 0;
+    if (request.fsCapture === true || request.staleIdentity === true || request.mutateJournalBeforeCallback === true) {
       const implementations = { ...fsPromises, createReadStream, lstatSync, realpathSync };
       source = {};
       for (const method of ${JSON.stringify(FS_METHODS)}) {
@@ -498,13 +499,21 @@ try {
                 chmodSync(join(request.quarantineRoot, request.transactionId), 0o700);
                 writeFileSync(join(request.quarantineRoot, "replacement-sentinel"), "foreign");
               }
+              if (
+                method === "lstat" && request.mutateJournalBeforeCallback === true &&
+                args[0] === join(request.quarantineRoot, request.transactionId, "journal.log") &&
+                ++journalReads === 2
+              ) appendFileSync(args[0], Buffer.from([0, 0, 0]));
               return Reflect.apply(implementation, implementations, args);
             };
           },
         });
       }
     }
-    const { fsCapture, staleIdentity: _staleIdentity, callbackThrows: _callbackThrows, ...coreRequest } = request;
+    const {
+      fsCapture, staleIdentity: _staleIdentity, callbackThrows: _callbackThrows,
+      mutateJournalBeforeCallback: _mutateJournalBeforeCallback, ...coreRequest
+    } = request;
     const pending = withExistingQuarantineRun({
       ...coreRequest,
       writersStopped: true,
