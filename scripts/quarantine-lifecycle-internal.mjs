@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import {
@@ -10,12 +11,12 @@ import { summarizeInventoryDirectory, hashVerifiedRegularFile } from "./quaranti
 import { captureRunFsSource, getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
 import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
-import { restoreRecoveryCallback } from "./quarantine-lifecycle-recovery-run.mjs";
 
 const OPTION_KEYS = Object.freeze([
   "repoRoot", "quarantineRoot", "transactionId", "writersStopped", "fsApi",
 ]);
 const RECOVERY_OPTION_KEYS = Object.freeze([...OPTION_KEYS, "action", "faultHook"]);
+const restoreRecoveryStorage = new AsyncLocalStorage();
 
 function frozenRecord(entries) {
   const result = Object.create(null);
@@ -372,11 +373,8 @@ function sameSnapshot(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-export async function withExistingQuarantineRunInternal(options, callback) {
-  const recoveryCallback = callback === restoreRecoveryCallback;
-  const input = snapshotOptions(options, recoveryCallback);
-  if (typeof callback !== "function") throw new TypeError("existing quarantine run callback must be a function");
-  const recovery = Object.freeze({ allowRestoreLocationConflict: recoveryCallback });
+async function enterExistingRun(input, { recovery, callback }) {
+  const recoveryOptions = Object.freeze({ allowRestoreLocationConflict: recovery });
   const source = captureRunFsSource(input.fsApi);
   return withQuarantineRunCapability({
     repoRoot: input.repoRoot,
@@ -386,11 +384,11 @@ export async function withExistingQuarantineRunInternal(options, callback) {
     fsApi: source,
   }, async (capability) => {
     const fsApi = getRunFsContext(capability, source);
-    const validated = await validateExistingRun(capability, input, fsApi, recovery);
+    const validated = await validateExistingRun(capability, input, fsApi, recoveryOptions);
     // Re-read every mutable evidence boundary immediately before capability
     // handoff.  This is cooperative TOCTOU detection; all reads still use the
     // exact adapter captured synchronously above.
-    const stable = await validateExistingRun(capability, input, fsApi, recovery);
+    const stable = await validateExistingRun(capability, input, fsApi, recoveryOptions);
     if (
       !sameSnapshot(validated.repository, stable.repository) ||
       !sameSnapshot(validated.journalTip, stable.journalTip) ||
@@ -409,8 +407,35 @@ export async function withExistingQuarantineRunInternal(options, callback) {
       ["journalTip", validated.journalTip],
       ["manifestGeneration", validated.manifestGeneration],
       ["fsApi", fsApi],
-      ...(recoveryCallback ? [["recoveryOptions", input]] : []),
+      ...(recovery ? [["recoveryOptions", input]] : []),
     ]);
     return callback(handoff);
   });
+}
+
+export async function withExistingQuarantineRunInternal(options, callback) {
+  const input = snapshotOptions(options, false);
+  if (typeof callback !== "function") throw new TypeError("existing quarantine run callback must be a function");
+  return enterExistingRun(input, { recovery: false, callback });
+}
+
+// This entry is intentionally fixed: it validates the recovery-only evidence
+// and invokes the public recovery algorithm itself.  It never accepts a
+// caller-provided callback, authority flag, or handoff.
+export async function withRestoreRecoveryRunInternal(options) {
+  const input = snapshotOptions(options, true);
+  return enterExistingRun(input, {
+    recovery: true,
+    callback: async (handoff) => restoreRecoveryStorage.run(handoff, async () => {
+      const { recoverRestore } = await import("./quarantine-restore.mjs");
+      return recoverRestore(input);
+    }),
+  });
+}
+
+// This read-only lookup has no paired setter.  Only the fixed entry above can
+// install the scoped handoff, and identity ties it to its immutable input.
+export function takeRestoreRecoveryHandoff(input) {
+  const handoff = restoreRecoveryStorage.getStore();
+  return handoff?.recoveryOptions === input ? handoff : null;
 }

@@ -11,7 +11,7 @@ import {
 } from "./quarantine-inventory-reader.mjs";
 import { appendJournalRecord, IndeterminateJournalAppendError, replayJournal, withJournalLock } from "./quarantine-journal.mjs";
 import { withExistingQuarantineRun } from "./quarantine-lifecycle-core.mjs";
-import { restoreRecoveryCallback, takeRestoreRecoveryHandoff } from "./quarantine-lifecycle-recovery-run.mjs";
+import { takeRestoreRecoveryHandoff, withRestoreRecoveryRunInternal } from "./quarantine-lifecycle-internal.mjs";
 import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
 import { deriveRunPath, revalidateRunCapability } from "./quarantine-run-capability.mjs";
 
@@ -698,13 +698,7 @@ export async function recoverRestore(input) {
   const handoff = takeRestoreRecoveryHandoff(input);
   const options = snapshotOptions(input, { recovery: true });
   if (handoff !== null) return recoverRestoreWithHandoff(options, handoff);
-  const existing = record([
-    ["repoRoot", options.repoRoot], ["quarantineRoot", options.quarantineRoot],
-    ["transactionId", options.transactionId], ["action", options.action], ["writersStopped", true],
-    ...(Object.hasOwn(options, "fsApi") ? [["fsApi", options.fsApi]] : []),
-    ...(Object.hasOwn(options, "faultHook") ? [["faultHook", options.faultHook]] : []),
-  ]);
-  return withExistingQuarantineRun(existing, restoreRecoveryCallback);
+  return withRestoreRecoveryRunInternal(options);
 }
 
 async function recoverRestoreWithHandoff(options, handoff) {
@@ -735,8 +729,12 @@ async function recoverRestoreWithHandoff(options, handoff) {
     }
     const missing = inspected.filter((entry) => entry.state === "missing");
     if (missing.length > 0) throw new Error("restore recovery evidence is missing");
+    // A completed forward entry is required to remain final before a resume
+    // can terminally claim RESTORED.  During rollback, however, those same
+    // entries are intentionally moved back through staged/initial states;
+    // the rollback ledger, not the forward completion bit, governs them.
     const conflicts = inspected.filter((entry) => entry.state === "conflict" ||
-      (completed.has(entry.id) && entry.state !== "final"))
+      (options.action === "resume" && completed.has(entry.id) && entry.state !== "final"))
       .map((entry) => entry.id).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
     if (conflicts.length > 0) {
       if (replayed.state !== "RECOVERY_REQUIRED") {

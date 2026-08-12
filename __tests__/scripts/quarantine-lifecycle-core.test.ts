@@ -44,18 +44,30 @@ describe("quarantine lifecycle core", () => {
     expect(attempt).toBe("missing");
   });
 
-  it("keeps every directly importable lifecycle helper free of arbitrary relaxed callbacks", () => {
-    const exports = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+  it("keeps direct lifecycle imports from injecting a relaxed arbitrary callback", () => {
+    const direct = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
       const internal = await import(${JSON.stringify(internalUrl)});
-      const recovery = await import(${JSON.stringify(recoveryRunUrl)});
+      let called = false;
+      let error = null;
+      try {
+        await internal.withExistingQuarantineRunInternal({
+          repoRoot: "/not-a-repo", quarantineRoot: "/not-a-quarantine",
+          transactionId: "test", writersStopped: true, action: "resume",
+        }, async () => { called = true; });
+      } catch (caught) { error = caught.message; }
+      let removed = "imported";
+      try { await import(${JSON.stringify(recoveryRunUrl)}); } catch { removed = "missing"; }
       process.stdout.write(JSON.stringify({
-        internal: Object.keys(internal), arity: internal.withExistingQuarantineRunInternal.length,
-        recovery: Object.keys(recovery), callbackArity: recovery.restoreRecoveryCallback.length,
+        keys: Object.keys(internal), genericArity: internal.withExistingQuarantineRunInternal.length,
+        fixedArity: internal.withRestoreRecoveryRunInternal.length,
+        takeArity: internal.takeRestoreRecoveryHandoff.length,
+        called, error, removed,
       }));
     `], { encoding: "utf8" }));
-    expect(exports).toEqual({
-      internal: ["withExistingQuarantineRunInternal"], arity: 2,
-      recovery: ["restoreRecoveryCallback", "takeRestoreRecoveryHandoff"], callbackArity: 1,
+    expect(direct).toEqual({
+      keys: ["takeRestoreRecoveryHandoff", "withExistingQuarantineRunInternal", "withRestoreRecoveryRunInternal"],
+      genericArity: 2, fixedArity: 1, takeArity: 1,
+      called: false, error: "existing quarantine run options are invalid", removed: "missing",
     });
   });
 
