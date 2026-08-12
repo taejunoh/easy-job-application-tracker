@@ -305,4 +305,20 @@ describe("quarantine lifecycle core", () => {
       }
     },
   );
+
+  it("rejects a restore payload whose inventory differs from the durable manifest", () => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    try {
+      writeFileSync(join(prepared.runRoot, "payload/generated/.next/build"), "foreign");
+      const result = invokeQuarantineWorker("core-restore-contract", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        restoreState: "RESTORE_PREPARED",
+      }) as unknown as { ok: boolean };
+      expect(result.ok).toBe(false);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
 });

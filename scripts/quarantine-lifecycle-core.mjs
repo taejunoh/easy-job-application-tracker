@@ -1,15 +1,17 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import {
   link, lstat, mkdir, open, opendir, readdir, readlink, realpath, rename, rm, unlink,
 } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   readCurrentManifestPointer,
   readManifestGeneration,
 } from "./quarantine-manifest.mjs";
 import { replayJournal } from "./quarantine-journal.mjs";
+import { hashFileStream } from "./quarantine-inventory.mjs";
 import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
 
@@ -182,6 +184,121 @@ function validateRestoreLedger(replayed, manifest) {
   if (rollbackIntents.some((id, index) => id !== expectedRollback[index])) {
     throw new Error("restore rollback intent order does not match restore provenance");
   }
+  const completed = replayed.records.slice(preparedIndex + 1)
+    .filter((record) => record.event === "RESTORED_ENTRY").map((record) => record.payload.id);
+  const rollbackCompleted = replayed.records.slice(preparedIndex + 1)
+    .filter((record) => record.event === "RESTORE_ROLLED_BACK_ENTRY").map((record) => record.payload.id);
+  return Object.freeze({
+    restoreId: prepared.payload.restoreId,
+    active: new Map(active.map((entry) => [entry.id, entry.inventory])),
+    intents: Object.freeze(intents),
+    completed: new Set(completed),
+    rollbackCompleted: new Set(rollbackCompleted),
+  });
+}
+
+function modeOf(stat) { return stat.mode & 0o7777; }
+
+async function optionalStat(path, fsApi) {
+  try { return await fsApi.lstat(path); } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function privateTreeSummary(root, fsApi) {
+  const rootStat = await optionalStat(root, fsApi);
+  if (rootStat === null) return null;
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("restore tree endpoint is unsafe");
+  const records = [];
+  let bytes = 0;
+  async function visit(path, relativePath, stat) {
+    if (stat.isSymbolicLink()) throw new Error("restore tree contains a symlink");
+    if (stat.isDirectory()) {
+      records.push({ scope: "relative", path: relativePath, type: "directory", mode: modeOf(stat), size: 0 });
+      const names = await fsApi.readdir(path);
+      for (const name of [...names].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
+        const child = join(path, name);
+        await visit(child, `${relativePath}/${name}`, await fsApi.lstat(child));
+      }
+      return;
+    }
+    if (!stat.isFile()) throw new Error("restore tree contains an unsupported endpoint");
+    const hashed = await hashFileStream(path, { fsApi });
+    if (hashed.bytes !== stat.size) throw new Error("restore file changed while being read");
+    records.push({ scope: "relative", path: relativePath, type: "file", mode: modeOf(stat), size: stat.size, sha256: hashed.sha256 });
+    bytes += stat.size;
+  }
+  const names = await fsApi.readdir(root);
+  for (const name of [...names].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
+    await visit(join(root, name), name, await fsApi.lstat(join(root, name)));
+  }
+  records.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
+  const digest = createHash("sha256");
+  for (const record of records) digest.update(Buffer.from(`${JSON.stringify(record)}\n`));
+  return { sha256: digest.digest("hex"), entries: records.length, bytes };
+}
+
+function sameSummary(expected, observed) {
+  return observed !== null && expected !== null &&
+    expected.sha256 === observed.sha256 && expected.entries === observed.entries && expected.bytes === observed.bytes;
+}
+
+async function verifySourceEndpoint(path, entry, expectedPresent, fsApi) {
+  const stat = await optionalStat(path, fsApi);
+  if (!expectedPresent) {
+    if (stat !== null) throw new Error("restore source endpoint should be absent");
+    return;
+  }
+  if (stat === null || stat.isSymbolicLink() || !stat.isFile() || modeOf(stat) !== entry.mode || stat.size !== entry.size) {
+    throw new Error("restore source endpoint is invalid");
+  }
+  const hashed = await hashFileStream(path, { fsApi });
+  if (hashed.bytes !== entry.size || hashed.sha256 !== entry.sha256) {
+    throw new Error("restore source endpoint content is invalid");
+  }
+}
+
+async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, fsApi }) {
+  const intended = new Set(ledger.intents);
+  for (const entry of manifest.entries) {
+    const completed = ledger.completed.has(entry.id);
+    const rolledBack = ledger.rollbackCompleted.has(entry.id);
+    const forward = intended.has(entry.id) && !rolledBack;
+    const payload = deriveRunPath(capability, { purpose: "payload", id: entry.id });
+    const active = join(repoRoot, ...entry.relativePath.split("/"));
+    if (entry.kind === "source-copy") {
+      await verifySourceEndpoint(payload, entry, !forward || !completed, fsApi);
+      await verifySourceEndpoint(active, entry, forward && completed, fsApi);
+      continue;
+    }
+    const activeExpected = ledger.active.get(entry.id);
+    const payloadObserved = await privateTreeSummary(payload, fsApi);
+    const activeObserved = await privateTreeSummary(active, fsApi);
+    const rollbackObserved = activeExpected === null
+      ? null
+      : await privateTreeSummary(deriveRunPath(capability, {
+        purpose: "rollback-entry", id: ledger.restoreId, phase: entry.id,
+      }), fsApi);
+    const original = entry.preMoveInventory;
+    if (!forward || rolledBack) {
+      if (!sameSummary(original, payloadObserved) ||
+          (activeExpected === null ? activeObserved !== null : !sameSummary(activeExpected, activeObserved)) ||
+          rollbackObserved !== null) {
+        throw new Error("restore initial location evidence is invalid");
+      }
+    } else if (!completed) {
+      if (!sameSummary(original, payloadObserved) || activeObserved !== null ||
+          (activeExpected === null ? rollbackObserved !== null : !sameSummary(activeExpected, rollbackObserved))) {
+        throw new Error("restore in-progress location evidence is invalid");
+      }
+    } else if (
+      payloadObserved !== null || !sameSummary(original, activeObserved) ||
+      (activeExpected === null ? rollbackObserved !== null : !sameSummary(activeExpected, rollbackObserved))
+    ) {
+      throw new Error("restore completed location evidence is invalid");
+    }
+  }
 }
 
 async function readPointer(capability) {
@@ -227,7 +344,16 @@ async function validateExistingRun(capability, options, fsApi) {
   ) {
     throw new Error("quarantine lifecycle provenance does not match the live repository");
   }
-  if (restoreContext) validateRestoreLedger(replayed, manifest);
+  if (restoreContext) {
+    const ledger = validateRestoreLedger(replayed, manifest);
+    await verifyRestoreLocations({
+      capability,
+      repoRoot: options.repoRoot,
+      manifest,
+      ledger,
+      fsApi,
+    });
+  }
 
   const pointer = await readPointer(capability);
   if (!validated && pointer !== null) {
