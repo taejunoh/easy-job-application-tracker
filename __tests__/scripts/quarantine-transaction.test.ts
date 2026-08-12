@@ -895,6 +895,7 @@ process.stdout.write(JSON.stringify({ failure, events }));
     expect(exports.exports).not.toContain("withExistingQuarantineRun");
     expect(exports.runtimeExports).toEqual([
       "inspectWorkspace",
+      "markQuarantineValidated",
       "prepareQuarantineWorkspace",
       "quarantineWorkspace",
       "recoverQuarantine",
