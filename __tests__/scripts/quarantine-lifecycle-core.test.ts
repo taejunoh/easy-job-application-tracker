@@ -339,4 +339,92 @@ describe("quarantine lifecycle core", () => {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    "prepared",
+    "intent-pre",
+    "stage",
+    "completed",
+    "no-active-pre",
+    "no-active-completed",
+    "mixed-prefix",
+    "rollback-pre",
+    "rollback-post-first",
+    "rollback-post-second",
+    "rollback-partial-prefix",
+    "source-pre",
+    "source-mid",
+    "source-post",
+    "source-rollback-pre",
+    "source-rollback-post",
+  ])("accepts the real filesystem restore seam row %s from both Q and V provenance", (row) => {
+    for (const preState of ["QUARANTINED", "VALIDATED"] as const) {
+      const prepared = prepareQuarantinedFixture({ regenerate: preState === "VALIDATED" });
+      try {
+        const result = invokeQuarantineWorker("core-restore-matrix", {
+          repoRoot: prepared.fixture.repoRoot,
+          quarantineRoot: prepared.fixture.quarantineRoot,
+          transactionId: prepared.transactionId,
+          row,
+          preState,
+        }, {}, 30_000) as unknown as { ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean; error?: unknown };
+        expect(result).toEqual(expect.objectContaining({ ok: true, callbackInvoked: 1, durableStable: true, endpointsStable: true }));
+      } finally {
+        rmSync(prepared.fixture.base, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it.each([
+    ["extra payload after completion", "completed", "wrong-payload"],
+    ["foreign active endpoint", "completed", "wrong-active"],
+    ["extra rollback endpoint", "completed", "extra-rollback"],
+    ["missing required rollback endpoint", "stage", "missing-rollback"],
+    ["foreign required rollback endpoint", "stage", "wrong-rollback"],
+    ["workspace endpoint symlink", "completed", "endpoint-symlink"],
+    ["foreign restored source copy", "source-post", "wrong-source-active"],
+  ])("rejects a restore seam with %s without mutating the journal or pointer", (_label, row, corruption) => {
+    const prepared = prepareQuarantinedFixture({ regenerate: true });
+    try {
+      const result = invokeQuarantineWorker("core-restore-matrix", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        row,
+        preState: "VALIDATED",
+        corruption,
+      }, {}, 30_000) as unknown as { ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean };
+      expect(result).toEqual(expect.objectContaining({ ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true }));
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it.each([1, 2])("rejects a deterministic workspace ancestor swap at validation pass %i", (ancestorSwap) => {
+    const copyPath = "nested/notes 2.txt";
+    const prepared = prepareQuarantinedFixture({ canonicalPath: "nested/notes.txt", copyPath });
+    try {
+      const result = invokeQuarantineWorker("core-restore-matrix", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        row: "source-pre",
+        preState: "QUARANTINED",
+        copyPath,
+        ancestorSwap,
+      }, {}, 30_000) as unknown as {
+        ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean; externalReads: number; foreignIntact: boolean;
+      };
+      expect(result).toEqual(expect.objectContaining({
+        ok: false,
+        callbackInvoked: 0,
+        durableStable: true,
+        endpointsStable: true,
+        externalReads: 0,
+        foreignIntact: true,
+      }));
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
 });

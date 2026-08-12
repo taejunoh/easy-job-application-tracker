@@ -207,8 +207,10 @@ export function createQuarantineFixture({
 export function prepareQuarantinedFixture({
   divergent = false,
   regenerate = true,
-}: { divergent?: boolean; regenerate?: boolean } = {}) {
-  const fixture = createQuarantineFixture({ divergent });
+  canonicalPath = "notes.txt",
+  copyPath = "notes 2.txt",
+}: { divergent?: boolean; regenerate?: boolean; canonicalPath?: string; copyPath?: string } = {}) {
+  const fixture = createQuarantineFixture({ divergent, canonicalPath, copyPath });
   const transactionId = "tx-0001";
   const createdAt = "2026-08-11T00:00:00.000Z";
   const applyResult = invokeQuarantineWorker("apply", {
@@ -359,13 +361,14 @@ export function invokeQuarantineWorker(
   const source = `
 import * as transaction from ${JSON.stringify(transactionUrl)};
 import * as runtime from ${JSON.stringify(runtimeUrl)};
-import { withQuarantineRunCapability } from ${JSON.stringify(capabilityUrl)};
+import { deriveRunPath, withQuarantineRunCapability } from ${JSON.stringify(capabilityUrl)};
 import { appendJournalRecord, replayJournal, withJournalLock } from ${JSON.stringify(journalUrl)};
 import { getRunFsContext } from ${JSON.stringify(fsContextUrl)};
 import { withExistingQuarantineRun } from ${JSON.stringify(lifecycleCoreUrl)};
+import { writeInventoryJsonl } from ${JSON.stringify(pathToFileURL(join(__dirname, "../../../scripts/quarantine-inventory.mjs")).href)};
 import * as fsPromises from "node:fs/promises";
 import {
-  appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, realpathSync, rmSync,
+  appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync,
   renameSync, symlinkSync, truncateSync, writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -595,6 +598,194 @@ try {
     let callbackInvoked = 0;
     await withExistingQuarantineRun({ ...restoreRequest, writersStopped: true }, async () => { callbackInvoked += 1; });
     process.stdout.write(JSON.stringify({ ok: true, callbackInvoked }));
+  } else if (operation === "core-restore-matrix") {
+    const restoreId = "restore-123e4567-e89b-42d3-a456-426614174000";
+    const { row, preState, corruption, ancestorSwap, copyPath, ...restoreRequest } = request;
+    const append = async (capability, event, payload) => withJournalLock({ capability }, (heldLock) =>
+      appendJournalRecord({ capability, heldLock, event, payload }),
+    );
+    const generated = ["generated-next", "generated-node-modules"];
+    const sourceId = "copy-0001";
+    if (preState === "VALIDATED") {
+      await transaction.markQuarantineValidated({
+        ...restoreRequest,
+        writersStopped: true,
+        validatedAt: "2026-08-11T00:00:00.000Z",
+      });
+    }
+    let callbackInvoked = 0;
+    let beforeJournal;
+    let beforePointer;
+    let beforeEndpoints;
+    let endpointPaths;
+    await withQuarantineRunCapability({ ...restoreRequest, writersStopped: true }, async (capability) => {
+      const payload = Object.fromEntries([...generated, sourceId].map((id) => [id, deriveRunPath(capability, { purpose: "payload", id })]));
+      mkdirSync(join(request.quarantineRoot, request.transactionId, "rollback", "regenerated-before-restore", restoreId), {
+        recursive: true,
+        mode: 0o700,
+      });
+      const rollback = Object.fromEntries(generated.map((id) => [id, deriveRunPath(capability, {
+        purpose: "rollback-entry", id: restoreId, phase: id,
+      })]));
+      const workspace = {
+        "generated-next": join(request.repoRoot, ".next"),
+        "generated-node-modules": join(request.repoRoot, "node_modules"),
+        [sourceId]: join(request.repoRoot, copyPath ?? "notes 2.txt"),
+      };
+      endpointPaths = { ...payload, ...workspace, ...rollback };
+      for (const id of generated) rmSync(workspace[id], { recursive: true, force: true });
+      const active = !String(row).startsWith("no-active") && !String(row).startsWith("source");
+      const activeGenerated = [];
+      for (const id of generated) {
+        if (!active) {
+          activeGenerated.push({ id, inventory: null });
+          continue;
+        }
+        mkdirSync(workspace[id], { recursive: true, mode: 0o700 });
+        writeFileSync(join(workspace[id], "foreign"), "active-" + id + "\\n");
+        const inventory = await writeInventoryJsonl({ capability, root: workspace[id], entryId: id, phase: "restore-active" });
+        activeGenerated.push({ id, inventory });
+      }
+      await append(capability, "RESTORE_PREPARED", { restoreId, activeGenerated });
+      const intent = async (id) => append(capability, "RESTORE_INTENT", { id });
+      const completed = async (id) => append(capability, "RESTORED_ENTRY", { id });
+      const enterRollback = async () => {
+        await append(capability, "RECOVERY_REQUIRED", { entryIds: generated });
+        await append(capability, "RESTORE_ROLLING_BACK", {});
+      };
+      const rollbackIntent = async (id) => append(capability, "RESTORE_ROLLBACK_INTENT", { id });
+      const rollbackComplete = async (id) => append(capability, "RESTORE_ROLLED_BACK_ENTRY", { id });
+      const forwardGenerated = async (id, finish = true) => {
+        await intent(id);
+        renameSync(workspace[id], rollback[id]);
+        renameSync(payload[id], workspace[id]);
+        if (finish) await completed(id);
+      };
+      if (row === "prepared") {
+        // RESTORE_PREPARED has the original payload and the generated active endpoint.
+      } else if (row === "intent-pre" || row === "no-active-pre") {
+        await append(capability, "RESTORING", {});
+        await intent("generated-next");
+      } else if (row === "stage") {
+        await append(capability, "RESTORING", {});
+        await intent("generated-next");
+        renameSync(workspace["generated-next"], rollback["generated-next"]);
+      } else if (row === "completed" || row === "no-active-completed") {
+        await append(capability, "RESTORING", {});
+        await intent("generated-next");
+        if (active) renameSync(workspace["generated-next"], rollback["generated-next"]);
+        renameSync(payload["generated-next"], workspace["generated-next"]);
+        await completed("generated-next");
+      } else if (row === "mixed-prefix") {
+        await append(capability, "RESTORING", {});
+        await forwardGenerated("generated-next");
+        await intent("generated-node-modules");
+      } else if (row === "rollback-pre" || row === "rollback-post-first" || row === "rollback-post-second" || row === "rollback-partial-prefix") {
+        await append(capability, "RESTORING", {});
+        await forwardGenerated("generated-next");
+        await forwardGenerated("generated-node-modules");
+        await enterRollback();
+        await rollbackIntent("generated-node-modules");
+        if (row !== "rollback-pre") {
+          renameSync(workspace["generated-node-modules"], payload["generated-node-modules"]);
+          if (row === "rollback-post-second" || row === "rollback-partial-prefix") {
+            renameSync(rollback["generated-node-modules"], workspace["generated-node-modules"]);
+            await rollbackComplete("generated-node-modules");
+            if (row === "rollback-partial-prefix") await rollbackIntent("generated-next");
+          }
+        }
+      } else if (row === "source-pre" || row === "source-mid" || row === "source-post" || row === "source-rollback-pre" || row === "source-rollback-post") {
+        await append(capability, "RESTORING", {});
+        await intent(sourceId);
+        if (row !== "source-pre") {
+          renameSync(payload[sourceId], workspace[sourceId]);
+          if (row !== "source-mid") await completed(sourceId);
+        }
+        if (row === "source-rollback-pre" || row === "source-rollback-post") {
+          await append(capability, "RECOVERY_REQUIRED", { entryIds: [sourceId] });
+          await append(capability, "RESTORE_ROLLING_BACK", {});
+          await rollbackIntent(sourceId);
+          if (row === "source-rollback-post") {
+            renameSync(workspace[sourceId], payload[sourceId]);
+            await rollbackComplete(sourceId);
+          }
+        }
+      } else {
+        throw new Error("unknown restore matrix row: " + row);
+      }
+      if (corruption === "wrong-payload") {
+        mkdirSync(payload["generated-next"], { recursive: true, mode: 0o700 });
+        writeFileSync(join(payload["generated-next"], "foreign"), "wrong\\n");
+      }
+      if (corruption === "extra-rollback") {
+        mkdirSync(rollback["generated-next"], { recursive: true, mode: 0o700 });
+        writeFileSync(join(rollback["generated-next"], "foreign"), "extra\\n");
+      }
+      if (corruption === "missing-rollback") rmSync(rollback["generated-next"], { recursive: true, force: true });
+      if (corruption === "wrong-rollback") writeFileSync(join(rollback["generated-next"], "foreign"), "wrong\\n");
+      if (corruption === "wrong-active") writeFileSync(join(workspace["generated-next"], "foreign"), "wrong\\n");
+      if (corruption === "wrong-source-active") writeFileSync(workspace[sourceId], "wrong\\n");
+      if (corruption === "endpoint-symlink") {
+        rmSync(workspace["generated-next"], { recursive: true, force: true });
+        symlinkSync(payload["generated-next"], workspace["generated-next"]);
+      }
+      beforeJournal = readFileSync(deriveRunPath(capability, { purpose: "journal" }));
+      const pointer = join(request.quarantineRoot, "current");
+      beforePointer = existsSync(pointer) ? readFileSync(pointer) : null;
+      beforeEndpoints = JSON.stringify(Object.fromEntries(Object.entries(endpointPaths).map(([key, value]) => [key, existsSync(value) ? lstatSync(value).ino : null])));
+    });
+    let error;
+    let externalReads = 0;
+    let foreignSentinel;
+    let coreFs;
+    if (ancestorSwap !== undefined) {
+      const nested = join(request.repoRoot, "nested");
+      const foreign = join(request.quarantineRoot, "foreign-ancestor");
+      mkdirSync(foreign, { recursive: true, mode: 0o700 });
+      foreignSentinel = join(foreign, "sentinel");
+      writeFileSync(foreignSentinel, "foreign");
+      const implementations = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+      coreFs = { ...implementations };
+      const originalLstat = coreFs.lstat;
+      let nestedReads = 0;
+      coreFs.lstat = async function (path, ...args) {
+        if (typeof path === "string" && path.startsWith(foreign)) externalReads += 1;
+        if (path === nested && ++nestedReads === ancestorSwap) {
+          renameSync(nested, nested + ".original");
+          symlinkSync(foreign, nested);
+        }
+        return Reflect.apply(originalLstat, implementations, [path, ...args]);
+      };
+      for (const method of ["realpath", "readdir", "createReadStream"]) {
+        const original = coreFs[method];
+        coreFs[method] = function (path, ...args) {
+          if (typeof path === "string" && path.startsWith(foreign)) externalReads += 1;
+          return Reflect.apply(original, implementations, [path, ...args]);
+        };
+      }
+    }
+    try {
+      await withExistingQuarantineRun({
+        ...restoreRequest,
+        writersStopped: true,
+        ...(coreFs === undefined ? {} : { fsApi: coreFs }),
+      }, async () => { callbackInvoked += 1; });
+    } catch (caught) { error = caught; }
+    const pointer = join(request.quarantineRoot, "current");
+    const runRoot = join(request.quarantineRoot, request.transactionId);
+    const afterJournal = readFileSync(join(runRoot, "journal.log"));
+    const afterPointer = existsSync(pointer) ? readFileSync(pointer) : null;
+    const afterEndpoints = JSON.stringify(Object.fromEntries(Object.entries(endpointPaths).map(([key, value]) => [key, existsSync(value) ? lstatSync(value).ino : null])));
+    process.stdout.write(JSON.stringify({
+      ok: error === undefined,
+      callbackInvoked,
+      durableStable: Buffer.compare(beforeJournal, afterJournal) === 0 &&
+        ((beforePointer === null && afterPointer === null) || (beforePointer !== null && afterPointer !== null && Buffer.compare(beforePointer, afterPointer) === 0)),
+      endpointsStable: beforeEndpoints === afterEndpoints,
+      externalReads,
+      foreignIntact: foreignSentinel === undefined || readFileSync(foreignSentinel, "utf8") === "foreign",
+      error: error === undefined ? undefined : errorShape(error),
+    }));
   } else if (operation === "apply-stop-after-layout") {
     const phases = [];
     let captured;
