@@ -246,6 +246,7 @@ async function captureActiveGenerated(handoff, faultHook) {
     const stat = await optionalStat(root, handoff.fsApi);
     if (stat === null) {
       active.push(activeRecord(id, null, ancestors));
+      await invokeHook(faultHook, `after-inventory:restore-active:${id}`);
       continue;
     }
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("active generated root is unsafe");
