@@ -159,6 +159,10 @@ describe("quarantine lifecycle core", () => {
           "journalTip", "manifestGeneration", "fsApi",
         ],
       });
+      expect(result.observed.handoff.keys).toEqual([
+        "capability", "repoRoot", "quarantineRoot", "runRoot", "transactionId", "head",
+        "journalTip", "manifestGeneration", "fsApi",
+      ]);
       expect(result.observed.journalTip).toMatchObject({
         prototype: "null",
         frozen: true,

@@ -356,7 +356,6 @@ async function validateExistingRun(capability, options, fsApi) {
   ) {
     throw lifecycleIntegrityError("quarantine lifecycle provenance does not match the live repository");
   }
-  let restoreLocations = null;
   if (restoreContext && replayed.state !== "INCOMPLETE_CONFLICT") {
     const ledger = buildRestoreLedger(replayed, manifest);
     try {
@@ -369,9 +368,7 @@ async function validateExistingRun(capability, options, fsApi) {
       });
     } catch (error) {
       if (!(error instanceof RestoreLocationConflictError)) throw error;
-      restoreLocations = frozenRecord([["status", "CONFLICT"]]);
     }
-    if (restoreLocations === null) restoreLocations = frozenRecord([["status", "EXACT"]]);
   }
 
   const pointer = await readPointer(capability);
@@ -409,7 +406,6 @@ async function validateExistingRun(capability, options, fsApi) {
       ["manifest", manifest],
     ])],
     ["pointer", pointer],
-    ["restoreLocations", restoreLocations],
   ]);
 }
 
@@ -436,8 +432,7 @@ async function enterExistingRun(input, callback) {
       !sameSnapshot(validated.repository, stable.repository) ||
       !sameSnapshot(validated.journalTip, stable.journalTip) ||
       !sameSnapshot(validated.manifestGeneration, stable.manifestGeneration) ||
-      !sameSnapshot(validated.pointer, stable.pointer) ||
-      !sameSnapshot(validated.restoreLocations, stable.restoreLocations)
+      !sameSnapshot(validated.pointer, stable.pointer)
     ) {
       throw lifecycleIntegrityError("quarantine lifecycle evidence changed before callback");
     }
@@ -450,7 +445,6 @@ async function enterExistingRun(input, callback) {
       ["head", validated.head],
       ["journalTip", validated.journalTip],
       ["manifestGeneration", validated.manifestGeneration],
-      ["restoreLocations", validated.restoreLocations],
       ["fsApi", fsApi],
     ]);
     return callback(handoff);
