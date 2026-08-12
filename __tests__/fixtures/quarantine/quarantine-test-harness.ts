@@ -39,6 +39,9 @@ const fsContextUrl = pathToFileURL(
 const lifecycleCoreUrl = pathToFileURL(
   join(__dirname, "../../../scripts/quarantine-lifecycle-core.mjs"),
 ).href;
+const restoreUrl = pathToFileURL(
+  join(__dirname, "../../../scripts/quarantine-restore.mjs"),
+).href;
 const legacyFacadeUrl = pathToFileURL(
   join(__dirname, "../../../scripts/quarantine-numbered-copies-support.mjs"),
 ).href;
@@ -382,6 +385,7 @@ export function invokeQuarantineWorker(
   const source = `
 import * as transaction from ${JSON.stringify(transactionUrl)};
 import * as runtime from ${JSON.stringify(runtimeUrl)};
+import * as restore from ${JSON.stringify(restoreUrl)};
 import { deriveRunPath, withQuarantineRunCapability } from ${JSON.stringify(capabilityUrl)};
 import { appendJournalRecord, replayJournal, withJournalLock } from ${JSON.stringify(journalUrl)};
 import { getRunFsContext } from ${JSON.stringify(fsContextUrl)};
@@ -513,6 +517,21 @@ try {
       },
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+  } else if (operation === "restore") {
+    const { stopPhase, ...restoreRequest } = request;
+    const phases = [];
+    try {
+      const result = await restore.restoreQuarantine({
+        ...restoreRequest,
+        async faultHook(phase) {
+          phases.push(phase);
+          if (phase === stopPhase) throw new RangeError("stop at requested restore phase");
+        },
+      });
+      process.stdout.write(JSON.stringify({ ok: true, result, phases }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, phases, error: errorShape(error) }));
+    }
   } else if (operation === "mark-validated") {
     const { stopPhase, ...validationRequest } = request;
     const phases = [];
