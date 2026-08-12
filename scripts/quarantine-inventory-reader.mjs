@@ -108,7 +108,7 @@ async function withVerifiedDirectory(path, expected, ancestorChain, fsApi, callb
     dir = await fsApi.opendir(path);
     await validateAncestorChain(ancestorChain, fsApi);
     const canonicalPath = await assertPathMatchesHandle(path, opened, "isDirectory", fsApi);
-    value = await callback(dir, frozenDirectoryIdentity(path, opened, canonicalPath));
+    value = await callback(dir, frozenDirectoryIdentity(path, opened, canonicalPath), handle);
     const finalHandle = await handle.stat();
     assertIdentity(opened, finalHandle, "isDirectory", "restore directory handle");
     await validateAncestorChain(ancestorChain, fsApi);
@@ -169,7 +169,7 @@ async function readVerifiedLink(path, expected, ancestorChain, fsApi) {
   return linkTarget;
 }
 
-export async function summarizeInventoryDirectory(root, { fsApi }) {
+export async function summarizeInventoryDirectory(root, { fsApi, ancestorChain = Object.freeze([]) }) {
   assertAbsolutePath(root, "read-only inventory root");
   const rootStat = await fsApi.lstat(root);
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
@@ -179,7 +179,7 @@ export async function summarizeInventoryDirectory(root, { fsApi }) {
   const pending = [{
     absolutePath: root, relativePath: "", depth: 0, root: true,
     expected: frozenDirectoryIdentity(root, rootStat, await fsApi.realpath(root)),
-    ancestorChain: Object.freeze([]),
+    ancestorChain,
   }];
   let pendingBytes = Buffer.byteLength(JSON.stringify(pending[0])) + 1;
   let recordBytes = 0;
@@ -254,4 +254,63 @@ export async function summarizeInventoryDirectory(root, { fsApi }) {
   const digest = createHash("sha256");
   for (const record of records) digest.update(Buffer.from(`${JSON.stringify(record)}\n`));
   return parseInventorySummary({ sha256: digest.digest("hex"), entries: records.length, bytes });
+}
+
+/* Internal restore authority.  Each pathname is rebound to an O_NOFOLLOW
+ * handle and every ancestor identity is checked before and after the handle
+ * operation.  It deliberately does not use path-recursive `readdir`/`open`
+ * sequences, which could traverse an exchanged ancestor between calls. */
+export async function fsyncVerifiedTree(root, { fsApi, ancestorChain = Object.freeze([]) }) {
+  assertAbsolutePath(root, "verified sync root");
+  const syncFile = async (path, expected, chain) => {
+    let handle;
+    let primary;
+    try {
+      await validateAncestorChain(chain, fsApi);
+      handle = await fsApi.open(path, FILE_OPEN_FLAGS);
+      const opened = await handle.stat();
+      assertIdentity(expected, opened, "isFile", "restore sync file handle");
+      await validateAncestorChain(chain, fsApi);
+      await assertPathMatchesHandle(path, opened, "isFile", fsApi);
+      await handle.sync();
+      const final = await handle.stat();
+      assertIdentity(opened, final, "isFile", "restore sync file handle");
+      await validateAncestorChain(chain, fsApi);
+      await assertPathMatchesHandle(path, opened, "isFile", fsApi);
+    } catch (error) {
+      primary = error;
+    }
+    await closeAll(undefined, handle, primary);
+  };
+  const visit = async (path, expected, chain) => {
+    if (expected.isSymbolicLink() || (!expected.isFile() && !expected.isDirectory())) {
+      throw new Error("restore sync endpoint is unsafe");
+    }
+    if (expected.isFile()) return syncFile(path, expected, chain);
+    return withVerifiedDirectory(path, expected, chain, fsApi, async (dir, identity, handle) => {
+      const children = [];
+      while (true) {
+        const item = await dir.read();
+        if (item === null) break;
+        if (typeof item.name !== "string" || Buffer.byteLength(item.name) > LIMITS.nameBytes) {
+          throw new Error("restore sync directory entry is invalid");
+        }
+        children.push(item.name);
+      }
+      children.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+      const childChain = appendAncestorChain(chain, identity);
+      for (const name of children) {
+        const child = join(path, name);
+        await validateAncestorChain(childChain, fsApi);
+        const childStat = await fsApi.lstat(child);
+        await visit(child, childStat, childChain);
+      }
+      await validateAncestorChain(chain, fsApi);
+      await handle.sync();
+      await validateAncestorChain(chain, fsApi);
+      await assertPathMatchesHandle(path, identity, "isDirectory", fsApi);
+    });
+  };
+  const stat = await fsApi.lstat(root);
+  await visit(root, stat, ancestorChain);
 }

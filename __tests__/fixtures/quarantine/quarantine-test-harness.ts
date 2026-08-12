@@ -518,13 +518,30 @@ try {
     });
     process.stdout.write(JSON.stringify({ ok: true, result, phases }));
   } else if (operation === "restore") {
-    const { stopPhase, ...restoreRequest } = request;
+    const { stopPhase, interloperAtFinalPrecheck, ...restoreRequest } = request;
     const phases = [];
     try {
+      let armed = false;
+      let inserted = false;
+      let fsApi;
+      if (interloperAtFinalPrecheck === "source-active") {
+        const target = join(request.repoRoot, "notes 2.txt");
+        fsApi = { ...fsPromises, createReadStream, lstatSync, realpathSync };
+        const originalLstat = fsApi.lstat;
+        fsApi.lstat = async (path) => {
+          if (armed && !inserted && path === target) {
+            inserted = true;
+            writeFileSync(target, "foreign interloper\\n");
+          }
+          return originalLstat(path);
+        };
+      }
       const result = await restore.restoreQuarantine({
         ...restoreRequest,
+        ...(fsApi === undefined ? {} : { fsApi }),
         async faultHook(phase) {
           phases.push(phase);
+          if (phase === "after-event:RESTORING") armed = true;
           if (phase === stopPhase) throw new RangeError("stop at requested restore phase");
         },
       });

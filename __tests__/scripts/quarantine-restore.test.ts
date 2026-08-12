@@ -18,6 +18,42 @@ describe("quarantine restore", () => {
     expect(exports).toEqual(["restoreQuarantine"]);
   });
 
+  it("closes option records before filesystem authority and reads each supplied getter once", async () => {
+    const invalid = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+      const { restoreQuarantine } = await import(${JSON.stringify(restoreUrl)});
+      const cases = [Object.create({ repoRoot: "/unused", quarantineRoot: "/unused", transactionId: "tx-0001", writersStopped: true }), {
+        repoRoot: "/unused", quarantineRoot: "/unused", transactionId: "tx-0001", writersStopped: true, [Symbol("unknown")]: true,
+      }];
+      const output = [];
+      for (const input of cases) try { await restoreQuarantine(input); } catch (error) { output.push(error.message); }
+      process.stdout.write(JSON.stringify(output));
+    `], { encoding: "utf8" }));
+    expect(invalid).toEqual([expect.stringMatching(/exact record/u), expect.stringMatching(/invalid/u)]);
+
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const output = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+        const { restoreQuarantine } = await import(${JSON.stringify(restoreUrl)});
+        const values = ${JSON.stringify({ repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot, transactionId: prepared.transactionId, writersStopped: true })};
+        const reads = {}; const input = Object.create(null);
+        for (const [key, value] of Object.entries(values)) Object.defineProperty(input, key, { enumerable: true, get() { reads[key] = (reads[key] ?? 0) + 1; return value; } });
+        const result = await restoreQuarantine(input);
+        process.stdout.write(JSON.stringify({ reads, prototype: Object.getPrototypeOf(result) === null, frozen: Object.isFrozen(result), keys: Reflect.ownKeys(result), descriptors: Object.fromEntries(Reflect.ownKeys(result).map((key) => [key, Object.getOwnPropertyDescriptor(result, key)])) }));
+      `], { encoding: "utf8" }));
+      expect(output.reads).toEqual({ repoRoot: 1, quarantineRoot: 1, transactionId: 1, writersStopped: 1 });
+      expect(output.prototype).toBe(true);
+      expect(output.frozen).toBe(true);
+      expect(output.keys).toEqual(["transactionId", "restoreId", "status", "restoredEntries"]);
+      for (const key of output.keys) {
+        expect(output.descriptors[key]).toMatchObject({
+          enumerable: true, writable: false, configurable: false,
+        });
+      }
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it("restores the deterministic transaction namespace in manifest order", () => {
     const prepared = prepareQuarantinedFixture();
     try {
@@ -39,14 +75,40 @@ describe("quarantine restore", () => {
       });
       expect(existsSync(prepared.fixture.copyPath!)).toBe(false);
       expect(readFileSync(`${prepared.fixture.repoRoot}/${prepared.fixture.copyPath}`, "utf8")).toBe("canonical\n");
-      expect(result.phases).toEqual(expect.arrayContaining([
+      expect(result.phases).toEqual([
         "after-inventory:restore-active:generated-next",
         "after-inventory:restore-active:generated-node-modules",
         "after-event:RESTORE_PREPARED",
         "after-event:RESTORING",
+        "after-event:RESTORE_INTENT:generated-next",
+        "after-active-to-rollback-rename:generated-next",
+        "after-rollback-tree-sync:generated-next",
+        "after-rollback-destination-parent-sync:generated-next",
+        "after-rollback-source-parent-sync:generated-next",
+        "after-payload-to-active-rename:generated-next",
+        "after-restored-payload-sync:generated-next",
+        "after-restore-destination-parent-sync:generated-next",
+        "after-restore-source-parent-sync:generated-next",
+        "after-event:RESTORED_ENTRY:generated-next",
+        "after-event:RESTORE_INTENT:generated-node-modules",
+        "after-active-to-rollback-rename:generated-node-modules",
+        "after-rollback-tree-sync:generated-node-modules",
+        "after-rollback-destination-parent-sync:generated-node-modules",
+        "after-rollback-source-parent-sync:generated-node-modules",
+        "after-payload-to-active-rename:generated-node-modules",
+        "after-restored-payload-sync:generated-node-modules",
+        "after-restore-destination-parent-sync:generated-node-modules",
+        "after-restore-source-parent-sync:generated-node-modules",
+        "after-event:RESTORED_ENTRY:generated-node-modules",
+        "after-event:RESTORE_INTENT:copy-0001",
+        "after-payload-to-active-rename:copy-0001",
+        "after-restored-payload-sync:copy-0001",
+        "after-restore-destination-parent-sync:copy-0001",
+        "after-restore-source-parent-sync:copy-0001",
+        "after-event:RESTORED_ENTRY:copy-0001",
         "after-event:RESTORED",
         "before-lock-cleanup",
-      ]));
+      ]);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
@@ -130,6 +192,25 @@ describe("quarantine restore", () => {
       );
       expect(readFileSync(join(rollbackRoot, ".next", "build"), "utf8")).toBe("ignored");
       expect(readFileSync(join(rollbackRoot, "node_modules", "package"), "utf8")).toBe("ignored");
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves an interloper observed at the final cooperative source destination precheck", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const before = readFileSync(join(prepared.runRoot, "journal.log"));
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        writersStopped: true,
+        interloperAtFinalPrecheck: "source-active",
+      });
+      expect(result.ok).toBe(false);
+      expect(readFileSync(join(prepared.fixture.repoRoot, prepared.fixture.copyPath!), "utf8")).toBe("foreign interloper\n");
+      expect(readFileSync(join(prepared.runRoot, "journal.log")).subarray(0, before.length)).toEqual(before);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
