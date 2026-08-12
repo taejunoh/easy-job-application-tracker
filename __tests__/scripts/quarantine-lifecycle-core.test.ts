@@ -424,8 +424,16 @@ describe("quarantine lifecycle core", () => {
           quarantineRoot: prepared.fixture.quarantineRoot,
           transactionId: prepared.transactionId,
           callbackBoundary,
-        }) as unknown as { ok: boolean; callbackInvoked: number; boundarySentinel?: boolean };
+        }) as unknown as {
+          ok: boolean;
+          callbackInvoked: number;
+          boundarySentinel?: boolean;
+          durableEvidenceStable?: boolean;
+          callbackBoundary?: { firedAt: number; firstPassCompleted: boolean };
+        };
         expect(result).toMatchObject({ ok: false, callbackInvoked: 0 });
+        expect(result.callbackBoundary).toEqual({ firedAt: 4, firstPassCompleted: true });
+        expect(result.durableEvidenceStable).toBe(true);
         if (callbackBoundary === "repo-swap") expect(result.boundarySentinel).toBe(true);
         expect(readFileSync(join(prepared.runRoot, "journal.log"))).toEqual(before);
       } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }

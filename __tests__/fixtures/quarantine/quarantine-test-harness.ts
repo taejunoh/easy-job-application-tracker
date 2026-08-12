@@ -520,6 +520,10 @@ try {
     let journalReads = 0;
     let boundaryJournalReads = 0;
     let repoBoundaryReads = 0;
+    let callbackBoundary;
+    const beforeDurableEvidence = request.callbackBoundary === undefined
+      ? undefined
+      : treeSnapshot(request.quarantineRoot);
     if (request.fsCapture === true || request.staleIdentity === true || request.mutateJournalBeforeCallback === true || request.callbackBoundary === "repo-swap" || request.callbackBoundary === "head-advance") {
       const implementations = { ...fsPromises, createReadStream, lstatSync, realpathSync };
       source = {};
@@ -550,10 +554,17 @@ try {
                 args[0] === join(request.quarantineRoot, request.transactionId, "journal.log") &&
                 ++journalReads === 2
               ) appendFileSync(args[0], Buffer.from([0, 0, 0]));
+              if (method === "lstat" && args[0] === request.repoRoot) {
+                repoBoundaryReads += 1;
+              }
               if (
                 method === "lstat" && request.callbackBoundary !== undefined &&
-                args[0] === request.repoRoot && ++repoBoundaryReads === 3
+                args[0] === request.repoRoot && repoBoundaryReads === 4
               ) {
+                // Read 1 belongs to capability setup, reads 2/3 are the
+                // first validateExistingRun repository evidence, so this is
+                // the initial repository lstat of the second validation.
+                callbackBoundary = { firedAt: repoBoundaryReads, firstPassCompleted: true };
                 if (request.callbackBoundary === "repo-swap") {
                   renameSync(request.repoRoot, request.repoRoot + ".original");
                   mkdirSync(request.repoRoot, { recursive: true, mode: 0o700 });
@@ -612,6 +623,8 @@ try {
         calls,
         wrongReceiver,
         revoked,
+        callbackBoundary,
+        durableEvidenceStable: beforeDurableEvidence === treeSnapshot(request.quarantineRoot),
         boundarySentinel: request.callbackBoundary !== "repo-swap" || readFileSync(join(request.repoRoot, "foreign-sentinel"), "utf8") === "foreign",
         error: errorShape(captured),
       }));
