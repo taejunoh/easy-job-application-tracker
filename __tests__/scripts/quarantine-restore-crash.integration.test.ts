@@ -28,10 +28,8 @@ function journalPayloads(path: string) {
   return records;
 }
 
-function liveOwnerLockBytes() {
+function lockBytesForOwner(pid: number, ownerToken = "11111111-1111-4111-8111-111111111111") {
   const version = 1;
-  const ownerToken = "11111111-1111-4111-8111-111111111111";
-  const pid = process.pid;
   const checksum = createHash("sha256").update(JSON.stringify({ version, ownerToken, pid })).digest("hex");
   const body = Buffer.from(JSON.stringify({ version, ownerToken, pid, checksum }));
   const length = Buffer.alloc(4);
@@ -291,7 +289,7 @@ describe("quarantine restore real SIGKILL recovery", () => {
       })).signal).toBe("SIGKILL");
       const lockPath = join(prepared.runRoot, "journal.lock");
       const journalPath = join(prepared.runRoot, "journal.log");
-      const liveLock = liveOwnerLockBytes();
+      const liveLock = lockBytesForOwner(process.pid);
       rmSync(lockPath);
       writeFileSync(lockPath, liveLock, { mode: 0o600 });
       const journalBefore = readFileSync(journalPath);
@@ -303,6 +301,57 @@ describe("quarantine restore real SIGKILL recovery", () => {
       expect(readFileSync(lockPath)).toEqual(liveLock);
       expect(readFileSync(journalPath)).toEqual(journalBefore);
       expect(journalEvents(journalPath).at(-1)).toBe("RESTORE_INTENT");
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("public recoverRestore preserves an inaccessible or live foreign owner lock", async () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true,
+      };
+      expect((await spawnLifecycleChild("restoreQuarantine", options, {
+        killAt: "after-event:RESTORE_INTENT:generated-next",
+      })).signal).toBe("SIGKILL");
+      const lockPath = join(prepared.runRoot, "journal.lock");
+      const journalPath = join(prepared.runRoot, "journal.log");
+      const foreignLock = lockBytesForOwner(1, "22222222-2222-4222-8222-222222222222");
+      rmSync(lockPath);
+      writeFileSync(lockPath, foreignLock, { mode: 0o600 });
+      const journalBefore = readFileSync(journalPath);
+
+      const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
+
+      expect(recovered.code).not.toBe(0);
+      expect(recovered.stderr).toMatch(/refuses a live owner|cannot verify owner liveness/u);
+      expect(readFileSync(lockPath)).toEqual(foreignLock);
+      expect(readFileSync(journalPath)).toEqual(journalBefore);
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("public recoverRestore preserves a malformed foreign lock replacement", async () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true,
+      };
+      expect((await spawnLifecycleChild("restoreQuarantine", options, {
+        killAt: "after-event:RESTORE_INTENT:generated-next",
+      })).signal).toBe("SIGKILL");
+      const lockPath = join(prepared.runRoot, "journal.lock");
+      const journalPath = join(prepared.runRoot, "journal.log");
+      const foreignLock = Buffer.from("foreign replacement lock\n");
+      rmSync(lockPath);
+      writeFileSync(lockPath, foreignLock, { mode: 0o600 });
+      const journalBefore = readFileSync(journalPath);
+
+      const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
+
+      expect(recovered.code).not.toBe(0);
+      expect(readFileSync(lockPath)).toEqual(foreignLock);
+      expect(readFileSync(journalPath)).toEqual(journalBefore);
     } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
   }, 60_000);
 
@@ -732,16 +781,11 @@ describe("quarantine restore real SIGKILL recovery", () => {
       expect(initial.signal).toBe("SIGKILL");
       rmSync(join(prepared.runRoot, "journal.lock"));
       const index = RECOVERY_RESUME_PHASES.indexOf(killAt);
-      const { release } = await killThenReleaseFixtureLock(
+      await killThenReleaseFixtureLock(
         "recoverRestore", { ...options, action: "resume" }, prepared.runRoot, killAt,
         RECOVERY_RESUME_PHASES.slice(0, index + 1),
       );
       const journal = join(prepared.runRoot, "journal.log");
-      const beforeStaleRetry = readFileSync(journal);
-      const staleRetry = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
-      expect(staleRetry.code).not.toBe(0);
-      expect(readFileSync(journal)).toEqual(beforeStaleRetry);
-      release();
       const resumed = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
       if (killAt === "after-event:RESTORED" || killAt === "before-lock-cleanup") {
         expect(resumed.code).not.toBe(0);
@@ -778,7 +822,7 @@ describe("quarantine restore real SIGKILL recovery", () => {
         ? "after-event:RESTORE_ABORTED_TO_QUARANTINED"
         : killAt;
       const index = RECOVERY_ROLLBACK_PHASES.indexOf(phaseForIndex);
-      const { release } = await killThenReleaseFixtureLock(
+      await killThenReleaseFixtureLock(
         "recoverRestore", { ...options, action: "rollback" }, prepared.runRoot, killAt,
         RECOVERY_ROLLBACK_PHASES.slice(0, index + 1).map((phase) =>
           prior === "VALIDATED" && phase === "after-event:RESTORE_ABORTED_TO_QUARANTINED"
@@ -787,11 +831,6 @@ describe("quarantine restore real SIGKILL recovery", () => {
         ),
       );
       const journal = join(prepared.runRoot, "journal.log");
-      const beforeStaleRetry = readFileSync(journal);
-      const staleRetry = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
-      expect(staleRetry.code).not.toBe(0);
-      expect(readFileSync(journal)).toEqual(beforeStaleRetry);
-      release();
       const rolledBack = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
       if (killAt === `after-event:${prior === "VALIDATED" ? "RESTORE_ABORTED_TO_VALIDATED" : "RESTORE_ABORTED_TO_QUARANTINED"}` || killAt === "before-lock-cleanup") {
         expect(rolledBack.code).not.toBe(0);
@@ -818,22 +857,15 @@ describe("quarantine restore real SIGKILL recovery", () => {
           transactionId: prepared.transactionId, writersStopped: true,
         };
         const index = NORMAL_RESTORE_PHASES.indexOf(killAt);
-        const { release } = await killThenReleaseFixtureLock(
+        await killThenReleaseFixtureLock(
           "restoreQuarantine", options, prepared.runRoot, killAt, NORMAL_RESTORE_PHASES.slice(0, index + 1),
         );
         const journal = join(prepared.runRoot, "journal.log");
-        const beforeStaleRetry = readFileSync(journal);
-        const staleRetry = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
-        expect(staleRetry.code).not.toBe(0);
-        expect(readFileSync(journal)).toEqual(beforeStaleRetry);
-        release(); // This fixture owns the lock created by the verified dead child above.
-
+        const continued = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
         if (killAt === "after-event:RESTORED" || killAt === "before-lock-cleanup") {
-          const completed = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
-          expect(completed.code).not.toBe(0);
+          expect(continued.code).not.toBe(0);
           expect(journalEvents(journal).at(-1)).toBe("RESTORED");
         } else {
-          const continued = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
           if (continued.code !== 0) throw new Error(JSON.stringify(continued));
           expect(JSON.parse(continued.stdout)).toMatchObject({
             status: "RESTORED", action: "resume", reconciledEntries: 3,
@@ -868,7 +900,7 @@ describe("quarantine restore real SIGKILL recovery", () => {
     } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
   }, 60_000);
 
-  it("resumes a durable restore intent only after fixture-owned stale lock cleanup", async () => {
+  it("resumes a durable restore intent by reclaiming its authenticated dead lock", async () => {
     const prepared = prepareQuarantinedFixture();
     try {
       const options = {
@@ -882,16 +914,10 @@ describe("quarantine restore real SIGKILL recovery", () => {
       });
       expect(crashed.signal).toBe("SIGKILL");
       const journal = join(prepared.runRoot, "journal.log");
-      const beforeRetry = readFileSync(journal);
-      const rejected = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
-      expect(rejected.code).not.toBe(0);
-      expect(readFileSync(journal)).toEqual(beforeRetry);
-      const lock = join(prepared.runRoot, "journal.lock");
-      expect(existsSync(lock)).toBe(true);
-      rmSync(lock); // Fixtures own this dead SIGKILL residue.
       const resumed = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
       if (resumed.code !== 0) throw new Error(JSON.stringify(resumed));
       expect(JSON.parse(resumed.stdout)).toMatchObject({ status: "RESTORED", action: "resume", reconciledEntries: 3 });
+      expect(existsSync(join(prepared.runRoot, "journal.lock"))).toBe(false);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
     }
