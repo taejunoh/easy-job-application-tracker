@@ -2054,7 +2054,7 @@ function recoveryConflict(schemaVersion, transactionId, action, ids) {
   ]);
 }
 
-function buildApplyLedger(replayed, manifest) {
+function buildApplyLedger(replayed, manifest, manifestSha256) {
   const prepared = replayed.records.find((record) => record.event === "PREPARED");
   if (
     prepared === undefined ||
@@ -2083,7 +2083,7 @@ function buildApplyLedger(replayed, manifest) {
       completionIndex += 1;
     } else if (
       record.event === "VALIDATED" &&
-      record.payload.manifestSha256 !== prepared.payload.manifestSha256
+      record.payload.manifestSha256 !== manifestSha256
     ) {
       fail("ERR_INTEGRITY");
     } else if (record.event === "ROLLBACK_INTENT") {
@@ -2306,11 +2306,16 @@ async function readRecoveryManifest({ capability, options, replayed }) {
   if (prepared === undefined || prepared.payload.transactionId !== options.transactionId) {
     fail("ERR_INTEGRITY");
   }
+  const validated = [...replayed.records].reverse().find((record) => record.event === "VALIDATED");
+  const selectedSha256 = replayed.state === "VALIDATED"
+    ? validated?.payload.manifestSha256
+    : prepared.payload.manifestSha256;
+  if (typeof selectedSha256 !== "string") fail("ERR_INTEGRITY");
   let manifest;
   try {
     manifest = await readManifestGeneration({
       capability,
-      manifestSha256: prepared.payload.manifestSha256,
+      manifestSha256: selectedSha256,
     });
   } catch {
     fail("ERR_INTEGRITY");
@@ -2318,9 +2323,9 @@ async function readRecoveryManifest({ capability, options, replayed }) {
   if (
     manifest.transactionId !== options.transactionId ||
     manifest.repositoryRoot !== options.repoRoot ||
-    manifest.state !== "PREPARED"
+    manifest.state !== (replayed.state === "VALIDATED" ? "VALIDATED" : "PREPARED")
   ) fail("ERR_INTEGRITY");
-  return manifest;
+  return Object.freeze({ manifest, manifestSha256: selectedSha256 });
 }
 
 async function resumeApplyFromLedger({ capability, heldLock, ledger, manifest, options }) {
@@ -2518,8 +2523,9 @@ async function recoverApplyOnCapability({ capability, options }) {
   if (initial.truncatedTail) fail("ERR_INTEGRITY");
   // Terminal shortcuts are safe only after the immutable recovery evidence has
   // been authenticated. This performs no append or filesystem mutation.
-  const initialManifest = await readRecoveryManifest({ capability, options, replayed: initial });
-  buildApplyLedger(initial, initialManifest);
+  const initialGeneration = await readRecoveryManifest({ capability, options, replayed: initial });
+  const initialManifest = initialGeneration.manifest;
+  buildApplyLedger(initial, initialManifest, initialGeneration.manifestSha256);
   if (initial.state === "QUARANTINED" || initial.state === "VALIDATED") {
     if (options.action !== "resume") fail("ERR_USAGE");
     return recoveryResult(initialManifest.schemaVersion, options.transactionId, initial.state, "resume", 0);
@@ -2535,8 +2541,9 @@ async function recoverApplyOnCapability({ capability, options }) {
   }
   return withJournalLock({ capability }, async (heldLock) => {
     const replayed = await replayJournal({ capability });
-    const manifest = await readRecoveryManifest({ capability, options, replayed });
-    const ledger = buildApplyLedger(replayed, manifest);
+    const generation = await readRecoveryManifest({ capability, options, replayed });
+    const manifest = generation.manifest;
+    const ledger = buildApplyLedger(replayed, manifest, generation.manifestSha256);
     if (replayed.state !== "RECOVERY_REQUIRED" && replayed.state !== "ROLLING_BACK") {
       if (
         replayed.state !== "PREPARED" &&

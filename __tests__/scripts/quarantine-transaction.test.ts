@@ -562,12 +562,17 @@ describe("quarantine transaction Slice 1", () => {
     };
     if (terminal === "VALIDATED") {
       expect(invokeQuarantineWorker("apply", request)).toMatchObject({ ok: true });
-      const journal = join(f.quarantineRoot, transactionId, "journal.log");
-      const records = journalRecords(journal);
-      rewriteJournal(journal, [...records, {
-        event: "VALIDATED",
-        payload: { manifestSha256: records[0].payload.manifestSha256 },
-      }]);
+      privateDirectory(join(f.repoRoot, ".next"));
+      privateDirectory(join(f.repoRoot, "node_modules"));
+      writeFileSync(join(f.repoRoot, ".next", "build"), "regenerated\n");
+      writeFileSync(join(f.repoRoot, "node_modules", "package"), "regenerated\n");
+      expect(invokeQuarantineWorker("mark-validated", {
+        repoRoot: f.repoRoot,
+        quarantineRoot: f.quarantineRoot,
+        transactionId,
+        validatedAt: "2026-08-13T00:00:00.000Z",
+        writersStopped: true,
+      })).toMatchObject({ ok: true, result: { status: "VALIDATED" } });
     } else {
       expect(invokeQuarantineWorker("apply-stop", {
         ...request,
@@ -617,34 +622,18 @@ describe("quarantine transaction Slice 1", () => {
     expect(invokeQuarantineWorker("apply", request)).toMatchObject({ ok: true });
     const runRoot = join(f.quarantineRoot, transactionId);
     const journal = join(runRoot, "journal.log");
-    const journalBytes = readFileSync(journal);
-    const firstSize = journalBytes.readUInt32BE(0);
-    const prepared = JSON.parse(journalBytes.subarray(4, 4 + firstSize).toString("utf8"));
-    let offset = 0;
-    let previousHash = "0".repeat(64);
-    let sequence = 0;
-    while (offset < journalBytes.length) {
-      const size = journalBytes.readUInt32BE(offset);
-      const record = JSON.parse(journalBytes.subarray(offset + 4, offset + 4 + size).toString("utf8"));
-      previousHash = record.recordHash;
-      sequence = record.sequence;
-      offset += 4 + size;
-    }
-    const payload = { manifestSha256: prepared.payload.manifestSha256 };
-    const recordHash = createHash("sha256")
-      .update(JSON.stringify({ schemaVersion: 2, sequence: sequence + 1, previousHash, event: "VALIDATED", payload }))
-      .digest("hex");
-    const body = Buffer.from(JSON.stringify({
-      schemaVersion: 2,
-      sequence: sequence + 1,
-      previousHash,
-      event: "VALIDATED",
-      payload,
-      recordHash,
-    }));
-    const length = Buffer.alloc(4);
-    length.writeUInt32BE(body.length);
-    appendFileSync(journal, Buffer.concat([length, body]));
+    privateDirectory(join(f.repoRoot, ".next"));
+    privateDirectory(join(f.repoRoot, "node_modules"));
+    writeFileSync(join(f.repoRoot, ".next", "build"), "regenerated\n");
+    writeFileSync(join(f.repoRoot, "node_modules", "package"), "regenerated\n");
+    const validation = invokeQuarantineWorker("mark-validated", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      transactionId,
+      validatedAt: "2026-08-13T00:00:00.000Z",
+      writersStopped: true,
+    });
+    expect(validation).toMatchObject({ ok: true, result: { status: "VALIDATED" } });
     expect(invokeQuarantineWorker("recover", {
       repoRoot: f.repoRoot,
       quarantineRoot: f.quarantineRoot,
@@ -659,7 +648,7 @@ describe("quarantine transaction Slice 1", () => {
       reconciledEntries: 0,
     });
 
-    const manifest = join(runRoot, "manifests", `${prepared.payload.manifestSha256}.json`);
+    const manifest = join(runRoot, "manifests", `${validation.result?.manifestSha256}.json`);
     rmSync(manifest);
     const beforeJournal = readFileSync(journal);
     const payloadPath = join(runRoot, "payload/source-copies/copy-0001");

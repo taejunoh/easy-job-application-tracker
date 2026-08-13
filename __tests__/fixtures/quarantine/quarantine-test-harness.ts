@@ -207,6 +207,14 @@ export function createQuarantineFixture({
   generatedInnerSymlink = false,
   generatedNestedDirectory = false,
   tempResiduePaths = [],
+}: {
+  divergent?: boolean;
+  repoName?: string;
+  canonicalPath?: string;
+  copyPath?: string;
+  generatedInnerSymlink?: boolean;
+  generatedNestedDirectory?: boolean;
+  tempResiduePaths?: string[];
 } = {}): Fixture {
   const base = mkdtempSync(join(tmpdir(), "quarantine-transaction-"));
   const repoRoot = join(base, repoName);

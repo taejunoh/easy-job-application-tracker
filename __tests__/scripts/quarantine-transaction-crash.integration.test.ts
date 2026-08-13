@@ -190,6 +190,7 @@ describe("quarantine transaction real SIGKILL recovery", () => {
     const conflict = runChild("recoverQuarantine", resume);
     expect(conflict.status).toBe(0);
     expect(JSON.parse(conflict.stdout)).toEqual({
+      schemaVersion: 2,
       transactionId,
       status: "INCOMPLETE_CONFLICT",
       action: "resume",
