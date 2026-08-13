@@ -1339,13 +1339,17 @@ async function initializePopup() {
         (!tombstoneOrigin || tombstoneOrigin === stored.serverUrl);
       if (tombstoneMatchesStored) {
         const origin = tombstoneOrigin || stored.serverUrl || "";
+        const unresolvedRevocation = stored.remoteRevocationUnconfirmed === true;
         const persistence = origin
           ? await persistInvalidatedRecord(origin, [
             ...normalizePendingCleanupOrigins(
               workingRecord?.pendingCleanupOrigins
             ),
             origin,
-          ])
+          ], unresolvedRevocation ? {
+            installationId: stored.installationId,
+            remoteRevocationUnconfirmed: true,
+          } : {})
           : { record: null, storageClean: await purgeKnownCredentials() };
         const permissionClean = origin
           ? await removePermission(permissionPattern(origin))
@@ -1363,10 +1367,14 @@ async function initializePopup() {
           await clearSessionTombstone();
         }
         setConnectionStatus(
-          persistence.storageClean && permissionClean
+          unresolvedRevocation
+            ? directRemoteRevocation(origin, stored.installationId)
+            : persistence.storageClean && permissionClean
             ? "Disconnected. Create a new pairing code to reconnect."
             : "Disconnected. Credential or host-access cleanup remains pending.",
-          persistence.storageClean && permissionClean ? "info" : "error"
+          unresolvedRevocation || !persistence.storageClean || !permissionClean
+            ? "error"
+            : "info"
         );
         return null;
       }

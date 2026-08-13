@@ -358,6 +358,9 @@ describe("trusted extension storage", () => {
     harness.api.restoreConnection({ connection: harness.storageState.connection });
     harness.grantedOrigins.add(permissionFor("https://jobs.example.com"));
     harness.fetchMock.mockRejectedValueOnce(new Error("offline"));
+    harness.session.remove.mockRejectedValueOnce(
+      new Error("session tombstone unavailable")
+    );
 
     await harness.api.disconnectServer();
 
@@ -381,11 +384,26 @@ describe("trusted extension storage", () => {
       url: "https://jobs.example.com/settings#extension-installations",
     });
 
-    const reopened = loadLifecyclePopup({ storageState: harness.storageState });
+    const reopened = loadLifecyclePopup({
+      sessionState: harness.sessionState,
+      storageState: harness.storageState,
+    });
     await reopened.ready();
+    expect(reopened.storageState.connection).toEqual({
+      serverUrl: "https://jobs.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334499",
+      invalidated: true,
+      remoteRevocationUnconfirmed: true,
+    });
     expect(reopened.getElement("connectionStatus").textContent).toContain(
       "018f9f72-f2e9-7c29-a6fc-001122334499",
     );
+    await eventHandler(reopened.getElement("openTracker"), "click")({
+      preventDefault: jest.fn(),
+    });
+    expect(reopened.chrome.tabs.create).toHaveBeenCalledWith({
+      url: "https://jobs.example.com/settings#extension-installations",
+    });
     expect(JSON.stringify(reopened.storageState)).not.toContain(TOKEN_B);
   });
 
