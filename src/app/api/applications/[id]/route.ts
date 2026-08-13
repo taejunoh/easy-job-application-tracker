@@ -69,6 +69,20 @@ export const DELETE = route.handler(async function DELETE(
     await prisma.application.delete({ where: { id } });
     return NextResponse.json({ success: true });
   } catch (error) {
+    if (isForeignKeyViolation(error)) {
+      const duplicateCount = await prisma.application.count({
+        where: { duplicateOfId: id },
+      });
+      if (duplicateCount > 0) {
+        return NextResponse.json(
+          {
+            error: "Application has preserved duplicates",
+            code: "identity_has_duplicates",
+          },
+          { status: 409 },
+        );
+      }
+    }
     if (!isApplicationNotFound(error)) {
       throw error;
     }
@@ -83,5 +97,12 @@ function isApplicationNotFound(error: unknown): boolean {
   return (
     error instanceof Prisma.PrismaClientKnownRequestError &&
     error.code === "P2025"
+  );
+}
+
+function isForeignKeyViolation(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2003"
   );
 }

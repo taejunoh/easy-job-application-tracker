@@ -581,6 +581,7 @@ describe("connection generations", () => {
     harness.establish("https://a.example.com", TOKEN_A);
     harness.getElement("jobTitle").value = "Engineer";
     harness.getElement("company").value = "Example";
+    harness.getElement("jobUrl").value = "https://jobs.example.test/1";
     const responseA = deferred<Response>();
     harness.fetchMock
       .mockReturnValueOnce(responseA.promise)
@@ -592,7 +593,7 @@ describe("connection generations", () => {
     responseA.resolve({
       ok: true,
       status: 200,
-      json: async () => ({ id: 17, updated: false }),
+      json: async () => ({ id: 17, result: "created" }),
     } as Response);
     await save;
 
@@ -1170,6 +1171,7 @@ describe("connection teardown", () => {
     harness.establish("https://a.example.com", TOKEN_A);
     harness.getElement("jobTitle").value = "Engineer";
     harness.getElement("company").value = "Example";
+    harness.getElement("jobUrl").value = "https://jobs.example.test/1";
     const response = deferred<Response>();
     harness.fetchMock.mockReturnValueOnce(response.promise);
 
@@ -1178,7 +1180,7 @@ describe("connection teardown", () => {
     response.resolve({
       ok: true,
       status: 200,
-      json: async () => ({ id: 17, updated: false }),
+      json: async () => ({ id: 17, result: "created" }),
     } as Response);
     await save;
 

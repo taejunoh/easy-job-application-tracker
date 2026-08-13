@@ -670,7 +670,7 @@ describe("authenticated extension API client", () => {
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
-        json: async () => ({ id: 17, updated: false }),
+        json: async () => ({ id: 17, result: "created" }),
       });
 
     await api.serverExtract("https://jobs.example.com/role");
@@ -680,6 +680,7 @@ describe("authenticated extension API client", () => {
 
     getElement("jobTitle").value = "Engineer";
     getElement("company").value = "Example";
+    getElement("jobUrl").value = "https://jobs.example.com/role";
     await eventHandler(getElement("saveBtn"), "click")();
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
@@ -693,6 +694,35 @@ describe("authenticated extension API client", () => {
         `Bearer ${TEST_TOKEN}`
       );
     }
+  });
+
+  it("requires a URL before sending an application create request", async () => {
+    const { fetchMock, getElement } = loadPopup();
+    getElement("jobTitle").value = "Engineer";
+    getElement("company").value = "Example";
+    getElement("jobUrl").value = "";
+
+    await eventHandler(getElement("saveBtn"), "click")();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getElement("statusMsg").textContent).toMatch(/job URL.*required/i);
+  });
+
+  it("reports an existing identity without claiming it was updated", async () => {
+    const { fetchMock, getElement } = loadPopup();
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: 17, result: "existing" }),
+    });
+    getElement("jobTitle").value = "Engineer";
+    getElement("company").value = "Example";
+    getElement("jobUrl").value = "https://jobs.example.com/role";
+
+    await eventHandler(getElement("saveBtn"), "click")();
+
+    expect(getElement("statusMsg").textContent).toMatch(/already exists/i);
+    expect(getElement("statusMsg").textContent).not.toMatch(/updated/i);
   });
 });
 

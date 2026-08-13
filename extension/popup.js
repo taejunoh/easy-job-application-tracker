@@ -1043,6 +1043,11 @@ saveBtn.addEventListener("click", async () => {
   const jobType = document.getElementById("jobType").value.trim();
   const url = document.getElementById("jobUrl").value.trim();
 
+  if (!url) {
+    showStatus("Job URL is required.", "error");
+    return;
+  }
+
   if (!jobTitle || !company) {
     showStatus("Job title and company are required.", "error");
     return;
@@ -1056,7 +1061,7 @@ saveBtn.addEventListener("click", async () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        url: url || "",
+        url,
         jobTitle,
         company,
         location: location || null,
@@ -1078,8 +1083,8 @@ saveBtn.addEventListener("click", async () => {
     }
     const appUrl = `${request.connection.serverUrl}/applications/${result.id}`;
 
-    if (result.updated) {
-      showStatus("Existing application updated with full details!", "success");
+    if (result.result === "existing") {
+      showStatus("Application already exists; saved details were kept.", "success");
     } else {
       showStatus("Application saved to JobTracker!", "success");
     }

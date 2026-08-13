@@ -22,6 +22,7 @@ export default function UrlInput() {
   const [textUrl, setTextUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [extracted, setExtracted] = useState<ExtractedData | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const [editCompany, setEditCompany] = useState("");
@@ -80,12 +81,18 @@ export default function UrlInput() {
       setError("Job title and company are required");
       return;
     }
+    const applicationUrl = extracted?.url || textUrl.trim() || url.trim();
+    if (!applicationUrl) {
+      setError("Job URL is required");
+      return;
+    }
 
     setLoading(true);
     setError("");
+    setNotice("");
 
     try {
-      await saveNewApplication(
+      const result = await saveNewApplication(
         api,
         () => {
           setUrl("");
@@ -97,10 +104,15 @@ export default function UrlInput() {
           router.refresh();
         },
         {
-          url: extracted?.url || textUrl.trim() || url.trim() || "",
+          url: applicationUrl,
           jobTitle: editTitle.trim(),
           company: editCompany.trim(),
         },
+      );
+      setNotice(
+        result.result === "existing"
+          ? "This application already exists; its saved details were kept."
+          : "Application saved.",
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
@@ -179,7 +191,7 @@ export default function UrlInput() {
               type="url"
               value={textUrl}
               onChange={(e) => setTextUrl(e.target.value)}
-              placeholder="Job URL (optional, for reference)"
+              placeholder="Job URL (required)"
               className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
               disabled={loading}
             />
@@ -247,6 +259,9 @@ export default function UrlInput() {
       {error && (
         <div role="alert" className="mt-2 text-red-400 text-xs">{error}</div>
       )}
+      {notice && (
+        <div role="status" className="mt-2 text-green-400 text-xs">{notice}</div>
+      )}
     </div>
   );
 }
@@ -257,15 +272,21 @@ interface NewApplication {
   company: string;
 }
 
+interface NewApplicationResult {
+  id: string;
+  result: "created" | "existing";
+}
+
 export async function saveNewApplication(
   api: ClientApi,
   clearForm: () => void,
   application: NewApplication,
-): Promise<void> {
-  await api("/api/applications", {
+): Promise<NewApplicationResult> {
+  const result = await api<NewApplicationResult>("/api/applications", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(application),
   });
   clearForm();
+  return result;
 }

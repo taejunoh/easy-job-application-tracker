@@ -119,4 +119,22 @@ describe("client mutations", () => {
 
     expect(clearForm).not.toHaveBeenCalled();
   });
+
+  it("returns the server identity result before clearing the add form", async () => {
+    const response = {
+      id: "018f9f72-f2e9-7c29-a6fc-001122334455",
+      result: "existing" as const,
+    };
+    const request = jest.fn(() => Promise.resolve(response)) as ClientApi;
+    const clearForm = jest.fn();
+
+    await expect(
+      saveNewApplication(request, clearForm, {
+        url: "https://jobs.example/1",
+        jobTitle: "Engineer",
+        company: "Example",
+      }),
+    ).resolves.toEqual(response);
+    expect(clearForm).toHaveBeenCalledTimes(1);
+  });
 });

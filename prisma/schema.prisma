@@ -7,19 +7,27 @@ datasource db {
 }
 
 model Application {
-  id          String   @id @default(uuid())
-  url         String
-  jobTitle    String
-  company     String
-  status      String   @default("Applied")
-  appliedDate DateTime @default(now())
-  description String?
-  notes       String?
-  salary      String?
-  location    String?
-  jobType     String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id            String        @id @default(uuid())
+  url           String
+  jobTitle      String
+  company       String
+  status        String        @default("Applied")
+  appliedDate   DateTime      @default(now())
+  description   String?
+  notes         String?
+  salary        String?
+  location      String?
+  jobType       String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  identityKey   String?       @unique
+  canonicalUrl  String?
+  duplicateOfId String?
+  identityState String        @default("legacy_unresolved")
+  duplicateOf   Application?  @relation("ApplicationDuplicates", fields: [duplicateOfId], references: [id], onDelete: Restrict)
+  duplicates    Application[] @relation("ApplicationDuplicates")
+
+  @@index([duplicateOfId])
 }
 
 model Settings {

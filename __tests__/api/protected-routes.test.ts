@@ -36,6 +36,7 @@ jest.mock("@/lib/server-env", () => {
 
 jest.mock("@/lib/prisma", () => ({
   prisma: {
+    $queryRaw: jest.fn(),
     application: {
       findMany: jest.fn(),
       findUnique: jest.fn(),
@@ -182,6 +183,92 @@ describe("application route contract enforcement", () => {
       code: "request_too_large",
     });
     expect(prisma.application.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("application identity route behavior", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    arrangeSuccessfulBusinessLogic();
+  });
+
+  it("returns the atomic created result", async () => {
+    const response = await applicationsRoute.POST(applicationPostRequest());
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      id: APPLICATION_ID,
+      result: "created",
+    });
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.application.create).not.toHaveBeenCalled();
+  });
+
+  it("returns an existing identity without mutating it", async () => {
+    jest.mocked(prisma.$queryRaw).mockResolvedValueOnce([]);
+    jest.mocked(prisma.application.findUnique).mockResolvedValueOnce({
+      ...applicationFixture(),
+      canonicalUrl: "https://example.com/jobs/1",
+      identityKey: "url-v1:placeholder",
+      identityState: "canonical",
+      duplicateOfId: null,
+    } as never);
+
+    const response = await applicationsRoute.POST(applicationPostRequest());
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      id: APPLICATION_ID,
+      result: "existing",
+    });
+    expect(prisma.application.update).not.toHaveBeenCalled();
+    expect(prisma.application.create).not.toHaveBeenCalled();
+  });
+
+  it("returns a closed collision when a digest resolves to a different URL", async () => {
+    jest.mocked(prisma.$queryRaw).mockResolvedValueOnce([]);
+    jest.mocked(prisma.application.findUnique).mockResolvedValueOnce({
+      ...applicationFixture(),
+      canonicalUrl: "https://collision.example/different",
+      identityKey: "url-v1:collision",
+      identityState: "canonical",
+      duplicateOfId: null,
+    } as never);
+
+    const response = await applicationsRoute.POST(applicationPostRequest());
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: "Application identity collision",
+      code: "identity_collision",
+    });
+  });
+
+  it("refuses deletion of a canonical row with preserved duplicates", async () => {
+    jest.mocked(prisma.application.delete).mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("foreign key", {
+        code: "P2003",
+        clientVersion: "7.9.1",
+      }) as never,
+    );
+    jest.mocked(prisma.application.count).mockResolvedValueOnce(1);
+    const route = actualRoutes.find(
+      ({ name }) => name === "application detail DELETE",
+    ) as ActualRouteCase;
+
+    const response = await invokeActual(
+      route,
+      productRequest(route, {
+        origin: APP_ORIGIN,
+        authorization: `Bearer ${ACCESS_TOKEN}`,
+      }),
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: "Application has preserved duplicates",
+      code: "identity_has_duplicates",
+    });
   });
 });
 
@@ -540,7 +627,7 @@ describe("protected product API actual requests", () => {
       "applications POST",
       () =>
         jest
-          .mocked(prisma.application.create)
+          .mocked(prisma.$queryRaw)
           .mockRejectedValueOnce(new Error("database detail")),
     ],
     [
@@ -1189,13 +1276,8 @@ async function invokeOptions(
 }
 
 function arrangeSuccessfulBusinessLogic(): void {
-  const application = {
-    id: APPLICATION_ID,
-    url: "https://example.com/jobs/1",
-    jobTitle: "Engineer",
-    company: "Example",
-    status: "Applied",
-  };
+  const application = applicationFixture();
+  jest.mocked(prisma.$queryRaw).mockResolvedValue([application] as never);
   jest.mocked(prisma.application.findMany).mockResolvedValue([]);
   jest.mocked(prisma.application.findUnique).mockResolvedValue(application as never);
   jest.mocked(prisma.application.create).mockResolvedValue(application as never);
@@ -1239,6 +1321,45 @@ function arrangeSuccessfulBusinessLogic(): void {
   jest.mocked(parsePdfInWorker).mockResolvedValue("resume text");
 }
 
+function applicationFixture() {
+  const now = new Date("2026-08-13T14:00:00.000Z");
+  return {
+    id: APPLICATION_ID,
+    url: "https://example.com/jobs/1",
+    jobTitle: "Engineer",
+    company: "Example",
+    status: "Applied",
+    appliedDate: now,
+    description: null,
+    notes: null,
+    salary: null,
+    location: null,
+    jobType: null,
+    createdAt: now,
+    updatedAt: now,
+    identityKey: "url-v1:placeholder",
+    canonicalUrl: "https://example.com/jobs/1",
+    duplicateOfId: null,
+    identityState: "canonical",
+  };
+}
+
+function applicationPostRequest(): NextRequest {
+  return new NextRequest(`${APP_ORIGIN}/api/applications`, {
+    method: "POST",
+    headers: {
+      Origin: APP_ORIGIN,
+      Cookie: SESSION_COOKIE,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      url: "https://example.com/jobs/1",
+      jobTitle: "Engineer",
+      company: "Example",
+    }),
+  });
+}
+
 function expectNoDownstreamWork(): void {
   for (const mock of downstreamMocks()) {
     expect(mock).not.toHaveBeenCalled();
@@ -1255,7 +1376,7 @@ function expectedDownstream(route: ActualRouteCase): jest.Mock {
     case "applications GET":
       return jest.mocked(prisma.application.findMany);
     case "applications POST":
-      return jest.mocked(prisma.application.create);
+      return jest.mocked(prisma.$queryRaw);
     case "application detail GET":
       return jest.mocked(prisma.application.findUnique);
     case "application detail PATCH":
@@ -1286,6 +1407,7 @@ function downstreamMocks(): jest.Mock[] {
     jest.mocked(prisma.application.update),
     jest.mocked(prisma.application.delete),
     jest.mocked(prisma.application.count),
+    jest.mocked(prisma.$queryRaw),
     jest.mocked(prisma.settings.findFirst),
     jest.mocked(prisma.settings.create),
     jest.mocked(prisma.settings.update),

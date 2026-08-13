@@ -1,4 +1,9 @@
 import type { PrismaClient } from "@prisma/client";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { NextRequest } from "next/server";
 import { generatedPdf } from "../fixtures/resume/generated-pdf";
 import { assertDatabaseTestSafety } from "./database-test-guard";
@@ -213,6 +218,167 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
     );
     expect(deletedResponse.status).toBe(200);
     await expect(deletedResponse.json()).resolves.toEqual({ success: true });
+  });
+
+  it("creates one row for 20 concurrent identical POSTs without mutating retries", async () => {
+    const version = await prisma.$queryRawUnsafe<Array<{ server_version_num: string }>>(
+      "SHOW server_version_num",
+    );
+    expect(Number(version[0]?.server_version_num)).toBeGreaterThanOrEqual(170_000);
+    expect(Number(version[0]?.server_version_num)).toBeLessThan(180_000);
+    await prisma.application.deleteMany();
+    const payload = {
+      url: "https://example.test/jobs/concurrent?utm_source=ci&job=42",
+      jobTitle: "Concurrency Engineer",
+      company: "Fixture Labs",
+      status: "Applied",
+      notes: "Original notes",
+    };
+
+    const responses = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        applications.POST(
+          request("/api/applications", {
+            method: "POST",
+            origin: APP_ORIGIN,
+            bearer: true,
+            json: payload,
+          }),
+        ),
+      ),
+    );
+    const bodies = await Promise.all(responses.map((response) => response.json()));
+
+    expect(responses.filter(({ status }) => status === 201)).toHaveLength(1);
+    expect(responses.filter(({ status }) => status === 200)).toHaveLength(19);
+    expect(bodies.filter(({ result }) => result === "created")).toHaveLength(1);
+    expect(bodies.filter(({ result }) => result === "existing")).toHaveLength(19);
+    expect(new Set(bodies.map(({ id }) => id)).size).toBe(1);
+
+    const retry = await applications.POST(
+      request("/api/applications", {
+        method: "POST",
+        origin: APP_ORIGIN,
+        bearer: true,
+        json: { ...payload, status: "Offer", notes: "Replacement notes" },
+      }),
+    );
+    expect(retry.status).toBe(200);
+    await expect(retry.json()).resolves.toMatchObject({ result: "existing" });
+
+    const stored = await prisma.application.findMany({
+      where: { canonicalUrl: "https://example.test/jobs/concurrent?job=42" },
+    });
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({ status: "Applied", notes: "Original notes" });
+    await prisma.application.deleteMany();
+  });
+
+  it("backfills legacy rows losslessly and idempotently with private reports", async () => {
+    await prisma.application.deleteMany();
+    const createdAt = new Date("2026-01-01T00:00:00.000Z");
+    const winnerId = "00000000-0000-4000-8000-000000000001";
+    const duplicateId = "00000000-0000-4000-8000-000000000002";
+    const unresolvedId = "00000000-0000-4000-8000-000000000003";
+    await prisma.application.createMany({
+      data: [
+        {
+          id: duplicateId,
+          url: "https://example.test/jobs/legacy?utm_source=feed",
+          jobTitle: "Private duplicate title",
+          company: "Private duplicate company",
+          createdAt,
+        },
+        {
+          id: winnerId,
+          url: "https://example.test/jobs/legacy",
+          jobTitle: "Private winner title",
+          company: "Private winner company",
+          createdAt,
+        },
+        {
+          id: unresolvedId,
+          url: "legacy invalid url",
+          jobTitle: "Private unresolved title",
+          company: "Private unresolved company",
+          createdAt: new Date("2026-01-02T00:00:00.000Z"),
+        },
+      ],
+    });
+    const directory = await mkdtemp(join(tmpdir(), "application-backfill-integration-"));
+    const dryRunPath = join(directory, "dry-run.json");
+    const applyPath = join(directory, "apply.json");
+    const rerunPath = join(directory, "rerun.json");
+
+    expect((await runBackfill(["--report", dryRunPath])).code).toBe(0);
+    expect((await runBackfill(["--apply", "--writers-stopped", "--report", applyPath])).code).toBe(0);
+    expect((await runBackfill(["--apply", "--writers-stopped", "--report", rerunPath])).code).toBe(0);
+
+    const stored = await prisma.application.findMany({ orderBy: { id: "asc" } });
+    expect(stored).toHaveLength(3);
+    expect(stored[0]).toMatchObject({
+      id: winnerId,
+      identityState: "canonical",
+      canonicalUrl: "https://example.test/jobs/legacy",
+      duplicateOfId: null,
+    });
+    expect(stored[0].identityKey).toMatch(/^url-v1:[0-9a-f]{64}$/u);
+    expect(stored[1]).toMatchObject({
+      id: duplicateId,
+      identityState: "legacy_duplicate",
+      identityKey: null,
+      canonicalUrl: "https://example.test/jobs/legacy",
+      duplicateOfId: winnerId,
+    });
+    expect(stored[2]).toMatchObject({
+      id: unresolvedId,
+      identityState: "legacy_unresolved",
+      identityKey: null,
+      canonicalUrl: null,
+      duplicateOfId: null,
+    });
+    const protectedDelete = await applicationDetail.DELETE(
+      request(`/api/applications/${winnerId}`, {
+        method: "DELETE",
+        origin: APP_ORIGIN,
+        bearer: true,
+      }),
+      detailContext(winnerId),
+    );
+    expect(protectedDelete.status).toBe(409);
+    await expect(protectedDelete.json()).resolves.toMatchObject({
+      code: "identity_has_duplicates",
+    });
+    await expect(
+      prisma.$executeRawUnsafe(
+        `UPDATE "Application" SET "identityKey" = NULL, "duplicateOfId" = "id", "identityState" = 'legacy_duplicate' WHERE "id" = '${winnerId}'`,
+      ),
+    ).rejects.toBeDefined();
+    await expect(
+      prisma.$executeRawUnsafe(
+        `UPDATE "Application" SET "identityState" = 'unknown' WHERE "id" = '${unresolvedId}'`,
+      ),
+    ).rejects.toBeDefined();
+
+    const reportText = await readFile(applyPath, "utf8");
+    expect((await stat(applyPath)).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(reportText)).toMatchObject({
+      rowCountBefore: 3,
+      rowCountAfter: 3,
+      stateTotals: { canonical: 1, legacy_duplicate: 1, legacy_unresolved: 1 },
+      uniqueIndexVerified: true,
+    });
+    for (const privateValue of [
+      winnerId,
+      duplicateId,
+      unresolvedId,
+      "https://example.test/jobs/legacy",
+      "Private winner title",
+      process.env.DATABASE_URL ?? "postgresql://",
+    ]) {
+      expect(reportText).not.toContain(privateValue);
+    }
+    await prisma.application.deleteMany();
   });
 
   it("persists settings and accepts the signed web session", async () => {
@@ -435,4 +601,25 @@ function requiredDatabaseIdentity() {
 
 function detailContext(id: string): { params: Promise<{ id: string }> } {
   return { params: Promise.resolve({ id }) };
+}
+
+async function runBackfill(args: readonly string[]): Promise<{
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}> {
+  const child = spawn(process.execPath, [
+    join(process.cwd(), "scripts/backfill-application-identities.mjs"),
+    ...args,
+  ], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+  child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+  const [code] = (await once(child, "close")) as [number | null];
+  return { code, stdout, stderr };
 }
