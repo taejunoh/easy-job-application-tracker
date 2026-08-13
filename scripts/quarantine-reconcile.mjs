@@ -21,6 +21,7 @@ const REQUIRED_KEYS = Object.freeze([
 ]);
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const ENDPOINT_CONTENT_MISMATCH = Symbol("endpoint-content-mismatch");
 const DIRECTIVES = new Map([
   ["PREPARED", [false, "recover_required"]],
   ["MOVING", [false, "recover_required"]],
@@ -128,7 +129,13 @@ async function workspaceAncestors(repoRoot, endpoint, fsApi) {
   return identities;
 }
 
-async function observeEntry(path, entry, fsApi, ancestors = undefined) {
+async function observeEntry(
+  path,
+  entry,
+  fsApi,
+  ancestors = undefined,
+  allowContentMismatch = false,
+) {
   const stat = await optionalStat(path, fsApi);
   if (stat === null) return null;
   if (stat.isSymbolicLink()) fail("ERR_INTEGRITY", "quarantine endpoint is a symlink");
@@ -143,12 +150,16 @@ async function observeEntry(path, entry, fsApi, ancestors = undefined) {
       throw error;
     }
   }
-  if (!stat.isFile() || modeOf(stat) !== entry.mode || Number(stat.size) !== entry.size) {
+  if (!stat.isFile()) {
     fail("ERR_INTEGRITY", "file endpoint metadata does not match the manifest");
   }
   try {
     const observed = await hashVerifiedRegularFile(path, stat, fsApi, ancestors ?? Object.freeze([]));
-    if (observed.sha256 !== entry.sha256 || observed.bytes !== entry.size) {
+    if (
+      modeOf(stat) !== entry.mode || Number(stat.size) !== entry.size ||
+      observed.sha256 !== entry.sha256 || observed.bytes !== entry.size
+    ) {
+      if (allowContentMismatch) return ENDPOINT_CONTENT_MISMATCH;
       fail("ERR_INTEGRITY", "file endpoint content does not match the manifest");
     }
     return entry.preMoveInventory;
@@ -285,18 +296,25 @@ async function validateRestoreLayout({ capability, fsApi, input, replayed, manif
   const observedConflicts = new Set();
   const layouts = [];
   for (const entry of manifest.entries) {
+    const journalConflict = conflictIds.has(entry.id);
     const source = join(input.repoRoot, ...entry.relativePath.split("/"));
     const ancestors = await workspaceAncestors(input.repoRoot, source, fsApi);
     const payload = deriveRunPath(capability, { purpose: "payload", id: entry.id });
-    const sourceObserved = await observeEntry(source, entry, fsApi, ancestors);
-    const payloadObserved = await observeEntry(payload, entry, fsApi);
+    const sourceObserved = await observeEntry(
+      source, entry, fsApi, ancestors, journalConflict,
+    );
+    const payloadObserved = await observeEntry(
+      payload, entry, fsApi, undefined, journalConflict,
+    );
     const rollbackRoot = deriveRunPath(capability, { purpose: "rollback", id: ledger.restoreId });
     const rollback = join(rollbackRoot, entry.relativePath === ".next" ? ".next" : "node_modules");
     const rollbackObserved = entry.kind === "generated-root"
-      ? await observeEntry(rollback, entry, fsApi)
+      ? await observeEntry(rollback, entry, fsApi, undefined, journalConflict)
       : null;
-    if (payloadObserved !== null) assertMatches(entry, payloadObserved, "restore payload endpoint");
-    if (sourceObserved !== null && entry.kind !== "generated-root") {
+    if (!journalConflict && payloadObserved !== null) {
+      assertMatches(entry, payloadObserved, "restore payload endpoint");
+    }
+    if (!journalConflict && sourceObserved !== null && entry.kind !== "generated-root") {
       assertMatches(entry, sourceObserved, "restored workspace endpoint");
     }
     const activeExpected = entry.kind === "generated-root" ? ledger.active.get(entry.id) : null;
@@ -333,6 +351,27 @@ async function validateRestoreLayout({ capability, fsApi, input, replayed, manif
     fail("ERR_INTEGRITY", "terminal restore layout is incomplete");
   }
   return layouts;
+}
+
+async function validatePublishedInventories({ capability, replayed, manifest }) {
+  const phases = ["pre"];
+  if (replayed.records.some((record) => record.event === "QUARANTINED")) {
+    phases.push("moved-pass-2");
+  }
+  try {
+    for (const phase of phases) {
+      for (const entry of manifest.entries) {
+        await verifyPublishedInventory({
+          capability,
+          entryId: entry.id,
+          phase,
+          expectedSummary: entry.preMoveInventory,
+        });
+      }
+    }
+  } catch {
+    fail("ERR_INTEGRITY", "published quarantine inventory is invalid");
+  }
 }
 
 async function repositorySnapshot(input, fsApi) {
@@ -419,6 +458,8 @@ async function validateSnapshot(capability, input, fsApi) {
        manifest.repositoryIdentity.dev !== repository.dev || manifest.repositoryIdentity.ino !== repository.ino)) ||
     (manifest.schemaVersion === 1 && replayed.schemaVersion === 2)
   ) fail("ERR_INTEGRITY", "journal, manifest, and repository provenance conflict");
+
+  await validatePublishedInventories({ capability, replayed, manifest });
 
   const pointer = await optionalPointer(capability);
   if (selection.manifestState === "VALIDATED") {

@@ -340,6 +340,22 @@ describe("read-only quarantine reconciliation", () => {
     })).toMatchObject({ ok: false, code: "ERR_INTEGRITY" });
   });
 
+  it.each(["pre", "moved-pass-2"] as const)(
+    "fails closed when a settled %s inventory is missing",
+    (phase) => {
+      const prepared = prepareQuarantinedFixture({ regenerate: false });
+      bases.push(prepared.fixture.base);
+      rmSync(join(prepared.runRoot, "inventories", phase, "copy-0001.jsonl"));
+
+      expect(reconcile({
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        writersStopped: true,
+      })).toMatchObject({ ok: false, code: "ERR_INTEGRITY" });
+    },
+  );
+
   it("explicitly requires settled apply intents and completions to cover the manifest", () => {
     const prepared = prepareQuarantinedFixture({ regenerate: false });
     bases.push(prepared.fixture.base);
@@ -436,7 +452,10 @@ describe("read-only quarantine reconciliation", () => {
       killAt: "after-event:RESTORE_INTENT:copy-0001",
     })).signal).toBe("SIGKILL");
     rmSync(join(prepared.runRoot, "journal.lock"));
-    writeFileSync(join(prepared.fixture.repoRoot, "notes 2.txt"), "canonical\n");
+    writeFileSync(
+      join(prepared.fixture.repoRoot, "notes 2.txt"),
+      "foreign operator content\n",
+    );
     expect((await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" }, {
       killAt: "after-event:INCOMPLETE_CONFLICT",
     })).signal).toBe("SIGKILL");

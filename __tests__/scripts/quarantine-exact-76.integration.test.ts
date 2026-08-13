@@ -121,7 +121,10 @@ function discoveryArgs(fixture: ExactFixture, command: "inspect" | "apply") {
   ];
 }
 
-function lifecycleArgs(fixture: ExactFixture, command: "mark-validated" | "restore") {
+function lifecycleArgs(
+  fixture: ExactFixture,
+  command: "mark-validated" | "reconcile" | "restore",
+) {
   return [
     command,
     "--repo-root", fixture.repoRoot,
@@ -181,6 +184,17 @@ describe("exact disposable 76-record quarantine proof", () => {
     expect(fixture.numberedPaths.every((path) => !existsSync(join(fixture.repoRoot, path)))).toBe(true);
     expect(fixture.tempPaths.every((path) => !existsSync(join(fixture.repoRoot, path)))).toBe(true);
 
+    const quarantinedReconcile = runCli(lifecycleArgs(fixture, "reconcile"));
+    expect(quarantinedReconcile.status).toBe(0);
+    expect(JSON.parse(quarantinedReconcile.stdout)).toEqual({
+      ok: true,
+      command: "reconcile",
+      schemaVersion: 1,
+      state: "QUARANTINED",
+      complete: false,
+      nextAction: "mark_validated",
+    });
+
     regenerateStableRoots(fixture);
     const validated = runCli(lifecycleArgs(fixture, "mark-validated"));
     expect(validated.status).toBe(0);
@@ -208,6 +222,17 @@ describe("exact disposable 76-record quarantine proof", () => {
       "generated-next",
       "generated-node-modules",
     ]);
+
+    const validatedReconcile = runCli(lifecycleArgs(fixture, "reconcile"));
+    expect(validatedReconcile.status).toBe(0);
+    expect(JSON.parse(validatedReconcile.stdout)).toEqual({
+      ok: true,
+      command: "reconcile",
+      schemaVersion: 1,
+      state: "VALIDATED",
+      complete: false,
+      nextAction: "retain_and_review",
+    });
 
     const resumed = runCli([
       "recover",
@@ -242,6 +267,17 @@ describe("exact disposable 76-record quarantine proof", () => {
     expect(readFileSync(join(fixture.repoRoot, ".next", "build"), "utf8")).toBe("original-build\n");
     expect(readFileSync(join(fixture.repoRoot, "node_modules", "package"), "utf8"))
       .toBe("original-dependency\n");
+
+    const restoredReconcile = runCli(lifecycleArgs(fixture, "reconcile"));
+    expect(restoredReconcile.status).toBe(0);
+    expect(JSON.parse(restoredReconcile.stdout)).toEqual({
+      ok: true,
+      command: "reconcile",
+      schemaVersion: 1,
+      state: "RESTORED",
+      complete: true,
+      nextAction: "none",
+    });
   }, 120_000);
 
   it("rolls back an interrupted exact 78-entry v2 manifest through the public CLI", () => {
