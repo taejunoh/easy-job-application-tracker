@@ -60,7 +60,26 @@ describe("npm audit exception policy", () => {
 
     expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe(
-      "Audit policy passed: critical=0 high=0 moderate=5 low=0 exceptions=2",
+      "Audit policy passed: full critical=0 high=0 moderate=5 low=0 exceptions=2",
+    );
+    expect(result.stderr).toBe("");
+  });
+
+  it("reports full and production graphs separately while enforcing both gates", () => {
+    const production = structuredClone(allowedAudit);
+    production.metadata.vulnerabilities.moderate = 0;
+    production.metadata.vulnerabilities.total = 0;
+    production.vulnerabilities = {};
+
+    const result = runPolicy(
+      join(fixtures, "audit-allowed.json"),
+      join(fixtures, "exceptions-allowed.json"),
+      writeFixture("production.json", production),
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      "Audit policy passed: full critical=0 high=0 moderate=5 low=0 production critical=0 high=0 moderate=0 low=0 exceptions=2",
     );
     expect(result.stderr).toBe("");
   });
@@ -89,7 +108,7 @@ describe("npm audit exception policy", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr.trim()).toBe(
-      `Audit policy failed: critical=${severity === "critical" ? 1 : 0} high=${severity === "high" ? 1 : 0} moderate=5 low=0 exceptions=3`,
+      `Audit policy failed: full critical=${severity === "critical" ? 1 : 0} high=${severity === "high" ? 1 : 0} moderate=5 low=0 exceptions=3`,
     );
   });
 
@@ -187,18 +206,26 @@ describe("npm audit exception policy", () => {
   }
 });
 
-function runPolicy(auditPath: string, exceptionsPath: string) {
+function runPolicy(
+  auditPath: string,
+  exceptionsPath: string,
+  productionAuditPath?: string,
+) {
+  const args = [
+    script,
+    "--audit-file",
+    auditPath,
+    "--exceptions-file",
+    exceptionsPath,
+    "--today",
+    "2026-07-14",
+  ];
+  if (productionAuditPath) {
+    args.push("--production-audit-file", productionAuditPath);
+  }
   return spawnSync(
     process.execPath,
-    [
-      script,
-      "--audit-file",
-      auditPath,
-      "--exceptions-file",
-      exceptionsPath,
-      "--today",
-      "2026-07-14",
-    ],
+    args,
     { cwd: root, encoding: "utf8" },
   );
 }

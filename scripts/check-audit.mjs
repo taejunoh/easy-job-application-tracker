@@ -11,28 +11,44 @@ const defaultExceptionsPath = resolve(
 const severityNames = ["info", "low", "moderate", "high", "critical"];
 
 let counts;
+let productionCounts;
 let exceptionCount = 0;
 
 try {
   const options = parseArguments(process.argv.slice(2));
   const audit = loadAudit(options.auditFile);
   counts = validateAuditCounts(audit);
+  const shouldCheckProduction = !options.auditFile || options.productionAuditFile;
+  if (shouldCheckProduction) {
+    productionCounts = validateAuditCounts(
+      loadAudit(options.productionAuditFile, true),
+    );
+  }
   const policy = readJson(options.exceptionsFile ?? defaultExceptionsPath);
   exceptionCount = Array.isArray(policy?.exceptions)
     ? policy.exceptions.length
     : 0;
 
-  if (counts.high > 0 || counts.critical > 0) throw new Error("blocked severity");
+  if (
+    counts.high > 0 ||
+    counts.critical > 0 ||
+    productionCounts?.high > 0 ||
+    productionCounts?.critical > 0
+  ) {
+    throw new Error("blocked severity");
+  }
 
   validatePolicyDates(policy, options.today);
   const actual = mapConcreteAdvisories(audit.vulnerabilities);
   validateExceptions(policy.exceptions, actual);
 
-  console.log(formatResult("passed", counts, exceptionCount));
+  console.log(
+    formatResult("passed", counts, productionCounts, exceptionCount),
+  );
 } catch {
   console.error(
     counts
-      ? formatResult("failed", counts, exceptionCount)
+      ? formatResult("failed", counts, productionCounts, exceptionCount)
       : "Audit policy failed: counts unavailable",
   );
   process.exitCode = 1;
@@ -46,6 +62,9 @@ function parseArguments(arguments_) {
     if (!value) throw new Error("missing argument value");
     if (flag === "--audit-file") options.auditFile = resolve(value);
     else if (flag === "--exceptions-file") options.exceptionsFile = resolve(value);
+    else if (flag === "--production-audit-file") {
+      options.productionAuditFile = resolve(value);
+    }
     else if (flag === "--today") options.today = value;
     else throw new Error("unknown argument");
   }
@@ -53,14 +72,18 @@ function parseArguments(arguments_) {
   return options;
 }
 
-function loadAudit(auditFile) {
+function loadAudit(auditFile, omitDev = false) {
   if (auditFile) return readJson(auditFile);
 
-  const result = spawnSync("npm", ["audit", "--json"], {
+  const result = spawnSync(
+    "npm",
+    ["audit", "--json", ...(omitDev ? ["--omit=dev"] : [])],
+    {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 20 * 1024 * 1024,
-  });
+    },
+  );
   if (result.error || result.signal || ![0, 1].includes(result.status)) {
     throw new Error("npm audit failed");
   }
@@ -241,8 +264,13 @@ function sameStrings(left, right) {
   );
 }
 
-function formatResult(status, auditCounts, exceptions) {
-  return `Audit policy ${status}: critical=${auditCounts.critical} high=${auditCounts.high} moderate=${auditCounts.moderate} low=${auditCounts.low} exceptions=${exceptions}`;
+function formatResult(status, auditCounts, productionAuditCounts, exceptions) {
+  const full = `full critical=${auditCounts.critical} high=${auditCounts.high} moderate=${auditCounts.moderate} low=${auditCounts.low}`;
+  if (!productionAuditCounts) {
+    return `Audit policy ${status}: ${full} exceptions=${exceptions}`;
+  }
+  const production = `production critical=${productionAuditCounts.critical} high=${productionAuditCounts.high} moderate=${productionAuditCounts.moderate} low=${productionAuditCounts.low}`;
+  return `Audit policy ${status}: ${full} ${production} exceptions=${exceptions}`;
 }
 
 function isRecord(value) {

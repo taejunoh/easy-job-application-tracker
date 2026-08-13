@@ -1,23 +1,6 @@
 {
   "schemaVersion": 1,
-  "reviewedOn": "2026-07-14",
-  "reviewBy": "2026-08-14",
-  "exceptions": [
-    {
-      "id": "GHSA-92pp-h63x-v22m",
-      "url": "https://github.com/advisories/GHSA-92pp-h63x-v22m",
-      "severity": "moderate",
-      "scope": ["@hono/node-server", "@prisma/dev", "prisma"],
-      "rationale": "The affected serveStatic middleware is pulled into the Prisma CLI toolchain and is not used by the deployed application. npm's proposed fix is an unsupported downgrade from Prisma 7.8.0 to 6.19.3.",
-      "remediation": "Upgrade all three Prisma direct packages together after a supported 7.x or later release includes @hono/node-server 1.19.13 or newer, then remove this exception."
-    },
-    {
-      "id": "GHSA-qx2v-qp2m-jg93",
-      "url": "https://github.com/advisories/GHSA-qx2v-qp2m-jg93",
-      "severity": "moderate",
-      "scope": ["next", "postcss"],
-      "rationale": "Next 16.2.10 bundles PostCSS 8.4.31 internally. The application does not stringify attacker-supplied CSS, and npm's proposed fix is an unsupported downgrade to Next 9.3.3.",
-      "remediation": "Upgrade Next when a supported release bundles PostCSS 8.5.10 or newer, then remove this exception; do not override Next internals."
-    }
-  ]
+  "reviewedOn": "2026-08-13",
+  "reviewBy": "2026-09-13",
+  "exceptions": []
 }
