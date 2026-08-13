@@ -3,6 +3,11 @@ import "server-only";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 import { getServerEnv } from "../server-env";
+import {
+  digestInstallationSecret,
+  parseInstallationToken,
+  verifyCredentialDigest,
+} from "./extension-credentials";
 
 export const SESSION_COOKIE_NAME = "jobtracker_session";
 export const SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
@@ -11,11 +16,28 @@ export type AuthConfig = Readonly<{
   appAccessToken: string;
   encryptionSecret: string;
   appOrigin: string;
+  corsAllowedOrigins?: readonly string[];
+}>;
+
+export type InstallationAuthenticationRecord = Readonly<{
+  id: string;
+  origin: string;
+  tokenDigest: string;
+  expiresAt: Date;
+  revokedAt: Date | null;
+}>;
+
+export type InstallationAuthenticationStore = Readonly<{
+  findForAuthentication(
+    selector: string,
+  ): Promise<InstallationAuthenticationRecord | null>;
+  touch(id: string, usedAt: Date): Promise<boolean>;
 }>;
 
 export type AuthOptions = Readonly<{
   config?: AuthConfig;
   now?: number;
+  installationStore?: InstallationAuthenticationStore;
 }>;
 
 export type SessionCookieOptions = Readonly<{
@@ -50,8 +72,17 @@ export type AuthenticationError =
 
 export type AuthenticationSuccess = Readonly<{
   authenticated: true;
-  via: "bearer" | "session";
-}>;
+}> & (
+  | Readonly<{ via: "bearer" | "session" }>
+  | Readonly<{
+      via: "installation";
+      principal: Readonly<{
+        kind: "installation";
+        installationId: string;
+        origin: string;
+      }>;
+    }>
+);
 
 export type ApiAuthenticationResult =
   | AuthenticationSuccess
@@ -228,6 +259,69 @@ export function authenticateApiRequest(
   return { authenticated: true, via: "session" };
 }
 
+export async function authenticateApiRequestAsync(
+  request: Request,
+  options: AuthOptions = {},
+): Promise<ApiAuthenticationResult> {
+  const config = resolveConfig(options.config);
+  const now = authenticationTimeInSeconds(options.now);
+  if (now === null) return UNAUTHORIZED;
+
+  const authorization = request.headers.get("authorization");
+  const match = authorization?.match(/^Bearer +([^\s]+)$/iu);
+  if (authorization !== null && match === null) return UNAUTHORIZED;
+
+  if (match) {
+    const parsed = parseInstallationToken(match[1]);
+    if (parsed) {
+      const origin = request.headers.get("origin");
+      if (
+        origin === null ||
+        !isExtensionOrigin(origin) ||
+        !(config.corsAllowedOrigins ?? []).includes(origin)
+      ) {
+        return UNAUTHORIZED;
+      }
+      const store =
+        options.installationStore ?? (await defaultInstallationStore());
+      const record = await store.findForAuthentication(parsed.selector);
+      if (
+        record === null ||
+        record.origin !== origin ||
+        record.revokedAt !== null ||
+        record.expiresAt.getTime() <= now * 1000
+      ) {
+        return UNAUTHORIZED;
+      }
+      const digest = digestInstallationSecret(
+        parsed.selector,
+        parsed.secret,
+        origin,
+        config.encryptionSecret,
+      );
+      if (
+        !verifyCredentialDigest(record.tokenDigest, digest) ||
+        !(await store.touch(record.id, new Date(now * 1000)))
+      ) {
+        return UNAUTHORIZED;
+      }
+      return {
+        authenticated: true,
+        via: "installation",
+        principal: Object.freeze({
+          kind: "installation",
+          installationId: record.id,
+          origin,
+        }),
+      };
+    }
+
+    if (isExtensionOrigin(request.headers.get("origin"))) return UNAUTHORIZED;
+  }
+
+  return authenticateApiRequest(request, options);
+}
+
 function resolveConfig(config: AuthConfig | undefined): AuthConfig {
   return config ?? getServerEnv();
 }
@@ -344,4 +438,18 @@ function readCookie(header: string | null, name: string): string | undefined {
     value = entry.slice(separator + 1).trim();
   }
   return value;
+}
+
+function isExtensionOrigin(origin: string | null): boolean {
+  return (
+    typeof origin === "string" &&
+    /^chrome-extension:\/\/[a-p]{32}$/u.test(origin)
+  );
+}
+
+async function defaultInstallationStore(): Promise<InstallationAuthenticationStore> {
+  const installationStoreModule = await import(
+    "./extension-installation-store"
+  );
+  return installationStoreModule.extensionInstallationAuthenticationStore;
 }

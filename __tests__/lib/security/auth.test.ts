@@ -4,17 +4,21 @@ import {
   SESSION_COOKIE_NAME,
   SESSION_MAX_AGE_SECONDS,
   authenticateApiRequest,
+  authenticateApiRequestAsync,
   createSessionToken,
   getSessionCookieOptions,
   verifyBearerToken,
   verifySessionToken,
   type AuthConfig,
 } from "@/lib/security/auth";
+import { createInstallationCredential } from "@/lib/security/extension-credentials";
 
 const NOW = Date.UTC(2026, 6, 13, 12, 0, 0);
 const APP_ACCESS_TOKEN = "access-token-" + "a".repeat(32);
 const ENCRYPTION_SECRET = "encryption-secret-" + "e".repeat(32);
 const APP_ORIGIN = "https://jobs.example.com";
+const EXTENSION_ORIGIN =
+  "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
 const SESSION_KEY_LABEL = "jobtracker/session-key/v1\0";
 const SESSION_FINGERPRINT_LABEL = "jobtracker/session-fingerprint/v1\0";
 
@@ -22,6 +26,7 @@ const config: AuthConfig = {
   appAccessToken: APP_ACCESS_TOKEN,
   encryptionSecret: ENCRYPTION_SECRET,
   appOrigin: APP_ORIGIN,
+  corsAllowedOrigins: [APP_ORIGIN, EXTENSION_ORIGIN],
 };
 
 const unauthorized = {
@@ -260,6 +265,103 @@ describe("session cookie metadata", () => {
 });
 
 describe("authenticateApiRequest", () => {
+  it("rejects the root bearer credential from a Chrome extension origin", async () => {
+    const request = apiRequest("POST", {
+      authorization: `Bearer ${APP_ACCESS_TOKEN}`,
+      origin: EXTENSION_ORIGIN,
+    });
+
+    await expect(
+      authenticateApiRequestAsync(request, { config, now: NOW }),
+    ).resolves.toEqual(unauthorized);
+  });
+
+  it("authenticates an active installation only for its exact bound origin", async () => {
+    const credential = createInstallationCredential({
+      encryptionSecret: ENCRYPTION_SECRET,
+      origin: EXTENSION_ORIGIN,
+    });
+    const touch = jest.fn().mockResolvedValue(true);
+    const installationStore = {
+      findForAuthentication: jest.fn().mockResolvedValue({
+        id: credential.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: credential.digest,
+        expiresAt: new Date(NOW + 60_000),
+        revokedAt: null,
+      }),
+      touch,
+    };
+    const request = apiRequest("POST", {
+      authorization: `Bearer ${credential.token}`,
+      origin: EXTENSION_ORIGIN,
+    });
+
+    await expect(
+      authenticateApiRequestAsync(request, {
+        config,
+        now: NOW,
+        installationStore,
+      }),
+    ).resolves.toEqual({
+      authenticated: true,
+      via: "installation",
+      principal: {
+        kind: "installation",
+        installationId: credential.selector,
+        origin: EXTENSION_ORIGIN,
+      },
+    });
+    expect(touch).toHaveBeenCalledWith(credential.selector, new Date(NOW));
+
+    const wrongOrigin = apiRequest("POST", {
+      authorization: `Bearer ${credential.token}`,
+      origin: "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba",
+    });
+    await expect(
+      authenticateApiRequestAsync(wrongOrigin, {
+        config,
+        now: NOW,
+        installationStore,
+      }),
+    ).resolves.toEqual(unauthorized);
+  });
+
+  it.each([
+    ["revoked", new Date(NOW - 1), new Date(NOW + 60_000)],
+    ["expired", null, new Date(NOW)],
+  ])(
+    "rejects a %s installation without touching last use",
+    async (_label, revokedAt, expiresAt) => {
+      const credential = createInstallationCredential({
+        encryptionSecret: ENCRYPTION_SECRET,
+        origin: EXTENSION_ORIGIN,
+      });
+      const touch = jest.fn();
+      const installationStore = {
+        findForAuthentication: jest.fn().mockResolvedValue({
+          id: credential.selector,
+          origin: EXTENSION_ORIGIN,
+          tokenDigest: credential.digest,
+          expiresAt,
+          revokedAt,
+        }),
+        touch,
+      };
+
+      await expect(
+        authenticateApiRequestAsync(
+          apiRequest("POST", {
+            authorization: `Bearer ${credential.token}`,
+            origin: EXTENSION_ORIGIN,
+          }),
+          { config, now: NOW, installationStore },
+        ),
+      ).resolves.toEqual(unauthorized);
+      expect(touch).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["Bearer", "bearer", "BEARER"])(
     "accepts the case-insensitive %s authorization scheme",
     (scheme) => {
