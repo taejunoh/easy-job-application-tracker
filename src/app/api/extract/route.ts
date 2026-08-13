@@ -12,7 +12,9 @@ import {
 
 export const runtime = "nodejs";
 
-const route = createProtectedRoute(["POST"]);
+const route = createProtectedRoute(["POST"], {
+  installationMethods: ["POST"],
+});
 const MAX_LLM_TEXT_CODE_POINTS = 4_000;
 
 export const OPTIONS = route.OPTIONS;

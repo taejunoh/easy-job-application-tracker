@@ -14,6 +14,9 @@ import {
   createSessionToken,
 } from "@/lib/security/auth";
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import {
+  createInstallationCredential,
+} from "@/lib/security/extension-credentials";
 
 jest.mock("@/lib/server-env", () => {
   const actual = jest.requireActual<typeof import("@/lib/server-env")>(
@@ -50,6 +53,13 @@ jest.mock("@/lib/prisma", () => ({
       create: jest.fn(),
       update: jest.fn(),
     },
+  },
+}));
+
+jest.mock("@/lib/security/extension-installation-store", () => ({
+  extensionInstallationAuthenticationStore: {
+    findForAuthentication: jest.fn(),
+    touch: jest.fn(),
   },
 }));
 
@@ -91,12 +101,19 @@ import {
   type SafeFetchErrorCode,
 } from "@/lib/security/safe-fetch";
 import { parsePdfInWorker } from "@/lib/resume/pdf-worker-client";
+import { extensionInstallationAuthenticationStore } from "@/lib/security/extension-installation-store";
 
 const APP_ORIGIN = "https://jobs.example.com";
 const EXTENSION_ORIGIN =
   "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
 const UNKNOWN_ORIGIN = "https://evil.example.com";
 const ACCESS_TOKEN = "access-token-" + "a".repeat(32);
+const INSTALLATION = createInstallationCredential({
+  encryptionSecret: "encryption-secret-" + "e".repeat(32),
+  origin: EXTENSION_ORIGIN,
+  randomUUID: () => "018f9f72-f2e9-7c29-a6fc-001122334499",
+  randomBytes: () => Buffer.alloc(32, 7),
+});
 const SESSION_COOKIE = `${SESSION_COOKIE_NAME}=${createSessionToken()}`;
 const APPLICATION_ID = "018f9f72-f2e9-7c29-a6fc-001122334455";
 
@@ -190,6 +207,18 @@ describe("application identity route behavior", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     arrangeSuccessfulBusinessLogic();
+    jest
+      .mocked(extensionInstallationAuthenticationStore.findForAuthentication)
+      .mockResolvedValue({
+        id: INSTALLATION.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: INSTALLATION.digest,
+        expiresAt: new Date(Date.now() + 60_000),
+        revokedAt: null,
+      });
+    jest
+      .mocked(extensionInstallationAuthenticationStore.touch)
+      .mockResolvedValue(true);
   });
 
   it("returns the atomic created result", async () => {
@@ -505,7 +534,7 @@ describe("protected product API actual requests", () => {
   );
 
   it.each(actualRoutes)(
-    "$name lets a valid extension Bearer request reach business logic",
+    "$name rejects the root bearer from an extension Origin",
     async (route) => {
       const response = await invokeActual(
         route,
@@ -515,13 +544,58 @@ describe("protected product API actual requests", () => {
         }),
       );
 
-      expect(response.status).toBe(route.successStatus);
+      expect(response.status).toBe(401);
       expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
         EXTENSION_ORIGIN,
       );
-      expectAnyDownstreamWork(route);
+      expectNoDownstreamWork();
     },
   );
+
+  it.each(
+    actualRoutes.filter(({ name }) =>
+      ["applications POST", "extract POST", "keyword analysis POST"].includes(
+        name,
+      ),
+    ),
+  )("$name accepts an active installation credential", async (route) => {
+    const response = await invokeActual(
+      route,
+      productRequest(route, {
+        origin: EXTENSION_ORIGIN,
+        authorization: `Bearer ${INSTALLATION.token}`,
+      }),
+    );
+
+    expect(response.status).toBe(route.successStatus);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      EXTENSION_ORIGIN,
+    );
+    expectAnyDownstreamWork(route);
+  });
+
+  it.each(
+    actualRoutes.filter(({ name }) =>
+      !["applications POST", "extract POST", "keyword analysis POST"].includes(
+        name,
+      ),
+    ),
+  )("$name denies an installation credential outside its scope", async (route) => {
+    const response = await invokeActual(
+      route,
+      productRequest(route, {
+        origin: EXTENSION_ORIGIN,
+        authorization: `Bearer ${INSTALLATION.token}`,
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: "Forbidden",
+      code: "forbidden",
+    });
+    expectNoDownstreamWork();
+  });
 
   it.each(actualRoutes)(
     "$name lets a valid same-origin web session reach business logic",
@@ -571,7 +645,7 @@ describe("protected product API actual requests", () => {
       method: "POST",
       headers: {
         Origin: EXTENSION_ORIGIN,
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        Authorization: `Bearer ${INSTALLATION.token}`,
         "Content-Type": "application/json",
       },
       body: "{}",
@@ -603,8 +677,8 @@ describe("protected product API actual requests", () => {
     const response = await invokeActual(
       route,
       productRequest(route, {
-        origin: EXTENSION_ORIGIN,
-        authorization: `Bearer ${ACCESS_TOKEN}`,
+        origin: APP_ORIGIN,
+        cookie: SESSION_COOKIE,
       }),
     );
 
@@ -616,7 +690,7 @@ describe("protected product API actual requests", () => {
     });
     expect(text).not.toContain("database password leaked");
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
-      EXTENSION_ORIGIN,
+      APP_ORIGIN,
     );
     expect(consoleError).toHaveBeenCalled();
     consoleError.mockRestore();
@@ -652,7 +726,7 @@ describe("protected product API actual requests", () => {
         route,
         productRequest(route, {
           origin: EXTENSION_ORIGIN,
-          authorization: `Bearer ${ACCESS_TOKEN}`,
+          authorization: `Bearer ${INSTALLATION.token}`,
         }),
       );
 
@@ -686,7 +760,7 @@ describe("protected product API actual requests", () => {
         route,
         productRequest(route, {
           origin: EXTENSION_ORIGIN,
-          authorization: `Bearer ${ACCESS_TOKEN}`,
+          authorization: `Bearer ${INSTALLATION.token}`,
         }),
       );
 
@@ -732,7 +806,7 @@ describe("protected product API actual requests", () => {
         route,
         productRequest(route, {
           origin: EXTENSION_ORIGIN,
-          authorization: `Bearer ${ACCESS_TOKEN}`,
+          authorization: `Bearer ${INSTALLATION.token}`,
         }),
       );
 
@@ -785,8 +859,8 @@ describe("protected product API actual requests", () => {
       {
         method: route.method,
         headers: {
-          Origin: EXTENSION_ORIGIN,
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          Origin: APP_ORIGIN,
+          Cookie: SESSION_COOKIE,
           "Content-Type": "application/json",
         },
         body: "{",
@@ -804,7 +878,7 @@ describe("protected product API actual requests", () => {
       code: "invalid_request",
     });
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
-      EXTENSION_ORIGIN,
+      APP_ORIGIN,
     );
     expectNoDownstreamWork();
     expect(consoleError).not.toHaveBeenCalled();
@@ -820,8 +894,8 @@ describe("protected product API actual requests", () => {
       {
         method: "POST",
         headers: {
-          Origin: EXTENSION_ORIGIN,
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          Origin: APP_ORIGIN,
+          Cookie: SESSION_COOKIE,
           "Content-Type": "multipart/form-data",
         },
         body: "not-multipart",
@@ -839,7 +913,7 @@ describe("protected product API actual requests", () => {
       code: "invalid_request",
     });
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
-      EXTENSION_ORIGIN,
+      APP_ORIGIN,
     );
     expectNoDownstreamWork();
     expect(consoleError).not.toHaveBeenCalled();
@@ -923,8 +997,8 @@ describe("protected product API actual requests", () => {
     const request = new NextRequest("https://jobs.example.com/api/settings", {
       method: "PUT",
       headers: {
-        Origin: EXTENSION_ORIGIN,
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        Origin: APP_ORIGIN,
+        Cookie: SESSION_COOKIE,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ resumeText: `${"a".repeat(500_000)}😀` }),
@@ -1021,8 +1095,8 @@ describe("protected product API actual requests", () => {
       const response = await invokeActual(
         route,
         productRequest(route, {
-          origin: EXTENSION_ORIGIN,
-          authorization: `Bearer ${ACCESS_TOKEN}`,
+          origin: APP_ORIGIN,
+          cookie: SESSION_COOKIE,
         }),
       );
 
@@ -1053,8 +1127,8 @@ describe("protected product API actual requests", () => {
       const response = await invokeActual(
         route,
         productRequest(route, {
-          origin: EXTENSION_ORIGIN,
-          authorization: `Bearer ${ACCESS_TOKEN}`,
+          origin: APP_ORIGIN,
+          cookie: SESSION_COOKIE,
         }),
       );
 
@@ -1066,7 +1140,7 @@ describe("protected product API actual requests", () => {
       });
       expect(text).not.toContain("database connection detail");
       expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
-        EXTENSION_ORIGIN,
+        APP_ORIGIN,
       );
       consoleError.mockRestore();
     },
@@ -1159,8 +1233,8 @@ function authenticatedResumeRequest(
   extraHeaders?: HeadersInit,
 ): NextRequest {
   const headers = new Headers(extraHeaders);
-  headers.set("Origin", EXTENSION_ORIGIN);
-  headers.set("Authorization", `Bearer ${ACCESS_TOKEN}`);
+  headers.set("Origin", APP_ORIGIN);
+  headers.set("Cookie", SESSION_COOKIE);
   return new NextRequest("https://jobs.example.com/api/parse-resume", {
     method: "POST",
     headers,
@@ -1173,8 +1247,8 @@ function authenticatedSettingsRequest(
   contentLength?: string,
 ): NextRequest {
   const headers = new Headers({
-    Origin: EXTENSION_ORIGIN,
-    Authorization: `Bearer ${ACCESS_TOKEN}`,
+    Origin: APP_ORIGIN,
+    Cookie: SESSION_COOKIE,
     "Content-Type": "application/json",
   });
   if (contentLength !== undefined) headers.set("Content-Length", contentLength);
@@ -1191,8 +1265,8 @@ function authenticatedSettingsStreamRequest(
   return new NextRequest("https://jobs.example.com/api/settings", {
     method: "PUT",
     headers: {
-      Origin: EXTENSION_ORIGIN,
-      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      Origin: APP_ORIGIN,
+      Cookie: SESSION_COOKIE,
       "Content-Type": "application/json",
     },
     body,
@@ -1276,6 +1350,18 @@ async function invokeOptions(
 }
 
 function arrangeSuccessfulBusinessLogic(): void {
+  jest
+    .mocked(extensionInstallationAuthenticationStore.findForAuthentication)
+    .mockResolvedValue({
+      id: INSTALLATION.selector,
+      origin: EXTENSION_ORIGIN,
+      tokenDigest: INSTALLATION.digest,
+      expiresAt: new Date(Date.now() + 60_000),
+      revokedAt: null,
+    });
+  jest
+    .mocked(extensionInstallationAuthenticationStore.touch)
+    .mockResolvedValue(true);
   const application = applicationFixture();
   jest.mocked(prisma.$queryRaw).mockResolvedValue([application] as never);
   jest.mocked(prisma.application.findMany).mockResolvedValue([]);

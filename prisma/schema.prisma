@@ -38,3 +38,30 @@ model Settings {
   githubUrl   String @default("")
   resumeText  String @default("")
 }
+
+model ExtensionPairingGrant {
+  id             String                 @id
+  origin         String
+  codeDigest     String
+  expiresAt      DateTime
+  consumedAt     DateTime?
+  installationId String?                @unique
+  createdAt      DateTime               @default(now())
+  installation   ExtensionInstallation? @relation(fields: [installationId], references: [id], onDelete: SetNull)
+
+  @@index([origin, expiresAt])
+}
+
+model ExtensionInstallation {
+  id           String                 @id
+  origin       String
+  tokenDigest  String
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  lastUsedAt   DateTime?
+  createdAt    DateTime               @default(now())
+  updatedAt    DateTime               @updatedAt
+  pairingGrant ExtensionPairingGrant?
+
+  @@index([origin, revokedAt, expiresAt])
+}

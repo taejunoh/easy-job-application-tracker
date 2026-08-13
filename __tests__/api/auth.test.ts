@@ -11,6 +11,14 @@ import {
   SESSION_MAX_AGE_SECONDS,
   verifySessionToken,
 } from "@/lib/security/auth";
+import { createInstallationCredential } from "@/lib/security/extension-credentials";
+
+jest.mock("@/lib/security/extension-installation-store", () => ({
+  extensionInstallationAuthenticationStore: {
+    findForAuthentication: jest.fn(),
+    touch: jest.fn(),
+  },
+}));
 
 jest.mock("@/lib/server-env", () => {
   const actual = jest.requireActual<typeof import("@/lib/server-env")>(
@@ -35,6 +43,14 @@ const APP_ORIGIN = "https://jobs.example.com";
 const EXTENSION_ORIGIN =
   "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
 const ACCESS_TOKEN = "access-token-" + "a".repeat(32);
+const INSTALLATION = createInstallationCredential({
+  encryptionSecret: "encryption-secret-" + "e".repeat(32),
+  origin: EXTENSION_ORIGIN,
+  randomUUID: () => "018f9f72-f2e9-7c29-a6fc-001122334499",
+  randomBytes: () => Buffer.alloc(32, 4),
+});
+
+import { extensionInstallationAuthenticationStore } from "@/lib/security/extension-installation-store";
 
 describe("POST /api/auth/session", () => {
   it("creates a signed HttpOnly 30-day session for the exact app origin", async () => {
@@ -192,20 +208,45 @@ describe("DELETE /api/auth/session", () => {
 });
 
 describe("POST /api/auth/verify", () => {
-  it.each([APP_ORIGIN, EXTENSION_ORIGIN])(
-    "accepts a valid Bearer token from %s without returning it",
-    async (origin) => {
-      const response = await verifyAccess(verifyRequest(origin, ACCESS_TOKEN));
+  beforeEach(() => {
+    jest
+      .mocked(extensionInstallationAuthenticationStore.findForAuthentication)
+      .mockResolvedValue({
+        id: INSTALLATION.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: INSTALLATION.digest,
+        expiresAt: new Date(Date.now() + 60_000),
+        revokedAt: null,
+      });
+    jest
+      .mocked(extensionInstallationAuthenticationStore.touch)
+      .mockResolvedValue(true);
+  });
+
+  it("accepts an installation token from its exact extension origin without returning it", async () => {
+      const response = await verifyAccess(
+        verifyRequest(EXTENSION_ORIGIN, INSTALLATION.token),
+      );
 
       expect(response.status).toBe(200);
       const text = await response.text();
-      expect(JSON.parse(text)).toEqual({ authenticated: true });
-      expect(text).not.toContain(ACCESS_TOKEN);
+      expect(JSON.parse(text)).toEqual({
+        authenticated: true,
+        installationId: INSTALLATION.selector,
+      });
+      expect(text).not.toContain(INSTALLATION.token);
       expect(response.headers.get("Set-Cookie")).toBeNull();
-      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(origin);
-      expect(response.headers.get("Access-Control-Allow-Credentials")).toBe(
-        origin === APP_ORIGIN ? "true" : null,
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        EXTENSION_ORIGIN,
       );
+      expect(response.headers.get("Access-Control-Allow-Credentials")).toBeNull();
+  });
+
+  it.each([APP_ORIGIN, EXTENSION_ORIGIN])(
+    "rejects the root bearer from %s",
+    async (origin) => {
+      const response = await verifyAccess(verifyRequest(origin, ACCESS_TOKEN));
+      expect(response.status).toBe(401);
     },
   );
 
@@ -340,11 +381,11 @@ describe("auth response caching", () => {
   });
 
   it("marks verify success, errors, and preflight responses as non-cacheable", async () => {
-    const responses = [
-      verifyAccess(verifyRequest(EXTENSION_ORIGIN, ACCESS_TOKEN)),
+    const responses = await Promise.all([
+      verifyAccess(verifyRequest(EXTENSION_ORIGIN, INSTALLATION.token)),
       verifyAccess(verifyRequest(EXTENSION_ORIGIN, "wrong")),
       verifyAccess(verifyRequest(undefined, ACCESS_TOKEN)),
-      verifyPreflight(
+      Promise.resolve(verifyPreflight(
         new Request("https://jobs.example.com/api/auth/verify", {
           method: "OPTIONS",
           headers: {
@@ -353,8 +394,8 @@ describe("auth response caching", () => {
             "Access-Control-Request-Headers": "Authorization",
           },
         }),
-      ),
-      verifyPreflight(
+      )),
+      Promise.resolve(verifyPreflight(
         new Request("https://jobs.example.com/api/auth/verify", {
           method: "OPTIONS",
           headers: {
@@ -362,8 +403,8 @@ describe("auth response caching", () => {
             "Access-Control-Request-Method": "DELETE",
           },
         }),
-      ),
-    ];
+      )),
+    ]);
 
     responses.forEach(expectPrivateNoStore);
   });

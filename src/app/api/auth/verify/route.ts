@@ -1,4 +1,4 @@
-import { authenticateApiRequest } from "@/lib/security/auth";
+import { authenticateApiRequestAsync } from "@/lib/security/auth";
 import { privateNoStore } from "@/lib/security/auth-response";
 import {
   corsHeaders,
@@ -17,7 +17,7 @@ const ORIGIN_NOT_ALLOWED = Object.freeze({
   code: "origin_not_allowed" as const,
 });
 
-export function POST(request: Request): Response {
+export async function POST(request: Request): Promise<Response> {
   const cors = corsHeaders(request, ["POST"]);
   if (!cors.allowed) {
     return privateNoStore(cors.response);
@@ -27,9 +27,9 @@ export function POST(request: Request): Response {
   }
 
   const authentication = request.headers.has("authorization")
-    ? authenticateApiRequest(request)
+    ? await authenticateApiRequestAsync(request)
     : undefined;
-  if (!authentication?.authenticated || authentication.via !== "bearer") {
+  if (!authentication?.authenticated || authentication.via !== "installation") {
     return privateNoStore(
       decorateCorsResponse(
         Response.json(UNAUTHORIZED, { status: 401 }),
@@ -40,7 +40,10 @@ export function POST(request: Request): Response {
 
   return privateNoStore(
     decorateCorsResponse(
-      Response.json({ authenticated: true }),
+      Response.json({
+        authenticated: true,
+        installationId: authentication.principal.installationId,
+      }),
       cors,
     ),
   );

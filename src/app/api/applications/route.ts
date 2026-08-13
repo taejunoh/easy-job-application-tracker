@@ -12,7 +12,9 @@ import {
 } from "@/lib/applications/atomic-create";
 import { createPrismaApplicationIdentityStore } from "@/lib/applications/prisma-identity-store";
 
-const route = createProtectedRoute(["GET", "POST"]);
+const route = createProtectedRoute(["GET", "POST"], {
+  installationMethods: ["POST"],
+});
 const identityStore = createPrismaApplicationIdentityStore(prisma);
 
 export const OPTIONS = route.OPTIONS;

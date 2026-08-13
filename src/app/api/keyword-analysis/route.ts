@@ -4,7 +4,9 @@ import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
 import { createProtectedRoute } from "@/lib/security/protected-route";
 import { readJsonBody } from "@/lib/security/request-body";
 
-const route = createProtectedRoute(["POST"]);
+const route = createProtectedRoute(["POST"], {
+  installationMethods: ["POST"],
+});
 
 export const OPTIONS = route.OPTIONS;
 
