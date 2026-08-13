@@ -322,6 +322,7 @@ describe("quarantine transaction Slice 1", () => {
     expect(recovered.result).toMatchObject({ transactionId, action, status: expectedStatus });
     if (expectedStatus === "INCOMPLETE_CONFLICT") {
       expect(recovered.result).toEqual({
+        schemaVersion: 2,
         transactionId,
         status: "INCOMPLETE_CONFLICT",
         action,
@@ -330,7 +331,7 @@ describe("quarantine transaction Slice 1", () => {
       for (const [path, bytes] of before) expect(readFileSync(path)).toEqual(bytes);
     } else {
       expect(Object.keys(recovered.result!)).toEqual([
-        "transactionId", "status", "action", "reconciledEntries",
+        "schemaVersion", "transactionId", "status", "action", "reconciledEntries",
       ]);
     }
   });
@@ -405,6 +406,7 @@ describe("quarantine transaction Slice 1", () => {
     });
 
     expect(recovered.result).toEqual({
+      schemaVersion: 2,
       transactionId,
       status: "QUARANTINED",
       action: "resume",
@@ -441,6 +443,7 @@ describe("quarantine transaction Slice 1", () => {
       action: "resume",
       writersStopped: true,
     }).result).toEqual({
+      schemaVersion: 2,
       transactionId,
       status: "QUARANTINED",
       action: "resume",
@@ -708,6 +711,7 @@ describe("quarantine transaction Slice 1", () => {
           action: "rollback",
           writersStopped: true,
         }).result).toEqual({
+          schemaVersion: 2,
           transactionId,
           status: "ROLLED_BACK",
           action: "rollback",
@@ -722,6 +726,7 @@ describe("quarantine transaction Slice 1", () => {
           action: "resume",
           writersStopped: true,
         }).result).toEqual({
+          schemaVersion: 2,
           transactionId,
           status: "INCOMPLETE_CONFLICT",
           action: "resume",
