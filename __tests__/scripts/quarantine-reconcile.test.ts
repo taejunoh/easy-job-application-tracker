@@ -69,6 +69,43 @@ function convertPreparedRunToV1(prepared: ReturnType<typeof prepareQuarantinedFi
   `]);
 }
 
+function omitLastEntryFromSettledJournal(
+  prepared: ReturnType<typeof prepareQuarantinedFixture>,
+) {
+  execFileSync(process.execPath, ["--input-type=module", "--eval", `
+    import { readFileSync, readdirSync, rmSync } from "node:fs";
+    import { join } from "node:path";
+    import { appendJournalRecord, withJournalLock } from ${JSON.stringify(new URL("../../scripts/quarantine-journal.mjs", pathToFileURL(__filename)).href)};
+    import { withQuarantineRunCapability } from ${JSON.stringify(new URL("../../scripts/quarantine-run-capability.mjs", pathToFileURL(__filename)).href)};
+    const options = ${JSON.stringify({
+      repoRoot: prepared.fixture.repoRoot,
+      quarantineRoot: prepared.fixture.quarantineRoot,
+      transactionId: prepared.transactionId,
+      writersStopped: true,
+    })};
+    const runRoot = ${JSON.stringify(prepared.runRoot)};
+    const generation = readdirSync(join(runRoot, "manifests")).find((name) => name.endsWith(".json"));
+    const manifest = JSON.parse(readFileSync(join(runRoot, "manifests", generation), "utf8"));
+    const digest = generation.slice(0, -".json".length);
+    rmSync(join(runRoot, "journal.log"));
+    await withQuarantineRunCapability(options, async (capability) => {
+      await withJournalLock({ capability }, async (heldLock) => {
+        const append = (event, payload) => appendJournalRecord({
+          capability, heldLock, event, payload, schemaVersion: 2,
+        });
+        await append("PREPARED", { transactionId: options.transactionId, manifestSha256: digest });
+        await append("MOVING", {});
+        for (const entry of manifest.entries.slice(0, -1)) {
+          await append("MOVE_INTENT", { id: entry.id, expected: entry.preMoveInventory });
+          await append("MOVED", { id: entry.id, observed: entry.preMoveInventory });
+        }
+        await append("VERIFYING", {});
+        await append("QUARANTINED", {});
+      });
+    });
+  `]);
+}
+
 describe("read-only quarantine reconciliation", () => {
   it("exports one separate authority and maps a complete QUARANTINED snapshot", () => {
     const prepared = prepareQuarantinedFixture({ regenerate: false });
@@ -303,6 +340,23 @@ describe("read-only quarantine reconciliation", () => {
     })).toMatchObject({ ok: false, code: "ERR_INTEGRITY" });
   });
 
+  it("explicitly requires settled apply intents and completions to cover the manifest", () => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    bases.push(prepared.fixture.base);
+    omitLastEntryFromSettledJournal(prepared);
+
+    expect(reconcile({
+      repoRoot: prepared.fixture.repoRoot,
+      quarantineRoot: prepared.fixture.quarantineRoot,
+      transactionId: prepared.transactionId,
+      writersStopped: true,
+    })).toMatchObject({
+      ok: false,
+      code: "ERR_INTEGRITY",
+      message: "settled apply journal does not cover the manifest",
+    });
+  });
+
   it.each([
     ["resume", "after-event:RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
     ["rollback", "after-event:ROLLING_BACK", "ROLLING_BACK"],
@@ -396,5 +450,27 @@ describe("read-only quarantine reconciliation", () => {
         nextAction: "investigate_conflict",
       },
     });
+  });
+
+  it("fails closed when a restore conflict coexists with unrelated missing evidence", async () => {
+    const prepared = prepareQuarantinedFixture();
+    bases.push(prepared.fixture.base);
+    const options = {
+      repoRoot: prepared.fixture.repoRoot,
+      quarantineRoot: prepared.fixture.quarantineRoot,
+      transactionId: prepared.transactionId,
+      writersStopped: true,
+    };
+    expect((await spawnLifecycleChild("restoreQuarantine", options, {
+      killAt: "after-event:RESTORE_INTENT:copy-0001",
+    })).signal).toBe("SIGKILL");
+    rmSync(join(prepared.runRoot, "journal.lock"));
+    writeFileSync(join(prepared.fixture.repoRoot, "notes 2.txt"), "canonical\n");
+    expect((await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" }, {
+      killAt: "after-event:INCOMPLETE_CONFLICT",
+    })).signal).toBe("SIGKILL");
+    rmSync(join(prepared.fixture.repoRoot, ".next"), { recursive: true, force: true });
+
+    expect(reconcile(options)).toMatchObject({ ok: false, code: "ERR_INTEGRITY" });
   });
 });

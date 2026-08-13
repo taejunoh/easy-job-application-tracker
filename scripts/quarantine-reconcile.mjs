@@ -209,6 +209,11 @@ function preRestoreState(replayed) {
 
 async function validateApplyLayout({ capability, fsApi, input, replayed, manifest }) {
   const ledger = buildApplyLedger(replayed, manifest);
+  if (
+    new Set(["QUARANTINED", "VALIDATED"]).has(replayed.state) &&
+    (ledger.intents.length !== manifest.entries.length ||
+      ledger.completed.size !== manifest.entries.length)
+  ) fail("ERR_INTEGRITY", "settled apply journal does not cover the manifest");
   const intended = new Set(ledger.intents.map((entry) => entry.id));
   const layouts = [];
   for (const entry of manifest.entries) {
@@ -274,6 +279,10 @@ async function validateRestoreLayout({ capability, fsApi, input, replayed, manif
     fail("ERR_INTEGRITY", "restore ledger is invalid");
   }
   const intended = new Set(ledger.intents);
+  const conflictIds = replayed.state === "INCOMPLETE_CONFLICT"
+    ? new Set(replayed.records.at(-1)?.payload.conflictEntryIds)
+    : new Set();
+  const observedConflicts = new Set();
   const layouts = [];
   for (const entry of manifest.entries) {
     const source = join(input.repoRoot, ...entry.relativePath.split("/"));
@@ -308,11 +317,18 @@ async function validateRestoreLayout({ capability, fsApi, input, replayed, manif
         : !ledger.completed.has(entry.id)
           ? initial || staging || final
           : final;
-    if (!legal && replayed.state !== "INCOMPLETE_CONFLICT") {
-      fail("ERR_INTEGRITY", "restore physical layout conflicts with the journal");
+    if (!legal) {
+      if (!conflictIds.has(entry.id)) {
+        fail("ERR_INTEGRITY", "restore physical layout conflicts with the journal");
+      }
+      observedConflicts.add(entry.id);
     }
     layouts.push([entry.id, initial ? "initial" : staging ? "staging" : final ? "final" : "conflict"]);
   }
+  if (
+    observedConflicts.size !== conflictIds.size ||
+    [...conflictIds].some((entryId) => !observedConflicts.has(entryId))
+  ) fail("ERR_INTEGRITY", "restore conflict evidence does not match the journal");
   if (replayed.state === "RESTORED" && layouts.some(([, state]) => state !== "final")) {
     fail("ERR_INTEGRITY", "terminal restore layout is incomplete");
   }
