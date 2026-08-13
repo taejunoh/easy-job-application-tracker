@@ -38,7 +38,10 @@ function inspectArgs(fixture: ReturnType<typeof createQuarantineFixture>) {
 }
 
 function applyArgs(fixture: ReturnType<typeof createQuarantineFixture>) {
-  return [...inspectArgs(fixture).map((value) => value === "inspect" ? "apply" : value), "--writers-stopped"];
+  return [
+    ...inspectArgs(fixture).map((value) => value === "inspect" ? "apply" : value),
+    "--transaction-id", "operator-tx-0001", "--writers-stopped",
+  ];
 }
 
 describe("quarantine cleanup CLI", () => {
@@ -54,7 +57,8 @@ describe("quarantine cleanup CLI", () => {
     expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stdout.match(/\n/g)).toHaveLength(1);
     expect(JSON.parse(result.stdout)).toEqual({
-      ok: true, command: "inspect", status: "INSPECTED", sourceCopies: 1,
+      ok: true, command: "inspect", status: "INSPECTED", schemaVersion: 2, sourceCopies: 1,
+      tempResidues: 0,
       generatedRoots: 2, identicalCopies: 1, divergentCopies: 0,
     });
   });
@@ -70,10 +74,12 @@ describe("quarantine cleanup CLI", () => {
     expect(applied.stderr).toBe("");
     expect(records).toHaveLength(2);
     expect(records[0]).toEqual({
-      ok: true, command: "apply", status: "STARTING", transactionId: expect.stringMatching(/^cli-[0-9a-f-]{36}$/u),
+      ok: true, command: "apply", status: "STARTING", schemaVersion: 2,
+      transactionId: "operator-tx-0001",
     });
     expect(records[1]).toEqual({
-      ok: true, command: "apply", status: "QUARANTINED", transactionId: records[0].transactionId,
+      ok: true, command: "apply", status: "QUARANTINED", schemaVersion: 2,
+      transactionId: records[0].transactionId,
       movedEntries: 3, manifestSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
     mkdirSync(join(fixture.repoRoot, ".next"), { mode: 0o700 });

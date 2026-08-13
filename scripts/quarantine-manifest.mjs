@@ -15,7 +15,7 @@ const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 const COMMIT_HASH = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const GIT_OBJECT_ID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
-const MANIFEST_KEYS = [
+const MANIFEST_V1_KEYS = [
   "schemaVersion",
   "transactionId",
   "state",
@@ -28,6 +28,13 @@ const MANIFEST_KEYS = [
   "deleteAfter",
   "deletionStatus",
   "entries",
+];
+const MANIFEST_V2_KEYS = [
+  ...MANIFEST_V1_KEYS,
+  "branch",
+  "repositoryIdentity",
+  "validationAttempt",
+  "regeneratedEvidence",
 ];
 const SOURCE_ENTRY_KEYS = [
   "id",
@@ -44,9 +51,15 @@ const SOURCE_ENTRY_KEYS = [
   "preMoveInventory",
 ];
 const GENERATED_ENTRY_KEYS = ["id", "kind", "relativePath", "mode", "preMoveInventory"];
-const ALL_ENTRY_KEYS = [...new Set([...SOURCE_ENTRY_KEYS, ...GENERATED_ENTRY_KEYS])];
+const TEMP_ENTRY_KEYS = ["id", "kind", "relativePath", "mode", "size", "sha256", "preMoveInventory"];
+const ALL_ENTRY_KEYS = [...new Set([...SOURCE_ENTRY_KEYS, ...GENERATED_ENTRY_KEYS, ...TEMP_ENTRY_KEYS])];
 const INVENTORY_KEYS = ["sha256", "entries", "bytes"];
 const POINTER_KEYS = ["schemaVersion", "transactionId", "manifestSha256"];
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const VALIDATION_ATTEMPT = /^attempt-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const REGENERATED_IDS = Object.freeze(["generated-next", "generated-node-modules"]);
+const REPOSITORY_IDENTITY_KEYS = ["dev", "ino"];
+const REGENERATED_EVIDENCE_KEYS = ["pass1Path", "pass1Summary", "pass2Path", "pass2Summary"];
 
 class ManifestIntegrityError extends Error {
   constructor(message = "durable manifest evidence is invalid") {
@@ -65,7 +78,7 @@ function isPlainObject(value) {
   return prototype === Object.prototype || prototype === null;
 }
 
-function snapshotRecord(value, allowedKeys, requiredKeys, label) {
+function snapshotRecord(value, allowedKeys, requiredKeys, label, preRead = Object.freeze({})) {
   if (!isPlainObject(value)) throw new TypeError(`${label} must be a plain object`);
   const keys = Reflect.ownKeys(value);
   for (const key of keys) {
@@ -77,7 +90,7 @@ function snapshotRecord(value, allowedKeys, requiredKeys, label) {
     if (!keys.includes(key)) throw new TypeError(`${label} is missing field: ${key}`);
   }
   const snapshot = Object.create(null);
-  for (const key of keys) snapshot[key] = value[key];
+  for (const key of keys) snapshot[key] = Object.hasOwn(preRead, key) ? preRead[key] : value[key];
   return snapshot;
 }
 
@@ -150,6 +163,60 @@ function snapshotInventory(value) {
     entries: snapshot.entries,
     bytes: snapshot.bytes,
   });
+}
+
+function snapshotRepositoryIdentity(value) {
+  const identity = snapshotRecord(
+    value,
+    REPOSITORY_IDENTITY_KEYS,
+    REPOSITORY_IDENTITY_KEYS,
+    "repository identity",
+  );
+  return Object.freeze({
+    dev: assertNonnegativeSafeInteger(identity.dev, "repository device"),
+    ino: assertNonnegativeSafeInteger(identity.ino, "repository inode"),
+  });
+}
+
+function assertValidationAttempt(value) {
+  if (typeof value !== "string" || !VALIDATION_ATTEMPT.test(value)) {
+    throw new TypeError("validation attempt ID is invalid");
+  }
+  return value;
+}
+
+function sameInventory(left, right) {
+  return left.sha256 === right.sha256 && left.entries === right.entries && left.bytes === right.bytes;
+}
+
+function snapshotRegeneratedEvidence(value, attemptId) {
+  const evidence = snapshotRecord(
+    value,
+    REGENERATED_IDS,
+    REGENERATED_IDS,
+    "regenerated evidence",
+  );
+  const parsed = Object.create(null);
+  for (const id of REGENERATED_IDS) {
+    const item = snapshotRecord(
+      evidence[id],
+      REGENERATED_EVIDENCE_KEYS,
+      REGENERATED_EVIDENCE_KEYS,
+      `regenerated evidence ${id}`,
+    );
+    const pass1Path = `inventories/validation-pass-1/${attemptId}-${id}.jsonl`;
+    const pass2Path = `inventories/validation-pass-2/${attemptId}-${id}.jsonl`;
+    if (item.pass1Path !== pass1Path || item.pass2Path !== pass2Path) {
+      throw new TypeError(`regenerated evidence paths are invalid for ${id}`);
+    }
+    const pass1Summary = snapshotInventory(item.pass1Summary);
+    const pass2Summary = snapshotInventory(item.pass2Summary);
+    if (!sameInventory(pass1Summary, pass2Summary)) {
+      throw new TypeError(`regenerated evidence passes differ for ${id}`);
+    }
+    parsed[id] = Object.freeze({ pass1Path, pass1Summary, pass2Path, pass2Summary });
+  }
+  return Object.freeze(parsed);
 }
 
 function parseEnrichedManifestEntry(value) {
@@ -231,10 +298,29 @@ function parseEnrichedManifestEntry(value) {
       preMoveInventory: snapshotInventory(exact.preMoveInventory),
     });
   }
+  if (snapshot.kind === "temp-residue") {
+    const exact = snapshotRecord(snapshot, TEMP_ENTRY_KEYS, TEMP_ENTRY_KEYS, "temp-residue entry");
+    const locator = parseManifestEntry({
+      id: exact.id,
+      kind: exact.kind,
+      relativePath: exact.relativePath,
+    });
+    const mode = assertMode(exact.mode);
+    const size = assertNonnegativeSafeInteger(exact.size, "temp-residue size");
+    const sha256 = assertSha256(exact.sha256, "temp-residue SHA-256");
+    const preMoveInventory = snapshotInventory(exact.preMoveInventory);
+    if (
+      mode !== 0o600 || size !== 0 || sha256 !== EMPTY_SHA256 ||
+      preMoveInventory.entries !== 1 || preMoveInventory.bytes !== 0
+    ) {
+      throw new TypeError("temp-residue evidence must describe one empty mode-0600 file");
+    }
+    return Object.freeze({ ...locator, mode, size, sha256, preMoveInventory });
+  }
   throw new TypeError("manifest entry kind is invalid");
 }
 
-function parseManifestEntries(value) {
+function parseManifestEntries(value, schemaVersion) {
   const entries = snapshotArray(value, "manifest entries").map(parseEnrichedManifestEntry);
   const ids = new Set();
   const paths = new Set();
@@ -265,12 +351,26 @@ function parseManifestEntries(value) {
       throw new TypeError("source-copy IDs must follow deterministic bytewise numbering");
     }
   }
+  const tempResidues = entries.filter((entry) => entry.kind === "temp-residue");
+  if (schemaVersion === 1 && tempResidues.length !== 0) {
+    throw new TypeError("v1 manifests cannot contain temp-residue entries");
+  }
+  for (let index = 0; index < tempResidues.length; index += 1) {
+    if (tempResidues[index].id !== `temp-${String(index + 1).padStart(4, "0")}`) {
+      throw new TypeError("temp-residue IDs must follow deterministic bytewise numbering");
+    }
+  }
   return Object.freeze(entries);
 }
 
 export function buildValidatedManifest(value) {
-  const manifest = snapshotRecord(value, MANIFEST_KEYS, MANIFEST_KEYS, "manifest");
-  if (manifest.schemaVersion !== 1) throw new TypeError("manifest schema version is invalid");
+  if (!isPlainObject(value)) throw new TypeError("manifest must be a plain object");
+  const schemaVersion = value.schemaVersion;
+  if (schemaVersion !== 1 && schemaVersion !== 2) {
+    throw new TypeError("manifest schema version is invalid");
+  }
+  const manifestKeys = schemaVersion === 1 ? MANIFEST_V1_KEYS : MANIFEST_V2_KEYS;
+  const manifest = snapshotRecord(value, manifestKeys, manifestKeys, "manifest", { schemaVersion });
   const transactionId = assertTransactionId(manifest.transactionId);
   if (manifest.state !== "PREPARED" && manifest.state !== "VALIDATED") {
     throw new TypeError("manifest state must be PREPARED or VALIDATED");
@@ -318,8 +418,36 @@ export function buildValidatedManifest(value) {
       throw new TypeError("VALIDATED manifest deletion status is invalid");
     }
   }
+  let branch;
+  let repositoryIdentity;
+  let validationAttempt;
+  let regeneratedEvidence;
+  if (schemaVersion === 2) {
+    if (
+      typeof manifest.branch !== "string" || manifest.branch.length === 0 ||
+      manifest.branch.length > 1024 || manifest.branch.includes("\0") ||
+      manifest.branch !== manifest.branch.normalize("NFC")
+    ) {
+      throw new TypeError("manifest branch is invalid");
+    }
+    branch = manifest.branch;
+    repositoryIdentity = snapshotRepositoryIdentity(manifest.repositoryIdentity);
+    if (manifest.state === "PREPARED") {
+      if (manifest.validationAttempt !== null || manifest.regeneratedEvidence !== null) {
+        throw new TypeError("PREPARED v2 manifest validation evidence is invalid");
+      }
+      validationAttempt = null;
+      regeneratedEvidence = null;
+    } else {
+      validationAttempt = assertValidationAttempt(manifest.validationAttempt);
+      regeneratedEvidence = snapshotRegeneratedEvidence(
+        manifest.regeneratedEvidence,
+        validationAttempt,
+      );
+    }
+  }
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion,
     transactionId,
     state: manifest.state,
     repositoryRoot: manifest.repositoryRoot,
@@ -330,7 +458,13 @@ export function buildValidatedManifest(value) {
     deletionRequiresConfirmation: true,
     deleteAfter,
     deletionStatus: manifest.deletionStatus,
-    entries: parseManifestEntries(manifest.entries),
+    entries: parseManifestEntries(manifest.entries, schemaVersion),
+    ...(schemaVersion === 2 ? {
+      branch,
+      repositoryIdentity,
+      validationAttempt,
+      regeneratedEvidence,
+    } : {}),
   });
 }
 

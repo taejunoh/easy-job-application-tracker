@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 
 import {
@@ -47,7 +46,8 @@ function parseArgv(argv) {
   const values = Object.create(null);
   const flags = new Set();
   const expectsValue = new Set(command === "inspect" || command === "apply"
-    ? ["--repo-root", "--quarantine-root", "--expected-branch", "--expected-head", "--expected-count"]
+    ? ["--repo-root", "--quarantine-root", "--expected-branch", "--expected-head", "--expected-count",
+      ...(command === "apply" ? ["--transaction-id"] : [])]
     : command === "recover"
       ? ["--repo-root", "--quarantine-root", "--transaction-id", "--action"]
       : ["--repo-root", "--quarantine-root", "--transaction-id"]);
@@ -73,7 +73,8 @@ function parseArgv(argv) {
     if (typeof values["--expected-branch"] !== "string" || values["--expected-branch"].length === 0 ||
         values["--expected-branch"].includes("\0") || values["--expected-branch"] !== values["--expected-branch"].normalize("NFC") ||
         !HEAD.test(values["--expected-head"]) || !COUNT.test(values["--expected-count"]) ||
-        !Number.isSafeInteger(Number(values["--expected-count"]))) return cliFailure(command);
+        !Number.isSafeInteger(Number(values["--expected-count"])) ||
+        (command === "apply" && !validTransactionId(values["--transaction-id"]))) return cliFailure(command);
   } else if (!validTransactionId(values["--transaction-id"]) ||
       (command === "recover" && values["--action"] !== "resume" && values["--action"] !== "rollback")) {
     return cliFailure(command);
@@ -83,7 +84,7 @@ function parseArgv(argv) {
     return Object.freeze({ command, ...common, expectedBranch: values["--expected-branch"], expectedHead: values["--expected-head"], expectedCount: Number(values["--expected-count"]) });
   }
   if (command === "apply") {
-    return Object.freeze({ command, ...common, expectedBranch: values["--expected-branch"], expectedHead: values["--expected-head"], expectedCount: Number(values["--expected-count"]), writersStopped: true, transactionId: `cli-${randomUUID()}`, createdAt: new Date().toISOString() });
+    return Object.freeze({ command, ...common, expectedBranch: values["--expected-branch"], expectedHead: values["--expected-head"], expectedCount: Number(values["--expected-count"]), writersStopped: true, transactionId: values["--transaction-id"], createdAt: new Date().toISOString() });
   }
   return Object.freeze({ command, ...common, transactionId: values["--transaction-id"], writersStopped: true, ...(command === "recover" ? { action: values["--action"] } : {}) });
 }
@@ -93,12 +94,14 @@ function conflict(result) {
 }
 
 function publicInspect(result) {
-  return Object.freeze({ ok: true, command: "inspect", status: "INSPECTED", sourceCopies: result.sourceCopies,
+  return Object.freeze({ ok: true, command: "inspect", status: "INSPECTED", schemaVersion: 2,
+    sourceCopies: result.sourceCopies, tempResidues: result.tempResidues,
     generatedRoots: 2, identicalCopies: result.identicalCopies, divergentCopies: result.divergentCopies });
 }
 
 function publicApply(result) {
-  return Object.freeze({ ok: true, command: "apply", status: "QUARANTINED", transactionId: result.transactionId,
+  return Object.freeze({ ok: true, command: "apply", status: "QUARANTINED", schemaVersion: result.schemaVersion,
+    transactionId: result.transactionId,
     movedEntries: result.movedEntries, manifestSha256: result.manifestSha256 });
 }
 
@@ -181,7 +184,8 @@ async function main() {
   }
   try {
     if (parsed.command === "apply") {
-      await writeJsonl({ ok: true, command: "apply", status: "STARTING", transactionId: parsed.transactionId });
+      await writeJsonl({ ok: true, command: "apply", status: "STARTING", schemaVersion: 2,
+        transactionId: parsed.transactionId });
     }
     await writeJsonl(await dispatch(parsed));
   } catch (error) {

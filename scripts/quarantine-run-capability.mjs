@@ -20,6 +20,7 @@ const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const RESTORE_ID = /^restore-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const COPY_ID = /^copy-(?!0000)[0-9]{4}$/u;
+const TEMP_ID = /^temp-(?!0000)[0-9]{4}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const GENERATED_IDS = new Set(["generated-next", "generated-node-modules"]);
 const INVENTORY_PHASES = new Set([
@@ -104,7 +105,7 @@ function assertIdentifier(value, pattern, label) {
 }
 
 function assertEntryId(value) {
-  if (typeof value !== "string" || (!COPY_ID.test(value) && !GENERATED_IDS.has(value))) {
+  if (typeof value !== "string" || (!COPY_ID.test(value) && !TEMP_ID.test(value) && !GENERATED_IDS.has(value))) {
     throw new TypeError("manifest entry ID is invalid");
   }
 }
@@ -132,6 +133,9 @@ function payloadPath(runRoot, id) {
   assertEntryId(id);
   if (COPY_ID.test(id)) {
     return join(runRoot, "payload", "source-copies", id);
+  }
+  if (TEMP_ID.test(id)) {
+    return join(runRoot, "payload", "temp-residues", id);
   }
   return join(
     runRoot,

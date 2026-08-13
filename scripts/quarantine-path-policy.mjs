@@ -9,6 +9,8 @@ export const GENERATED_ROOTS = Object.freeze(["node_modules", ".next"]);
 
 const NUMBERED_COPY_SUFFIX = /^(.*) ([2-9][0-9]*)(\.[^/]+)$/u;
 const ENTRY_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
+const TEMP_RESIDUE_ID = /^temp-(?!0000)[0-9]{4}$/u;
+const TEMP_RESIDUE_BASENAME = /^\.BC\.T_[A-Za-z0-9]{6}$/u;
 
 function assertPlainObject(value, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -98,6 +100,20 @@ export function parseManifestEntry(value) {
     return Object.freeze({ id, kind: "generated-root", relativePath });
   }
 
+  if (value.kind === "temp-residue") {
+    assertExactKeys(value, ["id", "kind", "relativePath"]);
+    const id = assertEntryId(value.id);
+    const relativePath = assertRelativePath(value.relativePath);
+    const finalComponent = relativePath.slice(relativePath.lastIndexOf("/") + 1);
+    if (!TEMP_RESIDUE_ID.test(id)) {
+      throw new TypeError("temporary-residue entry ID is invalid");
+    }
+    if (!TEMP_RESIDUE_BASENAME.test(finalComponent)) {
+      throw new TypeError("temporary-residue basename is invalid");
+    }
+    return Object.freeze({ id, kind: "temp-residue", relativePath });
+  }
+
   throw new TypeError("manifest entry kind is invalid");
 }
 
@@ -173,6 +189,9 @@ export function derivePayloadPath(runRoot, entry) {
   const parsed = parseManifestEntry(entry);
   if (parsed.kind === "source-copy") {
     return join(runRoot, "payload", "source-copies", parsed.id);
+  }
+  if (parsed.kind === "temp-residue") {
+    return join(runRoot, "payload", "temp-residues", parsed.id);
   }
   return join(runRoot, "payload", "generated", parsed.relativePath);
 }

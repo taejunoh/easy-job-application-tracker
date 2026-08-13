@@ -14,7 +14,8 @@ import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
 const ZERO_HASH = "0".repeat(64);
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
-const ENVELOPE_KEYS = ["sequence", "previousHash", "event", "payload", "recordHash"];
+const V1_ENVELOPE_KEYS = ["sequence", "previousHash", "event", "payload", "recordHash"];
+const V2_ENVELOPE_KEYS = ["schemaVersion", ...V1_ENVELOPE_KEYS];
 const LOCK_KEYS = ["version", "ownerToken", "pid", "checksum"];
 const OWNER_TOKEN_PATTERN =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
@@ -35,7 +36,8 @@ const LOCK_BODY_FIXED_BYTES =
   LOCK_BODY_SUFFIX.length;
 const MIN_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + 1;
 const MAX_LOCK_BODY_BYTES = LOCK_BODY_FIXED_BYTES + String(Number.MAX_SAFE_INTEGER).length;
-const ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
+const V1_ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
+const V2_ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|temp-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 const RESTORE_ID =
   /^restore-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
@@ -266,8 +268,9 @@ function assertPayloadKeys(payload, expectedKeys, event) {
   }
 }
 
-function parseEntryId(value) {
-  if (typeof value !== "string" || value.length > 128 || !ENTRY_ID.test(value)) {
+function parseEntryId(value, schemaVersion) {
+  const pattern = schemaVersion === 2 ? V2_ENTRY_ID : V1_ENTRY_ID;
+  if (typeof value !== "string" || value.length > 128 || !pattern.test(value)) {
     throw new TypeError("journal payload entry ID is invalid");
   }
   return value;
@@ -285,9 +288,9 @@ function parseEmptyPayload(event, payload) {
   return Object.freeze({});
 }
 
-function parseEntryPayload(event, payload) {
+function parseEntryPayload(event, payload, schemaVersion) {
   assertPayloadKeys(payload, ["id"], event);
-  return Object.freeze({ id: parseEntryId(payload.id) });
+  return Object.freeze({ id: parseEntryId(payload.id, schemaVersion) });
 }
 
 function snapshotDenseArray(value, label, expectedLength) {
@@ -338,19 +341,19 @@ function snapshotDenseArray(value, label, expectedLength) {
   return Object.freeze(snapshot);
 }
 
-function parseRecoveryEntryIds(payload) {
+function parseRecoveryEntryIds(payload, schemaVersion) {
   const event = "RECOVERY_REQUIRED";
   const key = "entryIds";
   assertPayloadKeys(payload, [key], event);
   const input = snapshotDenseArray(payload[key], `${event} payload ${key}`);
-  const values = input.map((value) => parseEntryId(value));
+  const values = input.map((value) => parseEntryId(value, schemaVersion));
   if (new Set(values).size !== values.length) {
     throw new TypeError(`${event} payload ${key} must contain unique IDs`);
   }
   return Object.freeze({ [key]: Object.freeze(values) });
 }
 
-function parseConflictEntryIds(payload) {
+function parseConflictEntryIds(payload, schemaVersion) {
   const event = "INCOMPLETE_CONFLICT";
   const key = "conflictEntryIds";
   assertPayloadKeys(payload, [key], event);
@@ -358,7 +361,7 @@ function parseConflictEntryIds(payload) {
   if (input.length === 0) {
     throw new TypeError(`${event} payload ${key} must be a non-empty array`);
   }
-  const values = input.map((value) => parseEntryId(value));
+  const values = input.map((value) => parseEntryId(value, schemaVersion));
   for (let index = 1; index < values.length; index += 1) {
     if (Buffer.compare(Buffer.from(values[index - 1]), Buffer.from(values[index])) >= 0) {
       throw new TypeError(`${event} payload ${key} must be bytewise sorted and unique`);
@@ -422,17 +425,17 @@ const EVENT_PAYLOAD_PARSERS = Object.freeze({
     });
   },
   MOVING: (payload) => parseEmptyPayload("MOVING", payload),
-  MOVE_INTENT(payload) {
+  MOVE_INTENT(payload, schemaVersion) {
     assertPayloadKeys(payload, ["id", "expected"], "MOVE_INTENT");
     return Object.freeze({
       expected: parseInventorySummary(payload.expected),
-      id: parseEntryId(payload.id),
+      id: parseEntryId(payload.id, schemaVersion),
     });
   },
-  MOVED(payload) {
+  MOVED(payload, schemaVersion) {
     assertPayloadKeys(payload, ["id", "observed"], "MOVED");
     return Object.freeze({
-      id: parseEntryId(payload.id),
+      id: parseEntryId(payload.id, schemaVersion),
       observed: parseInventorySummary(payload.observed),
     });
   },
@@ -442,12 +445,12 @@ const EVENT_PAYLOAD_PARSERS = Object.freeze({
     assertPayloadKeys(payload, ["manifestSha256"], "VALIDATED");
     return Object.freeze({ manifestSha256: parseManifestSha256(payload.manifestSha256) });
   },
-  RECOVERY_REQUIRED: (payload) => parseRecoveryEntryIds(payload),
+  RECOVERY_REQUIRED: (payload, schemaVersion) => parseRecoveryEntryIds(payload, schemaVersion),
   ROLLING_BACK: (payload) => parseEmptyPayload("ROLLING_BACK", payload),
-  ROLLBACK_INTENT: (payload) => parseEntryPayload("ROLLBACK_INTENT", payload),
-  ROLLED_BACK_ENTRY: (payload) => parseEntryPayload("ROLLED_BACK_ENTRY", payload),
+  ROLLBACK_INTENT: (payload, schemaVersion) => parseEntryPayload("ROLLBACK_INTENT", payload, schemaVersion),
+  ROLLED_BACK_ENTRY: (payload, schemaVersion) => parseEntryPayload("ROLLED_BACK_ENTRY", payload, schemaVersion),
   ROLLED_BACK: (payload) => parseEmptyPayload("ROLLED_BACK", payload),
-  INCOMPLETE_CONFLICT: (payload) => parseConflictEntryIds(payload),
+  INCOMPLETE_CONFLICT: (payload, schemaVersion) => parseConflictEntryIds(payload, schemaVersion),
   RESTORE_PREPARED(payload) {
     assertPayloadKeys(payload, ["restoreId", "activeGenerated"], "RESTORE_PREPARED");
     return Object.freeze({
@@ -456,14 +459,14 @@ const EVENT_PAYLOAD_PARSERS = Object.freeze({
     });
   },
   RESTORING: (payload) => parseEmptyPayload("RESTORING", payload),
-  RESTORE_INTENT: (payload) => parseEntryPayload("RESTORE_INTENT", payload),
-  RESTORED_ENTRY: (payload) => parseEntryPayload("RESTORED_ENTRY", payload),
+  RESTORE_INTENT: (payload, schemaVersion) => parseEntryPayload("RESTORE_INTENT", payload, schemaVersion),
+  RESTORED_ENTRY: (payload, schemaVersion) => parseEntryPayload("RESTORED_ENTRY", payload, schemaVersion),
   RESTORED: (payload) => parseEmptyPayload("RESTORED", payload),
   RESTORE_ROLLING_BACK: (payload) => parseEmptyPayload("RESTORE_ROLLING_BACK", payload),
-  RESTORE_ROLLBACK_INTENT: (payload) =>
-    parseEntryPayload("RESTORE_ROLLBACK_INTENT", payload),
-  RESTORE_ROLLED_BACK_ENTRY: (payload) =>
-    parseEntryPayload("RESTORE_ROLLED_BACK_ENTRY", payload),
+  RESTORE_ROLLBACK_INTENT: (payload, schemaVersion) =>
+    parseEntryPayload("RESTORE_ROLLBACK_INTENT", payload, schemaVersion),
+  RESTORE_ROLLED_BACK_ENTRY: (payload, schemaVersion) =>
+    parseEntryPayload("RESTORE_ROLLED_BACK_ENTRY", payload, schemaVersion),
   RESTORE_ABORTED_TO_QUARANTINED: (payload) =>
     parseEmptyPayload("RESTORE_ABORTED_TO_QUARANTINED", payload),
   RESTORE_ABORTED_TO_VALIDATED: (payload) =>
@@ -478,27 +481,42 @@ for (const transitions of TRANSITIONS.values()) {
   }
 }
 
-function parseEventPayload(event, payload) {
+function parseEventPayload(event, payload, schemaVersion) {
   const parser = EVENT_PAYLOAD_PARSERS[event];
   if (parser === undefined) throw new Error(`journal event has no payload parser: ${event}`);
-  return parser(payload);
+  return parser(payload, schemaVersion);
 }
 
-function hashRecord(sequence, previousHash, event, payload) {
+function hashRecord(schemaVersion, sequence, previousHash, event, payload) {
+  if (schemaVersion === 2) {
+    return createHash("sha256")
+      .update(JSON.stringify({ schemaVersion, sequence, previousHash, event, payload }))
+      .digest("hex");
+  }
   return createHash("sha256")
     .update(canonicalHashInput(sequence, previousHash, event, payload))
     .digest("hex");
 }
 
-function assertExactEnvelope(value) {
+function assertExactEnvelope(value, priorSchemaVersion) {
   if (!isPlainObject(value)) throw new Error("malformed journal envelope");
+  const schemaVersion = Object.hasOwn(value, "schemaVersion") ? value.schemaVersion : 1;
+  if (schemaVersion !== 1 && schemaVersion !== 2) throw new Error("journal schema version is invalid");
+  if (schemaVersion === 1 && Object.hasOwn(value, "schemaVersion")) {
+    throw new Error("v1 journal envelope must not contain schemaVersion");
+  }
+  if (priorSchemaVersion !== null && schemaVersion !== priorSchemaVersion) {
+    throw new Error("journal schema version changed within the chain");
+  }
+  const envelopeKeys = schemaVersion === 2 ? V2_ENVELOPE_KEYS : V1_ENVELOPE_KEYS;
   const keys = Object.keys(value);
   for (const key of keys) {
-    if (!ENVELOPE_KEYS.includes(key)) throw new Error(`unknown field: ${key}`);
+    if (!envelopeKeys.includes(key)) throw new Error(`unknown field: ${key}`);
   }
-  if (keys.length !== ENVELOPE_KEYS.length || keys.some((key, index) => key !== ENVELOPE_KEYS[index])) {
+  if (keys.length !== envelopeKeys.length || keys.some((key, index) => key !== envelopeKeys[index])) {
     throw new Error("journal envelope is not canonical");
   }
+  return schemaVersion;
 }
 
 export function validateTransition(state, event) {
@@ -703,8 +721,8 @@ function validateJournalSemantics(records) {
   }
 }
 
-function validateFrame(record, rawBody, expectedSequence, expectedPreviousHash, state) {
-  assertExactEnvelope(record);
+function validateFrame(record, rawBody, expectedSequence, expectedPreviousHash, state, priorSchemaVersion) {
+  const schemaVersion = assertExactEnvelope(record, priorSchemaVersion);
   if (!Number.isSafeInteger(record.sequence) || record.sequence !== expectedSequence) {
     throw new Error("journal sequence gap");
   }
@@ -717,8 +735,9 @@ function validateFrame(record, rawBody, expectedSequence, expectedPreviousHash, 
     throw new Error("journal record hash is invalid");
   }
 
-  const payload = canonicalize(parseEventPayload(record.event, record.payload));
+  const payload = canonicalize(parseEventPayload(record.event, record.payload, schemaVersion));
   const canonicalRecord = {
+    ...(schemaVersion === 2 ? { schemaVersion } : {}),
     sequence: record.sequence,
     previousHash: record.previousHash,
     event: record.event,
@@ -729,18 +748,20 @@ function validateFrame(record, rawBody, expectedSequence, expectedPreviousHash, 
     throw new Error("journal frame is not canonical");
   }
   const expectedHash = hashRecord(
+    schemaVersion,
     record.sequence,
     record.previousHash,
     record.event,
     payload,
   );
   if (record.recordHash !== expectedHash) throw new Error("journal record hash mismatch");
-  return { record: canonicalRecord, state: validateTransition(state, record.event) };
+  return { record: canonicalRecord, state: validateTransition(state, record.event), schemaVersion };
 }
 
 function replayJournalBufferUnchecked(input) {
   const records = [];
   let state = null;
+  let schemaVersion = null;
   let offset = 0;
   let truncatedTail = false;
   while (offset < input.length) {
@@ -771,13 +792,21 @@ function replayJournalBufferUnchecked(input) {
       records.length + 1,
       records.at(-1)?.recordHash ?? ZERO_HASH,
       state,
+      schemaVersion,
     );
     records.push(validated.record);
     state = validated.state;
+    schemaVersion = validated.schemaVersion;
     offset = bodyEnd;
   }
   validateJournalSemantics(records);
-  return { records, state, validEndOffset: offset, truncatedTail };
+  return {
+    records,
+    state,
+    ...(schemaVersion === 2 ? { schemaVersion } : {}),
+    validEndOffset: offset,
+    truncatedTail,
+  };
 }
 
 function replayJournalBuffer(input) {
@@ -1432,6 +1461,7 @@ async function appendAttemptUnderHeldLock({
   capability,
   event,
   payload,
+  schemaVersion: requestedSchemaVersion,
   fsApi,
   faultHook,
   state,
@@ -1447,12 +1477,27 @@ async function appendAttemptUnderHeldLock({
     await assertHeldLockOwned(state);
     const snapshot = await readJournalSnapshot({ capability, fsApi });
     const replayed = snapshot.replayed;
+    const schemaVersion = replayed.schemaVersion ?? requestedSchemaVersion ?? 1;
+    if (
+      requestedSchemaVersion !== undefined &&
+      replayed.schemaVersion != null &&
+      requestedSchemaVersion !== replayed.schemaVersion
+    ) {
+      throw new Error("journal append schema version conflicts with the durable chain");
+    }
     validateTransition(replayed.state, event);
-    const canonicalPayload = canonicalize(parseEventPayload(event, payload));
+    const canonicalPayload = canonicalize(parseEventPayload(event, payload, schemaVersion));
     const sequence = replayed.records.length + 1;
     const previousHash = replayed.records.at(-1)?.recordHash ?? ZERO_HASH;
-    const recordHash = hashRecord(sequence, previousHash, event, canonicalPayload);
-    candidate = { sequence, previousHash, event, payload: canonicalPayload, recordHash };
+    const recordHash = hashRecord(schemaVersion, sequence, previousHash, event, canonicalPayload);
+    candidate = {
+      ...(schemaVersion === 2 ? { schemaVersion } : {}),
+      sequence,
+      previousHash,
+      event,
+      payload: canonicalPayload,
+      recordHash,
+    };
     validateJournalSemantics([...replayed.records, candidate]);
     await validateRestorePreparedBacking(candidate, capability, fsApi);
     const body = Buffer.from(JSON.stringify(candidate));
@@ -1564,16 +1609,20 @@ async function appendUnderHeldLock(options) {
 export async function appendJournalRecord(options) {
   const input = snapshotOptions(
     options,
-    ["capability", "heldLock", "event", "payload", "fsApi", "faultHook"],
+    ["capability", "heldLock", "event", "payload", "schemaVersion", "fsApi", "faultHook"],
     ["capability", "heldLock", "event", "payload"],
     "journal append options",
   );
+  if (input.schemaVersion !== undefined && input.schemaVersion !== 1 && input.schemaVersion !== 2) {
+    throw new TypeError("journal append schema version is invalid");
+  }
   const fsApi = boundFsApi(input);
   return appendUnderHeldLock({
     capability: input.capability,
     heldLock: input.heldLock,
     event: input.event,
     payload: input.payload,
+    schemaVersion: input.schemaVersion,
     fsApi,
     faultHook: input.faultHook,
   });

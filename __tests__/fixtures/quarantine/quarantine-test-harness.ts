@@ -102,7 +102,7 @@ export const LAYOUT_RELATIVES = [
   "", "manifests", "inventories", "inventories/pre", "inventories/moved-pass-1",
   "inventories/moved-pass-2", "inventories/restore-active",
   "inventories/validation-pass-1", "inventories/validation-pass-2",
-  "inventories/work", "payload", "payload/source-copies", "payload/generated",
+  "inventories/work", "payload", "payload/source-copies", "payload/temp-residues", "payload/generated",
   "rollback", "rollback/regenerated-before-restore", "conflicts", "divergent-diffs",
 ] as const;
 
@@ -120,6 +120,7 @@ export type Fixture = {
   historyHead?: string;
   canonicalPath?: string;
   copyPath?: string;
+  tempResiduePaths?: string[];
   generatedNestedDirectory?: boolean;
 };
 
@@ -205,6 +206,7 @@ export function createQuarantineFixture({
   copyPath = "notes 2.txt",
   generatedInnerSymlink = false,
   generatedNestedDirectory = false,
+  tempResiduePaths = [],
 } = {}): Fixture {
   const base = mkdtempSync(join(tmpdir(), "quarantine-transaction-"));
   const repoRoot = join(base, repoName);
@@ -227,6 +229,11 @@ export function createQuarantineFixture({
   }
   mkdirSync(dirname(join(repoRoot, copyPath)), { recursive: true });
   writeFileSync(join(repoRoot, copyPath), "canonical\n");
+  for (const tempResiduePath of tempResiduePaths) {
+    mkdirSync(dirname(join(repoRoot, tempResiduePath)), { recursive: true });
+    writeFileSync(join(repoRoot, tempResiduePath), "", { mode: 0o600 });
+    chmodSync(join(repoRoot, tempResiduePath), 0o600);
+  }
   privateDirectory(join(repoRoot, ".next"));
   privateDirectory(join(repoRoot, "node_modules"));
   writeFileSync(join(repoRoot, ".next", "build"), "ignored");
@@ -239,7 +246,7 @@ export function createQuarantineFixture({
     symlinkSync("build", join(repoRoot, ".next", "inner-link"));
     symlinkSync("package", join(repoRoot, "node_modules", "inner-link"));
   }
-  const sourceCopyEntries = Object.freeze([copyPath]);
+  const sourceCopyEntries = Object.freeze([copyPath, ...tempResiduePaths]);
   return {
     base: realpathSync(base),
     repoRoot: realpathSync(repoRoot),
@@ -250,6 +257,7 @@ export function createQuarantineFixture({
     historyHead,
     canonicalPath,
     copyPath,
+    tempResiduePaths,
   };
 }
 

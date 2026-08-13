@@ -96,10 +96,18 @@ function gitEvidence(repoRoot) {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
+  const branch = execFileSync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(head)) {
     throw lifecycleIntegrityError("repository HEAD is invalid");
   }
-  return { topLevel, head };
+  if (branch.length === 0 || branch.includes("\0") || branch !== branch.normalize("NFC")) {
+    throw lifecycleIntegrityError("repository branch is invalid");
+  }
+  return { topLevel, head, branch };
 }
 
 function sameIdentity(left, right) {
@@ -122,6 +130,7 @@ async function repositoryEvidence(repoRoot, fsApi) {
     ["ino", before.ino],
     ["realPath", realPath],
     ["head", git.head],
+    ["branch", git.branch],
   ]);
 }
 
@@ -264,7 +273,7 @@ async function verifyRestoreLocations({ capability, repoRoot, manifest, ledger, 
     const payload = deriveRunPath(capability, { purpose: "payload", id: entry.id });
     const active = join(repoRoot, ...entry.relativePath.split("/"));
     const ancestors = await captureWorkspaceAncestors(repoRoot, active, fsApi);
-    if (entry.kind === "source-copy") {
+    if (entry.kind !== "generated-root") {
       const payloadStat = await optionalStat(payload, fsApi);
       const activeStat = await optionalStat(active, fsApi);
       const payloadPresent = payloadStat !== null;
@@ -375,6 +384,17 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
     manifest.head !== repository.head
   ) {
     throw lifecycleIntegrityError("quarantine lifecycle provenance does not match the live repository");
+  }
+  if (
+    manifest.schemaVersion === 2 &&
+    (replayed.schemaVersion !== 2 || manifest.branch !== repository.branch ||
+      manifest.repositoryIdentity.dev !== repository.dev ||
+      manifest.repositoryIdentity.ino !== repository.ino)
+  ) {
+    throw lifecycleIntegrityError("v2 quarantine provenance does not match the live repository");
+  }
+  if (manifest.schemaVersion === 1 && replayed.schemaVersion === 2) {
+    throw lifecycleIntegrityError("journal and manifest schema versions do not match");
   }
   if (restoreContext && replayed.state !== "INCOMPLETE_CONFLICT") {
     const ledger = buildRestoreLedger(replayed, manifest);

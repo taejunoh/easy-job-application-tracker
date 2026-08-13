@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
+  constants as fsConstants,
   createReadStream,
   lstatSync,
   realpathSync,
@@ -112,8 +113,11 @@ const STDERR_LIMIT = 64 * 1024;
 const BLOB_STREAM_HIGH_WATER_MARK = 64 * 1024;
 const PRIVATE_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
-const ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
+const ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|temp-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
 const COPY_ID = /^copy-(?!0000)[0-9]{4}$/u;
+const TEMP_ID = /^temp-(?!0000)[0-9]{4}$/u;
+const TEMP_RESIDUE_BASENAME = /^\.BC\.T_[A-Za-z0-9]{6}$/u;
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const SHA256 = /^[0-9a-f]{64}$/u;
 
 const LAYOUT = Object.freeze([
@@ -129,6 +133,7 @@ const LAYOUT = Object.freeze([
   "inventories/work",
   "payload",
   "payload/source-copies",
+  "payload/temp-residues",
   "payload/generated",
   "rollback",
   "rollback/regenerated-before-restore",
@@ -419,10 +424,13 @@ function parseStatusRecord(recordBytes) {
   if (!recordValue.startsWith("?? ") || recordValue.length === 3) fail("ERR_PREFLIGHT");
   const path = recordValue.slice(3);
   validateRelativePath(path);
-  try {
-    canonicalPathForNumberedCopy(path);
-  } catch {
-    fail("ERR_PREFLIGHT");
+  const basename = path.slice(path.lastIndexOf("/") + 1);
+  if (!TEMP_RESIDUE_BASENAME.test(basename)) {
+    try {
+      canonicalPathForNumberedCopy(path);
+    } catch {
+      fail("ERR_PREFLIGHT");
+    }
   }
   return path;
 }
@@ -579,6 +587,47 @@ async function hashFile(path, fsSource) {
     stream?.destroy();
     fail("ERR_PREFLIGHT");
   }
+}
+
+async function verifyEmptyPrivateRegularFile(path, expected, fsSource) {
+  if (modeOf(expected) !== PRIVATE_FILE_MODE || Number(expected.size) !== 0) fail("ERR_PREFLIGHT");
+  let handle;
+  let primary;
+  try {
+    handle = await fsSource.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (
+      opened.isSymbolicLink() || !opened.isFile() || modeOf(opened) !== PRIVATE_FILE_MODE ||
+      Number(opened.size) !== 0 || Number(opened.dev) !== Number(expected.dev) ||
+      Number(opened.ino) !== Number(expected.ino)
+    ) fail("ERR_PREFLIGHT");
+    const read = await handle.read(Buffer.alloc(1), 0, 1, 0);
+    if (read.bytesRead !== 0) fail("ERR_PREFLIGHT");
+    const after = await handle.stat();
+    const pathAfter = await fsSource.lstat(path);
+    if (
+      after.isSymbolicLink() || !after.isFile() || pathAfter.isSymbolicLink() || !pathAfter.isFile() ||
+      modeOf(after) !== PRIVATE_FILE_MODE || modeOf(pathAfter) !== PRIVATE_FILE_MODE ||
+      Number(after.size) !== 0 || Number(pathAfter.size) !== 0 ||
+      Number(after.dev) !== Number(expected.dev) || Number(after.ino) !== Number(expected.ino) ||
+      Number(pathAfter.dev) !== Number(expected.dev) || Number(pathAfter.ino) !== Number(expected.ino)
+    ) fail("ERR_PREFLIGHT");
+  } catch (error) {
+    primary = error;
+  }
+  if (handle !== undefined) {
+    try {
+      await handle.close();
+    } catch (closeError) {
+      if (primary === undefined) primary = closeError;
+      else primary = new AggregateError([primary, closeError], "temp residue read and close both failed");
+    }
+  }
+  if (primary !== undefined) {
+    if (primary instanceof ClassifiedFailure) throw primary;
+    fail("ERR_PREFLIGHT");
+  }
+  return EMPTY_SHA256;
 }
 
 async function collectHistoryOids(repoRoot, environment, canonicalPath) {
@@ -768,8 +817,23 @@ async function discoveryPass(options, fsSource, environment, roots) {
   ) fail("ERR_PREFLIGHT");
 
   const sourceEntries = [];
+  const tempEntries = [];
   for (let index = 0; index < before.paths.length; index += 1) {
     const relativePath = before.paths[index];
+    const basename = relativePath.slice(relativePath.lastIndexOf("/") + 1);
+    if (TEMP_RESIDUE_BASENAME.test(basename)) {
+      const sourcePath = resolve(roots.repoRoot, ...relativePath.split("/"));
+      const sourceStats = await assertSafeExistingPath(roots.repoRoot, relativePath, fsSource, "file");
+      const sourceBase = statsIdentity(sourceStats, true);
+      const sourceSha256 = await verifyEmptyPrivateRegularFile(sourcePath, sourceStats, fsSource);
+      tempEntries.push({
+        id: `temp-${String(tempEntries.length + 1).padStart(4, "0")}`,
+        kind: "temp-residue",
+        relativePath,
+        sourceIdentity: fileIdentity(sourceBase, sourceSha256),
+      });
+      continue;
+    }
     const canonicalRelativePath = canonicalPathForNumberedCopy(relativePath);
     const sourcePath = resolve(roots.repoRoot, ...relativePath.split("/"));
     const canonicalPath = resolve(roots.repoRoot, ...canonicalRelativePath.split("/"));
@@ -786,7 +850,7 @@ async function discoveryPass(options, fsSource, environment, roots) {
       ? null
       : await findHistoryMatch(roots.repoRoot, environment, canonicalRelativePath, sourceSha256);
     sourceEntries.push({
-      id: `copy-${String(index + 1).padStart(4, "0")}`,
+      id: `copy-${String(sourceEntries.length + 1).padStart(4, "0")}`,
       kind: "source-copy",
       relativePath,
       canonicalRelativePath,
@@ -816,7 +880,8 @@ async function discoveryPass(options, fsSource, environment, roots) {
     !sameStrings(after.statusPaths, before.statusPaths)
   ) fail("ERR_PREFLIGHT");
 
-  const entries = [...sourceEntries, ...generatedEntries].sort((left, right) => byteCompare(left.relativePath, right.relativePath));
+  const entries = [...sourceEntries, ...tempEntries, ...generatedEntries]
+    .sort((left, right) => byteCompare(left.relativePath, right.relativePath));
   const parts = [frameFields([
     "workspace",
     roots.repoRoot,
@@ -832,6 +897,12 @@ async function discoveryPass(options, fsSource, environment, roots) {
         entry.sourceIdentity.size, entry.sourceIdentity.sha256,
         entry.canonicalIdentity.dev, entry.canonicalIdentity.ino, entry.canonicalIdentity.mode,
         entry.canonicalIdentity.size, entry.canonicalIdentity.sha256,
+      ]));
+    } else if (entry.kind === "temp-residue") {
+      parts.push(frameFields([
+        "temp", entry.relativePath, entry.sourceIdentity.dev,
+        entry.sourceIdentity.ino, entry.sourceIdentity.mode,
+        entry.sourceIdentity.size, entry.sourceIdentity.sha256,
       ]));
     } else {
       parts.push(frameFields([
@@ -854,6 +925,14 @@ function freezeEntry(entry) {
       ["canonicalIdentity", entry.canonicalIdentity],
       ["classification", entry.classification],
       ["historyMatch", entry.historyMatch],
+    ]);
+  }
+  if (entry.kind === "temp-residue") {
+    return record([
+      ["id", entry.id],
+      ["kind", entry.kind],
+      ["relativePath", entry.relativePath],
+      ["sourceIdentity", entry.sourceIdentity],
     ]);
   }
   return record([
@@ -1150,7 +1229,50 @@ function isJournalResidueName(name) {
     name.startsWith("journal.lock.tombstone.");
 }
 
+async function gateOtherOwnedPrecommitRun(options, roots, fsSource) {
+  let names;
+  try {
+    names = await fsSource.readdir(roots.quarantineRoot);
+  } catch {
+    fail("ERR_INTEGRITY");
+  }
+  if (!Array.isArray(names) || names.some((name) => typeof name !== "string")) {
+    fail("ERR_INTEGRITY");
+  }
+  const requiredTopLevel = new Set(LAYOUT.slice(1).filter((path) => !path.includes("/")));
+  for (const name of names.sort(byteCompare)) {
+    if (name === options.transactionId || name === ".gitkeep" || !TRANSACTION_ID.test(name)) continue;
+    const candidate = join(roots.quarantineRoot, name);
+    let stats;
+    let rootNames;
+    try {
+      stats = await fsSource.lstat(candidate);
+      if (stats.isSymbolicLink() || !stats.isDirectory() || modeOf(stats) !== PRIVATE_MODE ||
+          Number(stats.dev) !== roots.quarantineIdentity.dev || await fsSource.realpath(candidate) !== candidate) continue;
+      rootNames = await fsSource.readdir(candidate);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(rootNames) || rootNames.some((entry) => typeof entry !== "string") ||
+        rootNames.some(isJournalResidueName) ||
+        [...requiredTopLevel].some((entry) => !rootNames.includes(entry))) continue;
+    try {
+      const scanned = await scanExistingLayout(
+        candidate,
+        roots.quarantineIdentity.dev,
+        fsSource,
+        "apply-precommit-resume",
+      );
+      if (scanned.identities.size === LAYOUT.length) fail("ERR_RECOVERY_REQUIRED");
+    } catch (error) {
+      if (error instanceof ClassifiedFailure && error.code === "ERR_RECOVERY_REQUIRED") throw error;
+      // A sibling is owned only after its entire closed layout validates.
+    }
+  }
+}
+
 async function gateExistingRun(options, roots, fsSource) {
+  await gateOtherOwnedPrecommitRun(options, roots, fsSource);
   const runRoot = join(roots.quarantineRoot, options.transactionId);
   let exists = true;
   try {
@@ -1238,6 +1360,7 @@ export async function inspectWorkspace(input) {
       ["status", "INSPECTED"],
       ["totalEntries", discovery.entries.length],
       ["sourceCopies", sourceEntries.length],
+      ["tempResidues", discovery.entries.filter((entry) => entry.kind === "temp-residue").length],
       ["generatedRoots", 2],
       ["identicalCopies", identicalCopies],
       ["divergentCopies", sourceEntries.length - identicalCopies],
@@ -1280,6 +1403,10 @@ async function prepareWorkspaceCore(input, mode, hookState) {
     ["transactionId", options.transactionId],
     ["createdAt", options.createdAt],
     ["repoRoot", discovery.roots.repoRoot],
+    ["repositoryIdentity", record([
+      ["dev", discovery.roots.repoIdentity.dev],
+      ["ino", discovery.roots.repoIdentity.ino],
+    ])],
     ["quarantineRoot", discovery.roots.quarantineRoot],
     ["runRoot", runRoot],
     ["branch", discovery.branch],
@@ -1830,7 +1957,7 @@ async function publishDivergentPatch({
 
 function preparedManifest(handoff, entries) {
   return buildValidatedManifest({
-    schemaVersion: 1,
+    schemaVersion: 2,
     transactionId: handoff.transactionId,
     state: "PREPARED",
     repositoryRoot: handoff.repoRoot,
@@ -1854,6 +1981,14 @@ function preparedManifest(handoff, entries) {
       classification: entry.classification,
       historyMatch: entry.historyMatch,
       preMoveInventory,
+    } : entry.kind === "temp-residue" ? {
+      id: entry.id,
+      kind: entry.kind,
+      relativePath: entry.relativePath,
+      mode: entry.sourceIdentity.mode,
+      size: entry.sourceIdentity.size,
+      sha256: entry.sourceIdentity.sha256,
+      preMoveInventory,
     } : {
       id: entry.id,
       kind: entry.kind,
@@ -1861,6 +1996,10 @@ function preparedManifest(handoff, entries) {
       mode: entry.sourceIdentity.mode,
       preMoveInventory,
     }),
+    branch: handoff.branch,
+    repositoryIdentity: handoff.repositoryIdentity,
+    validationAttempt: null,
+    regeneratedEvidence: null,
   });
 }
 
@@ -1870,6 +2009,7 @@ async function appendEvent({ capability, event, payload, faultHook }) {
     heldLock,
     event,
     payload,
+    schemaVersion: 2,
     faultHook,
   }));
 }
@@ -1993,7 +2133,7 @@ async function endpointStat(path, fsApi) {
 }
 
 async function endpointMatchesInventory({ capability, entry, path, phase }) {
-  if (entry.kind === "source-copy") {
+  if (entry.kind !== "generated-root") {
     try {
       const fsApi = getRunFsContext(capability);
       const stat = await fsApi.lstat(path);
@@ -2434,12 +2574,12 @@ async function assertEntrySourceIdentity(path, entry, fsApi) {
   const expected = entry.sourceIdentity;
   if (
     stats.isSymbolicLink() ||
-    (entry.kind === "source-copy" ? !stats.isFile() : !stats.isDirectory()) ||
+    (entry.kind === "generated-root" ? !stats.isDirectory() : !stats.isFile()) ||
     Number(stats.dev) !== expected.dev || Number(stats.ino) !== expected.ino ||
     modeOf(stats) !== expected.mode ||
-    (entry.kind === "source-copy" && Number(stats.size) !== expected.size)
+    (entry.kind !== "generated-root" && Number(stats.size) !== expected.size)
   ) fail("ERR_INTEGRITY");
-  if (entry.kind === "source-copy") {
+  if (entry.kind !== "generated-root") {
     let sha256;
     try {
       sha256 = await hashFile(path, fsApi);
@@ -2902,6 +3042,7 @@ async function prepareDurableApply({ capability, handoff, environment, options, 
     },
   });
   return record([
+    ["schemaVersion", 2],
     ["transactionId", handoff.transactionId],
     ["status", "QUARANTINED"],
     ["movedEntries", entries.length],
@@ -3015,7 +3156,7 @@ async function validateValidationWorkspace(handoff, options) {
 
   const entries = handoff.manifestGeneration.manifest.entries;
   for (const entry of entries) {
-    if (entry.kind !== "source-copy") continue;
+    if (entry.kind === "generated-root") continue;
     try {
       await fsApi.lstat(workspaceEntryPath(handoff.repoRoot, entry));
       fail("ERR_INTEGRITY");

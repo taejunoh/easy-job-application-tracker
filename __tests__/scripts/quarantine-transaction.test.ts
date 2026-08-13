@@ -99,6 +99,64 @@ describe("quarantine transaction Slice 1", () => {
     expect(result.exports).toContain("recoverQuarantine");
   });
 
+  it("moves and restores verified temp residues through a v2 manifest and journal", () => {
+    const tempResiduePath = "nested/.BC.T_aB09Zx";
+    const f = createQuarantineFixture({ tempResiduePaths: [tempResiduePath] });
+    bases.push(f.base);
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: f.expectedCount,
+      transactionId: "tx-temp-residue",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      writersStopped: true,
+    };
+
+    const applied = invokeQuarantineWorker("apply", request);
+    expect(applied.error).toBeUndefined();
+    expect(applied).toMatchObject({
+      ok: true,
+      result: { status: "QUARANTINED", movedEntries: 4, schemaVersion: 2 },
+    });
+    expect(existsSync(join(f.repoRoot, tempResiduePath))).toBe(false);
+    expect(readFileSync(join(
+      f.quarantineRoot,
+      request.transactionId,
+      "payload/temp-residues/temp-0001",
+    ))).toHaveLength(0);
+
+    const manifestPath = join(
+      f.quarantineRoot,
+      request.transactionId,
+      "manifests",
+      readdirSync(join(f.quarantineRoot, request.transactionId, "manifests"))[0],
+    );
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    expect(manifest).toMatchObject({ schemaVersion: 2, branch: f.branch });
+    expect(manifest.entries.find((entry: { kind: string }) => entry.kind === "temp-residue"))
+      .toEqual(expect.objectContaining({
+        id: "temp-0001",
+        relativePath: tempResiduePath,
+        mode: 0o600,
+        size: 0,
+        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      }));
+    const journal = journalRecords(join(f.quarantineRoot, request.transactionId, "journal.log"));
+    expect(journal.every((record) => record.schemaVersion === 2)).toBe(true);
+
+    const restored = invokeQuarantineWorker("restore", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+    });
+    expect(restored).toMatchObject({ ok: true, result: { status: "RESTORED", schemaVersion: 2 } });
+    expect(readFileSync(join(f.repoRoot, tempResiduePath))).toHaveLength(0);
+    expect(lstatSync(join(f.repoRoot, tempResiduePath)).mode & 0o7777).toBe(0o600);
+  });
+
   it("resumes a durable move intent left before its rename", () => {
     const f = createQuarantineFixture();
     bases.push(f.base);
@@ -1353,6 +1411,36 @@ process.stdout.write(JSON.stringify({ failure, events }));
       "Quarantine evidence failed integrity validation.",
     );
     expect(readFileSync(preInventory, "utf8")).toBe("preserve");
+  });
+
+  it("rejects a different transaction while an owned precommit run exists", () => {
+    const f = createQuarantineFixture();
+    bases.push(f.base);
+    const common = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: 1,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const first = invokeQuarantineWorker("apply-stop-after-layout", {
+      ...common,
+      transactionId: "tx-owned-precommit-a",
+    }, {}, 30_000);
+    expect(first.ok).toBe(false);
+    expect(first.phases).toEqual(["after-layout-sync"]);
+
+    expectWorkerError(
+      invokeQuarantineWorker("apply", {
+        ...common,
+        transactionId: "tx-owned-precommit-b",
+      }, {}, 30_000),
+      "ERR_RECOVERY_REQUIRED",
+      "Explicit quarantine recovery is required.",
+    );
+    expect(existsSync(join(f.quarantineRoot, "tx-owned-precommit-b"))).toBe(false);
   });
 
   it("publishes exact pre inventories and one immutable generation before durable PREPARED", () => {

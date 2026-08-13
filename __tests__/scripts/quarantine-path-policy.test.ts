@@ -84,6 +84,15 @@ function generatedEntry(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function tempResidueEntry(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "temp-0001",
+    kind: "temp-residue",
+    relativePath: "src/.BC.T_aB09Zx",
+    ...overrides,
+  };
+}
+
 describe("quarantine path policy", () => {
   it("maps only a numbered suffix on the final component", () => {
     expect(canonicalPathForNumberedCopy("src/archive 2/example 23.test.ts")).toBe(
@@ -142,6 +151,24 @@ describe("quarantine path policy", () => {
     );
   });
 
+  it("accepts only exact temporary-residue basenames with deterministic IDs", () => {
+    expect(parseManifestEntry(tempResidueEntry())).toEqual(tempResidueEntry());
+    for (const relativePath of [
+      "src/.BC.T_aB09Z",
+      "src/.BC.T_aB09Zx7",
+      "src/.BC.T_aB-9Zx",
+      "src/.bc.T_aB09Zx",
+      "src/prefix.BC.T_aB09Zx",
+      "src/.BC.T_Cafe\u0301",
+    ]) {
+      expect(() => parseManifestEntry(tempResidueEntry({ relativePath }))).toThrow();
+    }
+    expect(() => parseManifestEntry(tempResidueEntry({ id: "copy-0001" }))).toThrow(/ID/u);
+    expect(() => parseManifestEntry({ ...tempResidueEntry(), canonicalRelativePath: "src/x" })).toThrow(
+      /unknown field/u,
+    );
+  });
+
   it("derives destinations from validated IDs and the generated-root allowlist", () => {
     const runRoot = join(tmpdir(), "quarantine-run");
     const copy = parseManifestEntry(sourceEntry());
@@ -152,6 +179,9 @@ describe("quarantine path policy", () => {
     );
     expect(derivePayloadPath(runRoot, generated)).toBe(
       join(runRoot, "payload", "generated", "node_modules"),
+    );
+    expect(derivePayloadPath(runRoot, tempResidueEntry())).toBe(
+      join(runRoot, "payload", "temp-residues", "temp-0001"),
     );
     expect(() => parseManifestEntry(sourceEntry({ id: "../escape" }))).toThrow(/ID/u);
   });

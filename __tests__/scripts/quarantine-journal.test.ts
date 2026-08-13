@@ -178,6 +178,7 @@ const appendAll = async (capability, values, fsApi = boundFsApi, faultHook) =>
         payload: value.payload,
         fsApi,
         faultHook,
+        ...(request.schemaVersion === undefined ? {} : { schemaVersion: request.schemaVersion }),
       }));
     }
     return appended;
@@ -2648,6 +2649,53 @@ describe("capability-bound durable quarantine journal", () => {
     ]);
     expect(result.replayed.records[1].previousHash).toBe(result.replayed.records[0].recordHash);
     expect(result.replayed.records[0].recordHash).toMatch(/^[a-f0-9]{64}$/u);
+    expect(result.replayed.records[0].recordHash).toBe(
+      "f37b7620cb7306008d5ef81e6d1dedc7c2d032fe471872e797d524e178e98746",
+    );
+  });
+
+  it("uses an explicit v2 envelope and accepts temp IDs only after v2 PREPARED", () => {
+    const summary = {
+      sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      entries: 1,
+      bytes: 0,
+    };
+    const result = invoke(join(fixture, "v2-temp-chain"), {
+      operation: "append-valid-lifecycle",
+      schemaVersion: 2,
+      records: [
+        records.prepared,
+        records.moving,
+        { event: "MOVE_INTENT", payload: { id: "temp-0001", expected: summary } },
+        { event: "MOVED", payload: { id: "temp-0001", observed: summary } },
+        records.verifying,
+        records.quarantined,
+      ],
+    });
+    expect(result.schemaVersion).toBe(2);
+    expect(result.records.map((record: { schemaVersion: number }) => record.schemaVersion))
+      .toEqual([2, 2, 2, 2, 2, 2]);
+    expect(Object.keys(result.records[0])).toEqual([
+      "schemaVersion",
+      "sequence",
+      "previousHash",
+      "event",
+      "payload",
+      "recordHash",
+    ]);
+    expect(result.records[2].payload.id).toBe("temp-0001");
+
+    const v1 = invoke(join(fixture, "v1-temp-rejected"), {
+      operation: "journal-regression",
+      case: "illegal",
+      prefix: [records.prepared, records.moving],
+      record: { event: "MOVE_INTENT", payload: { id: "temp-0001", expected: summary } },
+    });
+    expect(v1.outcome).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/entry ID|temp|v1/i) },
+    });
+    expect(v1.bytesUnchanged).toBe(true);
   });
 
   it("snapshots the PREPARED transactionId accessor once before append", () => {

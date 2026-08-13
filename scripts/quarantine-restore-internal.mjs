@@ -303,7 +303,7 @@ async function guardedRestoreRename({
 
 async function assertPayload(capability, entry, path, fsApi, ancestorChain = Object.freeze([])) {
   await revalidateRunCapability(capability, { purpose: "payload", id: entry.id, boundary: "before-mutation" });
-  if (entry.kind === "source-copy") {
+  if (entry.kind !== "generated-root") {
     let stat;
     try {
       stat = await fsApi.lstat(path);
@@ -345,7 +345,7 @@ async function assertPrivatePayload(capability, entry, path, fsApi, parent) {
 
 async function assertRestoredEndpoint(entry, path, fsApi, ancestors) {
   await assertAncestors(ancestors, fsApi);
-  if (entry.kind === "source-copy") {
+  if (entry.kind !== "generated-root") {
     const stat = await fsApi.lstat(path);
     if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o7777) !== entry.mode || stat.size !== entry.size) {
       throw restoreIntegrityFailure();
@@ -444,7 +444,7 @@ async function restoreEntry({ handoff, heldLock, restoreId, entry, activeGenerat
 
   await assertPrivatePayload(handoff.capability, entry, payload, fsApi, payloadParent);
   await assertAncestors(ancestors, fsApi);
-  if (entry.kind === "source-copy") {
+  if (entry.kind !== "generated-root") {
     let restoredIdentity;
     await guardedRestoreRename({
       capability: handoff.capability, pathRequest: { purpose: "payload", id: entry.id }, source: payload, destination: active, fsApi,
@@ -567,7 +567,7 @@ async function classifyRecoveryEntry({ handoff, ledger, entry }) {
   const ancestors = await captureAncestors(handoff.repoRoot, active, fsApi);
   const pStat = await optionalStat(payload, fsApi);
   const aStat = await optionalStat(active, fsApi);
-  if (entry.kind === "source-copy") {
+  if (entry.kind !== "generated-root") {
     const p = pStat !== null && await sourceMatches(payload, entry, fsApi);
     const a = aStat !== null && await sourceMatches(active, entry, fsApi, ancestors);
     // A non-matching endpoint is concurrent evidence, not an absent endpoint.
@@ -607,7 +607,7 @@ async function moveRecoveryEndpoint({ handoff, entry, source, destination, sourc
     before: async () => {
       if (destinationAncestors !== undefined) await assertAncestors(destinationAncestors, fsApi);
       if (sourceExpected === "original") {
-        if (entry.kind === "source-copy") {
+        if (entry.kind !== "generated-root") {
           if (!await sourceMatches(source, entry, fsApi, sourceAncestors ?? Object.freeze([]))) throw restoreIntegrityFailure();
         } else if (!await treeMatches(source, entry.preMoveInventory, fsApi, sourceAncestors ?? Object.freeze([]))) throw restoreIntegrityFailure();
       } else if (sourceExpected === "generated" &&
@@ -739,6 +739,7 @@ export async function restoreQuarantine(input) {
       await invokeHook(options.faultHook, "after-event:RESTORED");
       await invokeHook(options.faultHook, "before-lock-cleanup");
       return record([
+        ["schemaVersion", handoff.manifestGeneration.manifest.schemaVersion],
         ["transactionId", options.transactionId], ["restoreId", restoreId],
         ["status", "RESTORED"], ["restoredEntries", handoff.manifestGeneration.manifest.entries.length],
       ]);

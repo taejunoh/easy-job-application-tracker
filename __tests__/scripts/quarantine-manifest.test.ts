@@ -84,6 +84,51 @@ const preparedManifest = {
   deleteAfter: null,
   deletionStatus: "retained",
 };
+const emptySha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const validationAttempt = "attempt-123e4567-e89b-42d3-a456-426614174000";
+const regeneratedEvidence = {
+  "generated-next": {
+    pass1Path: `inventories/validation-pass-1/${validationAttempt}-generated-next.jsonl`,
+    pass1Summary: inventory(hash("7"), 3, 31),
+    pass2Path: `inventories/validation-pass-2/${validationAttempt}-generated-next.jsonl`,
+    pass2Summary: inventory(hash("7"), 3, 31),
+  },
+  "generated-node-modules": {
+    pass1Path: `inventories/validation-pass-1/${validationAttempt}-generated-node-modules.jsonl`,
+    pass1Summary: inventory(hash("8"), 4, 41),
+    pass2Path: `inventories/validation-pass-2/${validationAttempt}-generated-node-modules.jsonl`,
+    pass2Summary: inventory(hash("8"), 4, 41),
+  },
+};
+const validManifestV2 = {
+  ...validManifest,
+  schemaVersion: 2,
+  branch: "slice-one",
+  repositoryIdentity: { dev: 100, ino: 200 },
+  validationAttempt,
+  regeneratedEvidence,
+  entries: [
+    ...validManifest.entries.slice(0, 2),
+    {
+      id: "temp-0001",
+      kind: "temp-residue",
+      relativePath: "src/.BC.T_aB09Zx",
+      mode: 0o600,
+      size: 0,
+      sha256: emptySha256,
+      preMoveInventory: inventory(emptySha256, 1, 0),
+    },
+    ...validManifest.entries.slice(2),
+  ],
+};
+const preparedManifestV2 = {
+  ...validManifestV2,
+  state: "PREPARED",
+  validatedAt: null,
+  deleteAfter: null,
+  validationAttempt: null,
+  regeneratedEvidence: null,
+};
 
 type Outcome =
   | { ok: true; value: unknown }
@@ -1283,6 +1328,60 @@ describe("immutable quarantine manifest generations", () => {
         manifestSha256: result.written.manifestSha256,
       },
     });
+  });
+
+  it("builds exact v2 temp-residue and attempt-scoped regenerated evidence", () => {
+    expect(invoke({ operation: "builder", value: preparedManifestV2 })).toEqual({
+      ok: true,
+      value: preparedManifestV2,
+    });
+    expect(invoke({ operation: "builder", value: validManifestV2 })).toEqual({
+      ok: true,
+      value: validManifestV2,
+    });
+  });
+
+  it.each([
+    ["v1 rejects temp entries", { ...validManifest, entries: validManifestV2.entries }],
+    ["v2 rejects nonempty temp hash", {
+      ...validManifestV2,
+      entries: validManifestV2.entries.map((entry) => entry.kind === "temp-residue"
+        ? { ...entry, sha256: hash("9") }
+        : entry),
+    }],
+    ["v2 rejects non-0600 temp mode", {
+      ...validManifestV2,
+      entries: validManifestV2.entries.map((entry) => entry.kind === "temp-residue"
+        ? { ...entry, mode: 0o644 }
+        : entry),
+    }],
+    ["v2 rejects mismatched regenerated passes", {
+      ...validManifestV2,
+      regeneratedEvidence: {
+        ...regeneratedEvidence,
+        "generated-next": {
+          ...regeneratedEvidence["generated-next"],
+          pass2Summary: inventory(hash("9"), 3, 31),
+        },
+      },
+    }],
+    ["v2 rejects cross-attempt inventory paths", {
+      ...validManifestV2,
+      regeneratedEvidence: {
+        ...regeneratedEvidence,
+        "generated-next": {
+          ...regeneratedEvidence["generated-next"],
+          pass1Path: "inventories/validation-pass-1/attempt-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa-generated-next.jsonl",
+        },
+      },
+    }],
+    ["PREPARED v2 rejects published validation evidence", {
+      ...preparedManifestV2,
+      validationAttempt,
+      regeneratedEvidence,
+    }],
+  ])("%s", (_label, value) => {
+    expect(invoke({ operation: "builder", value })).toMatchObject({ ok: false });
   });
 
   it("does not activate a PREPARED generation", () => {
