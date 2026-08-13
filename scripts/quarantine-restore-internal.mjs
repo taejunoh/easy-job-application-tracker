@@ -754,6 +754,7 @@ export async function recoverRestore(input) {
 
 export async function recoverRestoreWithHandoff(options, handoff) {
   return withJournalLock({ capability: handoff.capability }, async (heldLock) => {
+    const schemaVersion = handoff.manifestGeneration.manifest.schemaVersion;
     const replayed = await replayJournalForRestore(handoff.capability);
     if (replayed.truncatedTail) throw restoreIntegrityFailure();
     const tip = replayed.records.at(-1);
@@ -764,7 +765,7 @@ export async function recoverRestoreWithHandoff(options, handoff) {
     const restoreId = ledger.restoreId;
     if (replayed.state === "INCOMPLETE_CONFLICT") {
       const conflict = replayed.records.at(-1)?.payload.conflictEntryIds;
-      return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "INCOMPLETE_CONFLICT"], ["action", options.action], ["conflictEntryIds", Object.freeze([...conflict])]]);
+      return record([["schemaVersion", schemaVersion], ["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "INCOMPLETE_CONFLICT"], ["action", options.action], ["conflictEntryIds", Object.freeze([...conflict])]]);
     }
     if (replayed.state === "RESTORED") throw restoreRecoveryNotApplicable();
     if (!new Set(["RESTORE_PREPARED", "RESTORING", "RECOVERY_REQUIRED", "RESTORE_ROLLING_BACK"]).has(replayed.state)) {
@@ -794,7 +795,7 @@ export async function recoverRestoreWithHandoff(options, handoff) {
       }
       await append(heldLock, handoff.capability, "INCOMPLETE_CONFLICT", { conflictEntryIds: conflicts });
       await invokeHook(options.faultHook, "after-event:INCOMPLETE_CONFLICT");
-      return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "INCOMPLETE_CONFLICT"], ["action", options.action], ["conflictEntryIds", Object.freeze(conflicts)]]);
+      return record([["schemaVersion", schemaVersion], ["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "INCOMPLETE_CONFLICT"], ["action", options.action], ["conflictEntryIds", Object.freeze(conflicts)]]);
     }
     if (options.action === "resume") {
       if (replayed.state === "RESTORE_ROLLING_BACK") throw restoreRecoveryRequired();
@@ -812,7 +813,7 @@ export async function recoverRestoreWithHandoff(options, handoff) {
       await append(heldLock, handoff.capability, "RESTORED", {});
       await invokeHook(options.faultHook, "after-event:RESTORED");
       await invokeHook(options.faultHook, "before-lock-cleanup");
-      return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "RESTORED"], ["action", "resume"], ["reconciledEntries", entries.length]]);
+      return record([["schemaVersion", schemaVersion], ["transactionId", options.transactionId], ["restoreId", restoreId], ["status", "RESTORED"], ["action", "resume"], ["reconciledEntries", entries.length]]);
     }
     if (replayed.state !== "RESTORE_ROLLING_BACK") {
       if (replayed.state !== "RECOVERY_REQUIRED") {
@@ -831,6 +832,6 @@ export async function recoverRestoreWithHandoff(options, handoff) {
     await append(heldLock, handoff.capability, prior === "VALIDATED" ? "RESTORE_ABORTED_TO_VALIDATED" : "RESTORE_ABORTED_TO_QUARANTINED", {});
     await invokeHook(options.faultHook, prior === "VALIDATED" ? "after-event:RESTORE_ABORTED_TO_VALIDATED" : "after-event:RESTORE_ABORTED_TO_QUARANTINED");
     await invokeHook(options.faultHook, "before-lock-cleanup");
-    return record([["transactionId", options.transactionId], ["restoreId", restoreId], ["status", prior], ["action", "rollback"], ["reconciledEntries", intents.length], ["restoreAborted", true]]);
+    return record([["schemaVersion", schemaVersion], ["transactionId", options.transactionId], ["restoreId", restoreId], ["status", prior], ["action", "rollback"], ["reconciledEntries", intents.length], ["restoreAborted", true]]);
   });
 }

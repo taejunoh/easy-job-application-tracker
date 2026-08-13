@@ -14,6 +14,7 @@ const LIMITS = Object.freeze({
   depth: 1024,
   nameBytes: 255,
 });
+const PUBLISHED_RECORD_LIMIT = 1_000_000;
 
 export class InventoryStructuralError extends Error {
   constructor(message = "read-only inventory evidence is structurally invalid") {
@@ -287,6 +288,79 @@ export async function summarizeInventoryDirectory(root, {
     rootIdentity,
     ancestorChain,
   });
+}
+
+export async function verifyPublishedInventory({ capability, entryId, phase, expectedSummary }) {
+  const fsApi = getRunFsContext(capability);
+  const path = deriveRunPath(capability, { purpose: "inventory", id: entryId, phase });
+  const expected = parseInventorySummary(expectedSummary);
+  let handle;
+  let primary;
+  let result;
+  try {
+    const before = await fsApi.lstat(path);
+    if (before.isSymbolicLink() || !before.isFile() || modeOf(before) !== 0o600 || before.nlink !== 1) {
+      throw new InventoryStructuralError("published inventory endpoint is unsafe");
+    }
+    handle = await fsApi.open(path, FILE_OPEN_FLAGS);
+    const opened = await handle.stat();
+    assertInventoryIdentity(before, opened, "isFile");
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let pending = Buffer.alloc(0);
+    let entries = 0;
+    let bytes = 0;
+    while (true) {
+      const read = await handle.read(buffer, 0, buffer.length, null);
+      if (read.bytesRead === 0) break;
+      const chunk = Buffer.from(buffer.subarray(0, read.bytesRead));
+      digest.update(chunk);
+      pending = Buffer.concat([pending, chunk]);
+      if (pending.length > LIMITS.recordBytes) {
+        throw new InventoryStructuralError("published inventory record exceeds fixed bounds");
+      }
+      let newline;
+      while ((newline = pending.indexOf(0x0a)) !== -1) {
+        const lineBytes = pending.subarray(0, newline);
+        pending = pending.subarray(newline + 1);
+        if (lineBytes.length === 0 || entries >= PUBLISHED_RECORD_LIMIT) {
+          throw new InventoryStructuralError("published inventory has an invalid record count");
+        }
+        const line = lineBytes.toString("utf8");
+        if (!Buffer.from(line, "utf8").equals(lineBytes)) {
+          throw new InventoryStructuralError("published inventory is not valid UTF-8");
+        }
+        let raw;
+        try { raw = JSON.parse(line); } catch {
+          throw new InventoryStructuralError("published inventory JSON is invalid");
+        }
+        const record = parseInventoryRecord(raw);
+        if (JSON.stringify(record) !== line) {
+          throw new InventoryStructuralError("published inventory is not canonical JSONL");
+        }
+        entries += 1;
+        if (record.type === "file" || record.type === "symlink") bytes += record.size;
+        if (!Number.isSafeInteger(bytes)) {
+          throw new InventoryStructuralError("published inventory byte count exceeds fixed bounds");
+        }
+      }
+    }
+    if (pending.length !== 0) {
+      throw new InventoryStructuralError("published inventory has a torn final record");
+    }
+    const after = await handle.stat();
+    assertInventoryIdentity(opened, after, "isFile");
+    const finalPath = await fsApi.lstat(path);
+    assertInventoryIdentity(opened, finalPath, "isFile");
+    result = parseInventorySummary({ sha256: digest.digest("hex"), entries, bytes });
+    if (JSON.stringify(result) !== JSON.stringify(expected)) {
+      throw new InventoryStructuralError("published inventory summary does not match its manifest");
+    }
+  } catch (error) {
+    primary = error;
+  }
+  await closeAll(undefined, handle, primary);
+  return result;
 }
 
 export async function publishVerifiedRestoreActiveInventory({ capability, entryId, snapshot, replaceExisting = false }) {

@@ -106,19 +106,22 @@ function publicApply(result) {
 }
 
 function publicValidated(result) {
-  return Object.freeze({ ok: true, command: "mark-validated", status: "VALIDATED", transactionId: result.transactionId,
+  return Object.freeze({ ok: true, command: "mark-validated", status: "VALIDATED", schemaVersion: result.schemaVersion,
+    transactionId: result.transactionId,
     manifestSha256: result.manifestSha256, validatedAt: result.validatedAt, deleteAfter: result.deleteAfter,
     deletionRequiresConfirmation: true });
 }
 
 function publicRestore(result) {
-  return Object.freeze({ ok: true, command: "restore", status: "RESTORED", transactionId: result.transactionId,
+  return Object.freeze({ ok: true, command: "restore", status: "RESTORED", schemaVersion: result.schemaVersion,
+    transactionId: result.transactionId,
     restoreId: result.restoreId, restoredEntries: result.restoredEntries });
 }
 
 function publicRecovery(result) {
   if (conflict(result)) throw Object.freeze({ code: "ERR_CONFLICT" });
   const safe = Object.freeze({
+    schemaVersion: result.schemaVersion,
     transactionId: result.transactionId,
     ...(typeof result.restoreId === "string" ? { restoreId: result.restoreId } : {}),
     status: result.status,

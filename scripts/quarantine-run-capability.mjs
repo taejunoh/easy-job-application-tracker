@@ -18,6 +18,7 @@ const capabilityState = new WeakMap();
 
 const TRANSACTION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const VALIDATION_INVENTORY_ID = /^attempt-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-generated-(?:next|node-modules)$/u;
 const RESTORE_ID = /^restore-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const COPY_ID = /^copy-(?!0000)[0-9]{4}$/u;
 const TEMP_ID = /^temp-(?!0000)[0-9]{4}$/u;
@@ -294,7 +295,13 @@ function validateRequest(request, includeBoundary = false) {
         throw new TypeError("inventory phase is invalid");
       }
       if (GENERATED_INVENTORY_PHASES.has(normalized.phase)) {
-        assertGeneratedEntryId(normalized.id);
+        if (normalized.phase.startsWith("validation-pass-")) {
+          if (!GENERATED_IDS.has(normalized.id)) {
+            assertIdentifier(normalized.id, VALIDATION_INVENTORY_ID, "validation inventory");
+          }
+        } else {
+          assertGeneratedEntryId(normalized.id);
+        }
       } else {
         assertEntryId(normalized.id);
       }

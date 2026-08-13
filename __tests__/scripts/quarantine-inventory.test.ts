@@ -1054,6 +1054,31 @@ describe("bounded quarantine inventory", () => {
       join(realpathSync(quarantineRoot), nextTransaction, "inventories", phase, `${entryId}.jsonl`)));
   });
 
+  it("publishes validation inventories under an attempt-scoped generated ID", () => {
+    const transactionId = "inventory-attempt-scoped-validation";
+    createRun(quarantineRoot, transactionId);
+    const source = join(repoRoot, "attempt-validation-source");
+    privateDirectory(source);
+    writeFileSync(join(source, "file"), "attempt");
+    const attemptId = "attempt-123e4567-e89b-42d3-a456-426614174000-generated-next";
+    const result = runWorker({
+      operation: "one-pass",
+      repoRoot,
+      quarantineRoot,
+      transactionId,
+      root: source,
+      phase: "validation-pass-1",
+      entryId: attemptId,
+    }).result as { output: string; summary: { entries: number } };
+    expect(result.summary.entries).toBe(1);
+    expect(result.output).toBe(join(
+      realpathSync(quarantineRoot),
+      transactionId,
+      "inventories/validation-pass-1",
+      `${attemptId}.jsonl`,
+    ));
+  });
+
   it("accepts only the exact RootFileRecord and safe RelativeRecord union", () => {
     const rootFile = { scope: "root", type: "file", mode: 0o640, size: 1, sha256: "a".repeat(64) };
     const relative = { ...rootFile, scope: "relative", path: "src/file.ts" };

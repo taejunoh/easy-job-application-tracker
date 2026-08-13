@@ -1219,13 +1219,24 @@ try {
       error: captured === undefined ? undefined : errorShape(captured),
     }));
   } else if (operation === "mark-validated") {
-    const { stopPhase, ...validationRequest } = request;
+    const {
+      stopPhase, mutateAfterPhase, mutationPath, mutationContent, mutationKind, ...validationRequest
+    } = request;
     const phases = [];
     try {
       const result = await transaction.markQuarantineValidated({
         ...validationRequest,
         async faultHook(phase) {
           phases.push(phase);
+          if (phase === mutateAfterPhase) {
+            if (mutationKind === "replace-directory") {
+              rmSync(mutationPath, { recursive: true, force: true });
+              privateDirectory(mutationPath);
+              writeFileSync(join(mutationPath, "replacement"), mutationContent);
+            } else {
+              writeFileSync(mutationPath, mutationContent);
+            }
+          }
           if (phase === stopPhase) throw new RangeError("stop at requested validation phase");
         },
       });

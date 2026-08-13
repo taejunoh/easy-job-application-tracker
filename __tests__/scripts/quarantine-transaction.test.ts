@@ -157,6 +157,68 @@ describe("quarantine transaction Slice 1", () => {
     expect(lstatSync(join(f.repoRoot, tempResiduePath)).mode & 0o7777).toBe(0o600);
   });
 
+  it.each([
+    ["nonzero content", (path: string) => writeFileSync(path, "x", { mode: 0o600 })],
+    ["wrong mode", (path: string) => chmodSync(path, 0o644)],
+    ["symlink", (path: string) => { rmSync(path); symlinkSync("../notes.txt", path); }],
+    ["directory", (path: string) => { rmSync(path); privateDirectory(path); }],
+    ["FIFO", (path: string) => { rmSync(path); execFileSync("mkfifo", [path]); chmodSync(path, 0o600); }],
+  ])("rejects a temp-residue %s before layout publication", (_label, mutate) => {
+    const tempResiduePath = ".BC.T_aB09Zx";
+    const f = createQuarantineFixture({ tempResiduePaths: [tempResiduePath] });
+    bases.push(f.base);
+    mutate(join(f.repoRoot, tempResiduePath));
+    expectWorkerError(invokeQuarantineWorker("apply", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: f.expectedCount,
+      transactionId: `tx-bad-temp-${String(_label).replaceAll(" ", "-")}`,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      writersStopped: true,
+    }), "ERR_PREFLIGHT", "Workspace preflight failed.");
+  });
+
+  it("resumes a v2 temp-residue move intent through recovery", () => {
+    const tempResiduePath = "nested/.BC.T_aB09Zx";
+    const f = createQuarantineFixture({ tempResiduePaths: [tempResiduePath] });
+    bases.push(f.base);
+    const request = {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      expectedBranch: f.branch,
+      expectedHead: f.head,
+      expectedCount: f.expectedCount,
+      transactionId: "tx-temp-recovery",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      writersStopped: true,
+    };
+    const interrupted = invokeQuarantineWorker("apply-stop", {
+      ...request,
+      stopPhase: "after-event:MOVE_INTENT:temp-0001",
+    }, {}, 30_000);
+    expect(interrupted).toMatchObject({ ok: false, error: { name: "RangeError" } });
+
+    const recovered = invokeQuarantineWorker("recover", {
+      repoRoot: f.repoRoot,
+      quarantineRoot: f.quarantineRoot,
+      transactionId: request.transactionId,
+      writersStopped: true,
+      action: "resume",
+    }, {}, 30_000);
+    expect(recovered).toMatchObject({
+      ok: true,
+      result: { status: "QUARANTINED", action: "resume" },
+    });
+    expect(existsSync(join(f.repoRoot, tempResiduePath))).toBe(false);
+    expect(readFileSync(join(
+      f.quarantineRoot,
+      request.transactionId,
+      "payload/temp-residues/temp-0001",
+    ))).toHaveLength(0);
+  });
+
   it("resumes a durable move intent left before its rename", () => {
     const f = createQuarantineFixture();
     bases.push(f.base);
@@ -567,9 +629,10 @@ describe("quarantine transaction Slice 1", () => {
     }
     const payload = { manifestSha256: prepared.payload.manifestSha256 };
     const recordHash = createHash("sha256")
-      .update(JSON.stringify({ sequence: sequence + 1, previousHash, event: "VALIDATED", payload }))
+      .update(JSON.stringify({ schemaVersion: 2, sequence: sequence + 1, previousHash, event: "VALIDATED", payload }))
       .digest("hex");
     const body = Buffer.from(JSON.stringify({
+      schemaVersion: 2,
       sequence: sequence + 1,
       previousHash,
       event: "VALIDATED",
@@ -586,6 +649,7 @@ describe("quarantine transaction Slice 1", () => {
       action: "resume",
       writersStopped: true,
     }).result).toEqual({
+      schemaVersion: 2,
       transactionId,
       status: "VALIDATED",
       action: "resume",
@@ -976,6 +1040,7 @@ process.stdout.write(JSON.stringify({ failure, events }));
     const worker = invokeQuarantineWorker("apply", request, {}, 30_000);
     if (!worker.ok) throw new Error(JSON.stringify(worker.error));
     expect(worker.result).toEqual({
+      schemaVersion: 2,
       transactionId: "tx-slice-2-happy",
       status: "QUARANTINED",
       movedEntries: 3,
@@ -1028,7 +1093,7 @@ process.stdout.write(JSON.stringify({ failure, events }));
     expect(manifestBytes).toEqual(Buffer.from(`${JSON.stringify(manifest)}\n`));
     expect(createHash("sha256").update(manifestBytes).digest("hex")).toBe(manifestSha256);
     expect(manifest).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       transactionId: request.transactionId,
       state: "PREPARED",
       retentionDays: 4,
@@ -2763,6 +2828,7 @@ process.stdout.write(JSON.stringify({ failure, events }));
       "status",
       "totalEntries",
       "sourceCopies",
+      "tempResidues",
       "generatedRoots",
       "identicalCopies",
       "divergentCopies",
@@ -2781,6 +2847,7 @@ process.stdout.write(JSON.stringify({ failure, events }));
       status: "INSPECTED",
       totalEntries: 3,
       sourceCopies: 1,
+      tempResidues: 0,
       generatedRoots: 2,
       identicalCopies: 1,
       divergentCopies: 0,
@@ -2843,6 +2910,7 @@ process.stdout.write(JSON.stringify({ failure, events }));
       "transactionId",
       "createdAt",
       "repoRoot",
+      "repositoryIdentity",
       "quarantineRoot",
       "runRoot",
       "branch",

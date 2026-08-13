@@ -95,7 +95,8 @@ describe("quarantine cleanup CLI", () => {
     expect(validated.stderr).toBe("");
     expectSpawned(validated);
     expect(JSON.parse(validated.stdout)).toEqual({
-      ok: true, command: "mark-validated", status: "VALIDATED", transactionId: records[0].transactionId,
+      ok: true, command: "mark-validated", status: "VALIDATED", schemaVersion: 2,
+      transactionId: records[0].transactionId,
       manifestSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       validatedAt: expect.any(String), deleteAfter: expect.any(String), deletionRequiresConfirmation: true,
     });
@@ -201,7 +202,8 @@ describe("quarantine cleanup CLI", () => {
     expect(result.status).toBe(4);
     const starting = JSON.parse(result.stdout);
     expect(starting).toEqual({
-      ok: true, command: "apply", status: "STARTING", transactionId: expect.stringMatching(/^cli-[0-9a-f-]{36}$/u),
+      ok: true, command: "apply", status: "STARTING", schemaVersion: 2,
+      transactionId: "operator-tx-0001",
     });
     expect(result.stdout).toBe(`${JSON.stringify(starting)}\n`);
     expect(result.stderr).toBe("{\"ok\":false,\"command\":\"apply\",\"code\":\"ERR_INDETERMINATE_JOURNAL_APPEND\",\"message\":\"Journal durability could not be determined.\"}\n");
@@ -245,7 +247,8 @@ describe("quarantine cleanup CLI", () => {
     expect(result.status).toBe(1);
     const starting = JSON.parse(result.stdout);
     expect(starting).toEqual({
-      ok: true, command: "apply", status: "STARTING", transactionId: expect.stringMatching(/^cli-[0-9a-f-]{36}$/u),
+      ok: true, command: "apply", status: "STARTING", schemaVersion: 2,
+      transactionId: "operator-tx-0001",
     });
     expect(result.stdout).toBe(`${JSON.stringify(starting)}\n`);
     expect(result.stderr).toBe("{\"ok\":false,\"command\":\"apply\",\"code\":\"ERR_INTERNAL\",\"message\":\"Unexpected quarantine failure.\"}\n");
@@ -305,7 +308,8 @@ describe("quarantine cleanup CLI", () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
     expect(JSON.parse(result.stdout)).toEqual({
-      ok: true, command: "restore", status: "RESTORED", transactionId: prepared.transactionId,
+      ok: true, command: "restore", status: "RESTORED", schemaVersion: 2,
+      transactionId: prepared.transactionId,
       restoreId: expect.stringMatching(/^restore-[0-9a-f-]{36}$/u), restoredEntries: 3,
     });
   });
@@ -324,7 +328,8 @@ describe("quarantine cleanup CLI", () => {
     if (action === "resume") {
       expect(JSON.parse(result.stdout)).toEqual({
         ok: true, command: "recover", result: {
-          transactionId: prepared.transactionId, status: "QUARANTINED", action: "resume", reconciledEntries: 0,
+          schemaVersion: 2, transactionId: prepared.transactionId,
+          status: "QUARANTINED", action: "resume", reconciledEntries: 0,
         },
       });
       expect(result.stderr).toBe("");
@@ -355,7 +360,8 @@ describe("quarantine cleanup CLI", () => {
     expect(result.stderr).toBe("");
     expect(JSON.parse(result.stdout)).toEqual({
       ok: true, command: "recover", result: {
-        transactionId: prepared.transactionId, restoreId: expect.stringMatching(/^restore-[0-9a-f-]{36}$/u),
+        schemaVersion: 2, transactionId: prepared.transactionId,
+        restoreId: expect.stringMatching(/^restore-[0-9a-f-]{36}$/u),
         status: "RESTORED", action: "resume", reconciledEntries: 3,
       },
     });
@@ -713,7 +719,8 @@ describe("quarantine cleanup CLI", () => {
     expect(result.stderr).toBe("");
     expect(JSON.parse(result.stdout)).toEqual({
       ok: true, command: "recover", result: {
-        transactionId: prepared.transactionId, restoreId: expect.stringMatching(/^restore-[0-9a-f-]{36}$/u),
+        schemaVersion: 2, transactionId: prepared.transactionId,
+        restoreId: expect.stringMatching(/^restore-[0-9a-f-]{36}$/u),
         status: "QUARANTINED", action: "rollback", reconciledEntries: 0, restoreAborted: true,
       },
     });
@@ -772,7 +779,8 @@ describe("quarantine cleanup CLI", () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
     expect(JSON.parse(result.stdout)).toEqual({
-      ok: true, command: "inspect", status: "INSPECTED", sourceCopies: 1,
+      ok: true, command: "inspect", status: "INSPECTED", schemaVersion: 2,
+      sourceCopies: 1, tempResidues: 0,
       generatedRoots: 2, identicalCopies: 1, divergentCopies: 0,
     });
   });

@@ -183,6 +183,135 @@ describe("quarantine lifecycle core", () => {
     }
   });
 
+  it("validates regenerated roots against a matching second capture instead of original payload bytes", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const preInventoryBytes = new Map(
+        readdirSync(join(prepared.runRoot, "inventories/pre")).map((name) => [
+          name,
+          readFileSync(join(prepared.runRoot, "inventories/pre", name)),
+        ]),
+      );
+      writeFileSync(join(prepared.fixture.repoRoot, ".next", "build"), "new-build-output");
+      writeFileSync(join(prepared.fixture.repoRoot, "node_modules", "package"), "new-dependency-output");
+
+      const result = invokeQuarantineWorker("mark-validated", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        validatedAt: "2026-08-13T00:00:00.000Z",
+        writersStopped: true,
+      });
+      if (!result.ok) throw new Error(JSON.stringify(result.error));
+      expect(result.result).toMatchObject({ schemaVersion: 2, status: "VALIDATED" });
+
+      const validated = readdirSync(join(prepared.runRoot, "manifests"))
+        .map((name) => JSON.parse(readFileSync(join(prepared.runRoot, "manifests", name), "utf8")))
+        .find((manifest) => manifest.state === "VALIDATED");
+      expect(validated.validationAttempt).toMatch(/^attempt-[0-9a-f-]{36}$/u);
+      for (const evidence of Object.values(validated.regeneratedEvidence) as Array<{
+        pass1Path: string; pass1Summary: unknown; pass2Path: string; pass2Summary: unknown;
+      }>) {
+        expect(evidence.pass1Summary).toEqual(evidence.pass2Summary);
+        expect(readFileSync(join(prepared.runRoot, evidence.pass1Path)))
+          .toEqual(readFileSync(join(prepared.runRoot, evidence.pass2Path)));
+      }
+      for (const [name, bytes] of preInventoryBytes) {
+        expect(readFileSync(join(prepared.runRoot, "inventories/pre", name))).toEqual(bytes);
+      }
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects mismatched regenerated captures without advancing durable state and permits retry", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const journal = join(prepared.runRoot, "journal.log");
+      const beforeJournal = readFileSync(journal);
+      const beforePayload = readdirSync(join(prepared.runRoot, "payload/generated"));
+      const failed = invokeQuarantineWorker("mark-validated", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        validatedAt: "2026-08-13T00:00:00.000Z",
+        writersStopped: true,
+        mutateAfterPhase: "after-inventory:validation-pass-1:generated-next",
+        mutationPath: join(prepared.fixture.repoRoot, ".next", "build"),
+        mutationContent: "changed-between-passes",
+      });
+      expect(failed).toMatchObject({ ok: false, error: { code: "ERR_INTEGRITY" } });
+      expect(readFileSync(journal)).toEqual(beforeJournal);
+      expect(existsSync(join(prepared.fixture.quarantineRoot, "current"))).toBe(false);
+      expect(readdirSync(join(prepared.runRoot, "payload/generated"))).toEqual(beforePayload);
+      expect(readdirSync(join(prepared.runRoot, "inventories/validation-pass-1"))).toEqual([]);
+      expect(readdirSync(join(prepared.runRoot, "inventories/validation-pass-2"))).toEqual([]);
+
+      const retry = invokeQuarantineWorker("mark-validated", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        validatedAt: "2026-08-13T00:00:00.000Z",
+        writersStopped: true,
+      });
+      expect(retry).toMatchObject({ ok: true, result: { schemaVersion: 2, status: "VALIDATED" } });
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("reopens all manifest-bound regenerated inventories on validated-run entry", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const request = {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        validatedAt: "2026-08-13T00:00:00.000Z",
+        writersStopped: true,
+      };
+      const first = invokeQuarantineWorker("mark-validated", request);
+      if (!first.ok) throw new Error(JSON.stringify(first.error));
+      const validated = readdirSync(join(prepared.runRoot, "manifests"))
+        .map((name) => JSON.parse(readFileSync(join(prepared.runRoot, "manifests", name), "utf8")))
+        .find((manifest) => manifest.state === "VALIDATED");
+      appendFileSync(join(
+        prepared.runRoot,
+        validated.regeneratedEvidence["generated-next"].pass1Path,
+      ), "{}\n");
+
+      expect(invokeQuarantineWorker("mark-validated", request)).toMatchObject({
+        ok: false,
+        error: { code: "ERR_INTEGRITY" },
+      });
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects regenerated-root identity replacement between validation passes", () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const result = invokeQuarantineWorker("mark-validated", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        validatedAt: "2026-08-13T00:00:00.000Z",
+        writersStopped: true,
+        mutateAfterPhase: "after-inventory:validation-pass-1:generated-next",
+        mutationKind: "replace-directory",
+        mutationPath: join(prepared.fixture.repoRoot, ".next"),
+        mutationContent: "same-safe-shape",
+      });
+      expect(result).toMatchObject({ ok: false, error: { code: "ERR_INTEGRITY" } });
+      expect(existsSync(join(prepared.fixture.quarantineRoot, "current"))).toBe(false);
+      expect(readdirSync(join(prepared.runRoot, "inventories/validation-pass-1"))).toEqual([]);
+      expect(readdirSync(join(prepared.runRoot, "inventories/validation-pass-2"))).toEqual([]);
+    } finally {
+      rmSync(prepared.fixture.base, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     "after-inventory:validation-pass-1:generated-next",
     "after-inventory:validation-pass-2:generated-next",

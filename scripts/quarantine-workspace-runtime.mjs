@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
   constants as fsConstants,
@@ -2034,8 +2034,9 @@ function snapshotRecoveryOptions(input) {
   return options;
 }
 
-function recoveryResult(transactionId, status, action, reconciledEntries) {
+function recoveryResult(schemaVersion, transactionId, status, action, reconciledEntries) {
   return record([
+    ["schemaVersion", schemaVersion],
     ["transactionId", transactionId],
     ["status", status],
     ["action", action],
@@ -2043,8 +2044,9 @@ function recoveryResult(transactionId, status, action, reconciledEntries) {
   ]);
 }
 
-function recoveryConflict(transactionId, action, ids) {
+function recoveryConflict(schemaVersion, transactionId, action, ids) {
   return record([
+    ["schemaVersion", schemaVersion],
     ["transactionId", transactionId],
     ["status", "INCOMPLETE_CONFLICT"],
     ["action", action],
@@ -2353,7 +2355,7 @@ async function resumeApplyFromLedger({ capability, heldLock, ledger, manifest, o
       faultHook: options.faultHook,
       phase: "after-event:INCOMPLETE_CONFLICT",
     });
-    return recoveryConflict(options.transactionId, "resume", conflicts);
+    return recoveryConflict(manifest.schemaVersion, options.transactionId, "resume", conflicts);
   }
 
   await appendHeldEvent({ capability, heldLock, event: "MOVING", payload: {}, faultHook: options.faultHook });
@@ -2413,13 +2415,14 @@ async function resumeApplyFromLedger({ capability, heldLock, ledger, manifest, o
   }
   await appendHeldEvent({ capability, heldLock, event: "VERIFYING", payload: {}, faultHook: options.faultHook });
   await appendHeldEvent({ capability, heldLock, event: "QUARANTINED", payload: {}, faultHook: options.faultHook });
-  return recoveryResult(options.transactionId, "QUARANTINED", "resume", reconciledEntries);
+  return recoveryResult(manifest.schemaVersion, options.transactionId, "QUARANTINED", "resume", reconciledEntries);
 }
 
 async function rollbackApplyFromLedger({
   capability,
   heldLock,
   ledger,
+  manifest,
   options,
   isRollingBack,
 }) {
@@ -2445,7 +2448,7 @@ async function rollbackApplyFromLedger({
       faultHook: options.faultHook,
       phase: "after-event:INCOMPLETE_CONFLICT",
     });
-    return recoveryConflict(options.transactionId, "rollback", conflicts);
+    return recoveryConflict(manifest.schemaVersion, options.transactionId, "rollback", conflicts);
   }
   if (!isRollingBack) {
     await appendRecoveryEvent({
@@ -2504,7 +2507,7 @@ async function rollbackApplyFromLedger({
     faultHook: options.faultHook,
     phase: "after-event:ROLLED_BACK",
   });
-  return recoveryResult(options.transactionId, "ROLLED_BACK", "rollback", reconciledEntries);
+  return recoveryResult(manifest.schemaVersion, options.transactionId, "ROLLED_BACK", "rollback", reconciledEntries);
 }
 
 async function recoverApplyOnCapability({ capability, options }) {
@@ -2515,22 +2518,20 @@ async function recoverApplyOnCapability({ capability, options }) {
   if (initial.truncatedTail) fail("ERR_INTEGRITY");
   // Terminal shortcuts are safe only after the immutable recovery evidence has
   // been authenticated. This performs no append or filesystem mutation.
-  buildApplyLedger(
-    initial,
-    await readRecoveryManifest({ capability, options, replayed: initial }),
-  );
+  const initialManifest = await readRecoveryManifest({ capability, options, replayed: initial });
+  buildApplyLedger(initial, initialManifest);
   if (initial.state === "QUARANTINED" || initial.state === "VALIDATED") {
     if (options.action !== "resume") fail("ERR_USAGE");
-    return recoveryResult(options.transactionId, initial.state, "resume", 0);
+    return recoveryResult(initialManifest.schemaVersion, options.transactionId, initial.state, "resume", 0);
   }
   if (initial.state === "ROLLED_BACK") {
     if (options.action !== "rollback") fail("ERR_USAGE");
-    return recoveryResult(options.transactionId, "ROLLED_BACK", "rollback", 0);
+    return recoveryResult(initialManifest.schemaVersion, options.transactionId, "ROLLED_BACK", "rollback", 0);
   }
   if (initial.state === "INCOMPLETE_CONFLICT") {
     const conflict = initial.records.at(-1)?.payload?.conflictEntryIds;
     if (!Array.isArray(conflict)) fail("ERR_INTEGRITY");
-    return recoveryConflict(options.transactionId, options.action, conflict);
+    return recoveryConflict(initialManifest.schemaVersion, options.transactionId, options.action, conflict);
   }
   return withJournalLock({ capability }, async (heldLock) => {
     const replayed = await replayJournal({ capability });
@@ -2558,6 +2559,7 @@ async function recoverApplyOnCapability({ capability, options }) {
         capability,
         heldLock,
         ledger,
+        manifest,
         options,
         isRollingBack: replayed.state === "ROLLING_BACK",
       });
@@ -3141,6 +3143,26 @@ async function assertValidationJournalUnlocked(handoff) {
   throw new Error("journal lock already exists before validation");
 }
 
+async function cleanupValidationAttempt(handoff, publications) {
+  const fsApi = handoff.fsApi;
+  for (const publication of [...publications].reverse()) {
+    await revalidateRunCapability(handoff.capability, {
+      purpose: "inventory", id: publication.id, phase: publication.phase, boundary: "before-mutation",
+    });
+    const observed = await fsApi.lstat(publication.path);
+    if (
+      observed.isSymbolicLink() || !observed.isFile() || modeOf(observed) !== PRIVATE_FILE_MODE ||
+      Number(observed.nlink) !== 1 || Number(observed.dev) !== publication.dev ||
+      Number(observed.ino) !== publication.ino
+    ) fail("ERR_INTEGRITY");
+    await fsApi.unlink(publication.path);
+    await syncDirectory(dirname(publication.path), fsApi);
+    await revalidateRunCapability(handoff.capability, {
+      purpose: "inventory", id: publication.id, phase: publication.phase, boundary: "after-sync",
+    });
+  }
+}
+
 async function validateValidationWorkspace(handoff, options) {
   const fsApi = handoff.fsApi;
   let workspace;
@@ -3165,40 +3187,100 @@ async function validateValidationWorkspace(handoff, options) {
       if (error?.code !== "ENOENT") fail("ERR_INTEGRITY");
     }
   }
-  for (const entry of entries) {
-    if (entry.kind !== "generated-root") continue;
-    const root = workspaceEntryPath(handoff.repoRoot, entry);
-    let stat;
-    try {
-      stat = await fsApi.lstat(root);
-    } catch {
-      fail("ERR_INTEGRITY");
+  if (handoff.manifestGeneration.manifest.schemaVersion === 1) {
+    for (const entry of entries) {
+      if (entry.kind !== "generated-root") continue;
+      const root = workspaceEntryPath(handoff.repoRoot, entry);
+      const first = await writeInventoryJsonl({
+        capability: handoff.capability, root, entryId: entry.id, phase: "validation-pass-1",
+      });
+      await compareInventorySummary(entry.preMoveInventory, first);
+      if (options.faultHook !== undefined) {
+        await options.faultHook(`after-inventory:validation-pass-1:${entry.id}`);
+      }
+      const second = await writeInventoryJsonl({
+        capability: handoff.capability, root, entryId: entry.id, phase: "validation-pass-2",
+      });
+      await compareInventorySummary(entry.preMoveInventory, second);
+      if (options.faultHook !== undefined) {
+        await options.faultHook(`after-inventory:validation-pass-2:${entry.id}`);
+      }
     }
-    if (stat.isSymbolicLink() || !stat.isDirectory()) fail("ERR_INTEGRITY");
-    const first = await writeInventoryJsonl({
-      capability: handoff.capability,
-      root,
-      entryId: entry.id,
-      phase: "validation-pass-1",
-    });
-    await compareInventorySummary(entry.preMoveInventory, first);
-    if (options.faultHook !== undefined) {
-      await options.faultHook(`after-inventory:validation-pass-1:${entry.id}`);
-    }
-    const second = await writeInventoryJsonl({
-      capability: handoff.capability,
-      root,
-      entryId: entry.id,
-      phase: "validation-pass-2",
-    });
-    await compareInventorySummary(entry.preMoveInventory, second);
-    if (options.faultHook !== undefined) {
-      await options.faultHook(`after-inventory:validation-pass-2:${entry.id}`);
-    }
+    return null;
   }
+  const validationAttempt = `attempt-${randomUUID()}`;
+  const regeneratedEvidence = Object.create(null);
+  const publications = [];
+  const assertGeneratedRootIdentity = async (root, expected) => {
+    const repository = await fsApi.lstat(handoff.repoRoot);
+    const stat = await fsApi.lstat(root);
+    if (
+      repository.isSymbolicLink() || !repository.isDirectory() ||
+      Number(repository.dev) !== handoff.manifestGeneration.manifest.repositoryIdentity.dev ||
+      Number(repository.ino) !== handoff.manifestGeneration.manifest.repositoryIdentity.ino ||
+      await fsApi.realpath(handoff.repoRoot) !== handoff.repoRoot ||
+      stat.isSymbolicLink() || !stat.isDirectory() || await fsApi.realpath(root) !== root ||
+      (expected !== undefined &&
+        (Number(stat.dev) !== expected.dev || Number(stat.ino) !== expected.ino || modeOf(stat) !== expected.mode))
+    ) fail("ERR_INTEGRITY");
+    return Object.freeze({ dev: Number(stat.dev), ino: Number(stat.ino), mode: modeOf(stat) });
+  };
+  try {
+    for (const entry of entries) {
+      if (entry.kind !== "generated-root") continue;
+      const root = workspaceEntryPath(handoff.repoRoot, entry);
+      const rootIdentity = await assertGeneratedRootIdentity(root);
+      const inventoryId = `${validationAttempt}-${entry.id}`;
+      const capture = async (phase) => {
+        const summary = await writeInventoryJsonl({
+          capability: handoff.capability,
+          root,
+          entryId: inventoryId,
+          phase,
+        });
+        const path = deriveRunPath(handoff.capability, { purpose: "inventory", id: inventoryId, phase });
+        const identity = await fsApi.lstat(path);
+        if (identity.isSymbolicLink() || !identity.isFile() || modeOf(identity) !== PRIVATE_FILE_MODE ||
+            Number(identity.nlink) !== 1) fail("ERR_INTEGRITY");
+        publications.push({
+          path, id: inventoryId, phase,
+          dev: Number(identity.dev), ino: Number(identity.ino),
+        });
+        await assertGeneratedRootIdentity(root, rootIdentity);
+        return summary;
+      };
+      const first = await capture("validation-pass-1");
+      if (options.faultHook !== undefined) {
+        await options.faultHook(`after-inventory:validation-pass-1:${entry.id}`);
+      }
+      const second = await capture("validation-pass-2");
+      await compareInventorySummary(first, second);
+      if (options.faultHook !== undefined) {
+        await options.faultHook(`after-inventory:validation-pass-2:${entry.id}`);
+      }
+      regeneratedEvidence[entry.id] = Object.freeze({
+        pass1Path: `inventories/validation-pass-1/${inventoryId}.jsonl`,
+        pass1Summary: first,
+        pass2Path: `inventories/validation-pass-2/${inventoryId}.jsonl`,
+        pass2Summary: second,
+      });
+    }
+  } catch (error) {
+    try {
+      await cleanupValidationAttempt(handoff, publications);
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "validation attempt and cleanup both failed");
+    }
+    throw error;
+  }
+  return Object.freeze({
+    validationAttempt,
+    regeneratedEvidence: Object.freeze(regeneratedEvidence),
+    publications: Object.freeze([...publications]),
+  });
 }
 
-function validatedManifest(prepared, validatedAt) {
+function validatedManifest(prepared, validatedAt, evidence) {
   const deleteAfter = new Date(Date.parse(validatedAt) + (4 * 24 * 60 * 60 * 1000)).toISOString();
   return buildValidatedManifest({
     ...prepared,
@@ -3208,11 +3290,16 @@ function validatedManifest(prepared, validatedAt) {
     deletionRequiresConfirmation: true,
     deleteAfter,
     deletionStatus: "retained",
+    ...(prepared.schemaVersion === 2 ? {
+      validationAttempt: evidence.validationAttempt,
+      regeneratedEvidence: evidence.regeneratedEvidence,
+    } : {}),
   });
 }
 
 function validationResult(options, manifest) {
   return record([
+    ["schemaVersion", manifest.manifest.schemaVersion],
     ["transactionId", options.transactionId],
     ["status", "VALIDATED"],
     ["manifestSha256", manifest.manifestSha256],
@@ -3242,13 +3329,22 @@ export async function markQuarantineValidated(input) {
           manifest: prior.manifest,
         });
       } else {
-        await validateValidationWorkspace(handoff, options);
-        const manifest = validatedManifest(prior.manifest, options.validatedAt);
-        generation = await writeManifestGeneration({
-          capability: handoff.capability,
-          manifest,
-          faultHook: validationFaultHook(options.faultHook),
-        });
+        const evidence = await validateValidationWorkspace(handoff, options);
+        const manifest = validatedManifest(prior.manifest, options.validatedAt, evidence);
+        try {
+          generation = await writeManifestGeneration({
+            capability: handoff.capability,
+            manifest,
+            faultHook: validationFaultHook(options.faultHook),
+          });
+        } catch (error) {
+          try {
+            await cleanupValidationAttempt(handoff, evidence.publications);
+          } catch (cleanupError) {
+            throw new AggregateError([error, cleanupError], "validation publication and cleanup both failed");
+          }
+          throw error;
+        }
         generation = Object.freeze({ manifestSha256: generation.manifestSha256, manifest });
       }
       await activateManifestGeneration({
@@ -3270,6 +3366,7 @@ export async function markQuarantineValidated(input) {
               heldLock,
               event: "VALIDATED",
               payload: { manifestSha256 },
+              schemaVersion: generation.manifest.schemaVersion,
               faultHook: validationFaultHook(options.faultHook),
             });
             return Object.freeze({ status: "appended", manifestSha256 });

@@ -10,6 +10,7 @@ import {
   summarizeInventoryDirectory,
   hashVerifiedRegularFile,
   InventoryStructuralError,
+  verifyPublishedInventory,
 } from "./quarantine-inventory-reader.mjs";
 import { captureRunFsSource, getRunFsContext } from "./quarantine-run-fs-context.mjs";
 import { deriveRunPath, withQuarantineRunCapability } from "./quarantine-run-capability.mjs";
@@ -430,6 +431,31 @@ async function validateExistingRun(capability, options, fsApi, { allowRestoreLoc
       manifest.deleteAfter !== expectedDeleteAfter
     ) {
       throw lifecycleIntegrityError("VALIDATED retention evidence is invalid");
+    }
+    if (manifest.schemaVersion === 2) {
+      for (const entryId of ["generated-next", "generated-node-modules"]) {
+        const evidence = manifest.regeneratedEvidence[entryId];
+        const inventoryId = `${manifest.validationAttempt}-${entryId}`;
+        try {
+          await verifyPublishedInventory({
+            capability,
+            entryId: inventoryId,
+            phase: "validation-pass-1",
+            expectedSummary: evidence.pass1Summary,
+          });
+          await verifyPublishedInventory({
+            capability,
+            entryId: inventoryId,
+            phase: "validation-pass-2",
+            expectedSummary: evidence.pass2Summary,
+          });
+        } catch (error) {
+          if (error instanceof InventoryStructuralError) {
+            throw lifecycleIntegrityError("regenerated validation evidence is invalid");
+          }
+          throw error;
+        }
+      }
     }
   }
 

@@ -130,7 +130,7 @@ describe("quarantine restore", () => {
       expect(output.reads).toEqual({ repoRoot: 1, quarantineRoot: 1, transactionId: 1, writersStopped: 1 });
       expect(output.prototype).toBe(true);
       expect(output.frozen).toBe(true);
-      expect(output.keys).toEqual(["transactionId", "restoreId", "status", "restoredEntries"]);
+      expect(output.keys).toEqual(["schemaVersion", "transactionId", "restoreId", "status", "restoredEntries"]);
       for (const key of output.keys) {
         expect(output.descriptors[key]).toMatchObject({
           enumerable: true, writable: false, configurable: false,

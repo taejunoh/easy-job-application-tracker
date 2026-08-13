@@ -274,8 +274,8 @@ describe("quarantine restore real SIGKILL recovery", () => {
         const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action });
         if (recovered.code !== 0) throw new Error(JSON.stringify(recovered));
         expect(JSON.parse(recovered.stdout)).toEqual(action === "resume"
-          ? { transactionId: prepared.transactionId, restoreId, status: "RESTORED", action: "resume", reconciledEntries: 3 }
-          : { transactionId: prepared.transactionId, restoreId, status: prior, action: "rollback", reconciledEntries: 1, restoreAborted: true });
+          ? { schemaVersion: 2, transactionId: prepared.transactionId, restoreId, status: "RESTORED", action: "resume", reconciledEntries: 3 }
+          : { schemaVersion: 2, transactionId: prepared.transactionId, restoreId, status: prior, action: "rollback", reconciledEntries: 1, restoreAborted: true });
         expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe(action === "resume"
           ? "RESTORED"
           : prior === "VALIDATED" ? "RESTORE_ABORTED_TO_VALIDATED" : "RESTORE_ABORTED_TO_QUARANTINED");
@@ -301,8 +301,8 @@ describe("quarantine restore real SIGKILL recovery", () => {
       const result = await spawnLifecycleChild("recoverRestore", { ...options, action });
       if (result.code !== 0) throw new Error(JSON.stringify(result));
       expect(JSON.parse(result.stdout)).toEqual(action === "resume"
-        ? { transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume", reconciledEntries: 3 }
-        : { transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: prior, action: "rollback", reconciledEntries: 0, restoreAborted: true });
+        ? { schemaVersion: 2, transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume", reconciledEntries: 3 }
+        : { schemaVersion: 2, transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: prior, action: "rollback", reconciledEntries: 0, restoreAborted: true });
     } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
   }, 60_000);
 
@@ -317,15 +317,15 @@ describe("quarantine restore real SIGKILL recovery", () => {
       expect(lstatSync(payload).ino).not.toBe(lstatSync(active).ino);
       const result = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
       if (result.code !== 0) throw new Error(JSON.stringify(result));
-      expect(JSON.parse(result.stdout)).toEqual({ transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 1, restoreAborted: true });
+      expect(JSON.parse(result.stdout)).toEqual({ schemaVersion: 2, transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 1, restoreAborted: true });
       expect(lstatSync(join(prepared.fixture.repoRoot, ".next")).ino).toBe(lstatSync(active).ino);
       expect(lstatSync(join(prepared.runRoot, "payload", "generated", ".next")).ino).toBe(lstatSync(payload).ino);
     } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
   }, 60_000);
 
   it.each([
-    ["resume", "RESTORED", ["transactionId", "restoreId", "status", "action", "reconciledEntries"]],
-    ["rollback", "QUARANTINED", ["transactionId", "restoreId", "status", "action", "reconciledEntries", "restoreAborted"]],
+    ["resume", "RESTORED", ["schemaVersion", "transactionId", "restoreId", "status", "action", "reconciledEntries"]],
+    ["rollback", "QUARANTINED", ["schemaVersion", "transactionId", "restoreId", "status", "action", "reconciledEntries", "restoreAborted"]],
   ] as const)("returns an exact immutable public %s result record", async (action, _status, keys) => {
     const prepared = prepareQuarantinedFixture();
     try {
@@ -350,6 +350,7 @@ describe("quarantine restore real SIGKILL recovery", () => {
       const result = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
       if (result.code !== 0) throw new Error(JSON.stringify(result));
       expect(JSON.parse(result.stdout)).toEqual({
+        schemaVersion: 2,
         transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2",
         status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
       });
@@ -378,7 +379,8 @@ describe("quarantine restore real SIGKILL recovery", () => {
       const result = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
       if (result.code !== 0) throw new Error(JSON.stringify(result));
       expect(JSON.parse(result.stdout)).toEqual({
-        transactionId: prepared.transactionId, restoreId, status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
+        schemaVersion: 2, transactionId: prepared.transactionId, restoreId,
+        status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
       });
       const after = durableRecoveryEvidence(prepared, [payload, active, rollback]);
       expect(after.endpoints).toEqual(before.endpoints);
@@ -401,8 +403,8 @@ describe("quarantine restore real SIGKILL recovery", () => {
       }) as unknown as { ok: boolean; first: Record<string, unknown>; second: Record<string, unknown> };
       expect(concurrent).toEqual({
         ok: true,
-        first: { transactionId: first.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume", reconciledEntries: 3 },
-        second: { transactionId: second.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 1, restoreAborted: true },
+        first: { schemaVersion: 2, transactionId: first.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume", reconciledEntries: 3 },
+        second: { schemaVersion: 2, transactionId: second.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 1, restoreAborted: true },
       });
     } finally {
       rmSync(first.fixture.base, { recursive: true, force: true });
@@ -419,18 +421,20 @@ describe("quarantine restore real SIGKILL recovery", () => {
       const observed = invokeQuarantineWorker("recover-restore-shape", { ...options, action: "rollback" }) as unknown as { ok: boolean; result: Record<string, unknown>; shape: ReturnType<typeof exactResultShape> };
       expect(observed.ok).toBe(true);
       expect(observed.result).toEqual({
+        schemaVersion: 2,
         transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2",
         status: "INCOMPLETE_CONFLICT", action: "rollback", conflictEntryIds: ["generated-next"],
       });
-      expect(observed.shape).toEqual(exactResultShape(["transactionId", "restoreId", "status", "action", "conflictEntryIds"]));
+      expect(observed.shape).toEqual(exactResultShape(["schemaVersion", "transactionId", "restoreId", "status", "action", "conflictEntryIds"]));
       const terminal = invokeQuarantineWorker("recover-restore-shape", { ...options, action: "resume" }) as unknown as { ok: boolean; result: Record<string, unknown>; shape: ReturnType<typeof exactResultShape> };
       expect(terminal).toEqual({
         ok: true,
         result: {
+          schemaVersion: 2,
           transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2",
           status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
         },
-        shape: exactResultShape(["transactionId", "restoreId", "status", "action", "conflictEntryIds"]),
+        shape: exactResultShape(["schemaVersion", "transactionId", "restoreId", "status", "action", "conflictEntryIds"]),
       });
     } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
   }, 60_000);
@@ -463,7 +467,8 @@ describe("quarantine restore real SIGKILL recovery", () => {
       if (outcome === "conflict") {
         if (result.code !== 0) throw new Error(JSON.stringify(result));
         expect(JSON.parse(result.stdout)).toEqual({
-          transactionId: prepared.transactionId, restoreId, status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
+          schemaVersion: 2, transactionId: prepared.transactionId, restoreId,
+          status: "INCOMPLETE_CONFLICT", action: "resume", conflictEntryIds: ["generated-next"],
         });
       } else expect(result.code).not.toBe(0);
       const after = durableRecoveryEvidence(prepared, paths);
@@ -940,7 +945,7 @@ describe("quarantine restore real SIGKILL recovery", () => {
       rmSync(join(prepared.runRoot, "journal.lock"));
       const firstAbort = await spawnLifecycleChild("recoverRestore", { ...options, action: "rollback" });
       if (firstAbort.code !== 0) throw new Error(JSON.stringify(firstAbort));
-      expect(JSON.parse(firstAbort.stdout)).toEqual({ transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 3, restoreAborted: true });
+      expect(JSON.parse(firstAbort.stdout)).toEqual({ schemaVersion: 2, transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "QUARANTINED", action: "rollback", reconciledEntries: 3, restoreAborted: true });
       validatePriorState(prepared);
       const oldInventory = join(prepared.runRoot, "inventories", "restore-active", "generated-next.jsonl");
       const oldInventoryIdentity = lstatSync(oldInventory).ino;
@@ -955,8 +960,8 @@ describe("quarantine restore real SIGKILL recovery", () => {
       const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action });
       if (recovered.code !== 0) throw new Error(JSON.stringify(recovered));
       const expected = action === "resume"
-        ? { transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume", reconciledEntries: 3 }
-        : { transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "VALIDATED", action: "rollback", reconciledEntries: 3, restoreAborted: true };
+        ? { schemaVersion: 2, transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "RESTORED", action: "resume", reconciledEntries: 3 }
+        : { schemaVersion: 2, transactionId: prepared.transactionId, restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2", status: "VALIDATED", action: "rollback", reconciledEntries: 3, restoreAborted: true };
       expect(JSON.parse(recovered.stdout)).toEqual(expected);
       const events = journalEvents(join(prepared.runRoot, "journal.log"));
       const currentPrepared = events.lastIndexOf("RESTORE_PREPARED");
