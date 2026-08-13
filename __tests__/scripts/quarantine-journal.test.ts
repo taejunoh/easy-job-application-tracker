@@ -4719,6 +4719,7 @@ describe("capability-bound durable quarantine journal", () => {
       "IndeterminateJournalAppendError",
       "appendJournalRecord",
       "cleanupTerminalJournalArtifacts",
+      "reclaimDeadJournalLock",
       "reclaimJournalLock",
       "replayJournal",
       "validateTransition",

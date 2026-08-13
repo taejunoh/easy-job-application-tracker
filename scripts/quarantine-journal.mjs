@@ -1935,7 +1935,7 @@ async function restoreRecoveryArtifacts({
   }
 }
 
-export async function reclaimJournalLock(options, callback) {
+function snapshotReclaimOptions(options, callback) {
   const input = snapshotOptions(
     options,
     ["capability", "writersStopped", "fsApi"],
@@ -1950,6 +1950,28 @@ export async function reclaimJournalLock(options, callback) {
   if (typeof callback !== "function") {
     throw new TypeError("journal lock recovery callback is required");
   }
+  return { input, fsApi, capability };
+}
+
+function sameLockEvidence(left, right) {
+  return left !== null && right !== null &&
+    sameIdentity(left.identity, right.identity) &&
+    left.evidenceSha256 === right.evidenceSha256;
+}
+
+function assertDeadLockOwner(metadata) {
+  if (metadata === null) throw new Error("automatic journal lock recovery rejects a torn lock");
+  try {
+    process.kill(metadata.pid, 0);
+  } catch (error) {
+    if (error?.code === "ESRCH") return;
+    if (error?.code === "EPERM") throw new Error("automatic journal lock recovery cannot verify owner liveness", { cause: error });
+    throw error;
+  }
+  throw new Error("automatic journal lock recovery refuses a live owner");
+}
+
+async function reclaimJournalLockCore({ input, fsApi, capability }, callback, expectedStaleLock = null) {
   const before = await readJournalSnapshot({ capability, fsApi });
   if (TERMINAL_CLEANUP_STATES.has(before.replayed.state)) {
     return cleanupTerminalJournalArtifactsCore({
@@ -1961,6 +1983,9 @@ export async function reclaimJournalLock(options, callback) {
   const lockPath = deriveRunPath(capability, { purpose: "journal-lock" });
   const priorTombstones = await validatedTombstones(capability, fsApi);
   const staleLock = await readOptionalStaleLock(lockPath, fsApi);
+  if (expectedStaleLock !== null && !sameLockEvidence(staleLock, expectedStaleLock)) {
+    throw new Error("automatic journal lock recovery observed a changed lock");
+  }
   if (staleLock === null && priorTombstones.length === 0) {
     throw new Error("journal lock recovery requires a stale lock or tombstone");
   }
@@ -2087,6 +2112,19 @@ export async function reclaimJournalLock(options, callback) {
     throw run.state.lastCandidate === null ? error : indeterminate(run.state.lastCandidate, error);
   }
   return run.state.durableAppends === 0 ? settlementResult : run.result;
+}
+
+export async function reclaimJournalLock(options, callback) {
+  return reclaimJournalLockCore(snapshotReclaimOptions(options, callback), callback);
+}
+
+export async function reclaimDeadJournalLock(options, callback) {
+  const prepared = snapshotReclaimOptions(options, callback);
+  const lockPath = deriveRunPath(prepared.capability, { purpose: "journal-lock" });
+  const expectedStaleLock = await readOptionalStaleLock(lockPath, prepared.fsApi);
+  if (expectedStaleLock === null) throw new Error("automatic journal lock recovery requires a journal lock");
+  assertDeadLockOwner(expectedStaleLock.metadata);
+  return reclaimJournalLockCore(prepared, callback, expectedStaleLock);
 }
 
 function sameTerminalSnapshot(before, after) {

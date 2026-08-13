@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -25,6 +26,17 @@ function journalPayloads(path: string) {
     offset += length;
   }
   return records;
+}
+
+function liveOwnerLockBytes() {
+  const version = 1;
+  const ownerToken = "11111111-1111-4111-8111-111111111111";
+  const pid = process.pid;
+  const checksum = createHash("sha256").update(JSON.stringify({ version, ownerToken, pid })).digest("hex");
+  const body = Buffer.from(JSON.stringify({ version, ownerToken, pid, checksum }));
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(body.length);
+  return Buffer.concat([length, body]);
 }
 
 async function killThenReleaseFixtureLock(
@@ -242,6 +254,58 @@ function durableRecoveryEvidence(prepared: ReturnType<typeof prepareQuarantinedF
 }
 
 describe("quarantine restore real SIGKILL recovery", () => {
+  it("public recoverRestore reclaims the dead restore journal lock", async () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true,
+      };
+      const crashed = await spawnLifecycleChild("restoreQuarantine", options, {
+        killAt: "after-event:RESTORE_INTENT:generated-next",
+      });
+      expect(crashed.signal).toBe("SIGKILL");
+      expect(lstatSync(join(prepared.runRoot, "journal.lock")).isFile()).toBe(true);
+
+      const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
+
+      if (recovered.code !== 0) throw new Error(JSON.stringify(recovered));
+      expect(JSON.parse(recovered.stdout)).toEqual({
+        schemaVersion: 2, transactionId: prepared.transactionId,
+        restoreId: "restore-c3624475-87d7-4886-b0bf-68a5061663d2",
+        status: "RESTORED", action: "resume", reconciledEntries: 3,
+      });
+      expect(existsSync(join(prepared.runRoot, "journal.lock"))).toBe(false);
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("public recoverRestore preserves a live journal lock", async () => {
+    const prepared = prepareQuarantinedFixture();
+    try {
+      const options = {
+        repoRoot: prepared.fixture.repoRoot, quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId, writersStopped: true,
+      };
+      expect((await spawnLifecycleChild("restoreQuarantine", options, {
+        killAt: "after-event:RESTORE_INTENT:generated-next",
+      })).signal).toBe("SIGKILL");
+      const lockPath = join(prepared.runRoot, "journal.lock");
+      const journalPath = join(prepared.runRoot, "journal.log");
+      const liveLock = liveOwnerLockBytes();
+      rmSync(lockPath);
+      writeFileSync(lockPath, liveLock, { mode: 0o600 });
+      const journalBefore = readFileSync(journalPath);
+
+      const recovered = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
+
+      expect(recovered.code).not.toBe(0);
+      expect(recovered.stderr).toContain("refuses a live owner");
+      expect(readFileSync(lockPath)).toEqual(liveLock);
+      expect(readFileSync(journalPath)).toEqual(journalBefore);
+      expect(journalEvents(journalPath).at(-1)).toBe("RESTORE_INTENT");
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  }, 60_000);
+
   it.each(([
     "QUARANTINED",
     "VALIDATED",

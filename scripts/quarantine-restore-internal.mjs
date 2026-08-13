@@ -10,7 +10,13 @@ import {
   hashVerifiedRegularFile,
   InventoryStructuralError,
 } from "./quarantine-inventory-reader.mjs";
-import { appendJournalRecord, IndeterminateJournalAppendError, replayJournal, withJournalLock } from "./quarantine-journal.mjs";
+import {
+  appendJournalRecord,
+  IndeterminateJournalAppendError,
+  reclaimDeadJournalLock,
+  replayJournal,
+  withJournalLock,
+} from "./quarantine-journal.mjs";
 import { withExistingQuarantineRun } from "./quarantine-lifecycle-core.mjs";
 import { createFixedRestoreRecoveryCallback } from "./quarantine-restore-recovery.mjs";
 import { buildRestoreLedger } from "./quarantine-restore-ledger.mjs";
@@ -752,8 +758,21 @@ export async function recoverRestore(input) {
   return withExistingQuarantineRun(existingRunOptions(options), createFixedRestoreRecoveryCallback(options));
 }
 
-export async function recoverRestoreWithHandoff(options, handoff) {
-  return withJournalLock({ capability: handoff.capability }, async (heldLock) => {
+function staleJournalLock(error) {
+  return error?.message === "journal append lock already exists" && error?.cause?.code === "EEXIST";
+}
+
+async function withRestoreRecoveryJournalLock(handoff, callback) {
+  const lockOptions = { capability: handoff.capability };
+  try {
+    return await withJournalLock(lockOptions, callback);
+  } catch (error) {
+    if (!staleJournalLock(error)) throw error;
+    return reclaimDeadJournalLock({ ...lockOptions, writersStopped: true }, callback);
+  }
+}
+
+async function recoverRestoreWithHeldLock(options, handoff, heldLock) {
     const schemaVersion = handoff.manifestGeneration.manifest.schemaVersion;
     const replayed = await replayJournalForRestore(handoff.capability);
     if (replayed.truncatedTail) throw restoreIntegrityFailure();
@@ -833,5 +852,11 @@ export async function recoverRestoreWithHandoff(options, handoff) {
     await invokeHook(options.faultHook, prior === "VALIDATED" ? "after-event:RESTORE_ABORTED_TO_VALIDATED" : "after-event:RESTORE_ABORTED_TO_QUARANTINED");
     await invokeHook(options.faultHook, "before-lock-cleanup");
     return record([["schemaVersion", schemaVersion], ["transactionId", options.transactionId], ["restoreId", restoreId], ["status", prior], ["action", "rollback"], ["reconciledEntries", intents.length], ["restoreAborted", true]]);
-  });
+}
+
+export async function recoverRestoreWithHandoff(options, handoff) {
+  return withRestoreRecoveryJournalLock(
+    handoff,
+    async (heldLock) => recoverRestoreWithHeldLock(options, handoff, heldLock),
+  );
 }
