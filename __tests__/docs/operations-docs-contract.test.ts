@@ -26,7 +26,7 @@ describe("production operations documentation contract", () => {
     const runbook = readFileSync(
       join(root, "docs/operations/production-runbook.md"),
       "utf8",
-    );
+    ).replace(/\s+/gu, " ");
 
     for (const requiredText of [
       "DATABASE_URL",
@@ -47,6 +47,34 @@ describe("production operations documentation contract", () => {
     ]) {
       expect(runbook).toContain(requiredText);
     }
+  });
+
+  it("documents the maintenance-gated Application identity rollout in exact order", () => {
+    const runbook = readFileSync(
+      join(root, "docs/operations/production-runbook.md"),
+      "utf8",
+    ).replace(/\s+/gu, " ");
+    const requiredSteps = [
+      'APPLICATION_IDENTITY_WRITES_ENABLED="0"',
+      "stop every Application writer",
+      "Backup and restore",
+      "npm run backfill:application-identities -- --report",
+      "npm run backfill:application-identities -- --apply --writers-stopped --report",
+      "rowCountBefore",
+      "rowCountAfter",
+      "uniqueIndexVerified",
+      'APPLICATION_IDENTITY_WRITES_ENABLED="1"',
+      "resume Application writers",
+    ];
+    let prior = -1;
+    for (const text of requiredSteps) {
+      const next = runbook.indexOf(text, prior + 1);
+      expect(next).toBeGreaterThan(prior);
+      prior = next;
+    }
+    expect(runbook).toContain("scratch restore");
+    expect(runbook).toContain("mode `0600`");
+    expect(runbook).toContain("do not enable identity writes");
   });
 
   it("publishes the complete quarantine operator workflow", () => {
@@ -82,6 +110,9 @@ describe("production operations documentation contract", () => {
     ]) {
       expect(normalized).toContain(requiredText);
     }
+    expect(normalized).toContain(
+      'any failure | `{"ok":false,"command":"...","schemaVersion":2,"code":"ERR_...","message":"..."}`',
+    );
 
     for (const state of [
       "PREPARED",

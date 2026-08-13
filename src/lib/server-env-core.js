@@ -10,6 +10,7 @@
  *   appBaseUrl: string,
  *   appOrigin: string,
  *   corsAllowedOrigins: readonly string[],
+ *   applicationIdentityWritesEnabled: boolean,
  * }>} ServerEnv
  */
 
@@ -53,6 +54,10 @@ function parseServerEnv(source, nodeEnv) {
     appOrigin,
     nodeEnv,
   );
+  const applicationIdentityWritesEnabled = parseOptionalBinaryFlag(
+    source,
+    "APPLICATION_IDENTITY_WRITES_ENABLED",
+  );
 
   return Object.freeze({
     databaseUrl,
@@ -61,7 +66,16 @@ function parseServerEnv(source, nodeEnv) {
     appBaseUrl,
     appOrigin,
     corsAllowedOrigins,
+    applicationIdentityWritesEnabled,
   });
+}
+
+/** @param {ServerEnvSource} source @param {string} name @returns {boolean} */
+function parseOptionalBinaryFlag(source, name) {
+  const value = source[name];
+  if (value === undefined || value === "0") return false;
+  if (value === "1") return true;
+  invalid(name, 'must be exactly "0" or "1" when set');
 }
 
 /**

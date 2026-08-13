@@ -29,6 +29,11 @@ server variables:
 | `APP_BASE_URL` | Canonical root HTTPS origin, without a path. |
 | `CORS_ALLOWED_ORIGINS` | Exact canonical web origin plus each approved `chrome-extension://` origin; no wildcard. |
 
+`APPLICATION_IDENTITY_WRITES_ENABLED` is an optional closed rollout gate. It
+accepts only `"0"` or `"1"` and defaults to `"0"`. Keep it disabled until the
+maintenance backfill below is complete; fresh empty databases may enable it
+after migrations report current and the Application table is confirmed empty.
+
 Validate the checked-in build without printing any values:
 
 ```bash
@@ -129,6 +134,56 @@ migration history was tracked:
 
 Never use destructive reset, forced schema synchronization, manual migration
 row editing, or a restore with destructive cleanup against Production.
+
+## Application identity maintenance rollout
+
+This is a one-time, ordered rollout for an existing database. Do not combine or
+reorder the stages. First deploy the additive migration and the gated
+application release with `APPLICATION_IDENTITY_WRITES_ENABLED="0"`; this keeps
+the legacy Application write path active while the new nullable columns and
+indexes become available.
+
+1. Enter maintenance mode and stop every Application writer, including the web
+   service, extension installations, monitoring writes, background work, and
+   operator sessions. Keep them stopped through the final verification.
+2. Complete [Backup and restore](#backup-and-restore) verification, including a
+   scratch restore, and record only approved checksums, counts, and migration
+   identity.
+3. Create a private report directory outside the repository. The report paths
+   must not already exist; the backfill creates each report once with mode
+   `0600`.
+
+   ```bash
+   umask 077
+   BACKFILL_REPORT_ROOT="/absolute/private/application-identity-backfill"
+   install -d -m 0700 "$BACKFILL_REPORT_ROOT"
+   DRY_RUN_REPORT="$BACKFILL_REPORT_ROOT/dry-run.json"
+   APPLY_REPORT="$BACKFILL_REPORT_ROOT/apply.json"
+   npm run backfill:application-identities -- --report "$DRY_RUN_REPORT"
+   ```
+
+4. Inspect the privacy-safe dry-run report. Require `rowCountBefore` and
+   `rowCountAfter` to match, require the state totals to sum to that count, and
+   require `uniqueIndexVerified` to be `true`. The report must contain no raw
+   URLs, titles, companies, bodies, or connection values.
+5. With the same writer stop still in force, apply the deterministic backfill:
+
+   ```bash
+   npm run backfill:application-identities -- --apply --writers-stopped --report "$APPLY_REPORT"
+   ```
+
+6. Require the apply report's `rowCountBefore`, `rowCountAfter`, state totals,
+   and `uniqueIndexVerified` values to match the approved dry run. Run
+   `npx prisma migrate status`, verify an empty schema diff, and independently
+   verify row counts and the unique identity index. On any mismatch, keep
+   writers stopped and restore into an isolated target; do not enable identity
+   writes.
+7. Change the rollout gate to
+   `APPLICATION_IDENTITY_WRITES_ENABLED="1"`, deploy the same reviewed
+   application commit, and repeat the authenticated create/read checks.
+8. Only after those checks pass, resume Application writers. Retain the two
+   privacy-safe reports and backup evidence under the approved private evidence
+   policy.
 
 ## Backup and restore
 

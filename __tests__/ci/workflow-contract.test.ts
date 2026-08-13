@@ -54,6 +54,8 @@ describe("deployment verification contract", () => {
       "test:ci": "jest --runInBand",
       "check:audit": "node scripts/check-audit.mjs",
       "check:startup-env": "node scripts/verify-invalid-startup.mjs",
+      "backfill:application-identities":
+        "node scripts/backfill-application-identities.mjs",
       "test:backup:docker":
         "RUN_BACKUP_DOCKER_INTEGRATION=1 jest --runInBand __tests__/scripts/create-snapshot-backup.docker.integration.test.ts",
     });
@@ -148,7 +150,8 @@ describe("deployment verification contract", () => {
     expect(job["timeout-minutes"]).toBe(25);
     expect(job.services).toEqual({
       postgres: {
-        image: "postgres:16-alpine",
+        image:
+          "postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193",
         env: {
           POSTGRES_USER: "jobtracker",
           POSTGRES_PASSWORD: "jobtracker",
@@ -170,6 +173,7 @@ describe("deployment verification contract", () => {
         "https://jobtracker.test,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
       RUN_DATABASE_INTEGRATION: "1",
       ALLOW_DESTRUCTIVE_DATABASE_TESTS: "jobtracker-ci-delete-all",
+      APPLICATION_IDENTITY_WRITES_ENABLED: "1",
     });
     expect(job.steps).toEqual([
       {
@@ -266,6 +270,7 @@ describe("deployment verification contract", () => {
       RUN_EXTENSION_E2E: "1",
       ALLOW_DESTRUCTIVE_EXTENSION_E2E:
         "jobtracker-extension-e2e-delete-all",
+      APPLICATION_IDENTITY_WRITES_ENABLED: "1",
     });
     expect(job.steps).toEqual([
       {

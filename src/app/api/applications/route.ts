@@ -11,6 +11,7 @@ import {
   createApplicationAtomically,
 } from "@/lib/applications/atomic-create";
 import { createPrismaApplicationIdentityStore } from "@/lib/applications/prisma-identity-store";
+import { getServerEnv } from "@/lib/server-env";
 
 const route = createProtectedRoute(["GET", "POST"], {
   installationMethods: ["POST"],
@@ -55,6 +56,24 @@ export const POST = route.handler(async function POST(request: NextRequest) {
     const response = applicationContractErrorResponse(error);
     if (response) return response;
     throw error;
+  }
+
+  if (!getServerEnv().applicationIdentityWritesEnabled) {
+    const application = await prisma.application.create({
+      data: {
+        url: body.url,
+        jobTitle: body.jobTitle,
+        company: body.company,
+        status: body.status,
+        ...(body.appliedDate === undefined ? {} : { appliedDate: body.appliedDate }),
+        description: body.description,
+        notes: body.notes,
+        salary: body.salary,
+        location: body.location,
+        jobType: body.jobType,
+      },
+    });
+    return NextResponse.json({ ...application, result: "created" }, { status: 201 });
   }
 
   try {

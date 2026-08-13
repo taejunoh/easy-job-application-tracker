@@ -30,11 +30,12 @@ jest.mock("@/lib/server-env", () => {
       APP_BASE_URL: "https://jobs.example.com",
       CORS_ALLOWED_ORIGINS:
         "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+      APPLICATION_IDENTITY_WRITES_ENABLED: "1",
     },
     "production",
   );
 
-  return { ...actual, getServerEnv: () => config };
+  return { ...actual, getServerEnv: jest.fn(() => config) };
 });
 
 jest.mock("@/lib/prisma", () => ({
@@ -102,6 +103,7 @@ import {
 } from "@/lib/security/safe-fetch";
 import { parsePdfInWorker } from "@/lib/resume/pdf-worker-client";
 import { extensionInstallationAuthenticationStore } from "@/lib/security/extension-installation-store";
+import { getServerEnv } from "@/lib/server-env";
 
 const APP_ORIGIN = "https://jobs.example.com";
 const EXTENSION_ORIGIN =
@@ -120,6 +122,18 @@ const APPLICATION_ID = "018f9f72-f2e9-7c29-a6fc-001122334455";
 describe("application route contract enforcement", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.mocked(getServerEnv).mockImplementation(() => ({
+      ...jest.requireActual<typeof import("@/lib/server-env")>("@/lib/server-env")
+        .parseServerEnv({
+          DATABASE_URL: "postgresql://user:password@db.example.com:5432/jobtracker",
+          ENCRYPTION_SECRET: "encryption-secret-" + "e".repeat(32),
+          APP_ACCESS_TOKEN: "access-token-" + "a".repeat(32),
+          APP_BASE_URL: "https://jobs.example.com",
+          CORS_ALLOWED_ORIGINS:
+            "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+          APPLICATION_IDENTITY_WRITES_ENABLED: "1",
+        }, "production"),
+    }));
   });
 
   it("rejects unknown POST fields before Prisma", async () => {
@@ -231,6 +245,30 @@ describe("application identity route behavior", () => {
     });
     expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
     expect(prisma.application.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps the legacy write path active while identity writes are disabled", async () => {
+    const enabled = getServerEnv();
+    jest.mocked(getServerEnv).mockReturnValue({
+      ...enabled,
+      applicationIdentityWritesEnabled: false,
+    });
+    jest.mocked(prisma.application.create).mockResolvedValueOnce(applicationFixture() as never);
+
+    let response: Response;
+    try {
+      response = await applicationsRoute.POST(applicationPostRequest());
+    } finally {
+      jest.mocked(getServerEnv).mockReturnValue(enabled);
+    }
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      id: APPLICATION_ID,
+      result: "created",
+    });
+    expect(prisma.application.create).toHaveBeenCalledTimes(1);
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
   });
 
   it("returns an existing identity without mutating it", async () => {

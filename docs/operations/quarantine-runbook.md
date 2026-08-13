@@ -120,7 +120,7 @@ raw evidence. `apply` is the only command that emits two success records.
 | `recover` | `{"ok":true,"command":"recover","result":{"schemaVersion":1|2,...}}` |
 | `mark-validated` | `{"ok":true,"command":"mark-validated","status":"VALIDATED","schemaVersion":1|2,...}` |
 | `restore` | `{"ok":true,"command":"restore","status":"RESTORED","schemaVersion":1|2,...}` |
-| any failure | `{"ok":false,"command":"...","code":"ERR_...","message":"..."}` on stderr |
+| any failure | `{"ok":false,"command":"...","schemaVersion":2,"code":"ERR_...","message":"..."}` on stderr |
 
 The reconcile record uses its own output contract `schemaVersion: 1`; this is
 independent of whether the durable quarantine evidence is lifecycle v1 or v2.

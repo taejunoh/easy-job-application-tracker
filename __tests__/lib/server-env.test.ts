@@ -8,6 +8,7 @@ const productionSource = {
   APP_BASE_URL: "https://jobs.example.com/",
   CORS_ALLOWED_ORIGINS:
     "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+  APPLICATION_IDENTITY_WRITES_ENABLED: "1",
 };
 
 describe("parseServerEnv", () => {
@@ -24,6 +25,7 @@ describe("parseServerEnv", () => {
         "https://jobs.example.com",
         "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
       ],
+      applicationIdentityWritesEnabled: true,
     });
     expect(config).not.toHaveProperty("corsAllowedOriginSet");
     expect(Object.isFrozen(config.corsAllowedOrigins)).toBe(true);
@@ -92,6 +94,26 @@ describe("parseServerEnv", () => {
     );
 
     expect(config.appOrigin).toBe(origin);
+  });
+
+  it("defaults application identity writes off and accepts only exact binary values", () => {
+    const disabled = parseServerEnv({
+      ...productionSource,
+      APPLICATION_IDENTITY_WRITES_ENABLED: undefined,
+    }, "production");
+    const explicitDisabled = parseServerEnv({
+      ...productionSource,
+      APPLICATION_IDENTITY_WRITES_ENABLED: "0",
+    }, "production");
+
+    expect(disabled.applicationIdentityWritesEnabled).toBe(false);
+    expect(explicitDisabled.applicationIdentityWritesEnabled).toBe(false);
+    for (const value of ["true", "yes", " 1", "1 ", "2"]) {
+      expect(() => parseServerEnv({
+        ...productionSource,
+        APPLICATION_IDENTITY_WRITES_ENABLED: value,
+      }, "production")).toThrow("APPLICATION_IDENTITY_WRITES_ENABLED");
+    }
   });
 
   it.each(["production", "test", "staging"])(
