@@ -303,21 +303,28 @@ async function validateRestoreLayout({ capability, fsApi, input, replayed, manif
     const sourceObserved = await observeEntry(
       source, entry, fsApi, ancestors, journalConflict,
     );
-    const payloadObserved = await observeEntry(
-      payload, entry, fsApi, undefined, journalConflict,
-    );
+    const payloadObserved = await observeEntry(payload, entry, fsApi);
     const rollbackRoot = deriveRunPath(capability, { purpose: "rollback", id: ledger.restoreId });
     const rollback = join(rollbackRoot, entry.relativePath === ".next" ? ".next" : "node_modules");
     const rollbackObserved = entry.kind === "generated-root"
-      ? await observeEntry(rollback, entry, fsApi, undefined, journalConflict)
+      ? await observeEntry(rollback, entry, fsApi)
       : null;
-    if (!journalConflict && payloadObserved !== null) {
+    if (payloadObserved !== null) {
       assertMatches(entry, payloadObserved, "restore payload endpoint");
     }
     if (!journalConflict && sourceObserved !== null && entry.kind !== "generated-root") {
       assertMatches(entry, sourceObserved, "restored workspace endpoint");
     }
     const activeExpected = entry.kind === "generated-root" ? ledger.active.get(entry.id) : null;
+    if (
+      rollbackObserved !== null &&
+      !sameSummary(activeExpected, rollbackObserved)
+    ) fail("ERR_INTEGRITY", "restore rollback endpoint does not match active evidence");
+    const workspaceForeign = entry.kind === "generated-root"
+      ? sourceObserved !== null &&
+        !sameSummary(entry.preMoveInventory, sourceObserved) &&
+        !sameSummary(activeExpected, sourceObserved)
+      : sourceObserved === ENDPOINT_CONTENT_MISMATCH;
     const initial = sameSummary(entry.preMoveInventory, payloadObserved) &&
       (activeExpected === null ? sourceObserved === null : sameSummary(activeExpected, sourceObserved)) &&
       rollbackObserved === null;
@@ -336,9 +343,16 @@ async function validateRestoreLayout({ capability, fsApi, input, replayed, manif
           ? initial || staging || final
           : final;
     if (!legal) {
-      if (!conflictIds.has(entry.id)) {
+      if (!conflictIds.has(entry.id) || !workspaceForeign) {
         fail("ERR_INTEGRITY", "restore physical layout conflicts with the journal");
       }
+      if (payloadObserved === null && !ledger.completed.has(entry.id)) {
+        fail("ERR_INTEGRITY", "restore conflict is missing protected payload evidence");
+      }
+      if (
+        entry.kind === "generated-root" && activeExpected !== null &&
+        ledger.completed.has(entry.id) && rollbackObserved === null
+      ) fail("ERR_INTEGRITY", "restore conflict is missing protected rollback evidence");
       observedConflicts.add(entry.id);
     }
     layouts.push([entry.id, initial ? "initial" : staging ? "staging" : final ? "final" : "conflict"]);

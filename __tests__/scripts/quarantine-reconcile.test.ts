@@ -471,6 +471,80 @@ describe("read-only quarantine reconciliation", () => {
     });
   });
 
+  it.each(["missing", "corrupt"] as const)(
+    "fails closed when a conflict entry's protected payload is %s",
+    async (damage) => {
+      const prepared = prepareQuarantinedFixture();
+      bases.push(prepared.fixture.base);
+      const options = {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        writersStopped: true,
+      };
+      expect((await spawnLifecycleChild("restoreQuarantine", options, {
+        killAt: "after-event:RESTORE_INTENT:copy-0001",
+      })).signal).toBe("SIGKILL");
+      rmSync(join(prepared.runRoot, "journal.lock"));
+      writeFileSync(
+        join(prepared.fixture.repoRoot, "notes 2.txt"),
+        "foreign operator content\n",
+      );
+      expect((await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" }, {
+        killAt: "after-event:INCOMPLETE_CONFLICT",
+      })).signal).toBe("SIGKILL");
+      const payload = join(
+        prepared.runRoot,
+        "payload/source-copies/copy-0001",
+      );
+      if (damage === "missing") rmSync(payload);
+      else writeFileSync(payload, "corrupt protected payload\n");
+
+      expect(reconcile(options)).toMatchObject({
+        ok: false,
+        code: "ERR_INTEGRITY",
+      });
+    },
+  );
+
+  it.each(["missing", "corrupt"] as const)(
+    "fails closed when an active-tree conflict's protected rollback is %s",
+    async (damage) => {
+      const prepared = prepareQuarantinedFixture();
+      bases.push(prepared.fixture.base);
+      const options = {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        writersStopped: true,
+      };
+      expect((await spawnLifecycleChild("restoreQuarantine", options, {
+        killAt: "after-event:RESTORED_ENTRY:generated-next",
+      })).signal).toBe("SIGKILL");
+      rmSync(join(prepared.runRoot, "journal.lock"));
+      writeFileSync(
+        join(prepared.fixture.repoRoot, ".next", "foreign"),
+        "foreign active content\n",
+      );
+      expect((await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" }, {
+        killAt: "after-event:INCOMPLETE_CONFLICT",
+      })).signal).toBe("SIGKILL");
+      const rollback = join(
+        prepared.runRoot,
+        "rollback/regenerated-before-restore",
+        "restore-c3624475-87d7-4886-b0bf-68a5061663d2",
+        ".next",
+      );
+      if (damage === "missing") rmSync(rollback, { recursive: true });
+      else writeFileSync(join(rollback, "foreign"), "corrupt protected rollback\n");
+
+      expect(reconcile(options)).toMatchObject({
+        ok: false,
+        code: "ERR_INTEGRITY",
+      });
+    },
+  );
+
   it("fails closed when a restore conflict coexists with unrelated missing evidence", async () => {
     const prepared = prepareQuarantinedFixture();
     bases.push(prepared.fixture.base);

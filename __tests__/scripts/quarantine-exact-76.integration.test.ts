@@ -314,5 +314,16 @@ describe("exact disposable 76-record quarantine proof", () => {
     expect(fixture.tempPaths.every((path) => existsSync(join(fixture.repoRoot, path)))).toBe(true);
     expect(readdirSync(join(fixture.quarantineRoot, "release-proof-76", "payload", "temp-residues")))
       .toEqual([]);
+
+    const rolledBackReconcile = runCli(lifecycleArgs(fixture, "reconcile"));
+    expect(rolledBackReconcile.status).toBe(0);
+    expect(JSON.parse(rolledBackReconcile.stdout)).toEqual({
+      ok: true,
+      command: "reconcile",
+      schemaVersion: 1,
+      state: "ROLLED_BACK",
+      complete: true,
+      nextAction: "none",
+    });
   }, 120_000);
 });
