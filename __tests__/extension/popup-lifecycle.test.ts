@@ -370,6 +370,23 @@ describe("trusted extension storage", () => {
     expect(JSON.stringify(harness.storageState)).not.toContain(
       TOKEN_B,
     );
+    expect(harness.getElement("connectionStatus").textContent).toContain(
+      "018f9f72-f2e9-7c29-a6fc-001122334499",
+    );
+
+    await eventHandler(harness.getElement("openTracker"), "click")({
+      preventDefault: jest.fn(),
+    });
+    expect(harness.chrome.tabs.create).toHaveBeenCalledWith({
+      url: "https://jobs.example.com/settings#extension-installations",
+    });
+
+    const reopened = loadLifecyclePopup({ storageState: harness.storageState });
+    await reopened.ready();
+    expect(reopened.getElement("connectionStatus").textContent).toContain(
+      "018f9f72-f2e9-7c29-a6fc-001122334499",
+    );
+    expect(JSON.stringify(reopened.storageState)).not.toContain(TOKEN_B);
   });
 
   it("awaits trusted-context access before reading stored credentials", async () => {

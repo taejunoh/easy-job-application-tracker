@@ -2,8 +2,9 @@
 
 This runbook separates the destructive, isolated browser automation from the
 manual system Chrome verification required for a production release. Never
-copy an application access token, saved application row, resume content, or
-API response body into logs, screenshots, tickets, or release evidence.
+copy an application access token, pairing code, installation credential, saved
+application row, resume content, or API response body into logs, screenshots,
+tickets, or release evidence.
 
 ## Automated bundled-Chromium scope
 
@@ -15,11 +16,12 @@ Chromium with an isolated temporary profile; neither command launches system
 Chrome or touches an installed user extension.
 
 The automation discovers the temporary extension ID at runtime and drives the
-actual Chrome action popup. It covers the disconnected state, invalid token
-rejection, valid pairing, deterministic Lever extraction, application save,
-exact SQL verification, keyword analysis, popup close and reopen connection
-restoration, explicit disconnect, and server-`401` credential and permission
-cleanup.
+actual Chrome action popup. It covers the disconnected state, invalid pairing
+code rejection, origin-bound and expired code rejection, same-origin replay,
+concurrent one-time consumption, valid pairing across two isolated
+installations, deterministic Lever extraction, application save, exact SQL
+verification, keyword analysis, popup close and reopen connection restoration,
+explicit disconnect, and server-`401` credential and permission cleanup.
 
 After valid pairing, the runner uses the CDP ServiceWorker domain to identify
 the exact MV3 service worker registration and running version, stop the old
@@ -29,7 +31,7 @@ target in this harness, so the isolated profile uses
 `chrome.developerPrivate.openDevTools` as the wake equivalent, attaches to the
 new worker, closes the temporary DevTools window, and opens the actual action
 popup from that new worker. The test then proves the popup is connected, the
-token input is empty, and the stored credential and exact host permission were
+pairing-code input is empty, and the stored credential and exact host permission were
 retained across the MV3 service worker stop and restart. This does not perform
 a full extension reload.
 
@@ -78,8 +80,10 @@ behavior to other versions without re-verification.
 Preconditions:
 
 - Use a dedicated operator Chrome profile with no unrelated JobTracker data.
-- Have the production access credential available through the approved secret
-  channel without putting it in shell history, notes, or evidence.
+- Authenticate to the web app as an administrator, then open
+  **Settings → Chrome extension installations**. Create each one-time pairing
+  code only when its popup is ready; never reveal `APP_ACCESS_TOKEN` to the
+  extension or record either secret in shell history, notes, or evidence.
 - Open a real, reviewed job posting that may be removed after the check, and
   choose a unique marker for the temporary application so cleanup can be
   proven without recording sensitive row content.
@@ -93,17 +97,19 @@ Perform the smoke:
    reload check.
 2. Navigate to the job posting, click the real JobTracker toolbar icon, and
    confirm the actual toolbar click supplies `activeTab` extraction access.
-3. Enter the canonical origin and an intentionally invalid token. Approve the
+3. Enter the canonical origin and an intentionally invalid pairing code. Approve the
    exact optional host permission if Chrome asks, confirm pairing is rejected,
    and confirm the permission is removed rather than retained.
-4. Enter the valid credential through the popup and approve only the exact
-   canonical-origin permission. Confirm extraction completed, add the unique
+4. In **Settings → Chrome extension installations**, select the installed
+   extension's exact origin and create a fresh one-time pairing code. Enter that
+   code through the popup and approve only the exact canonical-origin
+   permission. Confirm extraction completed, add the unique
    marker, save the application, and verify it appears once in the production
    dashboard.
 5. Close the popup, click the toolbar icon again, and confirm popup reopen
-   connection restoration without entering the credential again. The visible
-   token input is cleared after successful pairing by design; verify retention
-   through connected status and reopen restoration, not visible token
+   connection restoration without entering another code. The visible
+   pairing-code input is cleared after successful pairing by design; verify retention
+   through connected status and reopen restoration, not visible code
    persistence.
 6. Delete the temporary application from the dashboard and confirm the unique
    marker no longer appears.
@@ -117,7 +123,8 @@ Perform the smoke:
 
 Cleanup is unconditional, including when an earlier step fails: delete the
 unique-marker row, disconnect the extension, remove the exact site permission,
-and clear any stored production credential from the dedicated profile. Do not
+and clear any stored installation credential from the dedicated profile. Do not
 close the release until row cleanup, permission cleanup, and credential cleanup
 are each confirmed. Record only pass/fail status, release identity, extension
-ID, and timestamps; do not record the token, row, or resume.
+ID, and timestamps; do not record the administrator token, pairing code,
+installation credential, row, or resume.

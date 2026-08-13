@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useReducer, useState } from "react";
 
 import type { ClientApi } from "@/lib/client-api";
 
@@ -18,12 +18,58 @@ type Props = Readonly<{
   origins?: readonly string[];
 }>;
 
+export type PairingSecret = Readonly<{
+  code: string;
+  expiresAt: string;
+}>;
+
+type PairingSecretAction =
+  | Readonly<{ type: "issued"; code: string; expiresAt: string }>
+  | Readonly<{ type: "dismissed" }>;
+
+export function pairingSecretReducer(
+  _state: PairingSecret | null,
+  action: PairingSecretAction,
+): PairingSecret | null {
+  return action.type === "issued"
+    ? { code: action.code, expiresAt: action.expiresAt }
+    : null;
+}
+
+export function PairingCodePanel({
+  secret,
+  onDismiss,
+}: Readonly<{
+  secret: PairingSecret | null;
+  onDismiss: () => void;
+}>) {
+  if (secret === null) return null;
+  return (
+    <div className="bg-gray-800 border border-blue-700 rounded p-3 mb-4">
+      <p className="text-xs text-gray-400 mb-2">
+        Shown once. Expires {new Date(secret.expiresAt).toLocaleString()}.
+      </p>
+      <code className="block break-all text-sm text-blue-300">{secret.code}</code>
+      <button
+        type="button"
+        aria-label="Dismiss pairing code"
+        onClick={onDismiss}
+        className="mt-3 text-xs text-gray-400 hover:text-white"
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
 export function ExtensionInstallations({ api, origins = [] }: Props) {
   const [installations, setInstallations] = useState<readonly Installation[]>([]);
   const [configuredOrigins, setConfiguredOrigins] = useState(origins);
   const [origin, setOrigin] = useState(origins[0] ?? "");
-  const [pairingCode, setPairingCode] = useState<string | null>(null);
-  const [expiresAt, setExpiresAt] = useState<string | null>(null);
+  const [pairingSecret, dispatchPairingSecret] = useReducer(
+    pairingSecretReducer,
+    null,
+  );
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
@@ -52,10 +98,14 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
   async function createPairingCode() {
     setBusy(true);
     setMessage("");
+    dispatchPairingSecret({ type: "dismissed" });
     try {
       const response = await createExtensionPairingCode(api, origin);
-      setPairingCode(response.code);
-      setExpiresAt(response.expiresAt);
+      dispatchPairingSecret({
+        type: "issued",
+        code: response.code,
+        expiresAt: response.expiresAt,
+      });
     } catch {
       setMessage("Failed to create pairing code.");
     } finally {
@@ -77,7 +127,10 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
   }
 
   return (
-    <section className="bg-gray-900 rounded-lg p-6 max-w-lg mt-6">
+    <section
+      id="extension-installations"
+      className="bg-gray-900 rounded-lg p-6 max-w-lg mt-6"
+    >
       <h2 className="text-sm font-medium text-gray-400 uppercase mb-4">
         Chrome extension installations
       </h2>
@@ -108,25 +161,10 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
         </button>
       </div>
 
-      {pairingCode && (
-        <div className="bg-gray-800 border border-blue-700 rounded p-3 mb-4">
-          <p className="text-xs text-gray-400 mb-2">
-            Shown once. Expires {expiresAt ? new Date(expiresAt).toLocaleString() : "soon"}.
-          </p>
-          <code className="block break-all text-sm text-blue-300">{pairingCode}</code>
-          <button
-            type="button"
-            aria-label="Dismiss pairing code"
-            onClick={() => {
-              setPairingCode(null);
-              setExpiresAt(null);
-            }}
-            className="mt-3 text-xs text-gray-400 hover:text-white"
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
+      <PairingCodePanel
+        secret={pairingSecret}
+        onDismiss={() => dispatchPairingSecret({ type: "dismissed" })}
+      />
 
       {installations.length === 0 ? (
         <p className="text-xs text-gray-500">No extension installations yet.</p>
@@ -135,6 +173,9 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
           {installations.map((installation) => (
             <li key={installation.id} className="bg-gray-800 rounded p-3 text-xs">
               <div className="break-all text-gray-300">{installation.origin}</div>
+              <div className="text-gray-500 mt-1 break-all">
+                Installation ID <code>{installation.id}</code>
+              </div>
               <div className="text-gray-500 mt-1">
                 {installation.revokedAt
                   ? "Revoked"

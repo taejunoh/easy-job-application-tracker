@@ -38,7 +38,8 @@ npm run screenshots:setup
 ```
 
 The setup images are synthetic and need no server or database. They contain no
-real extension ID, access token, Chrome profile, or production origin.
+real extension ID, administrator token, pairing code, installation credential,
+Chrome profile, or production origin.
 
 ## When to regenerate
 

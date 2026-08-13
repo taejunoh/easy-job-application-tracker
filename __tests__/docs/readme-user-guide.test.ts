@@ -152,7 +152,7 @@ describe("task-first README user guide", () => {
       'maskedToken: "••••••••••••••••••••••••••••••••"',
     );
     expect(popupConnectionFixture?.[0]).toContain(
-      'disconnectedStatus: "Disconnected — enter an access token to connect."',
+      'disconnectedStatus: "Disconnected — enter a pairing code to connect."',
     );
     expect(generator).toContain("connectBtn.disabled = false;");
     expect(chromeExtensionsSetup).toMatch(
@@ -314,7 +314,9 @@ describe("task-first README user guide", () => {
       "CORS_ALLOWED_ORIGINS",
       "chrome://extensions",
       "Load unpacked",
-      "The token field is cleared after a successful connection",
+      "The pairing-code field is cleared after a successful connection",
+      "Settings → Chrome extension installations",
+      "one-time pairing code",
       "docs/operations/production-runbook.md",
     ];
     const requiredSetupImageReferences = setupImages.map(
@@ -322,6 +324,9 @@ describe("task-first README user guide", () => {
     );
 
     expect(readme).not.toContain("GENERATE_WITH_OPENSSL_RAND_BASE64_32");
+    expect(readme).not.toContain(
+      "Paste the value of `APP_ACCESS_TOKEN` into **Access Token**",
+    );
 
     const unsafeTokenAssignments = readDocumentedTokenAssignments(
       readme,

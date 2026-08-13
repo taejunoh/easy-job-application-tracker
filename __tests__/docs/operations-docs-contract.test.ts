@@ -42,6 +42,8 @@ describe("production operations documentation contract", () => {
       "PDF worker",
       "RPO: 24 hours",
       "RTO: 30 minutes",
+      "one-time pairing code",
+      "Never paste `APP_ACCESS_TOKEN` into the extension",
     ]) {
       expect(runbook).toContain(requiredText);
     }
@@ -190,7 +192,9 @@ describe("production operations documentation contract", () => {
       "https://easy-job-application-tracker.vercel.app",
       "gihbagcjnmkhkekjkbfjhcbddnamaiap",
       "activeTab",
-      "invalid token",
+      "invalid pairing code",
+      "one-time pairing code",
+      "Settings → Chrome extension installations",
       "unique marker",
       "permission cleanup",
       "credential cleanup",
@@ -199,7 +203,7 @@ describe("production operations documentation contract", () => {
     }
 
     for (const requiredText of [
-      "The visible token input is cleared after successful pairing by design",
+      "The visible pairing-code input is cleared after successful pairing by design",
       "confirm no cleanup warning is shown in the popup connection-status area",
       "Reload the extension in `chrome://extensions`, return to the job tab, and click the JobTracker toolbar icon",
       "The reopened popup after reload must remain disconnected; confirm that it does",
@@ -209,5 +213,8 @@ describe("production operations documentation contract", () => {
     ]) {
       expect(normalizedProductionChromeSmokeRunbook).toContain(requiredText);
     }
+    expect(normalizedProductionChromeSmokeRunbook).not.toContain(
+      "production access credential available",
+    );
   });
 });

@@ -107,6 +107,17 @@ function clearApplicationTarget() {
   openTracker.textContent = "Open tracker";
 }
 
+function directRemoteRevocation(origin, installationId) {
+  if (origin && installationId) {
+    openTracker.dataset.appUrl =
+      `${origin}/settings#extension-installations`;
+    openTracker.textContent = "Open installation settings";
+  }
+  return installationId
+    ? `Remote revocation is unconfirmed for installation ${installationId}; revoke it in web Settings.`
+    : "Remote revocation is unconfirmed; revoke it in web Settings.";
+}
+
 function resetAnalysisUi() {
   const analyzeBtn = document.getElementById("analyzeBtn");
   analyzeBtn.style.display = "block";
@@ -797,7 +808,7 @@ async function disconnectServer() {
       !cleanupRecordClean ? "Host cleanup state could not be saved." : "",
       storageRetried && !storageClean ? "Credential purge also failed." : "",
       !remoteRevocationConfirmed
-        ? "Remote revocation is unconfirmed; revoke it in web Settings."
+        ? directRemoteRevocation(origin, connection?.installationId)
         : "",
     ].filter(Boolean).join(" ");
     setConnectionStatus(
@@ -856,7 +867,7 @@ async function invalidateUnauthorizedConnection(connection) {
       !cleanupRecordClean ? "Host cleanup state could not be saved." : "",
     ].filter(Boolean).join(" ");
     setConnectionStatus(
-      warnings || "Connection expired. Enter the access token to reconnect.",
+      warnings || "Connection expired. Create a new pairing code to reconnect.",
       "error"
     );
     return true;
@@ -1353,7 +1364,7 @@ async function initializePopup() {
         }
         setConnectionStatus(
           persistence.storageClean && permissionClean
-            ? "Disconnected. Enter an access token to reconnect."
+            ? "Disconnected. Create a new pairing code to reconnect."
             : "Disconnected. Credential or host-access cleanup remains pending.",
           persistence.storageClean && permissionClean ? "info" : "error"
         );
@@ -1389,6 +1400,13 @@ async function initializePopup() {
 
       if (stored.invalidated || !stored.installationId ||
           !stored.installationToken || !stored.serverUrl) {
+        if (stored.remoteRevocationUnconfirmed) {
+          setConnectionStatus(
+            directRemoteRevocation(stored.serverUrl, stored.installationId),
+            "error"
+          );
+          return null;
+        }
         setConnectionStatus(
           `Disconnected — enter a pairing code to connect.${cleanupWarning}`,
           cleanupWarning ? "error" : "info"

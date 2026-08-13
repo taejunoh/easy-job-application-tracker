@@ -213,23 +213,16 @@ async function run() {
   const connectionA = await readInstallationConnection(popup);
 
   processState.step = "one-time pairing replay rejection";
-  await grantOptionalHostPermission(
-    installationB.context,
-    installationB.identity.id,
+  await replayConsumedPairingCodeFromOrigin(grantA.code, identity.origin);
+
+  processState.step = "concurrent same-origin pairing consumption";
+  await proveConcurrentPairingConsumption(
+    adminCookie,
+    identity.origin,
+    database,
   );
-  popupB = await openActionPopup(
-    installationB.browserCdp,
-    installationB.worker,
-    jobPageB,
-    installationB.identity.origin,
-  );
-  rememberPopup(popupB);
-  await connectFromPopup(popupB, grantA.code);
-  await waitForText(popupB, "#connectionStatus", "not accepted");
 
   processState.step = "expired pairing rejection";
-  await popupB.close();
-  forgetPopup(popupB);
   const expiredGrant = await createPairingGrant(
     adminCookie,
     installationB.identity.origin,
@@ -484,6 +477,80 @@ async function createPairingGrant(cookie, origin) {
   );
   popupArtifactSensitiveValues.push(grant.code);
   return grant;
+}
+
+async function replayConsumedPairingCodeFromOrigin(code, origin) {
+  const response = await fetch(`${E2E_SERVER_ORIGIN}/api/extension/pair`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ code }),
+  });
+  requireCondition(
+    response.status === 401,
+    "consumed pairing code replayed from its bound origin",
+  );
+}
+
+async function proveConcurrentPairingConsumption(cookie, origin, database) {
+  const grant = await createPairingGrant(cookie, origin);
+  const consume = () =>
+    fetch(`${E2E_SERVER_ORIGIN}/api/extension/pair`, {
+      method: "POST",
+      headers: {
+        Origin: origin,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ code: grant.code }),
+    });
+  const responses = await Promise.all([consume(), consume()]);
+  const statuses = responses.map(({ status }) => status).sort();
+  requireCondition(
+    JSON.stringify(statuses) === JSON.stringify([201, 401]),
+    "concurrent pairing consumption did not produce exactly one installation",
+  );
+
+  const successfulResponse = responses.find(({ status }) => status === 201);
+  const installation = await successfulResponse.json();
+  requireCondition(
+    typeof installation.installationId === "string" &&
+      typeof installation.token === "string",
+    "concurrent pairing installation response mismatch",
+  );
+  popupArtifactSensitiveValues.push(installation.token);
+
+  const persisted = await database.query(
+    `SELECT grant."consumedAt", grant."installationId",
+      count(installation."id")::integer AS "installationCount"
+     FROM "ExtensionPairingGrant" AS grant
+     LEFT JOIN "ExtensionInstallation" AS installation
+       ON installation."id" = grant."installationId"
+     WHERE grant."id" = $1
+     GROUP BY grant."id"`,
+    [grant.id],
+  );
+  const row = persisted.rows[0];
+  requireCondition(
+    persisted.rows.length === 1 &&
+      row?.consumedAt instanceof Date &&
+      row.installationId === installation.installationId &&
+      row.installationCount === 1,
+    "concurrent pairing did not persist exactly one consumed installation",
+  );
+
+  const revoked = await fetch(`${E2E_SERVER_ORIGIN}/api/extension/revoke`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      Authorization: `Bearer ${installation.token}`,
+    },
+  });
+  requireCondition(
+    revoked.status === 200,
+    "concurrent pairing proof installation cleanup failed",
+  );
 }
 
 async function expirePairingGrant(database, grantId) {

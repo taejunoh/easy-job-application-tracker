@@ -272,16 +272,13 @@ export async function authenticateApiRequestAsync(
   if (authorization !== null && match === null) return UNAUTHORIZED;
 
   if (match) {
-    const parsed = parseInstallationToken(match[1]);
-    if (parsed) {
-      const origin = request.headers.get("origin");
+    const origin = request.headers.get("origin");
+    if (origin !== null && isExtensionOrigin(origin)) {
+      const parsed = parseInstallationToken(match[1]);
       if (
-        origin === null ||
-        !isExtensionOrigin(origin) ||
+        parsed === null ||
         !(config.corsAllowedOrigins ?? []).includes(origin)
-      ) {
-        return UNAUTHORIZED;
-      }
+      ) return UNAUTHORIZED;
       const store =
         options.installationStore ?? (await defaultInstallationStore());
       const record = await store.findForAuthentication(parsed.selector);
@@ -315,8 +312,6 @@ export async function authenticateApiRequestAsync(
         }),
       };
     }
-
-    if (isExtensionOrigin(request.headers.get("origin"))) return UNAUTHORIZED;
   }
 
   return authenticateApiRequest(request, options);

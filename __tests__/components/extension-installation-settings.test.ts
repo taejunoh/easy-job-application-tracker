@@ -1,8 +1,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 import {
+  PairingCodePanel,
   createExtensionPairingCode,
+  pairingSecretReducer,
   revokeExtensionInstallation,
 } from "@/components/ExtensionInstallations";
 
@@ -40,10 +44,39 @@ describe("ExtensionInstallations", () => {
     });
   });
 
-  it("renders a once-only secret with an explicit state-clearing dismissal", () => {
-    expect(source).toContain("Shown once.");
-    expect(source).toContain("setPairingCode(null)");
-    expect(source).toContain("setExpiresAt(null)");
+  it("renders the once-only secret and removes it after the dismiss state transition", () => {
+    const secret = "jt_pair_v1.selector.secret";
+    const issued = pairingSecretReducer(null, {
+      type: "issued",
+      code: secret,
+      expiresAt: "2026-08-13T12:10:00.000Z",
+    });
+    const visible = renderToStaticMarkup(
+      createElement(PairingCodePanel, {
+        secret: issued,
+        onDismiss: jest.fn(),
+      }),
+    );
+
+    expect(visible).toContain("Shown once.");
+    expect(visible).toContain(secret);
+    expect(visible).toContain('aria-label="Dismiss pairing code"');
+
+    const dismissed = pairingSecretReducer(issued, { type: "dismissed" });
+    const hidden = renderToStaticMarkup(
+      createElement(PairingCodePanel, {
+        secret: dismissed,
+        onDismiss: jest.fn(),
+      }),
+    );
+    expect(hidden).not.toContain(secret);
+    expect(hidden).toBe("");
     expect(source).not.toMatch(/localStorage|sessionStorage/u);
+  });
+
+  it("renders opaque installation ids in the deep-linked management section", () => {
+    expect(source).toContain('id="extension-installations"');
+    expect(source).toContain("installation.id");
+    expect(source).toContain("Installation ID");
   });
 });

@@ -265,6 +265,40 @@ describe("session cookie metadata", () => {
 });
 
 describe("authenticateApiRequest", () => {
+  it("preserves a syntactically installation-shaped root bearer outside Chrome", async () => {
+    const rootCredential = createInstallationCredential({
+      encryptionSecret: ENCRYPTION_SECRET,
+      origin: EXTENSION_ORIGIN,
+      randomUUID: () => "018f9f72-f2e9-7c29-a6fc-001122334499",
+      randomBytes: () => Buffer.alloc(32, 17),
+    }).token;
+    const collisionConfig = { ...config, appAccessToken: rootCredential };
+    const installationStore = {
+      findForAuthentication: jest.fn().mockResolvedValue(null),
+      touch: jest.fn(),
+    };
+
+    await expect(
+      authenticateApiRequestAsync(
+        apiRequest("DELETE", {
+          authorization: `Bearer ${rootCredential}`,
+        }),
+        { config: collisionConfig, now: NOW, installationStore },
+      ),
+    ).resolves.toEqual({ authenticated: true, via: "bearer" });
+    expect(installationStore.findForAuthentication).not.toHaveBeenCalled();
+
+    await expect(
+      authenticateApiRequestAsync(
+        apiRequest("POST", {
+          authorization: `Bearer ${rootCredential}`,
+          origin: EXTENSION_ORIGIN,
+        }),
+        { config: collisionConfig, now: NOW, installationStore },
+      ),
+    ).resolves.toEqual(unauthorized);
+  });
+
   it("rejects the root bearer credential from a Chrome extension origin", async () => {
     const request = apiRequest("POST", {
       authorization: `Bearer ${APP_ACCESS_TOKEN}`,

@@ -25,7 +25,7 @@ server variables:
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection for the Production Neon database. |
 | `ENCRYPTION_SECRET` | Existing encryption secret; changing it makes persisted encrypted settings unreadable. |
-| `APP_ACCESS_TOKEN` | Private application access credential with at least 32 bytes of entropy. |
+| `APP_ACCESS_TOKEN` | Private root credential with at least 32 bytes of entropy, used for web administrator sessions and protected monitoring only. |
 | `APP_BASE_URL` | Canonical root HTTPS origin, without a path. |
 | `CORS_ALLOWED_ORIGINS` | Exact canonical web origin plus each approved `chrome-extension://` origin; no wildcard. |
 
@@ -86,7 +86,7 @@ into tickets or release evidence.
 
 Web users open `/connect` and submit the application access credential. The app
 exchanges it for a Secure, HttpOnly, SameSite=Strict session cookie and does not
-persist the submitted value in browser storage.
+persist the submitted value in browser storage. Never paste `APP_ACCESS_TOKEN` into the extension.
 
 For Chrome extension pairing:
 
@@ -94,10 +94,12 @@ For Chrome extension pairing:
    ID through the approved private operator channel.
 2. Confirm its exact `chrome-extension://` origin is present in
    `CORS_ALLOWED_ORIGINS` before deployment.
-3. In the popup, enter the canonical server origin and access credential, then
-   select **Connect**.
-4. Confirm a read and one reversible save operation. Delete the smoke record.
-5. Use **Disconnect** before transferring or troubleshooting a browser profile.
+3. From the authenticated Settings page, open **Chrome extension
+   installations**, select that exact origin, and create a one-time pairing code.
+4. In the popup, enter the canonical server origin and the one-time pairing code,
+   then select **Connect**. The code is single-use and must not be recorded.
+5. Confirm a read and one reversible save operation. Delete the smoke record.
+6. Use **Disconnect** before transferring or troubleshooting a browser profile.
 
 A `401` means the credential or session is invalid. A `403` means the request
 Origin is not in the exact allowlist. Do not weaken either control during

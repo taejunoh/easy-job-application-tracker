@@ -223,6 +223,8 @@ describe("extension connection configuration", () => {
     expect(popupHtml).toContain('id="connectionStatus"');
     expect(popupHtml).toMatch(/id="connectionStatus"[^>]+aria-live="polite"/);
     expect(popupHtml).toMatch(/<button[^>]+id="analysisToggle"[^>]+aria-expanded="true"/);
+    expect(popupHtml).toContain("pairing code to connect");
+    expect(popupScript).not.toMatch(/enter (?:an |the )?access token/iu);
   });
 
   it("keeps keyword analysis disclosure state in sync", async () => {

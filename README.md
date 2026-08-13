@@ -91,7 +91,7 @@ The variables serve these purposes:
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string used by Prisma and the server. |
 | `ENCRYPTION_SECRET` | Separate secret used to encrypt stored provider credentials. |
-| `APP_ACCESS_TOKEN` | Private pairing credential used by the web `/connect` page and Chrome extension. It is not a provider API key. |
+| `APP_ACCESS_TOKEN` | Private root credential used only by the web `/connect` page to create an administrator session. Never paste it into the Chrome extension. It is not a provider API key. |
 | `APP_BASE_URL` | Exact public origin of the JobTracker server, with no path. Use `http://localhost:3000` locally. |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins allowed to call the server. Include the app origin and the exact `chrome-extension://<extension-id>` origin. |
 
@@ -144,19 +144,20 @@ Chrome may show the extension's declared job-site patterns under **Site access**
 
 ## Connect the Extension
 
-1. Open a supported job posting, then click the pinned JobTracker icon.
-2. Enter `http://localhost:3000` in **JobTracker URL**.
-3. Paste the value of `APP_ACCESS_TOKEN` into **Access Token**.
-4. Click **Connect**.
-5. Approve the Site Access request if Chrome shows it. Chrome asks for access to the configured JobTracker server origin, not the current job site.
+1. Sign in to the web app through `/connect` with `APP_ACCESS_TOKEN`.
+2. Open **Settings → Chrome extension installations**, select the exact configured extension origin, and choose **Create pairing code**.
+3. Open a supported job posting, then click the pinned JobTracker icon.
+4. Enter `http://localhost:3000` in **JobTracker URL** and paste the one-time pairing code into **One-time pairing code**.
+5. Click **Connect**.
+6. Approve the Site Access request if Chrome shows it. Chrome asks for access to the configured JobTracker server origin, not the current job site.
 
-![Enter the local server URL and access token](docs/screenshots/07-extension-connect.png)
+![Enter the local server URL and one-time pairing code](docs/screenshots/07-extension-connect.png)
 
 When pairing succeeds, the popup shows **Connected** and enables actions supported by the current page.
 
 ![Connected JobTracker extension](docs/screenshots/08-extension-connected.png)
 
-The token field is cleared after a successful connection. An empty token field while the popup says **Connected** is expected: the extension stores its authenticated connection state rather than displaying the credential again.
+The pairing-code field is cleared after a successful connection. An empty pairing-code field while the popup says **Connected** is expected: each code can be used only once, and the extension stores a separate installation credential without displaying it.
 
 Use **Disconnect** to remove the stored connection and revoke the runtime-requested server permission. Some Chrome versions may retain a previously requested server origin on the extension details page. The popup cleanup warning and the server-origin permission toggle are authoritative: if the popup reports that cleanup remains pending, follow that warning; if the toggle is off, host access is no longer granted. Mere list presence does not mean the extension remains connected.
 
@@ -206,8 +207,8 @@ Choose a provider in **Settings**, enter that provider's API key, then save. Pro
 | Symptom | Likely cause | Action |
 | --- | --- | --- |
 | Chrome does not show a permission prompt | Access to that server origin was already granted, or Chrome did not open a new prompt. | Click **Connect** with the exact server origin. In `chrome://extensions`, confirm JobTracker is enabled and check the configured server origin under Site access; the request is not for the current job site. |
-| The popup says **Disconnected** | The extension has not paired with this server, its saved state was cleared, or the unpacked extension was reloaded. | Confirm the server is running, enter its exact origin without a trailing path, paste `APP_ACCESS_TOKEN`, and click **Connect** again. |
-| A request returns HTTP `401` | The saved connection is not accepted because the server and extension tokens differ or the server token changed. | Disconnect, verify that both use the same `APP_ACCESS_TOKEN`, then reconnect. Never send the token as part of a URL. |
+| The popup says **Disconnected** | The extension has not paired with this server, its saved state was cleared, or the unpacked extension was reloaded. | Confirm the server is running, create a fresh one-time pairing code under **Settings → Chrome extension installations**, enter the exact server origin without a trailing path, and click **Connect** again. |
+| A request returns HTTP `401` | The installation credential was revoked, expired, or is otherwise no longer accepted. | Disconnect, create a fresh one-time pairing code in Settings, and reconnect. Never send a pairing code or credential as part of a URL. |
 | The server origin remains in Chrome's Site access list after **Disconnect** | Some Chrome versions may retain the entry after its permission has been removed. | Check the popup for a cleanup warning and confirm the server-origin permission toggle is off. The warning and toggle, rather than mere list presence, show whether cleanup is pending or access remains granted. |
 | Extracted fields are missing or inaccurate | The page is still loading, uses an unusual layout, or exposes incomplete metadata. | Wait for the job page to finish loading, reopen the popup, and click **Re-extract**. Edit fields before saving; for unusual layouts, use text paste mode and optionally configure an AI provider. |
 | **Save Application** fails | The connection, job URL, server, or PostgreSQL database is unavailable or invalid. | Confirm the popup is **Connected**, the server is reachable, the job URL is valid, and PostgreSQL is running. Check the server terminal for the specific error. |
@@ -235,7 +236,7 @@ For self-hosted Node, `npm start` and `npm run dev` are the supported launch con
 
 Do not give Vercel Preview deployments Production database credentials. Preview builds also validate environment variables, so use Preview-only credentials, a stable Preview HTTPS alias, and a disposable PostgreSQL database if Preview routes need database access.
 
-After deployment, open `/connect` on the canonical HTTPS origin and enter `APP_ACCESS_TOKEN`. Pair the extension with the same origin and credential, and ensure its exact extension origin is allowed. Follow the [production operations runbook](docs/operations/production-runbook.md) for deployment verification, Chrome pairing, logs, Neon connectivity, backups, restore tests, incident response, and rollback.
+After deployment, open `/connect` on the canonical HTTPS origin and enter `APP_ACCESS_TOKEN`. In the authenticated Settings page, create a one-time pairing code for the exact allowed extension origin and use that code in the popup; never give the root token to the extension. Follow the [production operations runbook](docs/operations/production-runbook.md) for deployment verification, Chrome pairing, logs, Neon connectivity, backups, restore tests, incident response, and rollback.
 
 ## Database Migration Notes
 
@@ -290,7 +291,7 @@ For the guarded local wrapper, run:
 npm run test:extension:e2e:local
 ```
 
-It requires a local **PostgreSQL 17** server on `127.0.0.1:5432` and refuses to reuse the disposable database named `jobtracker_extension_e2e_test`. It creates that database, builds the app with fixed test-only values, starts Playwright's **bundled Chromium** with a temporary profile, runs the real extension journey, and removes the database during cleanup.
+It requires a local **PostgreSQL 17** server on `127.0.0.1:5432` and refuses to reuse the disposable database named `jobtracker_extension_e2e_test`. It creates that database, builds the app with fixed test-only values, starts two isolated installations of Playwright's **bundled Chromium** with separate temporary profiles, runs the real extension journey, and removes the database during cleanup.
 
 The lower-level CI command is `npm run test:extension:e2e`. Do not run it directly unless all destructive-test sentinels, database identity checks, migrations, build outputs, and browser prerequisites are already in place. The test never launches or modifies your system Chrome profile.
 

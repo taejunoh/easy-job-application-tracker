@@ -54,6 +54,6 @@ export const keywordAnalysisFixture = {
 export const popupConnectionFixture = {
   serverUrl: "http://localhost:3000",
   maskedToken: "••••••••••••••••••••••••••••••••",
-  disconnectedStatus: "Disconnected — enter an access token to connect.",
+  disconnectedStatus: "Disconnected — enter a pairing code to connect.",
   connectedStatus: "Connected to http://localhost:3000",
 };
