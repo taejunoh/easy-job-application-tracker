@@ -3,18 +3,23 @@ import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join } from "node:path";
 
 import { parseInventoryRecord, parseInventorySummary } from "./quarantine-inventory.mjs";
+import {
+  MAX_INVENTORY_CHUNK_BYTES,
+  MAX_INVENTORY_CHUNK_RECORDS,
+  MAX_PUBLISHED_INVENTORY_BYTES,
+  MAX_PUBLISHED_INVENTORY_RECORDS,
+} from "./quarantine-inventory-limits.mjs";
 import { deriveRunPath, revalidateRunCapability } from "./quarantine-run-capability.mjs";
 import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
 
 const LIMITS = Object.freeze({
-  records: 4096,
-  recordBytes: 8 * 1024 * 1024,
-  frontier: 4096,
-  frontierBytes: 8 * 1024 * 1024,
+  records: MAX_PUBLISHED_INVENTORY_RECORDS,
+  recordBytes: MAX_PUBLISHED_INVENTORY_BYTES,
+  frontier: MAX_INVENTORY_CHUNK_RECORDS,
+  frontierBytes: MAX_INVENTORY_CHUNK_BYTES,
   depth: 1024,
   nameBytes: 255,
 });
-const PUBLISHED_RECORD_LIMIT = 1_000_000;
 
 export class InventoryStructuralError extends Error {
   constructor(message = "read-only inventory evidence is structurally invalid") {
@@ -305,6 +310,9 @@ export async function verifyPublishedInventory({ capability, entryId, phase, exp
     handle = await fsApi.open(path, FILE_OPEN_FLAGS);
     const opened = await handle.stat();
     assertInventoryIdentity(before, opened, "isFile");
+    if (opened.size > MAX_PUBLISHED_INVENTORY_BYTES) {
+      throw new InventoryStructuralError("published inventory exceeds the fixed total byte bound");
+    }
     const digest = createHash("sha256");
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let pending = Buffer.alloc(0);
@@ -323,7 +331,7 @@ export async function verifyPublishedInventory({ capability, entryId, phase, exp
       while ((newline = pending.indexOf(0x0a)) !== -1) {
         const lineBytes = pending.subarray(0, newline);
         pending = pending.subarray(newline + 1);
-        if (lineBytes.length === 0 || entries >= PUBLISHED_RECORD_LIMIT) {
+        if (lineBytes.length === 0 || entries >= MAX_PUBLISHED_INVENTORY_RECORDS) {
           throw new InventoryStructuralError("published inventory has an invalid record count");
         }
         const line = lineBytes.toString("utf8");
@@ -573,33 +581,46 @@ export async function fsyncVerifiedTree(root, {
     } catch (error) { primary = error; }
     await closeAll(undefined, handle, primary);
   };
-  const budget = { records: 0, recordBytes: 0 };
+  let visited = 0;
   const enumerateDirectory = async (path, expected, chain) => withVerifiedDirectory(
     path, expected, chain, fsApi,
     async (dir, identity) => {
       const names = [];
+      let nameBytes = 0;
       while (true) {
         const item = await dir.read();
         if (item === null) break;
         if (typeof item.name !== "string" || Buffer.byteLength(item.name) > LIMITS.nameBytes) {
           throw new Error("restore sync directory entry is invalid");
         }
-        const canonicalBytes = Buffer.byteLength(join(path, item.name));
-        if (budget.records >= LIMITS.records || budget.recordBytes + canonicalBytes > LIMITS.recordBytes) {
+        const serializedBytes = Buffer.byteLength(JSON.stringify(item.name)) + 1;
+        if (
+          names.length >= LIMITS.frontier ||
+          nameBytes + serializedBytes > LIMITS.frontierBytes
+        ) {
           throw new Error("restore sync tree exceeded fixed entry bounds");
         }
         names.push(item.name);
-        budget.records += 1;
-        budget.recordBytes += canonicalBytes;
+        nameBytes += serializedBytes;
       }
       names.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
       return Object.freeze({ identity, names: Object.freeze(names) });
     },
   );
-  const visit = async (path, expected, chain) => {
+  const visit = async (path, expected, chain, root = false) => {
+    if (!root) {
+      visited += 1;
+      if (visited > LIMITS.records) {
+        throw new Error("restore sync tree exceeded fixed entry bounds");
+      }
+    }
+    if (expected.isSymbolicLink?.()) {
+      await readVerifiedLink(path, expected, chain, fsApi);
+      return;
+    }
     const expectedFile = expected.type === undefined ? expected.isFile() : expected.type === "file";
     const expectedDirectory = expected.type === undefined ? expected.isDirectory() : expected.type === "directory";
-    if ((!expectedFile && !expectedDirectory) || expected.isSymbolicLink?.()) {
+    if (!expectedFile && !expectedDirectory) {
       throw new Error("restore sync endpoint is unsafe");
     }
     if (expectedFile) return syncFile(path, expected, chain);
@@ -622,5 +643,5 @@ export async function fsyncVerifiedTree(root, {
     }
     assertIdentity(rootIdentity, stat, expectedFile ? "isFile" : "isDirectory", "restore sync root");
   }
-  await visit(root, rootIdentity ?? stat, ancestorChain);
+  await visit(root, rootIdentity ?? stat, ancestorChain, true);
 }

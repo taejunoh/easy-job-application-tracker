@@ -6,6 +6,10 @@ import {
   parseInventorySummary,
 } from "./quarantine-inventory.mjs";
 import {
+  MAX_PUBLISHED_INVENTORY_BYTES,
+  MAX_PUBLISHED_INVENTORY_RECORDS,
+} from "./quarantine-inventory-limits.mjs";
+import {
   deriveRunPath,
   revalidateRunCapability,
 } from "./quarantine-run-capability.mjs";
@@ -1061,6 +1065,9 @@ function addInventoryRecord(line, observed) {
     throw new Error("restore-active inventory record is not canonical");
   }
   observed.entries += 1;
+  if (observed.entries > MAX_PUBLISHED_INVENTORY_RECORDS) {
+    throw new Error("restore-active inventory exceeded the fixed total record bound");
+  }
   observed.bytes += record.size;
   if (!Number.isSafeInteger(observed.entries) || !Number.isSafeInteger(observed.bytes)) {
     throw new Error("restore-active inventory summary exceeds safe integer bounds");
@@ -1070,6 +1077,9 @@ function addInventoryRecord(line, observed) {
 async function summarizeRestoreInventory(path, fsApi) {
   const before = await fsApi.lstat(path);
   assertPrivateRegularFile(before, "restore-active inventory", (message) => new JournalIntegrityError(message));
+  if (before.size > MAX_PUBLISHED_INVENTORY_BYTES) {
+    throw new JournalIntegrityError("restore-active inventory exceeded the fixed total byte bound");
+  }
   const stream = fsApi.createReadStream(path, { highWaterMark: 64 * 1024 });
   const digest = createHash("sha256");
   const observed = { entries: 0, bytes: 0 };
@@ -1079,6 +1089,9 @@ async function summarizeRestoreInventory(path, fsApi) {
     const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
     digest.update(chunk);
     totalBytes += chunk.length;
+    if (totalBytes > MAX_PUBLISHED_INVENTORY_BYTES) {
+      throw new JournalIntegrityError("restore-active inventory exceeded the fixed total byte bound");
+    }
     let start = 0;
     for (let index = 0; index < chunk.length; index += 1) {
       if (chunk[index] !== 0x0a) continue;

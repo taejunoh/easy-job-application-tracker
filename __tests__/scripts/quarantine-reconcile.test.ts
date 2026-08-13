@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -27,6 +27,17 @@ function reconcile(options: Record<string, unknown>) {
       process.stdout.write(JSON.stringify({ ok: false, code: error.code, message: error.message }));
     }
   `], { encoding: "utf8" }));
+}
+
+function populatePackageTree(root: string, packages = 410): void {
+  mkdirSync(root, { recursive: true });
+  for (let packageIndex = 0; packageIndex < packages; packageIndex += 1) {
+    const packageRoot = join(root, `package-${String(packageIndex).padStart(4, "0")}`);
+    mkdirSync(packageRoot);
+    for (let fileIndex = 0; fileIndex < 10; fileIndex += 1) {
+      writeFileSync(join(packageRoot, `file-${fileIndex}.js`), "module.exports = 1;\n");
+    }
+  }
 }
 
 function convertPreparedRunToV1(prepared: ReturnType<typeof prepareQuarantinedFixture>) {
@@ -107,6 +118,79 @@ function omitLastEntryFromSettledJournal(
 }
 
 describe("read-only quarantine reconciliation", () => {
+  it("reconciles a quarantined generated payload with more than 4,096 inventory records", () => {
+    const fixture = createQuarantineFixture();
+    bases.push(fixture.base);
+    populatePackageTree(join(fixture.repoRoot, "node_modules"));
+    const transactionId = "reconcile-large-generated-payload";
+    const applied = invokeQuarantineWorker("apply", {
+      repoRoot: fixture.repoRoot,
+      quarantineRoot: fixture.quarantineRoot,
+      expectedBranch: fixture.branch,
+      expectedHead: fixture.head,
+      expectedCount: fixture.expectedCount,
+      transactionId,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      writersStopped: true,
+    }, {}, 60_000);
+    expect(applied).toMatchObject({ ok: true, result: { status: "QUARANTINED" } });
+
+    expect(reconcile({
+      repoRoot: fixture.repoRoot,
+      quarantineRoot: fixture.quarantineRoot,
+      transactionId,
+      writersStopped: true,
+    })).toMatchObject({
+      ok: true,
+      result: {
+        schemaVersion: 1,
+        state: "QUARANTINED",
+        complete: false,
+        nextAction: "mark_validated",
+      },
+    });
+
+    mkdirSync(join(fixture.repoRoot, ".next"), { mode: 0o700 });
+    writeFileSync(join(fixture.repoRoot, ".next", "build"), "regenerated\n");
+    populatePackageTree(join(fixture.repoRoot, "node_modules"));
+    expect(invokeQuarantineWorker("mark-validated", {
+      repoRoot: fixture.repoRoot,
+      quarantineRoot: fixture.quarantineRoot,
+      transactionId,
+      writersStopped: true,
+      validatedAt: "2026-08-13T01:00:00.000Z",
+    }, {}, 60_000)).toMatchObject({
+      ok: true,
+      result: { status: "VALIDATED" },
+    });
+    const journal = join(fixture.quarantineRoot, transactionId, "journal.log");
+    const pointer = join(fixture.quarantineRoot, "current");
+    const work = join(fixture.quarantineRoot, transactionId, "inventories/work");
+    const before = {
+      journal: readFileSync(journal),
+      pointer: readFileSync(pointer),
+      work: readdirSync(work),
+    };
+
+    expect(reconcile({
+      repoRoot: fixture.repoRoot,
+      quarantineRoot: fixture.quarantineRoot,
+      transactionId,
+      writersStopped: true,
+    })).toMatchObject({
+      ok: true,
+      result: {
+        schemaVersion: 1,
+        state: "VALIDATED",
+        complete: false,
+        nextAction: "retain_and_review",
+      },
+    });
+    expect(readFileSync(journal)).toEqual(before.journal);
+    expect(readFileSync(pointer)).toEqual(before.pointer);
+    expect(readdirSync(work)).toEqual(before.work);
+  }, 60_000);
+
   it("exports one separate authority and maps a complete QUARANTINED snapshot", () => {
     const prepared = prepareQuarantinedFixture({ regenerate: false });
     bases.push(prepared.fixture.base);

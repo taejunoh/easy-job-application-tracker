@@ -828,6 +828,91 @@ try {
       failure = { message: error.message, code: error?.code };
     }
     result = { summary: result, failure };
+  } else if (request.operation === "total-byte-bound") {
+    const virtualRoot = "/virtual-total-byte-root";
+    const virtualChild = virtualRoot + "/oversized-link";
+    const directoryStat = {
+      dev: 1, ino: 1, mode: 0o40700, size: 0,
+      isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false,
+    };
+    const symlinkStat = {
+      dev: 1, ino: 2, mode: 0o120777, size: 8 * 1024 * 1024,
+      isSymbolicLink: () => true, isDirectory: () => false, isFile: () => false,
+    };
+    const fsApi = {
+      ...baseFsApi,
+      lstat: async (path) => path === virtualRoot
+        ? directoryStat
+        : path === virtualChild
+          ? symlinkStat
+          : fsPromises.lstat(path),
+      opendir: async (path) => {
+        if (path !== virtualRoot) return fsPromises.opendir(path);
+        let yielded = false;
+        return {
+          async close() {},
+          async *[Symbol.asyncIterator]() {
+            if (!yielded) {
+              yielded = true;
+              yield { name: "oversized-link" };
+            }
+          },
+        };
+      },
+      readlink: async (path) => path === virtualChild
+        ? "x".repeat(8 * 1024 * 1024)
+        : fsPromises.readlink(path),
+    };
+    result = await withCapability(async (capability) => {
+      let failure;
+      try {
+        await inventory.writeInventoryJsonl({
+          capability, root: virtualRoot, entryId: "generated-next", phase: "pre",
+          fsApi, metrics: {},
+        });
+      } catch (error) {
+        failure = { message: error.message };
+      }
+      const output = deriveRunPath(capability, {
+        purpose: "inventory", id: "generated-next", phase: "pre",
+      });
+      return {
+        failure,
+        outputExists: await fsPromises.lstat(output).then(() => true, (error) => {
+          if (error?.code === "ENOENT") return false;
+          throw error;
+        }),
+        workNames: await fsPromises.readdir(join(
+          request.quarantineRoot,
+          request.transactionId,
+          "inventories/work",
+        )),
+      };
+    }, fsApi);
+  } else if (request.operation === "published-total-byte-bound") {
+    result = await withCapability(async (capability) => {
+      const output = deriveRunPath(capability, {
+        purpose: "inventory", id: "generated-next", phase: "pre",
+      });
+      const bytes = Buffer.alloc(8 * 1024 * 1024 + 1, 0x20);
+      await fsPromises.writeFile(output, bytes, { mode: 0o600 });
+      await fsPromises.chmod(output, 0o600);
+      let failure;
+      try {
+        await reader.verifyPublishedInventory({
+          capability,
+          entryId: "generated-next",
+          phase: "pre",
+          expectedSummary: { sha256: "0".repeat(64), entries: 0, bytes: 0 },
+        });
+      } catch (error) {
+        failure = { message: error.message, code: error?.code };
+      }
+      return {
+        failure,
+        bytesUnchanged: bytes.equals(await fsPromises.readFile(output)),
+      };
+    });
   } else if (request.operation === "read-only-virtual-bounds") {
     const root = "/virtual-root";
     const depth = request.depth ?? 0;
@@ -974,13 +1059,17 @@ describe("bounded quarantine inventory", () => {
     privateDirectory(quarantineRoot);
     createRun(quarantineRoot, transactionId);
     mkdirSync(leaf, { recursive: true });
-    for (let index = 0; index < 38_975; index += 1) {
-      writeFileSync(join(leaf, `file-${String(index).padStart(5, "0")}.txt`), "x");
-    }
     for (let index = 0; index < 1_025; index += 1) {
       mkdirSync(join(leaf, `directory-${String(index).padStart(4, "0")}`));
     }
-    chmodSync(join(leaf, "file-00000.txt"), 0o640);
+    for (let index = 0; index < 38_975; index += 1) {
+      const directory = `directory-${String(index % 1_025).padStart(4, "0")}`;
+      writeFileSync(
+        join(leaf, directory, `file-${String(index).padStart(5, "0")}.txt`),
+        "x",
+      );
+    }
+    chmodSync(join(leaf, "directory-0000/file-00000.txt"), 0o640);
     symlinkSync("../../../outside-must-not-be-followed", join(leaf, "leaf-link"));
     twoPasses = runWorker({
       operation: "two-passes", repoRoot, quarantineRoot, transactionId, root,
@@ -1022,7 +1111,59 @@ describe("bounded quarantine inventory", () => {
     expect(records.find((record) => record.path.endsWith("leaf-link"))).toMatchObject({
       type: "symlink", linkTarget: "../../../outside-must-not-be-followed",
     });
+    const observed = runWorker({
+      operation: "read-only-summary",
+      repoRoot,
+      quarantineRoot,
+      transactionId,
+      root,
+    }).result as {
+      summary?: { sha256: string; entries: number; bytes: number };
+      failure?: { code?: string; message: string };
+    };
+    expect(observed.failure).toBeUndefined();
+    expect(observed.summary).toEqual(result.first);
   });
+
+  it("reads a realistic package inventory with more than 4,096 records", () => {
+    const largeTransaction = "inventory-large-reader";
+    createRun(quarantineRoot, largeTransaction);
+    const largeRoot = join(repoRoot, "large-reader-packages");
+    privateDirectory(largeRoot);
+    for (let packageIndex = 0; packageIndex < 410; packageIndex += 1) {
+      const packageRoot = join(
+        largeRoot,
+        `package-${String(packageIndex).padStart(4, "0")}`,
+      );
+      privateDirectory(packageRoot);
+      for (let fileIndex = 0; fileIndex < 10; fileIndex += 1) {
+        writeFileSync(join(packageRoot, `file-${fileIndex}.js`), "x");
+      }
+    }
+    const published = runWorker({
+      operation: "one-pass",
+      repoRoot,
+      quarantineRoot,
+      transactionId: largeTransaction,
+      root: largeRoot,
+      entryId: "generated-node-modules",
+      phase: "pre",
+    }).result as { summary: { sha256: string; entries: number; bytes: number } };
+    const observed = runWorker({
+      operation: "read-only-summary",
+      repoRoot,
+      quarantineRoot,
+      transactionId: largeTransaction,
+      root: largeRoot,
+    }).result as {
+      summary?: { sha256: string; entries: number; bytes: number };
+      failure?: { code?: string; message: string };
+    };
+
+    expect(published.summary.entries).toBe(4_510);
+    expect(observed.failure).toBeUndefined();
+    expect(observed.summary).toEqual(published.summary);
+  }, 60_000);
 
   it("publishes distinct generated inventories for restore and validation phases", () => {
     const nextTransaction = "inventory-restore-validation-phases";
@@ -1341,11 +1482,43 @@ describe("bounded quarantine inventory", () => {
   });
 
   it("hashes file bodies through createReadStream and reports handle counts", () => {
-    expect(runWorker({ operation: "hash", root: join(leaf, "file-00001.txt") }).result).toEqual({
+    expect(runWorker({ operation: "hash", root: join(leaf, "directory-0001/file-00001.txt") }).result).toEqual({
       sha256: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
       bytes: 1,
       handles: 0,
       maxHandles: 1,
+    });
+  });
+
+  it("rejects inventory evidence above 8 MiB before publication and cleans work", () => {
+    const transactionId = "inventory-total-byte-bound";
+    createRun(quarantineRoot, transactionId);
+    expect(runWorker({
+      operation: "total-byte-bound",
+      repoRoot,
+      quarantineRoot,
+      transactionId,
+    }).result).toEqual({
+      failure: { message: expect.stringMatching(/total canonical byte bound/u) },
+      outputExists: false,
+      workNames: [],
+    });
+  });
+
+  it("rejects an oversized published inventory without mutating its bytes", () => {
+    const transactionId = "inventory-published-total-byte-bound";
+    createRun(quarantineRoot, transactionId);
+    expect(runWorker({
+      operation: "published-total-byte-bound",
+      repoRoot,
+      quarantineRoot,
+      transactionId,
+    }).result).toEqual({
+      failure: {
+        message: expect.stringMatching(/fixed total byte bound/u),
+        code: "ERR_INVENTORY_STRUCTURAL",
+      },
+      bytesUnchanged: true,
     });
   });
 
@@ -1360,18 +1533,22 @@ describe("bounded quarantine inventory", () => {
     ]);
   });
 
-  it("fails closed at the read-only 4097-record bound without producing inventory output", () => {
+  it("reads 4,097 nested records without producing inventory work files", () => {
     const boundedRoot = join(fixture, "read-only-4097");
     try {
       privateDirectory(boundedRoot);
-      for (let index = 0; index < 4_097; index += 1) writeFileSync(join(boundedRoot, `entry-${index}`), "x");
+      for (let directory = 0; directory < 373; directory += 1) {
+        const parent = join(boundedRoot, `package-${directory}`);
+        privateDirectory(parent);
+        for (let file = 0; file < 10; file += 1) {
+          writeFileSync(join(parent, `entry-${file}`), "x");
+        }
+      }
       const result = runWorker({ operation: "read-only-summary", root: boundedRoot }).result as {
       summary?: unknown; failure?: { message: string; code?: string };
     };
-      expect(result).toEqual({ summary: undefined, failure: {
-        message: expect.stringMatching(/fixed (record|traversal) bounds/i),
-        code: "ERR_INVENTORY_STRUCTURAL",
-      } });
+      expect(result.failure).toBeUndefined();
+      expect(result.summary).toMatchObject({ entries: 4_103, bytes: 3_730 });
       expect(readdirSync(join(quarantineRoot, transactionId, "inventories/work"))).toEqual([]);
     } finally { rmSync(boundedRoot, { recursive: true, force: true }); }
   });

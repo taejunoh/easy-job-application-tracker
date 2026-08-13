@@ -3093,6 +3093,29 @@ describe("capability-bound durable quarantine journal", () => {
     expect(result.outcome.ok).toBe(true);
   });
 
+  it("rejects a restore-active inventory backing above the shared 8 MiB bound", () => {
+    const result = invoke(join(fixture, "restore-backing-total-byte-bound"), {
+      operation: "journal-regression",
+      case: "valid-payload",
+      prefix: quarantinedPrefix,
+      record: {
+        event: "RESTORE_PREPARED",
+        payload: { restoreId, activeGenerated: activeGenerated(restoreInventorySummary) },
+      },
+      inventoryBackings: [{
+        id: "generated-next",
+        base64: Buffer.alloc(8 * 1024 * 1024 + 1, 0x20).toString("base64"),
+      }],
+    });
+    expect(result.outcome).toMatchObject({
+      ok: false,
+      error: {
+        code: "ERR_JOURNAL_INTEGRITY",
+        message: expect.stringMatching(/fixed total byte bound/u),
+      },
+    });
+  });
+
   it.each([
     ["missing", undefined],
     ["digest mismatch", { ...restoreInventorySummary, sha256: "d".repeat(64) }],

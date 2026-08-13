@@ -9,13 +9,19 @@ import {
   revalidateRunCapability,
 } from "./quarantine-run-capability.mjs";
 import { getRunFsContext } from "./quarantine-run-fs-context.mjs";
+import {
+  MAX_INVENTORY_CHUNK_BYTES,
+  MAX_INVENTORY_CHUNK_RECORDS,
+  MAX_PUBLISHED_INVENTORY_BYTES,
+  MAX_PUBLISHED_INVENTORY_RECORDS,
+} from "./quarantine-inventory-limits.mjs";
 
 const MAX_WORK_REFERENCES = 4096;
 const DEFAULT_LIMITS = Object.freeze({
-  sortChunkRecords: 4096,
-  sortChunkBytes: 8 * 1024 * 1024,
+  sortChunkRecords: MAX_INVENTORY_CHUNK_RECORDS,
+  sortChunkBytes: MAX_INVENTORY_CHUNK_BYTES,
   frontierRecords: 1024,
-  frontierBytes: 8 * 1024 * 1024,
+  frontierBytes: MAX_INVENTORY_CHUNK_BYTES,
   mergeFanIn: 32,
   coordinatorReferences: MAX_WORK_REFERENCES,
 });
@@ -1196,6 +1202,7 @@ export async function writeInventoryJsonl(options) {
   let recordBytes = 0;
   let entries = 0;
   let bytes = 0;
+  let canonicalBytes = 0;
   let primaryError;
   let summary;
 
@@ -1217,8 +1224,14 @@ export async function writeInventoryJsonl(options) {
       ? [{ absolutePath: root, relativePath: null, stat: rootStat, scope: "root" }]
       : walkTree({ root, fsApi, limits, metrics, handles, work });
     for await (const item of items) {
+      if (entries >= MAX_PUBLISHED_INVENTORY_RECORDS) {
+        throw new Error("inventory exceeded the fixed total record bound");
+      }
       const result = await inventoryRecord(item, fsApi, handles);
       const serializedBytes = Buffer.byteLength(JSON.stringify(result.record)) + 1;
+      if (canonicalBytes + serializedBytes > MAX_PUBLISHED_INVENTORY_BYTES) {
+        throw new Error("inventory exceeded the fixed total canonical byte bound");
+      }
       if (
         records.length > 0 &&
         (records.length >= limits.sortChunkRecords ||
@@ -1230,6 +1243,7 @@ export async function writeInventoryJsonl(options) {
       recordBytes += serializedBytes;
       entries += 1;
       bytes += result.bytes;
+      canonicalBytes += serializedBytes;
       if (
         records.length >= limits.sortChunkRecords ||
         recordBytes >= limits.sortChunkBytes

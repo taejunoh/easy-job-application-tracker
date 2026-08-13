@@ -1,9 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 
-import { prepareQuarantinedFixture, invokeQuarantineWorker } from "../fixtures/quarantine/quarantine-test-harness";
+import {
+  createQuarantineFixture,
+  prepareQuarantinedFixture,
+  invokeQuarantineWorker,
+} from "../fixtures/quarantine/quarantine-test-harness";
 
 const restoreUrl = pathToFileURL(
   join(__dirname, "../../scripts/quarantine-restore.mjs"),
@@ -32,6 +36,17 @@ function generationEvidence(prepared: ReturnType<typeof prepareQuarantinedFixtur
     pointer: existsSync(pointer) ? readFileSync(pointer).toString("base64") : null,
     manifests: readdirSync(manifests).sort().map((name) => [name, readFileSync(join(manifests, name)).toString("base64")]),
   });
+}
+
+function populatePackageTree(root: string, packages = 410): void {
+  mkdirSync(root, { recursive: true });
+  for (let packageIndex = 0; packageIndex < packages; packageIndex += 1) {
+    const packageRoot = join(root, `package-${String(packageIndex).padStart(4, "0")}`);
+    mkdirSync(packageRoot);
+    for (let fileIndex = 0; fileIndex < 10; fileIndex += 1) {
+      writeFileSync(join(packageRoot, `file-${fileIndex}.js`), "module.exports = 1;\n");
+    }
+  }
 }
 
 const NORMAL_RESTORE_PHASES = [
@@ -84,6 +99,66 @@ const EXPECTED_DURABLE_TIP = (() => {
 })();
 
 describe("quarantine restore", () => {
+  it("restores generated payloads with more than 4,096 inventory records", () => {
+    const fixture = createQuarantineFixture();
+    const transactionId = "restore-large-generated-payload";
+    try {
+      populatePackageTree(join(fixture.repoRoot, "node_modules"));
+      symlinkSync(
+        "package-0409/file-9.js",
+        join(fixture.repoRoot, "node_modules", "original-link"),
+      );
+      const applied = invokeQuarantineWorker("apply", {
+        repoRoot: fixture.repoRoot,
+        quarantineRoot: fixture.quarantineRoot,
+        expectedBranch: fixture.branch,
+        expectedHead: fixture.head,
+        expectedCount: fixture.expectedCount,
+        transactionId,
+        createdAt: "2026-08-13T00:00:00.000Z",
+        writersStopped: true,
+      }, {}, 60_000);
+      expect(applied).toMatchObject({ ok: true, result: { status: "QUARANTINED" } });
+
+      mkdirSync(join(fixture.repoRoot, ".next"), { mode: 0o700 });
+      writeFileSync(join(fixture.repoRoot, ".next", "build"), "regenerated\n");
+      populatePackageTree(join(fixture.repoRoot, "node_modules"));
+      symlinkSync(
+        "package-0000/file-0.js",
+        join(fixture.repoRoot, "node_modules", "regenerated-link"),
+      );
+
+      const result = invokeQuarantineWorker("restore", {
+        repoRoot: fixture.repoRoot,
+        quarantineRoot: fixture.quarantineRoot,
+        transactionId,
+        writersStopped: true,
+      }, {}, 60_000);
+
+      if (!result.ok) throw new Error(JSON.stringify(result));
+      expect(result).toMatchObject({
+        ok: true,
+        result: { status: "RESTORED", restoredEntries: 3 },
+      });
+      expect(existsSync(join(
+        fixture.repoRoot,
+        "node_modules/package-0409/file-9.js",
+      ))).toBe(true);
+      expect(readlinkSync(join(fixture.repoRoot, "node_modules/original-link")))
+        .toBe("package-0409/file-9.js");
+      const restoreId = result.result?.restoreId as string;
+      expect(readlinkSync(join(
+        fixture.quarantineRoot,
+        transactionId,
+        "rollback/regenerated-before-restore",
+        restoreId,
+        "node_modules/regenerated-link",
+      ))).toBe("package-0000/file-0.js");
+    } finally {
+      rmSync(fixture.base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it("exports the restore and recovery entrypoints", () => {
     const exports = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
       const module = await import(${JSON.stringify(restoreUrl)});
@@ -434,7 +509,7 @@ describe("quarantine restore", () => {
     }
   });
 
-  it("bounds global restored-tree fsync traversal before RESTORED_ENTRY", () => {
+  it("fails closed when a restored tree changes after rename with bounded handles", () => {
     const prepared = prepareQuarantinedFixture();
     try {
       const startedAt = Date.now();
@@ -446,8 +521,8 @@ describe("quarantine restore", () => {
         error?: { message?: string };
       };
       expect(result.ok).toBe(false);
-      expect(result.error?.message).toMatch(/sync tree exceeded fixed entry bounds/u);
-      expect(result.phases.at(-1)).toBe("after-payload-to-active-rename:generated-next");
+      expect(result.error?.message).toMatch(/integrity|restore/i);
+      expect(result.phases).toContain("after-restored-payload-sync:generated-next");
       expect(result.phases).not.toContain("after-event:RESTORED_ENTRY:generated-next");
       expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_INTENT");
       expect(result.syncOpened).toBe(result.syncClosed);
