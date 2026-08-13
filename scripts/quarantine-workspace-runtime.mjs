@@ -115,7 +115,6 @@ const PRIVATE_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const ENTRY_ID = /^(?:copy-(?!0000)[0-9]{4}|temp-(?!0000)[0-9]{4}|generated-next|generated-node-modules)$/u;
 const COPY_ID = /^copy-(?!0000)[0-9]{4}$/u;
-const TEMP_ID = /^temp-(?!0000)[0-9]{4}$/u;
 const TEMP_RESIDUE_BASENAME = /^\.BC\.T_[A-Za-z0-9]{6}$/u;
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const SHA256 = /^[0-9a-f]{64}$/u;
