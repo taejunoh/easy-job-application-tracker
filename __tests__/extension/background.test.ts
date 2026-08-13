@@ -43,6 +43,8 @@ describe("extension trusted storage background", () => {
       "connection",
       "serverUrl",
       "accessToken",
+      "installationId",
+      "installationToken",
     ]);
   });
 
@@ -79,6 +81,8 @@ describe("extension trusted storage background", () => {
         "connection",
         "serverUrl",
         "accessToken",
+        "installationId",
+        "installationToken",
       ]);
     }
   );

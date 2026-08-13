@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
 import { RESUME_UPLOAD_FIELD } from "@/lib/resume/constants";
+import { ExtensionInstallations } from "@/components/ExtensionInstallations";
 
 const PROVIDERS = [
   { value: "openai", label: "OpenAI" },
@@ -258,6 +259,7 @@ export default function SettingsPage() {
           </div>
         )}
       </div>
+      <ExtensionInstallations api={api} />
     </div>
   );
 }

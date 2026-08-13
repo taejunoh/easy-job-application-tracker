@@ -20,7 +20,13 @@ let inMemoryConnectionTombstone = null;
 let trustedStorageFailurePromise = null;
 let trustedStoragePurgeSucceeded = false;
 
-const CREDENTIAL_KEYS = ["connection", "serverUrl", "accessToken"];
+const CREDENTIAL_KEYS = [
+  "connection",
+  "serverUrl",
+  "accessToken",
+  "installationId",
+  "installationToken",
+];
 const CONNECTION_TOMBSTONE_KEY = "connectionTombstone";
 
 let trustedStoragePromise;
@@ -182,23 +188,49 @@ function getStoredConnection(result) {
     ? result.connection
     : null;
   if (record) {
+    const installationId = record.installationId ||
+      installationSelector(record.installationToken);
+    const legacy = typeof record.accessToken === "string" ||
+      (!record.invalidated && !installationId);
     return {
       serverUrl: record.serverUrl,
-      accessToken: record.invalidated ? undefined : record.accessToken,
-      invalidated: record.invalidated === true,
+      installationId,
+      installationToken: record.invalidated || legacy
+        ? undefined
+        : record.installationToken,
+      invalidated: record.invalidated === true || legacy,
+      remoteRevocationUnconfirmed:
+        record.remoteRevocationUnconfirmed === true,
       pendingCleanupOrigins: normalizePendingCleanupOrigins(
         record.pendingCleanupOrigins
       ),
-      legacy: false,
+      legacy,
     };
   }
+  const installationId = result?.installationId ||
+    installationSelector(result?.installationToken);
   return {
     serverUrl: result?.serverUrl,
-    accessToken: result?.accessToken,
-    invalidated: false,
+    installationId,
+    installationToken: result?.accessToken
+      ? undefined
+      : result?.installationToken,
+    invalidated: Boolean(result?.accessToken) || !installationId,
+    remoteRevocationUnconfirmed: false,
     pendingCleanupOrigins: [],
-    legacy: true,
+    legacy: Boolean(result?.accessToken) || !installationId,
+    flatInstallation: Boolean(
+      installationId && result?.installationToken && !result?.accessToken
+    ),
   };
+}
+
+function installationSelector(token) {
+  if (typeof token !== "string") return undefined;
+  const match = token.match(
+    /^jt_install_v1\.([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.[A-Za-z0-9_-]{43}$/u
+  );
+  return match?.[1];
 }
 
 function normalizePendingCleanupOrigins(origins) {
@@ -218,8 +250,14 @@ function normalizePendingCleanupOrigins(origins) {
 function connectionRecord(record) {
   const normalized = {
     serverUrl: record.serverUrl,
-    ...(record.invalidated ? {} : { accessToken: record.accessToken }),
+    ...(record.installationId ? { installationId: record.installationId } : {}),
+    ...(record.invalidated ? {} : {
+      installationToken: record.installationToken,
+    }),
     invalidated: record.invalidated === true,
+    ...(record.remoteRevocationUnconfirmed
+      ? { remoteRevocationUnconfirmed: true }
+      : {}),
   };
   const pendingCleanupOrigins = normalizePendingCleanupOrigins(
     record.pendingCleanupOrigins
@@ -235,7 +273,12 @@ async function storeConnectionRecord(record) {
   await chrome.storage.local.set({ connection: normalized });
   currentConnectionRecord = normalized;
   try {
-    await chrome.storage.local.remove(["serverUrl", "accessToken"]);
+    await chrome.storage.local.remove([
+      "serverUrl",
+      "accessToken",
+      "installationId",
+      "installationToken",
+    ]);
     return true;
   } catch {
     return false;
@@ -253,17 +296,20 @@ function restoreConnection(result) {
     serverUrlInput.value = stored.serverUrl;
   }
 
-  if (!stored.invalidated && typeof stored.accessToken === "string" &&
-      stored.accessToken && typeof stored.serverUrl === "string") {
+  if (!stored.invalidated && typeof stored.installationId === "string" &&
+      typeof stored.installationToken === "string" &&
+      stored.installationToken && typeof stored.serverUrl === "string") {
     try {
       const origin = normalizeServerOrigin(stored.serverUrl);
       replaceCurrentConnection({
         serverUrl: origin,
-        accessToken: stored.accessToken,
+        installationId: stored.installationId,
+        installationToken: stored.installationToken,
       });
       currentConnectionRecord = connectionRecord({
         serverUrl: origin,
-        accessToken: stored.accessToken,
+        installationId: stored.installationId,
+        installationToken: stored.installationToken,
         invalidated: false,
         pendingCleanupOrigins: stored.pendingCleanupOrigins,
       });
@@ -276,7 +322,9 @@ function restoreConnection(result) {
   }
 
   setConnectionStatus(
-    "Disconnected — enter an access token to connect.",
+    stored.legacy
+      ? "Legacy credentials were removed — create a pairing code in Settings to re-pair."
+      : "Disconnected — enter a pairing code to connect.",
     "info"
   );
 }
@@ -332,7 +380,8 @@ function memoryRecord(fallbackOrigin = "") {
   if (currentConnection) {
     return connectionRecord({
       serverUrl: currentConnection.serverUrl,
-      accessToken: currentConnection.accessToken,
+      installationId: currentConnection.installationId,
+      installationToken: currentConnection.installationToken,
       invalidated: false,
       pendingCleanupOrigins: currentConnectionRecord?.pendingCleanupOrigins,
     });
@@ -416,17 +465,29 @@ async function readSessionTombstone() {
   }
 }
 
-async function persistInvalidatedRecord(origin, pendingCleanupOrigins = []) {
+async function persistInvalidatedRecord(
+  origin,
+  pendingCleanupOrigins = [],
+  metadata = {}
+) {
   const record = connectionRecord({
     serverUrl: origin,
+    installationId: metadata.installationId,
     invalidated: true,
+    remoteRevocationUnconfirmed:
+      metadata.remoteRevocationUnconfirmed === true,
     pendingCleanupOrigins,
   });
   try {
     const legacyClean = await storeConnectionRecord(record);
     if (legacyClean) return { record, storageClean: true, retried: false };
     try {
-      await chrome.storage.local.remove(["serverUrl", "accessToken"]);
+      await chrome.storage.local.remove([
+        "serverUrl",
+        "accessToken",
+        "installationId",
+        "installationToken",
+      ]);
       return { record, storageClean: true, retried: true };
     } catch {
       return { record, storageClean: false, retried: true };
@@ -439,7 +500,7 @@ async function persistInvalidatedRecord(origin, pendingCleanupOrigins = []) {
 }
 
 async function connectServer() {
-  const token = accessTokenInput.value;
+  const pairingCode = accessTokenInput.value;
   let origin;
 
   try {
@@ -451,8 +512,8 @@ async function connectServer() {
     return;
   }
 
-  if (!token) {
-    setConnectionStatus("Enter an access token to connect.", "error");
+  if (!pairingCode) {
+    setConnectionStatus("Enter a pairing code to connect.", "error");
     accessTokenInput.focus();
     return;
   }
@@ -492,20 +553,31 @@ async function connectServer() {
 
         phase = "storage-access";
         await requireTrustedStorage();
-        phase = "verify";
-        setConnectionStatus("Verifying access token...", "info", true);
-        const response = await fetch(`${origin}/api/auth/verify`, {
+        phase = "pair";
+        setConnectionStatus("Exchanging one-time pairing code...", "info", true);
+        const response = await fetch(`${origin}/api/extension/pair`, {
           method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code: pairingCode }),
         });
         if (response.status === 401) {
-          throw new Error("The access token was not accepted.");
+          throw new Error("The pairing code was not accepted.");
         }
         if (response.status === 403) {
           throw new Error("This extension is not allowed by the server.");
         }
         if (!response.ok) {
-          throw new Error(`The server could not verify this connection (${response.status}).`);
+          throw new Error(`The server could not pair this installation (${response.status}).`);
+        }
+        const issued = await response.json();
+        if (
+          typeof issued?.installationId !== "string" ||
+          typeof issued?.token !== "string" ||
+          !/^jt_install_v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/u.test(
+            issued.token
+          )
+        ) {
+          throw new Error("The server returned an invalid installation credential.");
         }
         phase = "permission-confirm";
         let permissionStillGranted = false;
@@ -545,7 +617,8 @@ async function connectServer() {
         ]);
         const pendingBeforeCleanup = connectionRecord({
           serverUrl: origin,
-          accessToken: token,
+          installationId: issued.installationId,
+          installationToken: issued.token,
           invalidated: false,
           pendingCleanupOrigins: pendingOrigins,
         });
@@ -555,7 +628,11 @@ async function connectServer() {
           throw new Error("Disconnect state could not be cleared safely.");
         }
         pendingStoredCredential = null;
-        replaceCurrentConnection({ serverUrl: origin, accessToken: token });
+        replaceCurrentConnection({
+          serverUrl: origin,
+          installationId: issued.installationId,
+          installationToken: issued.token,
+        });
         committed = true;
         const committedConnection = { ...currentConnection };
         clearApplicationTarget();
@@ -610,9 +687,10 @@ async function connectServer() {
             "Could not save the connection. The previous connection is unchanged.",
             "error"
           );
-        } else if (error?.message?.startsWith("The access token") ||
+        } else if (error?.message?.startsWith("The pairing code") ||
                    error?.message?.includes("not allowed") ||
-                   error?.message?.startsWith("The server could not verify")) {
+                   error?.message?.startsWith("The server could not pair") ||
+                   error?.message?.startsWith("The server returned")) {
           setConnectionStatus(error.message, "error");
         } else {
           setConnectionStatus(
@@ -653,6 +731,26 @@ async function disconnectServer() {
       }
     }
 
+    let remoteRevocationConfirmed = true;
+    if (connection?.installationToken && connection?.installationId && origin) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5_000);
+      try {
+        const response = await fetch(`${origin}/api/extension/revoke`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${connection.installationToken}`,
+          },
+          signal: controller.signal,
+        });
+        remoteRevocationConfirmed = response.ok || response.status === 401;
+      } catch {
+        remoteRevocationConfirmed = false;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
     pendingStoredCredential = null;
     replaceCurrentConnection(null);
     clearApplicationTarget();
@@ -668,7 +766,14 @@ async function disconnectServer() {
         ...normalizePendingCleanupOrigins(currentConnectionRecord?.pendingCleanupOrigins),
         origin,
       ];
-      const persistence = await persistInvalidatedRecord(origin, pendingOrigins);
+      const persistence = await persistInvalidatedRecord(
+        origin,
+        pendingOrigins,
+        {
+          installationId: connection?.installationId,
+          remoteRevocationUnconfirmed: !remoteRevocationConfirmed,
+        }
+      );
       storageClean = persistence.storageClean;
       storageRetried = persistence.retried;
       if (storageClean) {
@@ -690,9 +795,12 @@ async function disconnectServer() {
       !permissionClean ? "Host access could not be removed." : "",
       !cleanupRecordClean ? "Host cleanup state could not be saved." : "",
       storageRetried && !storageClean ? "Credential purge also failed." : "",
+      !remoteRevocationConfirmed
+        ? "Remote revocation is unconfirmed; revoke it in web Settings."
+        : "",
     ].filter(Boolean).join(" ");
     setConnectionStatus(
-      warnings || "Disconnected. Enter an access token to reconnect.",
+      warnings || "Disconnected. Enter a pairing code to reconnect.",
       warnings ? "error" : "info"
     );
   });
@@ -702,7 +810,8 @@ function sameConnection(left, right) {
   return Boolean(left && right &&
     left.generation === right.generation &&
     left.serverUrl === right.serverUrl &&
-    left.accessToken === right.accessToken);
+    left.installationId === right.installationId &&
+    left.installationToken === right.installationToken);
 }
 
 async function invalidateUnauthorizedConnection(connection) {
@@ -720,7 +829,8 @@ async function invalidateUnauthorizedConnection(connection) {
 
     const persistence = await persistInvalidatedRecord(
       connection.serverUrl,
-      [...existingPending, connection.serverUrl]
+      [...existingPending, connection.serverUrl],
+      { installationId: connection.installationId }
     );
     let permissionClean;
     let cleanupRecordClean = true;
@@ -763,7 +873,7 @@ async function authenticatedRequest(path, init = {}) {
 
   const connection = { ...currentConnection };
   const headers = new Headers(init.headers || {});
-  headers.set("Authorization", `Bearer ${connection.accessToken}`);
+  headers.set("Authorization", `Bearer ${connection.installationToken}`);
   const response = await fetch(`${connection.serverUrl}${path}`, {
     ...init,
     headers,
@@ -1127,7 +1237,7 @@ async function fillProfiles() {
   const fillBtn = document.getElementById("fillProfilesBtn");
 
   try {
-    const res = await apiFetch("/api/settings");
+    const res = await apiFetch("/api/extension/profile");
     if (!res.ok) return;
     const settings = await res.json();
 
@@ -1257,9 +1367,29 @@ async function initializePopup() {
         else cleanupWarning = " Host access cleanup remains pending.";
       }
 
-      if (stored.invalidated || !stored.accessToken || !stored.serverUrl) {
+      if (stored.legacy) {
+        const legacyOrigin = typeof stored.serverUrl === "string"
+          ? stored.serverUrl
+          : "";
+        const persistence = legacyOrigin
+          ? await persistInvalidatedRecord(legacyOrigin)
+          : { storageClean: await purgeKnownCredentials() };
+        if (legacyOrigin) {
+          await removePermission(permissionPattern(legacyOrigin));
+        }
         setConnectionStatus(
-          `Disconnected — enter an access token to connect.${cleanupWarning}`,
+          persistence.storageClean
+            ? "Legacy credentials were removed. Create a pairing code in web Settings to re-pair."
+            : "Legacy credentials are disabled but could not be removed. Re-pair after clearing extension storage.",
+          persistence.storageClean ? "info" : "error"
+        );
+        return null;
+      }
+
+      if (stored.invalidated || !stored.installationId ||
+          !stored.installationToken || !stored.serverUrl) {
+        setConnectionStatus(
+          `Disconnected — enter a pairing code to connect.${cleanupWarning}`,
           cleanupWarning ? "error" : "info"
         );
         return null;
@@ -1274,16 +1404,19 @@ async function initializePopup() {
       }
       pendingStoredCredential = {
         serverUrl: origin,
-        accessToken: stored.accessToken,
+        installationId: stored.installationId,
+        flatInstallation: stored.flatInstallation === true,
+        installationToken: stored.installationToken,
         generation: verificationGeneration,
       };
       setConnectionStatus("Verifying stored connection...", "info");
       return {
         cleanupWarning,
+        flatInstallation: stored.flatInstallation === true,
         generation: verificationGeneration,
-        legacy: stored.legacy,
+        installationId: stored.installationId,
         origin,
-        token: stored.accessToken,
+        token: stored.installationToken,
       };
     });
     if (!startup) return;
@@ -1333,29 +1466,24 @@ async function initializePopup() {
     if (response.ok) {
       await mutateCredentials(async () => {
         if (!isCurrentGeneration(startup.generation)) return;
-        let legacyWarning = "";
-        if (startup.legacy) {
-          const legacyClean = await storeConnectionRecord({
+        if (startup.flatInstallation) {
+          await storeConnectionRecord({
             serverUrl: startup.origin,
-            accessToken: startup.token,
+            installationId: startup.installationId,
+            installationToken: startup.token,
             invalidated: false,
-            pendingCleanupOrigins: currentConnectionRecord?.pendingCleanupOrigins,
+            pendingCleanupOrigins:
+              currentConnectionRecord?.pendingCleanupOrigins,
           });
-          if (!legacyClean) {
-            try {
-              await chrome.storage.local.remove(["serverUrl", "accessToken"]);
-            } catch {
-              legacyWarning = " Legacy credential cleanup failed.";
-            }
-          }
         }
         pendingStoredCredential = null;
         replaceCurrentConnection({
           serverUrl: startup.origin,
-          accessToken: startup.token,
+          installationId: startup.installationId,
+          installationToken: startup.token,
         });
         serverUrlInput.value = startup.origin;
-        const warning = `${startup.cleanupWarning}${legacyWarning}`;
+        const warning = startup.cleanupWarning;
         setConnectionStatus(
           `Connected to ${startup.origin}.${warning}`,
           warning ? "info" : "success"
@@ -1401,7 +1529,7 @@ async function initializePopup() {
           !cleanupRecordClean ? "Host cleanup state could not be saved." : "",
         ].filter(Boolean).join(" ");
         setConnectionStatus(
-          warning || "Connection expired. Enter the access token to reconnect.",
+          warning || "Connection expired. Create a new pairing code to reconnect.",
           "error"
         );
       });

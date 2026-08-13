@@ -222,7 +222,9 @@ describe("extension installation API", () => {
       new Request(`${APP_ORIGIN}/api/extension/installations`, { headers }),
     );
     expect(listed.status).toBe(200);
-    expect(JSON.stringify(await listed.json())).not.toContain(INSTALLATION.digest);
+    const listBody = await listed.json();
+    expect(listBody.configuredOrigins).toEqual([EXTENSION_ORIGIN]);
+    expect(JSON.stringify(listBody)).not.toContain(INSTALLATION.digest);
 
     const revoked = await installationRoute.DELETE(
       new Request(

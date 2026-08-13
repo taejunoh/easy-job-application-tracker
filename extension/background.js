@@ -1,4 +1,10 @@
-const credentialKeys = ["connection", "serverUrl", "accessToken"];
+const credentialKeys = [
+  "connection",
+  "serverUrl",
+  "accessToken",
+  "installationId",
+  "installationToken",
+];
 
 function purgeCredentials() {
   try {

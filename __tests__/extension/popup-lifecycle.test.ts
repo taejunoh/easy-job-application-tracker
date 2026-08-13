@@ -7,8 +7,12 @@ const popupScript = readFileSync(
   "utf8"
 );
 
-const TOKEN_A = "obvious-test-token-a";
-const TOKEN_B = "obvious-test-token-b";
+const TOKEN_A =
+  "jt_install_v1.018f9f72-f2e9-7c29-a6fc-001122334491." + "A".repeat(43);
+const TOKEN_B =
+  "jt_install_v1.018f9f72-f2e9-7c29-a6fc-001122334492." + "B".repeat(43);
+const PAIRING_CODE_B =
+  "jt_pair_v1.018f9f72-f2e9-7c29-a6fc-001122334488." + "C".repeat(43);
 
 interface MockElement {
   value: string;
@@ -42,6 +46,18 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, reject, resolve };
+}
+
+function successfulPairResponse(): Response {
+  return {
+    ok: true,
+    status: 201,
+    json: async () => ({
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      token: TOKEN_B,
+      expiresAt: "2026-11-11T12:00:00.000Z",
+    }),
+  } as Response;
 }
 
 function createElement(value = ""): MockElement {
@@ -145,7 +161,15 @@ function loadLifecyclePopup(options: {
       return removed;
     }),
   };
-  const fetchMock = jest.fn();
+  const fetchMock = jest.fn().mockResolvedValue({
+    ok: true,
+    status: 201,
+    json: async () => ({
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      token: TOKEN_B,
+      expiresAt: "2026-11-11T12:00:00.000Z",
+    }),
+  });
   const query = jest.fn().mockResolvedValue([]);
   const chrome = {
     permissions,
@@ -167,6 +191,9 @@ function loadLifecyclePopup(options: {
     fetch: fetchMock,
     Headers,
     module: commonJsModule,
+    AbortController,
+    clearTimeout,
+    setTimeout,
     URL,
   });
 
@@ -180,15 +207,20 @@ function loadLifecyclePopup(options: {
     await Promise.resolve();
   }
   function establish(serverUrl: string, accessToken: string) {
-    storageState.connection = { serverUrl, accessToken, invalidated: false };
+    storageState.connection = {
+      serverUrl,
+      installationId: accessToken.split(".")[1],
+      installationToken: accessToken,
+      invalidated: false,
+    };
     api.restoreConnection({
       connection: storageState.connection,
       serverUrl,
-      accessToken,
+      installationToken: accessToken,
     });
     grantedOrigins.add(permissionFor(serverUrl));
   }
-  function enterPair(serverUrl: string, token = TOKEN_B) {
+  function enterPair(serverUrl: string, token = PAIRING_CODE_B) {
     getElement("serverUrl").value = serverUrl;
     getElement("accessToken").value = token;
   }
@@ -218,6 +250,114 @@ function permissionFor(origin: string) {
 }
 
 describe("trusted extension storage", () => {
+  it("purges a legacy root-token record and requires re-pairing", async () => {
+    const storageState = {
+      connection: {
+        serverUrl: "https://jobs.example.com",
+        accessToken: TOKEN_A,
+        invalidated: false,
+      },
+    };
+    const harness = loadLifecyclePopup({ storageState });
+    harness.grantedOrigins.add(permissionFor("https://jobs.example.com"));
+
+    await harness.ready();
+
+    expect(harness.fetchMock).not.toHaveBeenCalled();
+    expect(storageState.connection).toEqual({
+      serverUrl: "https://jobs.example.com",
+      invalidated: true,
+    });
+    expect(harness.getElement("connectionStatus").textContent).toMatch(/pair/i);
+  });
+
+  it("exchanges a one-time code and persists only the installation credential", async () => {
+    const harness = loadLifecyclePopup();
+    await harness.ready();
+    harness.enterPair("https://jobs.example.com", "jt_pair_v1.selector.secret");
+    harness.fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334499",
+        token: TOKEN_B,
+        expiresAt: "2026-11-11T12:00:00.000Z",
+      }),
+    });
+
+    await harness.api.connectServer();
+
+    expect(harness.fetchMock).toHaveBeenCalledWith(
+      "https://jobs.example.com/api/extension/pair",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ code: "jt_pair_v1.selector.secret" }),
+      }),
+    );
+    expect(harness.storageState.connection).toEqual({
+      serverUrl: "https://jobs.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334499",
+      installationToken: TOKEN_B,
+      invalidated: false,
+    });
+    expect(JSON.stringify(harness.storageState)).not.toContain(
+      "jt_pair_v1.selector.secret",
+    );
+  });
+
+  it("revokes remotely before purging the local token and host permission", async () => {
+    const harness = loadLifecyclePopup();
+    await harness.ready();
+    harness.storageState.connection = {
+      serverUrl: "https://jobs.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334499",
+      installationToken: TOKEN_B,
+      invalidated: false,
+    };
+    harness.api.restoreConnection({ connection: harness.storageState.connection });
+    harness.grantedOrigins.add(permissionFor("https://jobs.example.com"));
+    harness.fetchMock.mockResolvedValueOnce(successfulPairResponse());
+
+    await harness.api.disconnectServer();
+
+    expect(harness.fetchMock).toHaveBeenCalledWith(
+      "https://jobs.example.com/api/extension/revoke",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(harness.fetchMock.mock.invocationCallOrder[0]).toBeLessThan(
+      harness.permissions.remove.mock.invocationCallOrder[0],
+    );
+    expect(JSON.stringify(harness.storageState)).not.toContain(
+      TOKEN_B,
+    );
+  });
+
+  it("marks an offline revocation unconfirmed without retaining a secret", async () => {
+    const harness = loadLifecyclePopup();
+    await harness.ready();
+    harness.storageState.connection = {
+      serverUrl: "https://jobs.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334499",
+      installationToken: TOKEN_B,
+      invalidated: false,
+    };
+    harness.api.restoreConnection({ connection: harness.storageState.connection });
+    harness.grantedOrigins.add(permissionFor("https://jobs.example.com"));
+    harness.fetchMock.mockRejectedValueOnce(new Error("offline"));
+
+    await harness.api.disconnectServer();
+
+    expect(harness.storageState.connection).toEqual({
+      serverUrl: "https://jobs.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334499",
+      invalidated: true,
+      remoteRevocationUnconfirmed: true,
+    });
+    expect(JSON.stringify(harness.storageState)).not.toContain(
+      TOKEN_B,
+    );
+  });
+
   it("awaits trusted-context access before reading stored credentials", async () => {
     const { accessGate, ready, storage } = loadLifecyclePopup({
       accessLevel: "defer",
@@ -242,7 +382,8 @@ describe("trusted extension storage", () => {
       storageState: {
         connection: {
           serverUrl: "https://jobs.example.com",
-          accessToken: TOKEN_A,
+          installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+          installationToken: TOKEN_A,
           invalidated: false,
         },
       },
@@ -255,6 +396,8 @@ describe("trusted extension storage", () => {
       "connection",
       "serverUrl",
       "accessToken",
+      "installationId",
+      "installationToken",
     ]);
     expect(getElement("connectionStatus").textContent).toMatch(/storage|chrome 102/i);
     await expect(api.apiFetch("/api/settings")).rejects.toThrow(/storage|connect/i);
@@ -266,7 +409,8 @@ describe("trusted extension storage", () => {
       storageState: {
         connection: {
           serverUrl: "https://jobs.example.com",
-          accessToken: TOKEN_A,
+          installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+          installationToken: TOKEN_A,
           invalidated: false,
         },
       },
@@ -300,7 +444,8 @@ describe("trusted extension storage", () => {
     const state = {
       connection: {
         serverUrl: "https://jobs.example.com",
-        accessToken: TOKEN_A,
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+        installationToken: TOKEN_A,
         invalidated: false,
       },
     };
@@ -319,7 +464,8 @@ describe("trusted extension storage", () => {
     const state = {
       connection: {
         serverUrl: "https://jobs.example.com",
-        accessToken: TOKEN_A,
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+        installationToken: TOKEN_A,
         invalidated: false,
       },
     };
@@ -341,7 +487,8 @@ describe("trusted extension storage", () => {
     const state = {
       connection: {
         serverUrl: "https://jobs.example.com",
-        accessToken: TOKEN_A,
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+        installationToken: TOKEN_A,
         invalidated: false,
       },
     };
@@ -365,7 +512,8 @@ describe("connection generations", () => {
     const state = {
       connection: {
         serverUrl: "https://a.example.com",
-        accessToken: TOKEN_A,
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+        installationToken: TOKEN_A,
         invalidated: false,
       },
     };
@@ -374,7 +522,7 @@ describe("connection generations", () => {
       storageState: state,
     });
     harness.grantedOrigins.add(permissionFor("https://a.example.com"));
-    harness.fetchMock.mockResolvedValue({ ok: true, status: 200 });
+    harness.fetchMock.mockResolvedValue(successfulPairResponse());
     for (let index = 0; index < 20 && !harness.storage.get.mock.calls.length; index += 1) {
       await Promise.resolve();
     }
@@ -387,7 +535,8 @@ describe("connection generations", () => {
 
     expect(state.connection).toEqual({
       serverUrl: "https://b.example.com",
-      accessToken: TOKEN_B,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      installationToken: TOKEN_B,
       invalidated: false,
     });
     expect(harness.getElement("connectionStatus").textContent).toContain(
@@ -404,7 +553,8 @@ describe("connection generations", () => {
     const state = {
       connection: {
         serverUrl: "https://a.example.com",
-        accessToken: TOKEN_A,
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+        installationToken: TOKEN_A,
         invalidated: false,
       },
     };
@@ -413,7 +563,7 @@ describe("connection generations", () => {
     const startupResponse = deferred<Response>();
     harness.fetchMock
       .mockReturnValueOnce(startupResponse.promise)
-      .mockResolvedValueOnce({ ok: true, status: 200 });
+      .mockResolvedValueOnce(successfulPairResponse());
     for (let index = 0; index < 50 && !harness.fetchMock.mock.calls.length; index += 1) {
       await Promise.resolve();
     }
@@ -426,7 +576,8 @@ describe("connection generations", () => {
 
     expect(state.connection).toEqual({
       serverUrl: "https://b.example.com",
-      accessToken: TOKEN_B,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      installationToken: TOKEN_B,
       invalidated: false,
     });
   });
@@ -438,7 +589,7 @@ describe("connection generations", () => {
     const responseA = deferred<Response>();
     harness.fetchMock
       .mockReturnValueOnce(responseA.promise)
-      .mockResolvedValueOnce({ ok: true, status: 200 });
+      .mockResolvedValueOnce(successfulPairResponse());
 
     const requestA = harness.api.apiFetch("/api/settings");
     harness.enterPair("https://b.example.com");
@@ -448,7 +599,8 @@ describe("connection generations", () => {
     await expect(requestA).rejects.toThrow(/reconnect|expired/i);
     expect(harness.storageState.connection).toEqual({
       serverUrl: "https://b.example.com",
-      accessToken: TOKEN_B,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      installationToken: TOKEN_B,
       invalidated: false,
     });
     expect(harness.permissions.remove).toHaveBeenCalledTimes(1);
@@ -456,7 +608,7 @@ describe("connection generations", () => {
       origins: [permissionFor("https://a.example.com")],
     });
 
-    harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    harness.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     await harness.api.apiFetch("/api/settings");
     const lastInit = harness.fetchMock.mock.calls[2][1] as RequestInit;
     expect(new Headers(lastInit.headers).get("Authorization")).toBe(
@@ -479,13 +631,14 @@ describe("connection generations", () => {
     const reconnect = harness.api.connectServer();
     oldResponse.resolve({ ok: false, status: 401 } as Response);
     await Promise.resolve();
-    pairResponse.resolve({ ok: true, status: 200 } as Response);
+    pairResponse.resolve(successfulPairResponse());
 
     await reconnect;
     await expect(oldRequest).rejects.toThrow(/reconnect|expired/i);
     expect(harness.storageState.connection).toEqual({
       serverUrl: "https://a.example.com",
-      accessToken: TOKEN_B,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      installationToken: TOKEN_B,
       invalidated: false,
     });
     expect(harness.grantedOrigins).toContain(permissionFor("https://a.example.com"));
@@ -502,7 +655,7 @@ describe("connection generations", () => {
       if (removed) origins.forEach((origin: string) => harness.grantedOrigins.delete(origin));
       return removed;
     });
-    harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    harness.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     harness.enterPair("https://b.example.com");
 
     const reconnect = harness.api.connectServer();
@@ -533,7 +686,7 @@ describe("connection generations", () => {
     harness.permissions.contains
       .mockResolvedValueOnce(false)
       .mockResolvedValueOnce(false);
-    harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    harness.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     harness.enterPair("https://b.example.com");
 
     await harness.api.connectServer();
@@ -571,6 +724,7 @@ describe("connection generations", () => {
     expect(harness.permissions.remove).toHaveBeenCalledTimes(1);
     expect(harness.storageState.connection).toEqual({
       serverUrl: "https://a.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
       invalidated: true,
     });
   });
@@ -585,7 +739,7 @@ describe("connection generations", () => {
     const responseA = deferred<Response>();
     harness.fetchMock
       .mockReturnValueOnce(responseA.promise)
-      .mockResolvedValueOnce({ ok: true, status: 200 });
+      .mockResolvedValueOnce(successfulPairResponse());
 
     const save = eventHandler(harness.getElement("saveBtn"), "click")();
     harness.enterPair("https://b.example.com");
@@ -639,7 +793,7 @@ describe("connection generations", () => {
     const analysisResponse = deferred<Response>();
     harness.fetchMock
       .mockReturnValueOnce(analysisResponse.promise)
-      .mockResolvedValueOnce({ ok: true, status: 200 });
+      .mockResolvedValueOnce(successfulPairResponse());
 
     const analysis = harness.api.runKeywordAnalysis();
     expect(harness.getElement("analyzeBtn").textContent).toBe("Analyzing...");
@@ -698,7 +852,7 @@ describe("connection generations", () => {
           json: () => jsonResponse.promise,
         });
       }
-      harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+      harness.fetchMock.mockResolvedValueOnce(successfulPairResponse());
 
       const analysis = harness.api.runKeywordAnalysis();
       harness.enterPair("https://b.example.com");
@@ -731,17 +885,18 @@ describe("connection teardown", () => {
     await first.ready();
     storageState.connection = {
       serverUrl: "https://a.example.com",
-      accessToken: TOKEN_A,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+      installationToken: TOKEN_A,
       invalidated: false,
       pendingCleanupOrigins: ["https://a.example.com"],
     };
     first.api.restoreConnection({ connection: storageState.connection });
-    first.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    first.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     first.enterPair("https://a.example.com", TOKEN_B);
     await first.api.connectServer();
 
     const reopened = loadLifecyclePopup({ grantedOrigins, storageState });
-    reopened.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    reopened.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     await reopened.ready();
 
     expect(grantedOrigins).toContain(permissionFor("https://a.example.com"));
@@ -751,7 +906,8 @@ describe("connection teardown", () => {
     );
     expect(storageState.connection).toEqual({
       serverUrl: "https://a.example.com",
-      accessToken: TOKEN_B,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      installationToken: TOKEN_B,
       invalidated: false,
     });
     expect(reopened.getElement("connectionStatus").textContent).toMatch(/connected/i);
@@ -848,7 +1004,7 @@ describe("connection teardown", () => {
       storageState,
     });
     await first.ready();
-    first.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    first.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     first.enterPair("https://b.example.com", TOKEN_B);
 
     await first.api.connectServer();
@@ -856,21 +1012,23 @@ describe("connection teardown", () => {
     expect(sessionState.connectionTombstone).toBeUndefined();
     expect(storageState.connection).toEqual({
       serverUrl: "https://b.example.com",
-      accessToken: TOKEN_B,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      installationToken: TOKEN_B,
       invalidated: false,
       pendingCleanupOrigins: ["https://a.example.com"],
     });
     expect(grantedOrigins).toContain(permissionFor("https://a.example.com"));
 
     const reopened = loadLifecyclePopup({ grantedOrigins, storageState });
-    reopened.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    reopened.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     await reopened.ready();
 
     expect(grantedOrigins).not.toContain(permissionFor("https://a.example.com"));
     expect(grantedOrigins).toContain(permissionFor("https://b.example.com"));
     expect(storageState.connection).toEqual({
       serverUrl: "https://b.example.com",
-      accessToken: TOKEN_B,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      installationToken: TOKEN_B,
       invalidated: false,
     });
   });
@@ -886,6 +1044,7 @@ describe("connection teardown", () => {
 
     expect(harness.storageState.connection).toEqual({
       serverUrl: "https://a.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
       invalidated: true,
     });
     expect(harness.getElement("serverUrl").value).toBe("https://a.example.com");
@@ -989,6 +1148,7 @@ describe("connection teardown", () => {
 
     expect(storageState.connection).toEqual({
       serverUrl: "https://a.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
       invalidated: true,
       pendingCleanupOrigins: ["https://a.example.com"],
     });
@@ -1021,26 +1181,28 @@ describe("connection teardown", () => {
     });
     await first.ready();
     first.establish("https://a.example.com", TOKEN_A);
-    first.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    first.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     first.enterPair("https://b.example.com");
 
     await first.api.connectServer();
 
     expect(storageState.connection).toEqual({
       serverUrl: "https://b.example.com",
-      accessToken: TOKEN_B,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      installationToken: TOKEN_B,
       invalidated: false,
       pendingCleanupOrigins: ["https://a.example.com"],
     });
 
     const reopened = loadLifecyclePopup({ grantedOrigins, storageState });
-    reopened.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    reopened.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     await reopened.ready();
 
     expect(grantedOrigins).not.toContain(permissionFor("https://a.example.com"));
     expect(storageState.connection).toEqual({
       serverUrl: "https://b.example.com",
-      accessToken: TOKEN_B,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      installationToken: TOKEN_B,
       invalidated: false,
     });
   });
@@ -1090,6 +1252,7 @@ describe("connection teardown", () => {
 
     expect(storageState.connection).toEqual({
       serverUrl: "https://a.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
       invalidated: true,
       pendingCleanupOrigins: ["https://a.example.com"],
     });
@@ -1099,6 +1262,7 @@ describe("connection teardown", () => {
     expect(grantedOrigins).not.toContain(permissionFor("https://a.example.com"));
     expect(storageState.connection).toEqual({
       serverUrl: "https://a.example.com",
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
       invalidated: true,
     });
   });
@@ -1106,19 +1270,21 @@ describe("connection teardown", () => {
   it("handles a false legacy cleanup result during successful startup migration", async () => {
     const storageState: Record<string, unknown> = {
       serverUrl: "https://a.example.com",
-      accessToken: TOKEN_A,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+      installationToken: TOKEN_A,
     };
     const grantedOrigins = new Set([permissionFor("https://a.example.com")]);
     const harness = loadLifecyclePopup({ grantedOrigins, storageState });
     harness.storage.remove.mockRejectedValueOnce(new Error("legacy cleanup failed"));
-    harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    harness.fetchMock.mockResolvedValueOnce(successfulPairResponse());
 
     await harness.ready();
 
     expect(storageState.accessToken).toBeUndefined();
     expect(storageState.connection).toEqual({
       serverUrl: "https://a.example.com",
-      accessToken: TOKEN_A,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+      installationToken: TOKEN_A,
       invalidated: false,
     });
     expect(harness.getElement("connectionStatus").textContent).toMatch(/connected/i);
@@ -1136,7 +1302,7 @@ describe("connection teardown", () => {
     expect(sessionState.connectionTombstone).toBeDefined();
 
     harness.session.remove.mockRejectedValueOnce(new Error("session unavailable"));
-    harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    harness.fetchMock.mockResolvedValueOnce(successfulPairResponse());
     harness.enterPair("https://a.example.com", TOKEN_B);
     await harness.api.connectServer();
 
@@ -1173,9 +1339,19 @@ describe("connection teardown", () => {
     harness.getElement("company").value = "Example";
     harness.getElement("jobUrl").value = "https://jobs.example.test/1";
     const response = deferred<Response>();
-    harness.fetchMock.mockReturnValueOnce(response.promise);
+    harness.fetchMock
+      .mockReturnValueOnce(response.promise)
+      .mockResolvedValueOnce({ ok: true, status: 200 });
 
     const save = eventHandler(harness.getElement("saveBtn"), "click")();
+    for (
+      let index = 0;
+      index < 20 && harness.fetchMock.mock.calls.length === 0;
+      index += 1
+    ) {
+      await Promise.resolve();
+    }
+    expect(harness.fetchMock).toHaveBeenCalledTimes(1);
     await harness.api.disconnectServer();
     response.resolve({
       ok: true,
@@ -1205,6 +1381,7 @@ describe("connection teardown", () => {
       expect(harness.getElement("openTracker").dataset.appUrl).toBeUndefined();
       expect(harness.storageState.connection).toEqual({
         serverUrl: "https://a.example.com",
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
         invalidated: true,
         pendingCleanupOrigins: ["https://a.example.com"],
       });
@@ -1235,14 +1412,15 @@ describe("connection teardown", () => {
       harness.establish("https://a.example.com", TOKEN_A);
       harness.getElement("openTracker").dataset.appUrl =
         "https://a.example.com/applications/17";
-      harness.fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+      harness.fetchMock.mockResolvedValueOnce(successfulPairResponse());
       harness.enterPair("https://b.example.com");
 
       await harness.api.connectServer();
 
       expect(harness.storageState.connection).toEqual({
         serverUrl: "https://b.example.com",
-        accessToken: TOKEN_B,
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+        installationToken: TOKEN_B,
         invalidated: false,
         pendingCleanupOrigins: ["https://a.example.com"],
       });

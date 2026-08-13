@@ -14,7 +14,12 @@ const manifest = JSON.parse(
   readFileSync(join(process.cwd(), "extension/manifest.json"), "utf8")
 ) as Record<string, unknown>;
 
-const TEST_TOKEN = "obvious-test-access-token";
+const TEST_TOKEN =
+  "jt_install_v1.018f9f72-f2e9-7c29-a6fc-001122334491." + "A".repeat(43);
+const PAIRED_TOKEN =
+  "jt_install_v1.018f9f72-f2e9-7c29-a6fc-001122334492." + "B".repeat(43);
+const PAIRING_CODE =
+  "jt_pair_v1.018f9f72-f2e9-7c29-a6fc-001122334488." + "C".repeat(43);
 
 interface MockElement {
   value: string;
@@ -43,7 +48,8 @@ interface PopupApi {
   permissionPattern(origin: string): string;
   restoreConnection(result: {
     serverUrl?: string;
-    accessToken?: string;
+    installationId?: string;
+    installationToken?: string;
   }): void;
   initializePopup(): Promise<void>;
   connectServer(): Promise<void>;
@@ -66,8 +72,24 @@ function createElement(value = ""): MockElement {
   };
 }
 
+function successfulPairResponse(): Response {
+  return {
+    ok: true,
+    status: 201,
+    json: async () => ({
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+      token: PAIRED_TOKEN,
+      expiresAt: "2026-11-11T12:00:00.000Z",
+    }),
+  } as Response;
+}
+
 function loadPopup(options: {
-  connection?: { serverUrl?: string; accessToken?: string };
+  connection?: {
+    serverUrl?: string;
+    installationId?: string;
+    installationToken?: string;
+  };
   permissionGranted?: boolean;
 } = {}) {
   const elements: Record<string, MockElement> = {};
@@ -131,6 +153,9 @@ function loadPopup(options: {
     fetch: fetchMock,
     Headers,
     module: commonJsModule,
+    AbortController,
+    clearTimeout,
+    setTimeout,
     URL,
   });
 
@@ -139,7 +164,8 @@ function loadPopup(options: {
   commonJsModule.exports.restoreConnection?.(
     options.connection ?? {
       serverUrl: "http://localhost:3000",
-      accessToken: TEST_TOKEN,
+      installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
+      installationToken: TEST_TOKEN,
     }
   );
 
@@ -264,7 +290,7 @@ describe("secure extension pairing", () => {
     serverUrl = "https://new.example.com/"
   ) {
     getElement("serverUrl").value = serverUrl;
-    getElement("accessToken").value = TEST_TOKEN;
+    getElement("accessToken").value = PAIRING_CODE;
   }
 
   it("does not store or verify when the selected origin permission is denied", async () => {
@@ -285,7 +311,7 @@ describe("secure extension pairing", () => {
     expect(getElement("connectionStatus").textContent).toMatch(/not granted/i);
     expect(getElement("accessToken").value).toBe("");
 
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    fetchMock.mockResolvedValueOnce(successfulPairResponse());
     await api.apiFetch("/api/settings");
     expect(fetchMock).toHaveBeenLastCalledWith(
       "http://localhost:3000/api/settings",
@@ -303,7 +329,7 @@ describe("secure extension pairing", () => {
         resolveContains = resolve;
       })
     );
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    fetchMock.mockResolvedValueOnce(successfulPairResponse());
     enterPair(getElement);
 
     const pairing = api.connectServer();
@@ -334,7 +360,7 @@ describe("secure extension pairing", () => {
   );
 
   it.each([
-    [401, /access token/i],
+    [401, /pairing code/i],
     [403, /not allowed/i],
   ])(
     "keeps the previous connection and removes a newly granted permission after verify %s",
@@ -342,7 +368,7 @@ describe("secure extension pairing", () => {
       const { api, fetchMock, getElement, permissions, storage } = loadPopup({
         connection: {
           serverUrl: "https://old.example.com",
-          accessToken: "obvious-old-test-token",
+          installationToken: TEST_TOKEN,
         },
         permissionGranted: false,
       });
@@ -357,7 +383,7 @@ describe("secure extension pairing", () => {
       });
       expect(getElement("connectionStatus").textContent).toMatch(message);
 
-      fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+      fetchMock.mockResolvedValueOnce(successfulPairResponse());
       await api.apiFetch("/api/settings");
       expect(fetchMock).toHaveBeenLastCalledWith(
         "https://old.example.com/api/settings",
@@ -388,7 +414,7 @@ describe("secure extension pairing", () => {
       const { api, fetchMock, getElement, permissions, storage } = loadPopup({
         connection: {
           serverUrl: "https://same.example.com",
-          accessToken: "obvious-old-test-token",
+          installationToken: TEST_TOKEN,
         },
       });
       permissions.contains.mockRejectedValueOnce(new Error("permission state unavailable"));
@@ -405,11 +431,11 @@ describe("secure extension pairing", () => {
       expect(storage.remove).not.toHaveBeenCalled();
       expect(permissions.remove).not.toHaveBeenCalled();
 
-      fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+      fetchMock.mockResolvedValueOnce(successfulPairResponse());
       await api.apiFetch("/api/settings");
       const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
       expect(new Headers(init.headers).get("Authorization")).toBe(
-        "Bearer obvious-old-test-token"
+        `Bearer ${TEST_TOKEN}`
       );
     }
   );
@@ -418,7 +444,7 @@ describe("secure extension pairing", () => {
     const { api, fetchMock, getElement, permissions, storage } = loadPopup({
       connection: {
         serverUrl: "https://old.example.com",
-        accessToken: "obvious-old-test-token",
+        installationToken: TEST_TOKEN,
       },
     });
     permissions.contains.mockRejectedValueOnce(new Error("permission state unavailable"));
@@ -437,7 +463,7 @@ describe("secure extension pairing", () => {
       connection: { serverUrl: "http://localhost:3000" },
       permissionGranted: false,
     });
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    fetchMock.mockResolvedValueOnce(successfulPairResponse());
     enterPair(getElement, "https://NEW.example.com:443/");
 
     await api.connectServer();
@@ -446,19 +472,19 @@ describe("secure extension pairing", () => {
       origins: ["https://new.example.com:443/*"],
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [verifyUrl, verifyInit] = fetchMock.mock.calls[0] as [
+    const [pairUrl, pairInit] = fetchMock.mock.calls[0] as [
       string,
       RequestInit,
     ];
-    expect(verifyUrl).toBe("https://new.example.com/api/auth/verify");
-    expect(verifyInit.method).toBe("POST");
-    expect(new Headers(verifyInit.headers).get("Authorization")).toBe(
-      `Bearer ${TEST_TOKEN}`
-    );
+    expect(pairUrl).toBe("https://new.example.com/api/extension/pair");
+    expect(pairInit.method).toBe("POST");
+    expect(JSON.parse(String(pairInit.body))).toEqual({ code: PAIRING_CODE });
+    expect(new Headers(pairInit.headers).get("Authorization")).toBeNull();
     expect(storage.set).toHaveBeenCalledWith({
       connection: {
         serverUrl: "https://new.example.com",
-        accessToken: TEST_TOKEN,
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334492",
+        installationToken: PAIRED_TOKEN,
         invalidated: false,
       },
     });
@@ -473,11 +499,11 @@ describe("secure extension pairing", () => {
     const { api, fetchMock, getElement, permissions, storage } = loadPopup({
       connection: {
         serverUrl: "https://old.example.com",
-        accessToken: "obvious-old-test-token",
+        installationToken: TEST_TOKEN,
       },
       permissionGranted: false,
     });
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    fetchMock.mockResolvedValueOnce(successfulPairResponse());
     storage.set.mockRejectedValueOnce(new Error("storage unavailable"));
     enterPair(getElement);
 
@@ -486,7 +512,7 @@ describe("secure extension pairing", () => {
     expect(permissions.remove).toHaveBeenCalledWith({
       origins: ["https://new.example.com:443/*"],
     });
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    fetchMock.mockResolvedValueOnce(successfulPairResponse());
     await api.apiFetch("/api/settings");
     expect(fetchMock).toHaveBeenLastCalledWith(
       "https://old.example.com/api/settings",
@@ -498,10 +524,10 @@ describe("secure extension pairing", () => {
     const { api, fetchMock, getElement, permissions, storage } = loadPopup({
       connection: {
         serverUrl: "https://old.example.com",
-        accessToken: "obvious-old-test-token",
+        installationToken: TEST_TOKEN,
       },
     });
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    fetchMock.mockResolvedValueOnce(successfulPairResponse());
     enterPair(getElement);
 
     await api.connectServer();
@@ -518,10 +544,10 @@ describe("secure extension pairing", () => {
     const { api, fetchMock, getElement, permissions } = loadPopup({
       connection: {
         serverUrl: "https://same.example.com",
-        accessToken: "obvious-old-test-token",
+        installationToken: TEST_TOKEN,
       },
     });
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    fetchMock.mockResolvedValueOnce(successfulPairResponse());
     enterPair(getElement, "https://same.example.com/");
 
     await api.connectServer();
@@ -536,7 +562,7 @@ describe("secure extension pairing", () => {
 
     expect(getElement("serverUrl").value).toBe("http://localhost:3000");
     expect(getElement("accessToken").value).toBe("");
-    expect(getElement("connectionStatus").textContent).toMatch(/disconnected/i);
+    expect(getElement("connectionStatus").textContent).toMatch(/legacy|pair/i);
   });
 
   it("shows a stored pair as connected without placing its token in the DOM", () => {
@@ -544,7 +570,7 @@ describe("secure extension pairing", () => {
 
     api.restoreConnection({
       serverUrl: "https://jobs.example.com",
-      accessToken: TEST_TOKEN,
+      installationToken: TEST_TOKEN,
     });
 
     expect(getElement("serverUrl").value).toBe("https://jobs.example.com");
@@ -559,9 +585,9 @@ describe("secure extension pairing", () => {
     query.mockResolvedValueOnce([]);
     storage.get.mockResolvedValueOnce({
       serverUrl: "https://jobs.example.com",
-      accessToken: TEST_TOKEN,
+      installationToken: TEST_TOKEN,
     });
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 });
+    fetchMock.mockResolvedValueOnce(successfulPairResponse());
 
     await api.initializePopup();
 
@@ -569,6 +595,8 @@ describe("secure extension pairing", () => {
       "connection",
       "serverUrl",
       "accessToken",
+      "installationId",
+      "installationToken",
     ]);
 
     expect(getElement("serverUrl").value).toBe("https://jobs.example.com");
@@ -603,19 +631,25 @@ describe("authenticated extension API client", () => {
     expect(init.body).toBe('{"jobTitle":"Engineer"}');
   });
 
-  it("clears only the access token and asks for reconnect after a 401", async () => {
+  it("clears the installation secret and asks for re-pairing after a 401", async () => {
     const { api, fetchMock, getElement, storage } = loadPopup();
     fetchMock.mockResolvedValueOnce({ ok: false, status: 401 });
 
     await expect(api.apiFetch("/api/settings")).rejects.toThrow(/reconnect/i);
 
-    expect(storage.set).toHaveBeenCalledWith({
+    expect(storage.set).toHaveBeenLastCalledWith({
       connection: {
         serverUrl: "http://localhost:3000",
+        installationId: "018f9f72-f2e9-7c29-a6fc-001122334491",
         invalidated: true,
       },
     });
-    expect(storage.remove).toHaveBeenCalledWith(["serverUrl", "accessToken"]);
+    expect(storage.remove).toHaveBeenCalledWith([
+      "serverUrl",
+      "accessToken",
+      "installationId",
+      "installationToken",
+    ]);
     expect(getElement("serverUrl").value).toBe("http://localhost:3000");
     expect(getElement("connectionStatus").textContent).toMatch(/reconnect/i);
     await expect(api.apiFetch("/api/settings")).rejects.toThrow(
@@ -686,7 +720,7 @@ describe("authenticated extension API client", () => {
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "http://localhost:3000/api/extract",
       "http://localhost:3000/api/keyword-analysis",
-      "http://localhost:3000/api/settings",
+      "http://localhost:3000/api/extension/profile",
       "http://localhost:3000/api/applications",
     ]);
     for (const [, init] of fetchMock.mock.calls) {
