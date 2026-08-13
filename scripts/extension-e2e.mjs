@@ -522,13 +522,13 @@ async function proveConcurrentPairingConsumption(cookie, origin, database) {
   popupArtifactSensitiveValues.push(installation.token);
 
   const persisted = await database.query(
-    `SELECT grant."consumedAt", grant."installationId",
+    `SELECT pairing_grant."consumedAt", pairing_grant."installationId",
       count(installation."id")::integer AS "installationCount"
-     FROM "ExtensionPairingGrant" AS grant
+     FROM "ExtensionPairingGrant" AS pairing_grant
      LEFT JOIN "ExtensionInstallation" AS installation
-       ON installation."id" = grant."installationId"
-     WHERE grant."id" = $1
-     GROUP BY grant."id"`,
+       ON installation."id" = pairing_grant."installationId"
+     WHERE pairing_grant."id" = $1
+     GROUP BY pairing_grant."id"`,
     [grant.id],
   );
   const row = persisted.rows[0];
