@@ -250,6 +250,20 @@ function permissionFor(origin: string) {
 }
 
 describe("trusted extension storage", () => {
+  it("treats a fresh installation as ready for pairing, not as legacy", async () => {
+    const harness = loadLifecyclePopup();
+
+    await harness.ready();
+
+    expect(harness.getElement("connectionStatus").textContent).toMatch(
+      /disconnected.*pairing code/i,
+    );
+    expect(harness.getElement("connectionStatus").textContent).not.toMatch(
+      /legacy/i,
+    );
+    expect(harness.storage.remove).not.toHaveBeenCalled();
+  });
+
   it("purges a legacy root-token record and requires re-pairing", async () => {
     const storageState = {
       connection: {

@@ -409,6 +409,29 @@ describe("extension E2E safety support", () => {
     }
   });
 
+  it("proves pairing grants and revocation across two isolated extension origins", () => {
+    const runner = readFileSync(
+      join(__dirname, "../../scripts/extension-e2e.mjs"),
+      "utf8",
+    );
+    for (const requiredText of [
+      "origin-bound pairing rejection",
+      "expired pairing rejection",
+      "one-time pairing replay rejection",
+      "two-install isolation",
+      "revoke one installation without affecting the other",
+      "createAdminSession",
+      "createPairingGrant",
+      "expirePairingGrant",
+      'join(workspace, "extension-a")',
+      'join(workspace, "extension-b")',
+      'join(workspace, "browser-profile-a")',
+      'join(workspace, "browser-profile-b")',
+    ]) {
+      expect(runner).toContain(requiredText);
+    }
+  });
+
   it("owns and drains the full local wrapper child process group", () => {
     const wrapper = readFileSync(
       join(__dirname, "../../scripts/extension-e2e-local.mjs"),

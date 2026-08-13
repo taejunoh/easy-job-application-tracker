@@ -209,16 +209,17 @@ function getStoredConnection(result) {
   }
   const installationId = result?.installationId ||
     installationSelector(result?.installationToken);
+  const legacy = typeof result?.accessToken === "string";
   return {
     serverUrl: result?.serverUrl,
     installationId,
-    installationToken: result?.accessToken
+    installationToken: legacy
       ? undefined
       : result?.installationToken,
-    invalidated: Boolean(result?.accessToken) || !installationId,
+    invalidated: legacy || !installationId,
     remoteRevocationUnconfirmed: false,
     pendingCleanupOrigins: [],
-    legacy: Boolean(result?.accessToken) || !installationId,
+    legacy,
     flatInstallation: Boolean(
       installationId && result?.installationToken && !result?.accessToken
     ),

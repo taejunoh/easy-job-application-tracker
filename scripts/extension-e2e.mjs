@@ -41,7 +41,7 @@ const { Client } = pg;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const artifactsDirectory = join(root, ".artifacts/extension-e2e");
 const permissionPattern = `${E2E_SERVER_ORIGIN}/*`;
-const popupArtifactSensitiveValues = Object.freeze([
+const popupArtifactSensitiveValues = [
   E2E_ACCESS_TOKEN,
   E2E_INVALID_ACCESS_TOKEN,
   E2E_ENCRYPTION_SECRET,
@@ -51,15 +51,15 @@ const popupArtifactSensitiveValues = Object.freeze([
   "TypeScript",
   "PostgreSQL",
   "Kubernetes",
-]);
+];
 const processState = {
   browserVersion: "unknown",
-  browserCdp: null,
-  context: null,
+  browserCdps: [],
+  contexts: [],
   database: null,
-  extensionId: "unknown",
+  extensionIds: [],
   profileDirectory: null,
-  popup: null,
+  popups: [],
   server: null,
   step: "safety validation",
 };
@@ -103,61 +103,53 @@ async function run() {
     tmpdir(),
   );
   processState.profileDirectory = workspace;
-  const extensionDirectory = join(workspace, "extension");
-  const browserProfile = join(workspace, "browser-profile");
-  await cp(join(root, "extension"), extensionDirectory, { recursive: true });
-  const manifestPath = join(extensionDirectory, "manifest.json");
-  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  await writeFile(
-    manifestPath,
-    `${JSON.stringify(
-      buildE2EManifest(
-        manifest,
-        E2E_SERVER_ORIGIN,
-        "https://jobs.lever.co/*",
-      ),
-      null,
-      2,
-    )}\n`,
-    { mode: 0o600 },
+  const extensionDirectoryA = join(workspace, "extension-a");
+  const extensionDirectoryB = join(workspace, "extension-b");
+  const browserProfileA = join(workspace, "browser-profile-a");
+  const browserProfileB = join(workspace, "browser-profile-b");
+  await prepareExtension(extensionDirectoryA);
+  await prepareExtension(extensionDirectoryB);
+
+  processState.step = "two isolated Chromium installations launch";
+  const installationA = await launchInstallation(
+    extensionDirectoryA,
+    browserProfileA,
   );
-
-  processState.step = "Chromium launch";
-  const context = await chromium.launchPersistentContext(browserProfile, {
-    channel: "chromium",
-    headless: process.env.EXTENSION_E2E_HEADED !== "1",
-    args: [
-      `--disable-extensions-except=${extensionDirectory}`,
-      `--load-extension=${extensionDirectory}`,
-    ],
-  });
-  processState.context = context;
+  const installationB = await launchInstallation(
+    extensionDirectoryB,
+    browserProfileB,
+  );
+  requireCondition(
+    installationA.identity.origin !== installationB.identity.origin,
+    "isolated extension origins matched",
+  );
+  let { context, browserCdp, worker, identity } = installationA;
   processState.browserVersion = context.browser()?.version() ?? "unknown";
-  const browserCdp = await context.browser().newBrowserCDPSession();
-  await browserCdp.send("Target.setDiscoverTargets", { discover: true });
-  processState.browserCdp = browserCdp;
-
-  let worker = context.serviceWorkers()[0];
-  if (!worker) {
-    worker = await context.waitForEvent("serviceworker", { timeout: 15_000 });
-  }
-  const identity = extensionIdentityFromWorkerUrl(worker.url());
-  processState.extensionId = identity.id;
 
   processState.step = "local application startup";
-  processState.server = startServer(identity.origin);
+  processState.server = startServer([
+    installationA.identity.origin,
+    installationB.identity.origin,
+  ]);
   await waitForServer(processState.server, identity.origin);
 
+  processState.step = "admin session and exact configured origins";
+  const adminCookie = await createAdminSession();
+  await requireConfiguredOrigins(adminCookie, [
+    installationA.identity.origin,
+    installationB.identity.origin,
+  ]);
+
+  processState.step = "root bearer rejection from Chrome origin";
+  await requireRootBearerRejected(identity.origin);
+
   processState.step = "deterministic job fixture";
-  await context.route(LEVER_FIXTURE_URL, async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "text/html; charset=utf-8",
-      body: LEVER_FIXTURE_HTML,
-    });
-  });
+  await installJobFixture(context);
+  await installJobFixture(installationB.context);
   const jobPage = await context.newPage();
   await jobPage.goto(LEVER_FIXTURE_URL, { waitUntil: "domcontentloaded" });
+  const jobPageB = await installationB.context.newPage();
+  await jobPageB.goto(LEVER_FIXTURE_URL, { waitUntil: "domcontentloaded" });
 
   processState.step = "optional host permission test setup";
   await grantOptionalHostPermission(context, identity.id);
@@ -169,11 +161,11 @@ async function run() {
     jobPage,
     identity.origin,
   );
-  processState.popup = popup;
+  rememberPopup(popup);
   await waitForPopupExtraction(popup);
   await waitForText(popup, "#connectionStatus", "Disconnected");
 
-  processState.step = "invalid token rejection";
+  processState.step = "invalid pairing rejection";
   await connectFromPopup(popup, E2E_INVALID_ACCESS_TOKEN);
   await waitForText(popup, "#connectionStatus", "not accepted");
   await requireEmptyTokenInput(popup);
@@ -182,24 +174,112 @@ async function run() {
     hasPermission: false,
   });
 
-  processState.step = "valid extension pairing";
+  processState.step = "origin-bound pairing rejection";
   await popup.close();
-  processState.popup = null;
+  forgetPopup(popup);
+  const grantA = await createPairingGrant(adminCookie, identity.origin);
+  await grantOptionalHostPermission(
+    installationB.context,
+    installationB.identity.id,
+  );
+  let popupB = await openActionPopup(
+    installationB.browserCdp,
+    installationB.worker,
+    jobPageB,
+    installationB.identity.origin,
+  );
+  rememberPopup(popupB);
+  await connectFromPopup(popupB, grantA.code);
+  await waitForText(popupB, "#connectionStatus", "not accepted");
+  await requireCredentialAndPermissionState(popupB, {
+    hasCredential: false,
+    hasPermission: false,
+  });
+
+  processState.step = "valid extension pairing";
+  await popupB.close();
+  forgetPopup(popupB);
   await grantOptionalHostPermission(context, identity.id);
   popup = await openActionPopup(browserCdp, worker, jobPage, identity.origin);
-  processState.popup = popup;
+  rememberPopup(popup);
   await waitForText(popup, "#connectionStatus", "Disconnected");
-  await connectFromPopup(popup, E2E_ACCESS_TOKEN);
+  await connectFromPopup(popup, grantA.code);
   await waitForText(popup, "#connectionStatus", "Connected to");
   await requireEmptyTokenInput(popup);
   await requireCredentialAndPermissionState(popup, {
     hasCredential: true,
     hasPermission: true,
   });
+  const connectionA = await readInstallationConnection(popup);
+
+  processState.step = "one-time pairing replay rejection";
+  await grantOptionalHostPermission(
+    installationB.context,
+    installationB.identity.id,
+  );
+  popupB = await openActionPopup(
+    installationB.browserCdp,
+    installationB.worker,
+    jobPageB,
+    installationB.identity.origin,
+  );
+  rememberPopup(popupB);
+  await connectFromPopup(popupB, grantA.code);
+  await waitForText(popupB, "#connectionStatus", "not accepted");
+
+  processState.step = "expired pairing rejection";
+  await popupB.close();
+  forgetPopup(popupB);
+  const expiredGrant = await createPairingGrant(
+    adminCookie,
+    installationB.identity.origin,
+  );
+  await expirePairingGrant(database, expiredGrant.id);
+  await grantOptionalHostPermission(
+    installationB.context,
+    installationB.identity.id,
+  );
+  popupB = await openActionPopup(
+    installationB.browserCdp,
+    installationB.worker,
+    jobPageB,
+    installationB.identity.origin,
+  );
+  rememberPopup(popupB);
+  await connectFromPopup(popupB, expiredGrant.code);
+  await waitForText(popupB, "#connectionStatus", "not accepted");
+
+  processState.step = "two-install isolation";
+  await popupB.close();
+  forgetPopup(popupB);
+  const grantB = await createPairingGrant(
+    adminCookie,
+    installationB.identity.origin,
+  );
+  await grantOptionalHostPermission(
+    installationB.context,
+    installationB.identity.id,
+  );
+  popupB = await openActionPopup(
+    installationB.browserCdp,
+    installationB.worker,
+    jobPageB,
+    installationB.identity.origin,
+  );
+  rememberPopup(popupB);
+  await connectFromPopup(popupB, grantB.code);
+  await waitForText(popupB, "#connectionStatus", "Connected to");
+  const connectionB = await readInstallationConnection(popupB);
+  requireCondition(
+    connectionA.installationId !== connectionB.installationId,
+    "two installations shared an identifier",
+  );
+  await requireInstallationScope(connectionB, installationB.identity.origin);
+  await requireTwoActiveInstallations(database, connectionA, connectionB);
 
   processState.step = "MV3 worker restart and connection restoration";
   await popup.close();
-  processState.popup = null;
+  forgetPopup(popup);
   worker = await restartExtensionServiceWorker(
     browserCdp,
     context,
@@ -208,7 +288,7 @@ async function run() {
     identity.id,
   );
   popup = await openActionPopup(browserCdp, worker, jobPage, identity.origin);
-  processState.popup = popup;
+  rememberPopup(popup);
   await waitForText(popup, "#connectionStatus", "Connected to");
   await requireEmptyTokenInput(popup);
   await requireCredentialAndPermissionState(popup, {
@@ -237,58 +317,49 @@ async function run() {
 
   processState.step = "action popup reopen and connection restoration";
   await popup.close();
-  processState.popup = null;
+  forgetPopup(popup);
   popup = await openActionPopup(browserCdp, worker, jobPage, identity.origin);
-  processState.popup = popup;
+  rememberPopup(popup);
   await waitForText(popup, "#connectionStatus", "Connected to");
   await requireEmptyTokenInput(popup);
 
-  processState.step = "user disconnect cleanup";
+  processState.step = "revoke one installation without affecting the other";
   await popup.click("#disconnectBtn");
   await waitForText(popup, "#connectionStatus", "Disconnected");
   await requireCredentialAndPermissionState(popup, {
     hasCredential: false,
     hasPermission: false,
   });
-
-  processState.step = "reconnect before forced unauthorized response";
-  await popup.close();
-  processState.popup = null;
-  await grantOptionalHostPermission(context, identity.id);
-  popup = await openActionPopup(browserCdp, worker, jobPage, identity.origin);
-  processState.popup = popup;
-  await waitForText(popup, "#connectionStatus", "Disconnected");
-  await connectFromPopup(popup, E2E_ACCESS_TOKEN);
-  await waitForText(popup, "#connectionStatus", "Connected to");
-  await requireCredentialAndPermissionState(popup, {
+  await waitForText(popupB, "#connectionStatus", "Connected to");
+  await requireCredentialAndPermissionState(popupB, {
     hasCredential: true,
     hasPermission: true,
   });
+  await requireRevocationIsolation(database, connectionA, connectionB);
 
   processState.step = "stored credential 401 invalidation";
-  await popup.call(
-    async (origin, invalidToken) => {
-      await chrome.storage.local.set({
-        connection: {
-          serverUrl: origin,
-          accessToken: invalidToken,
-          invalidated: false,
-        },
-      });
-    },
-    [E2E_SERVER_ORIGIN, E2E_INVALID_ACCESS_TOKEN],
+  await database.query(
+    'UPDATE "ExtensionInstallation" SET "revokedAt" = now(), "updatedAt" = now() WHERE "id" = $1',
+    [connectionB.installationId],
   );
-  await popup.close();
-  processState.popup = null;
-  popup = await openActionPopup(browserCdp, worker, jobPage, identity.origin);
-  processState.popup = popup;
-  await waitForText(popup, "#connectionStatus", "Connection expired");
-  await requireCredentialAndPermissionState(popup, {
+  await popupB.close();
+  forgetPopup(popupB);
+  popupB = await openActionPopup(
+    installationB.browserCdp,
+    installationB.worker,
+    jobPageB,
+    installationB.identity.origin,
+  );
+  rememberPopup(popupB);
+  await waitForText(popupB, "#connectionStatus", "Connection expired");
+  await requireCredentialAndPermissionState(popupB, {
     hasCredential: false,
     hasPermission: false,
   });
   await popup.close();
-  processState.popup = null;
+  forgetPopup(popup);
+  await popupB.close();
+  forgetPopup(popupB);
 
   processState.step = "final database cleanup verification";
   await resetDatabase(database);
@@ -296,6 +367,196 @@ async function run() {
     'SELECT count(*)::integer AS count FROM "Application"',
   );
   requireCondition(remaining.rows[0]?.count === 0, "test application remained");
+}
+
+async function prepareExtension(extensionDirectory) {
+  await cp(join(root, "extension"), extensionDirectory, { recursive: true });
+  const manifestPath = join(extensionDirectory, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  await writeFile(
+    manifestPath,
+    `${JSON.stringify(
+      buildE2EManifest(
+        manifest,
+        E2E_SERVER_ORIGIN,
+        "https://jobs.lever.co/*",
+      ),
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
+}
+
+async function launchInstallation(extensionDirectory, browserProfile) {
+  const context = await chromium.launchPersistentContext(browserProfile, {
+    channel: "chromium",
+    headless: process.env.EXTENSION_E2E_HEADED !== "1",
+    args: [
+      `--disable-extensions-except=${extensionDirectory}`,
+      `--load-extension=${extensionDirectory}`,
+    ],
+  });
+  processState.contexts.push(context);
+  const browserCdp = await context.browser().newBrowserCDPSession();
+  processState.browserCdps.push(browserCdp);
+  await browserCdp.send("Target.setDiscoverTargets", { discover: true });
+  let worker = context.serviceWorkers()[0];
+  if (!worker) {
+    worker = await context.waitForEvent("serviceworker", { timeout: 15_000 });
+  }
+  const identity = extensionIdentityFromWorkerUrl(worker.url());
+  processState.extensionIds.push(identity.id);
+  return { context, browserCdp, worker, identity };
+}
+
+async function installJobFixture(context) {
+  await context.route(LEVER_FIXTURE_URL, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      body: LEVER_FIXTURE_HTML,
+    });
+  });
+}
+
+async function createAdminSession() {
+  const response = await fetch(`${E2E_SERVER_ORIGIN}/api/auth/session`, {
+    method: "POST",
+    headers: {
+      Origin: E2E_CONFIGURED_APP_ORIGIN,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ token: E2E_ACCESS_TOKEN }),
+  });
+  requireCondition(response.status === 200, "admin session creation failed");
+  const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
+  requireCondition(cookie?.startsWith("jobtracker_session="), "session cookie missing");
+  return cookie;
+}
+
+async function requireConfiguredOrigins(cookie, origins) {
+  const response = await fetch(
+    `${E2E_SERVER_ORIGIN}/api/extension/installations`,
+    {
+      headers: {
+        Origin: E2E_CONFIGURED_APP_ORIGIN,
+        Cookie: cookie,
+      },
+    },
+  );
+  requireCondition(response.status === 200, "installation list failed");
+  const body = await response.json();
+  requireCondition(
+    JSON.stringify(body.configuredOrigins) === JSON.stringify(origins),
+    "configured extension origins mismatch",
+  );
+}
+
+async function requireRootBearerRejected(origin) {
+  const response = await fetch(`${E2E_SERVER_ORIGIN}/api/auth/verify`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      Authorization: `Bearer ${E2E_ACCESS_TOKEN}`,
+    },
+  });
+  requireCondition(response.status === 401, "root bearer worked from Chrome origin");
+}
+
+async function createPairingGrant(cookie, origin) {
+  const response = await fetch(`${E2E_SERVER_ORIGIN}/api/extension/pairing`, {
+    method: "POST",
+    headers: {
+      Origin: E2E_CONFIGURED_APP_ORIGIN,
+      Cookie: cookie,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ origin }),
+  });
+  requireCondition(response.status === 201, "pairing grant creation failed");
+  const grant = await response.json();
+  requireCondition(
+    typeof grant.id === "string" &&
+      typeof grant.code === "string" &&
+      grant.origin === origin,
+    "pairing grant response mismatch",
+  );
+  popupArtifactSensitiveValues.push(grant.code);
+  return grant;
+}
+
+async function expirePairingGrant(database, grantId) {
+  const result = await database.query(
+    'UPDATE "ExtensionPairingGrant" SET "expiresAt" = now() - interval \'1 second\' WHERE "id" = $1',
+    [grantId],
+  );
+  requireCondition(result.rowCount === 1, "pairing grant expiry setup failed");
+}
+
+async function readInstallationConnection(popup) {
+  const connection = await popup.call(async () => {
+    const result = await chrome.storage.local.get(["connection"]);
+    return result.connection ?? null;
+  });
+  requireCondition(
+    typeof connection?.installationId === "string" &&
+      typeof connection?.installationToken === "string" &&
+      connection.invalidated === false,
+    "installation credential was not persisted",
+  );
+  popupArtifactSensitiveValues.push(connection.installationToken);
+  return connection;
+}
+
+async function requireInstallationScope(connection, origin) {
+  const headers = {
+    Origin: origin,
+    Authorization: `Bearer ${connection.installationToken}`,
+  };
+  const verify = await fetch(`${E2E_SERVER_ORIGIN}/api/auth/verify`, {
+    method: "POST",
+    headers,
+  });
+  requireCondition(verify.status === 200, "installation verification failed");
+  const profile = await fetch(`${E2E_SERVER_ORIGIN}/api/extension/profile`, {
+    headers,
+  });
+  requireCondition(profile.status === 200, "minimal profile scope failed");
+  const settings = await fetch(`${E2E_SERVER_ORIGIN}/api/settings`, { headers });
+  requireCondition(settings.status === 403, "installation read settings");
+}
+
+async function requireTwoActiveInstallations(database, left, right) {
+  const result = await database.query(
+    'SELECT "id", "revokedAt" FROM "ExtensionInstallation" WHERE "id" = ANY($1::text[]) ORDER BY "id"',
+    [[left.installationId, right.installationId]],
+  );
+  requireCondition(
+    result.rows.length === 2 && result.rows.every((row) => row.revokedAt === null),
+    "two active installations were not isolated",
+  );
+}
+
+async function requireRevocationIsolation(database, revoked, active) {
+  const result = await database.query(
+    'SELECT "id", "revokedAt" FROM "ExtensionInstallation" WHERE "id" = ANY($1::text[])',
+    [[revoked.installationId, active.installationId]],
+  );
+  const byId = new Map(result.rows.map((row) => [row.id, row]));
+  requireCondition(
+    byId.get(revoked.installationId)?.revokedAt instanceof Date &&
+      byId.get(active.installationId)?.revokedAt === null,
+    "revocation crossed installation boundary",
+  );
+}
+
+function rememberPopup(popup) {
+  processState.popups.push(popup);
+}
+
+function forgetPopup(popup) {
+  processState.popups = processState.popups.filter((candidate) => candidate !== popup);
 }
 
 async function verifyLiveDatabaseIdentity(database, expected) {
@@ -311,7 +572,9 @@ async function verifyLiveDatabaseIdentity(database, expected) {
 }
 
 async function resetDatabase(database) {
-  await database.query('TRUNCATE TABLE "Application", "Settings"');
+  await database.query(
+    'TRUNCATE TABLE "ExtensionPairingGrant", "ExtensionInstallation", "Application", "Settings"',
+  );
 }
 
 async function seedResume(database) {
@@ -328,7 +591,7 @@ async function seedResume(database) {
   );
 }
 
-function startServer(extensionOrigin) {
+function startServer(extensionOrigins) {
   const environment = {
     ...process.env,
     NODE_ENV: "production",
@@ -336,7 +599,8 @@ function startServer(extensionOrigin) {
     ENCRYPTION_SECRET: E2E_ENCRYPTION_SECRET,
     APP_ACCESS_TOKEN: E2E_ACCESS_TOKEN,
     APP_BASE_URL: E2E_CONFIGURED_APP_ORIGIN,
-    CORS_ALLOWED_ORIGINS: `${E2E_CONFIGURED_APP_ORIGIN},${extensionOrigin}`,
+    CORS_ALLOWED_ORIGINS:
+      `${E2E_CONFIGURED_APP_ORIGIN},${extensionOrigins.join(",")}`,
   };
   const child = spawn(
     process.execPath,
@@ -851,12 +1115,15 @@ async function requireCredentialAndPermissionState(
       "connection",
       "serverUrl",
       "accessToken",
+      "installationToken",
     ]);
     return {
       hasCredential: Boolean(
-        storage.connection?.accessToken || storage.accessToken,
+        storage.connection?.installationToken || storage.installationToken,
       ),
-      hasLegacyToken: Object.hasOwn(storage, "accessToken"),
+      hasLegacyToken:
+        Object.hasOwn(storage, "accessToken") ||
+        typeof storage.connection?.accessToken === "string",
       hasPermission: await chrome.permissions.contains({ origins: [pattern] }),
     };
   }, [permissionPattern]);
@@ -914,7 +1181,7 @@ async function writeSanitizedFailureArtifacts(error) {
   await mkdir(artifactsDirectory, { recursive: true, mode: 0o700 }).catch(
     () => undefined,
   );
-  const popup = processState.popup;
+  const popup = processState.popups.at(-1);
   if (popup && !popup.closed) {
     try {
       const snapshot = await popup.redact();
@@ -931,7 +1198,7 @@ async function writeSanitizedFailureArtifacts(error) {
         {
           step: processState.step,
           browserVersion: processState.browserVersion,
-          extensionId: processState.extensionId,
+          extensionIds: processState.extensionIds,
           failureType: error instanceof Error ? error.name : "UnknownError",
         },
         null,
@@ -947,23 +1214,23 @@ async function writeSanitizedFailureArtifacts(error) {
 function cleanup() {
   if (cleanupPromise) return cleanupPromise;
   cleanupPromise = (async () => {
-    if (processState.popup) {
+    for (const popup of processState.popups) {
       try {
-        await processState.popup.close();
+        await popup.close();
       } catch {
-        // Continue closing the browser context.
+        // Continue closing the browser contexts.
       }
-      processState.popup = null;
     }
-    if (processState.context) {
+    processState.popups = [];
+    for (const context of processState.contexts) {
       try {
-        await processState.context.close();
+        await context.close();
       } catch {
         // Continue cleaning remaining resources.
       }
-      processState.context = null;
-      processState.browserCdp = null;
     }
+    processState.contexts = [];
+    processState.browserCdps = [];
     if (processState.server && processState.server.exitCode === null) {
       processState.server.kill("SIGTERM");
       const stopped = await Promise.race([
