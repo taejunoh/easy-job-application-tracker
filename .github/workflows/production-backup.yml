@@ -46,6 +46,7 @@ jobs:
         run: |
           printf 'POSTGRES_SERVICE_CONTAINER_ID=%s\n' "$POSTGRES_SERVICE_CONTAINER_ID" >> "$GITHUB_ENV"
           docker exec "$POSTGRES_SERVICE_CONTAINER_ID" pg_dump --version | grep -E '^pg_dump \(PostgreSQL\) 17\.'
+          docker exec "$POSTGRES_SERVICE_CONTAINER_ID" pg_restore --version | grep -E '^pg_restore \(PostgreSQL\) 17\.'
       - name: Create source backup and fingerprint
         env:
           PRODUCTION_DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
@@ -124,7 +125,12 @@ jobs:
         if: always()
         run: |
           rm -f "$RUNNER_TEMP/jobtracker.dump" \
+            "$RUNNER_TEMP/jobtracker.dump.partial" \
             "$RUNNER_TEMP/jobtracker.dump.sha256" \
             "$RUNNER_TEMP/jobtracker.toc" \
             "$RUNNER_TEMP/source-fingerprint.json" \
-            "$RUNNER_TEMP/restore-fingerprint.json"
+            "$RUNNER_TEMP/source-fingerprint.json.partial" \
+            "$RUNNER_TEMP/restore-fingerprint.json" \
+            "$RUNNER_TEMP/restore-fingerprint.json.partial" \
+            "$RUNNER_TEMP/jobtracker.dump.age.partial" \
+            "$RUNNER_TEMP/backup-manifest.json.partial"

@@ -5,36 +5,48 @@ import pg from "pg";
 
 const { Client } = pg;
 
-const TABLES = [
-  {
-    name: "Application",
-    query: `
-      SELECT "id", "url", "jobTitle", "company", "status", "appliedDate",
-             "description", "notes", "salary", "location", "jobType",
-             "createdAt", "updatedAt"
-      FROM "Application"
-      ORDER BY "id" COLLATE "C"
-    `,
-  },
-  {
-    name: "Settings",
-    query: `
-      SELECT "id", "llmProvider", "apiKey", "linkedinUrl", "githubUrl",
-             "resumeText"
-      FROM "Settings"
-      ORDER BY "id" COLLATE "C"
-    `,
-  },
-  {
-    name: "_prisma_migrations",
-    query: `
-      SELECT "id", "checksum", "finished_at", "migration_name", "logs",
-             "rolled_back_at", "started_at", "applied_steps_count"
-      FROM "_prisma_migrations"
-      ORDER BY "id" COLLATE "C"
-    `,
-  },
-];
+function quoteIdentifier(identifier) {
+  return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+async function fingerprintableTables(client) {
+  const result = await client.query(`
+    SELECT
+      tables.table_name AS "tableName",
+      array_agg(columns.column_name ORDER BY columns.ordinal_position)::text[] AS "columns",
+      COALESCE(
+        array_agg(primary_columns.column_name ORDER BY primary_columns.ordinal_position)
+          FILTER (WHERE primary_columns.column_name IS NOT NULL),
+        ARRAY[]::text[]
+      )::text[] AS "primaryKey"
+    FROM information_schema.tables AS tables
+    JOIN information_schema.columns AS columns
+      ON columns.table_schema = tables.table_schema
+     AND columns.table_name = tables.table_name
+    LEFT JOIN (
+      SELECT
+        constraints.table_schema,
+        constraints.table_name,
+        key_usage.column_name,
+        key_usage.ordinal_position
+      FROM information_schema.table_constraints AS constraints
+      JOIN information_schema.key_column_usage AS key_usage
+        ON key_usage.constraint_schema = constraints.constraint_schema
+       AND key_usage.constraint_name = constraints.constraint_name
+       AND key_usage.table_schema = constraints.table_schema
+       AND key_usage.table_name = constraints.table_name
+      WHERE constraints.constraint_type = 'PRIMARY KEY'
+    ) AS primary_columns
+      ON primary_columns.table_schema = tables.table_schema
+     AND primary_columns.table_name = tables.table_name
+     AND primary_columns.column_name = columns.column_name
+    WHERE tables.table_schema = 'public'
+      AND tables.table_type = 'BASE TABLE'
+    GROUP BY tables.table_name
+    ORDER BY tables.table_name COLLATE "C"
+  `);
+  return result.rows;
+}
 
 function digestRows(tableName, rows) {
   const hash = createHash("sha256");
@@ -52,14 +64,26 @@ function digestRows(tableName, rows) {
 
 export async function fingerprintClient(client) {
   const tables = {};
-  for (const table of TABLES) {
-    const result = await client.query(table.query);
-    tables[table.name] = {
+  const definitions = await fingerprintableTables(client);
+  for (const definition of definitions) {
+    if (!Array.isArray(definition.columns) || definition.columns.length === 0) {
+      throw new Error("Database fingerprint failed");
+    }
+    if (!Array.isArray(definition.primaryKey) || definition.primaryKey.length === 0) {
+      throw new Error("Database fingerprint requires a primary key");
+    }
+    const columns = definition.columns.map(quoteIdentifier).join(", ");
+    const primaryKey = definition.primaryKey.map(quoteIdentifier).join(", ");
+    const order = `jsonb_build_array(${primaryKey})::text COLLATE "C"`;
+    const result = await client.query(
+      `SELECT ${columns} FROM ${quoteIdentifier(definition.tableName)} ORDER BY ${order}`,
+    );
+    tables[definition.tableName] = {
       count: result.rows.length,
-      digest: digestRows(table.name, result.rows),
+      digest: digestRows(definition.tableName, result.rows),
     };
   }
-  return { version: 1, algorithm: "sha256", tables };
+  return { version: 2, algorithm: "sha256", tables };
 }
 
 export async function writeFingerprint(outputPath, fingerprint) {

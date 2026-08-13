@@ -27,6 +27,12 @@ type Workflow = Readonly<{
       env: Record<string, string>;
       steps: readonly WorkflowStep[];
     }>;
+    "backup-interruption": Readonly<{
+      "runs-on": string;
+      "timeout-minutes": number;
+      env: Record<string, string>;
+      steps: readonly WorkflowStep[];
+    }>;
   }>;
 }>;
 
@@ -48,10 +54,12 @@ describe("deployment verification contract", () => {
       "test:ci": "jest --runInBand",
       "check:audit": "node scripts/check-audit.mjs",
       "check:startup-env": "node scripts/verify-invalid-startup.mjs",
+      "test:backup:docker":
+        "RUN_BACKUP_DOCKER_INTEGRATION=1 jest --runInBand __tests__/scripts/create-snapshot-backup.docker.integration.test.ts",
     });
     expect(packageJson.dependencies).toMatchObject({
-      "@next/env": "16.2.10",
-      next: "16.2.10",
+      "@next/env": "16.3.0",
+      next: "16.3.0",
     });
     expect(packageJson.scripts?.["check:extension"]).toContain(
       "node --check extension/background.js",
@@ -300,6 +308,42 @@ describe("deployment verification contract", () => {
       },
     ]);
     expect(workflowSource).not.toContain("secrets.");
+  });
+
+  it("runs the real digest-pinned PostgreSQL 17 backup interruption proof", () => {
+    const workflow = parse(
+      readFileSync(join(root, ".github/workflows/ci.yml"), "utf8"),
+    ) as Workflow;
+    const job = workflow.jobs["backup-interruption"];
+
+    expect(job).toMatchObject({
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 15,
+      env: {
+        PG17_IMAGE:
+          "docker.io/library/postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193",
+      },
+    });
+    expect(job.steps).toEqual([
+      {
+        name: "Check out repository",
+        uses: `actions/checkout@${CHECKOUT_SHA}`,
+      },
+      {
+        name: "Set up Node.js",
+        uses: `actions/setup-node@${SETUP_NODE_SHA}`,
+        with: { "node-version": "22.22.2", cache: "npm" },
+      },
+      { name: "Install dependencies", run: "npm ci" },
+      {
+        name: "Pull digest-pinned PostgreSQL 17 image",
+        run: 'docker pull "$PG17_IMAGE"',
+      },
+      {
+        name: "Run PostgreSQL 17 backup interruption proof",
+        run: "npm run test:backup:docker",
+      },
+    ]);
   });
 
   it("uses only local typography sources", () => {

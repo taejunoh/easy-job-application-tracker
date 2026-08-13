@@ -154,11 +154,47 @@ workflows after changing their definitions and require successful runs from the
 default branch.
 
 Before a migration or risky release, create a PostgreSQL custom-format dump in
-an access-controlled location outside the repository:
+an access-controlled location outside the repository. Use PostgreSQL 17 tools
+only; confirm both client versions before starting. The service file contains
+only host, port, database, and user. The separate password file uses libpq's
+`hostname:port:database:username:password` format; escape any literal `:` or
+`\\` in a field with `\\`. Substitute the reviewed values through a private
+editor, never through shell arguments or command-line history:
 
 ```bash
 umask 077
-pg_dump "$DATABASE_URL" \
+BACKUP_SERVICE_FILE="$HOME/.config/jobtracker/production-backup.pg_service.conf"
+BACKUP_PASS_FILE="$HOME/.config/jobtracker/production-backup.pgpass"
+install -d -m 0700 "$(dirname "$BACKUP_SERVICE_FILE")"
+install -m 0600 /dev/null "$BACKUP_SERVICE_FILE"
+install -m 0600 /dev/null "$BACKUP_PASS_FILE"
+```
+
+Write this exact service-file shape to `$BACKUP_SERVICE_FILE`:
+
+```ini
+[production_backup]
+host=PRODUCTION_DATABASE_HOST
+port=5432
+dbname=PRODUCTION_DATABASE_NAME
+user=PRODUCTION_DATABASE_USER
+```
+
+Write one matching libpq password record to `$BACKUP_PASS_FILE`:
+
+```text
+PRODUCTION_DATABASE_HOST:5432:PRODUCTION_DATABASE_NAME:PRODUCTION_DATABASE_USER:PRODUCTION_DATABASE_PASSWORD
+```
+
+Then run only the service-based command family:
+
+```bash
+chmod 0600 "$BACKUP_SERVICE_FILE" "$BACKUP_PASS_FILE"
+export PGSERVICEFILE="$BACKUP_SERVICE_FILE"
+export PGPASSFILE="$BACKUP_PASS_FILE"
+pg_dump --version | grep -E '^pg_dump \(PostgreSQL\) 17\.'
+pg_restore --version | grep -E '^pg_restore \(PostgreSQL\) 17\.'
+pg_dump --dbname=service=production_backup \
   --format=custom \
   --no-owner \
   --no-privileges \
@@ -167,6 +203,11 @@ pg_restore --list "$BACKUP_FILE" > "$BACKUP_TOC"
 shasum -a 256 "$BACKUP_FILE" > "$BACKUP_CHECKSUM"
 shasum -a 256 -c "$BACKUP_CHECKSUM"
 ```
+
+Unset `PGSERVICEFILE` and `PGPASSFILE` after the operation. Retain or destroy
+their mode-`0600` files according to the private credential policy. Never put a
+raw database URL or password in `pg_dump`/`pg_restore` arguments, logs, tickets,
+or evidence.
 
 Record only the checksum, schema/migration identity, table counts, and
 non-reversible fingerprints. Never retain database URLs or row bodies in the
@@ -178,8 +219,9 @@ Restore rehearsal:
    Production database.
 2. Run `pg_restore --exit-on-error --no-owner --no-privileges` against that
    isolated target.
-3. Compare the Application, Settings, and migration counts plus the approved
-   ordered fingerprints with the source manifest.
+3. Compare every public application table, including Application, Settings,
+   ExtensionPairingGrant, ExtensionInstallation, and migration history, using
+   the approved ordered fingerprints from the source manifest.
 4. Run `npx prisma migrate status` and the schema-diff command against the
    restored target.
 5. Destroy the rehearsal target only after the comparison succeeds; retain the

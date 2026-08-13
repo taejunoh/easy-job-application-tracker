@@ -12,6 +12,7 @@ const POSTGRES_17_ALPINE_DIGEST =
 
 type Step = Readonly<{
   name: string;
+  if?: string;
   uses?: string;
   run?: string;
   env?: Record<string, string>;
@@ -146,6 +147,12 @@ describe("encrypted production backup workflow contract", () => {
     expect(joinedRuns).toContain("chmod 600");
     expect(joinedRuns).toContain("sha256sum");
     expect(joinedRuns).toContain("pg_restore --list");
+    expect(joinedRuns).toContain(
+      "pg_dump --version | grep -E '^pg_dump \\(PostgreSQL\\) 17\\.'",
+    );
+    expect(joinedRuns).toContain(
+      "pg_restore --version | grep -E '^pg_restore \\(PostgreSQL\\) 17\\.'",
+    );
     expect(fingerprintSource).toContain(
       "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
     );
@@ -192,6 +199,35 @@ describe("encrypted production backup workflow contract", () => {
     expect(paths.join("\n")).not.toMatch(/(?<!\.age)\.dump(?:\s|$)|fingerprint|toc/iu);
   });
 
+  it("removes every plaintext and partial backup path unconditionally", () => {
+    const workflow = parse(
+      readFileSync(
+        join(root, ".github/workflows/production-backup.yml"),
+        "utf8",
+      ),
+    ) as BackupWorkflow;
+    const cleanup = workflow.jobs.backup.steps.find(
+      (step) => step.name === "Remove temporary backup files",
+    );
+
+    expect(cleanup?.if).toBe("always()");
+    const command = cleanup?.run ?? "";
+    for (const path of [
+      "jobtracker.dump",
+      "jobtracker.dump.partial",
+      "jobtracker.dump.sha256",
+      "jobtracker.toc",
+      "source-fingerprint.json",
+      "source-fingerprint.json.partial",
+      "restore-fingerprint.json",
+      "restore-fingerprint.json.partial",
+      "jobtracker.dump.age.partial",
+      "backup-manifest.json.partial",
+    ]) {
+      expect(command).toContain(path);
+    }
+  });
+
   it("documents monitoring, nightly recovery, and private key handling", () => {
     const runbook = readFileSync(
       join(root, "docs/operations/production-runbook.md"),
@@ -208,8 +244,12 @@ describe("encrypted production backup workflow contract", () => {
       "0600",
       "30 days",
       "post-merge",
+      "PGSERVICEFILE",
+      "PGPASSFILE",
+      "--dbname=service=production_backup",
     ]) {
       expect(runbook).toContain(text);
     }
+    expect(runbook).not.toContain('pg_dump "$DATABASE_URL"');
   });
 });

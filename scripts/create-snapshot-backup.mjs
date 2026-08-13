@@ -45,34 +45,50 @@ const SIGNAL_EXIT_CODES = new Map([
   ["SIGTERM", 143],
 ]);
 const TERMINATION_GRACE_MS = 2_000;
-const CLEANUP_CONTROL_TIMEOUT_MS = 2_000;
+const CLEANUP_CONTROL_TIMEOUT_MS = 2_500;
 const DOCKER_DUMP_WRAPPER = [
-  "set -eu",
+  "set -u",
   "pidfile=$1; startfile=$2; cancelfile=$3; shift 3",
   "umask 077",
+  "child=",
+  "terminate() {",
+  "  if [ -n \"$child\" ]; then",
+  "    kill -TERM \"$child\" 2>/dev/null || true",
+  "    wait \"$child\" 2>/dev/null || true",
+  "  fi",
+  "  exit 143",
+  "}",
+  "trap terminate INT TERM HUP",
   "printf '%s\\n' \"$$\" > \"$pidfile\"",
   "while [ ! -e \"$startfile\" ]; do",
   "  [ -e \"$cancelfile\" ] && exit 143",
   "  sleep 0.05",
   "done",
   "[ -e \"$cancelfile\" ] && exit 143",
-  "exec pg_dump \"$@\"",
+  "sh -c 'kill -STOP \"$$\"; exec pg_dump \"$@\"' jobtracker-pg-dump \"$@\" &",
+  "child=$!",
+  "printf '%s\\n' \"$child\" > \"$pidfile\"",
+  "[ -e \"$cancelfile\" ] && terminate",
+  "kill -CONT \"$child\"",
+  "wait \"$child\"",
+  "status=$?",
+  "trap - INT TERM HUP",
+  "exit \"$status\"",
 ].join("\n");
 const DOCKER_STOP_WRAPPER = [
   "set -eu",
-  "pidfile=$1; cancelfile=$2; expected=$3",
+  "pidfile=$1; cancelfile=$2",
   "umask 077; : > \"$cancelfile\"",
   "[ -s \"$pidfile\" ] || exit 0",
   "pid=$(cat \"$pidfile\")",
   "case $pid in (*[!0-9]*|'') exit 0;; esac",
   "kill -0 \"$pid\" 2>/dev/null || exit 0",
-  "[ -r \"/proc/$pid/cmdline\" ] || exit 1",
-  "tr '\\000' '\\n' < \"/proc/$pid/cmdline\" | grep -F -x -- \"$expected\" >/dev/null || exit 1",
-  "kill -TERM \"$pid\" 2>/dev/null || exit 0",
-  "i=0; while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 40 ]; do i=$((i+1)); sleep 0.05; done",
+  "kill -INT \"$pid\" 2>/dev/null || exit 0",
+  "sleep 0.1",
+  "kill -TERM \"$pid\" 2>/dev/null || true",
+  "sleep 0.1",
   "kill -KILL \"$pid\" 2>/dev/null || true",
-  "i=0; while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 40 ]; do i=$((i+1)); sleep 0.05; done",
-  "! kill -0 \"$pid\" 2>/dev/null",
+  "exit 0",
 ].join("\n");
 
 function onceAsync(operation) {
@@ -243,6 +259,8 @@ async function createServiceCredential(databaseUrl) {
     }
     parameters.set(name, value);
   }
+  const dumpApplicationName = `jobtracker_backup_dump_${identifier}`;
+  parameters.set("application_name", dumpApplicationName);
   if (!parameters.get("host") || !parameters.get("dbname")) {
     throw new Error("Invalid database credential");
   }
@@ -419,7 +437,6 @@ async function dumpSnapshot(
             "jobtracker-backup",
             credential.pidPath,
             credential.cancelPath,
-            `--dbname=service=${credential.serviceName}`,
           ]);
         } catch (error) {
           remoteTerminationError = error;
@@ -509,7 +526,24 @@ async function createSnapshotBackup(
     application_name: "jobtracker-backup-coordinator",
   });
   const endClient = onceAsync(() => client.end().catch(() => undefined));
-  supervisor.trackDatabase(endClient);
+  const cancelAndEndClient = onceAsync(async () => {
+    if (client.processID) {
+      const cancellationClient = new Client({
+        connectionString: databaseUrl,
+        application_name: "jobtracker-backup-cleanup",
+      });
+      try {
+        await cancellationClient.connect();
+        await cancellationClient.query("SELECT pg_cancel_backend($1)", [
+          client.processID,
+        ]);
+      } finally {
+        await cancellationClient.end().catch(() => undefined);
+      }
+    }
+    await endClient();
+  });
+  supervisor.trackDatabase(cancelAndEndClient);
   let transactionStarted = false;
 
   try {
