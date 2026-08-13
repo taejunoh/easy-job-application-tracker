@@ -8,8 +8,9 @@ import {
   recoverRestore,
   restoreQuarantine,
 } from "./quarantine-numbered-copies-support.mjs";
+import { reconcileQuarantine } from "./quarantine-reconcile.mjs";
 
-const COMMANDS = new Set(["inspect", "apply", "recover", "mark-validated", "restore"]);
+const COMMANDS = new Set(["inspect", "apply", "reconcile", "recover", "mark-validated", "restore"]);
 const ROOT_FLAGS = ["--repo-root", "--quarantine-root"];
 const HEAD = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const COUNT = /^(?:0|[1-9][0-9]*)$/u;
@@ -118,6 +119,10 @@ function publicRestore(result) {
     restoreId: result.restoreId, restoredEntries: result.restoredEntries });
 }
 
+function publicReconciliation(result) {
+  return Object.freeze({ ok: true, command: "reconcile", ...result });
+}
+
 function publicRecovery(result) {
   if (conflict(result)) throw Object.freeze({ code: "ERR_CONFLICT" });
   const safe = Object.freeze({
@@ -136,6 +141,7 @@ async function dispatch(command) {
   const { command: name, ...options } = command;
   if (name === "inspect") return publicInspect(await inspectWorkspace(options));
   if (name === "apply") return publicApply(await quarantineWorkspace(options));
+  if (name === "reconcile") return publicReconciliation(await reconcileQuarantine(options));
   if (name === "mark-validated") {
     return publicValidated(await markQuarantineValidated({ ...options, validatedAt: new Date().toISOString() }));
   }
@@ -168,7 +174,7 @@ function errorCode(error) {
 
 function emitFailure(command, error) {
   const code = errorCode(error);
-  process.stderr.write(`${JSON.stringify({ ok: false, command, code, message: ERROR_MESSAGES[code] })}\n`);
+  process.stderr.write(`${JSON.stringify({ ok: false, command, schemaVersion: 2, code, message: ERROR_MESSAGES[code] })}\n`);
   process.exitCode = exitCodeFor(code);
 }
 

@@ -1,5 +1,11 @@
 # Quarantine Lifecycle Continuation Design
 
+> **Completed historical record (2026-08-13).** Recovery, validation,
+> four-day retention, restore/recovery, the closed facade, and the canonical
+> CLI were implemented and hardened in `7f1f94b^..97c18ca`; aggregate static
+> gate evidence is `4e0ae7d`. The status text below records the point-in-time
+> handoff that created this document and is not a statement of current work.
+
 ## Status and precedence
 
 Foundation Cleanup is complete through Task 2, Slice 2 (atomic journaled

@@ -1,5 +1,12 @@
 # Foundation Cleanup Implementation Plan
 
+> **Completed historical record (2026-08-13).** The quarantine lifecycle
+> implementation and hardening span `189721a^..97c18ca`, with aggregate static
+> gate evidence at `4e0ae7d`. The original checkbox text below is intentionally
+> unchanged and unchecked boxes are historical execution instructions, not a
+> current backlog. Live checkout quarantine and any destructive retention step
+> were not authorized by marking this implementation record complete.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Quarantine every numbered workspace copy without data loss, regenerate a deterministic local environment, route manual backups through the hardened coordinator, and prove real-Docker interruption cleanup.

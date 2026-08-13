@@ -302,6 +302,7 @@ Regenerate all documentation screenshots with `npm run screenshots`, or only the
 
 ## Documentation
 
+- [Quarantine operations runbook](docs/operations/quarantine-runbook.md) — lossless numbered-copy cleanup, reconciliation, recovery, validation retention, and restore. Stop writers before every mutating command; never use `git clean`, move payloads manually, edit the journal, or treat `deleteAfter` as deletion approval.
 - [Production operations runbook](docs/operations/production-runbook.md)
 - [Chrome extension smoke runbook](docs/operations/chrome-extension-smoke.md)
 - [Sanitized production cutover record](docs/operations/production-cutover-2026-07-14.md)

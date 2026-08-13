@@ -1,5 +1,12 @@
 # Foundation Cleanup Design
 
+> **Completed historical record (2026-08-13).** The quarantine lifecycle
+> described here was implemented and hardened in commit range
+> `189721a^..97c18ca`; aggregate static gates are recorded by `4e0ae7d`.
+> This document is preserved as design evidence, not a live backlog. The live
+> checkout quarantine and any future retained-payload deletion remain governed
+> by the release-readiness program; no purge was authorized by this completion.
+
 ## Goal
 
 Restore a trustworthy local checkout without losing any numbered-copy content,

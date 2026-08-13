@@ -47,6 +47,59 @@ describe("production operations documentation contract", () => {
     }
   });
 
+  it("publishes the complete quarantine operator workflow", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const runbook = readFileSync(
+      join(root, "docs/operations/quarantine-runbook.md"),
+      "utf8",
+    );
+    const normalized = runbook.replace(/\s+/gu, " ");
+
+    expect(readme).toContain("docs/operations/quarantine-runbook.md");
+    for (const requiredText of [
+      "$REPO_ROOT",
+      "$QUARANTINE_ROOT",
+      "npm run cleanup:quarantine -- inspect",
+      "npm run cleanup:quarantine -- apply",
+      "npm run cleanup:quarantine -- reconcile",
+      "npm run cleanup:quarantine -- recover",
+      "npm run cleanup:quarantine -- mark-validated",
+      "npm run cleanup:quarantine -- restore",
+      "--writers-stopped",
+      "schemaVersion",
+      "ERR_INTEGRITY",
+      "deleteAfter",
+      "earliest review time",
+      "flushed STARTING",
+      "sole durable input",
+      "git clean",
+      "manual payload movement",
+      "journal editing",
+      "retention auto-delete",
+      "No purge command",
+    ]) {
+      expect(normalized).toContain(requiredText);
+    }
+
+    for (const state of [
+      "PREPARED",
+      "MOVING",
+      "VERIFYING",
+      "ROLLING_BACK",
+      "QUARANTINED",
+      "VALIDATED",
+      "RESTORE_PREPARED",
+      "RESTORING",
+      "RESTORE_ROLLING_BACK",
+      "RESTORED",
+      "ROLLED_BACK",
+      "RECOVERY_REQUIRED",
+      "INCOMPLETE_CONFLICT",
+    ]) {
+      expect(normalized).toContain(state);
+    }
+  });
+
   it("distinguishes Vercel validation from self-hosted Node startup", () => {
     const documents = [
       readFileSync(join(root, "README.md"), "utf8"),

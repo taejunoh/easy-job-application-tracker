@@ -102,6 +102,25 @@ describe("quarantine cleanup CLI", () => {
     });
   });
 
+  it("runs read-only reconciliation through its canonical npm form", () => {
+    const prepared = prepareQuarantinedFixture({ regenerate: false });
+    bases.push(prepared.fixture.base);
+
+    const result = run([
+      "reconcile", "--repo-root", prepared.fixture.repoRoot,
+      "--quarantine-root", prepared.fixture.quarantineRoot,
+      "--transaction-id", prepared.transactionId, "--writers-stopped",
+    ]);
+
+    expectSpawned(result);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: true, command: "reconcile", schemaVersion: 1,
+      state: "QUARANTINED", complete: false, nextAction: "mark_validated",
+    });
+  });
+
   it.each([
     ["restore", (fixture: ReturnType<typeof createQuarantineFixture>) => [
       "restore", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot,
@@ -125,7 +144,7 @@ describe("quarantine cleanup CLI", () => {
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
     expect(result.stderr).toBe(
-      `{\"ok\":false,\"command\":\"${command}\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n`,
+      `{\"ok\":false,\"command\":\"${command}\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n`,
     );
   });
 
@@ -156,7 +175,7 @@ describe("quarantine cleanup CLI", () => {
       expectSpawned(result);
       expect(result.status).toBe(2);
       expect(result.stdout).toBe("");
-      expect(result.stderr).toBe(`{\"ok\":false,\"command\":\"${command}\",\"code\":\"ERR_PREFLIGHT\",\"message\":\"Workspace preflight failed.\"}\n`);
+      expect(result.stderr).toBe(`{\"ok\":false,\"command\":\"${command}\",\"schemaVersion\":2,\"code\":\"ERR_PREFLIGHT\",\"message\":\"Workspace preflight failed.\"}\n`);
     }
   });
 
@@ -206,7 +225,7 @@ describe("quarantine cleanup CLI", () => {
       transactionId: "operator-tx-0001",
     });
     expect(result.stdout).toBe(`${JSON.stringify(starting)}\n`);
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"apply\",\"code\":\"ERR_INDETERMINATE_JOURNAL_APPEND\",\"message\":\"Journal durability could not be determined.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"apply\",\"schemaVersion\":2,\"code\":\"ERR_INDETERMINATE_JOURNAL_APPEND\",\"message\":\"Journal durability could not be determined.\"}\n");
   });
 
   it("keeps an untyped facade failure internal after apply STARTING", () => {
@@ -251,7 +270,7 @@ describe("quarantine cleanup CLI", () => {
       transactionId: "operator-tx-0001",
     });
     expect(result.stdout).toBe(`${JSON.stringify(starting)}\n`);
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"apply\",\"code\":\"ERR_INTERNAL\",\"message\":\"Unexpected quarantine failure.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"apply\",\"schemaVersion\":2,\"code\":\"ERR_INTERNAL\",\"message\":\"Unexpected quarantine failure.\"}\n");
   });
 
   it("does not convert an unknown restore-recovery exception into apply integrity", () => {
@@ -292,7 +311,7 @@ describe("quarantine cleanup CLI", () => {
     expect(result.signal).toBeNull();
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"recover\",\"code\":\"ERR_INTERNAL\",\"message\":\"Unexpected quarantine failure.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"recover\",\"schemaVersion\":2,\"code\":\"ERR_INTERNAL\",\"message\":\"Unexpected quarantine failure.\"}\n");
   });
 
   it("runs restore through its canonical npm form", () => {
@@ -335,7 +354,7 @@ describe("quarantine cleanup CLI", () => {
       expect(result.stderr).toBe("");
     } else {
       expect(result.stdout).toBe("");
-      expect(JSON.parse(result.stderr)).toEqual({ ok: false, command: "recover", code: "ERR_USAGE", message: "Invalid quarantine request." });
+      expect(JSON.parse(result.stderr)).toEqual({ ok: false, command: "recover", schemaVersion: 2, code: "ERR_USAGE", message: "Invalid quarantine request." });
     }
   });
 
@@ -405,7 +424,7 @@ describe("quarantine cleanup CLI", () => {
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
     expect(JSON.parse(result.stderr)).toEqual({
-      ok: false, command: "recover", code: "ERR_CONFLICT", message: "Quarantine recovery found preserved conflicts.",
+      ok: false, command: "recover", schemaVersion: 2, code: "ERR_CONFLICT", message: "Quarantine recovery found preserved conflicts.",
     });
     expect(result.stderr).not.toContain("copy-0001");
   });
@@ -426,7 +445,7 @@ describe("quarantine cleanup CLI", () => {
     expectSpawned(result);
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
   it.each([
@@ -445,7 +464,7 @@ describe("quarantine cleanup CLI", () => {
     expectSpawned(result);
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
   it("classifies a generated payload root symlink as integrity failure", () => {
@@ -463,7 +482,7 @@ describe("quarantine cleanup CLI", () => {
     expectSpawned(result);
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
   it.each([
@@ -485,7 +504,7 @@ describe("quarantine cleanup CLI", () => {
     expectSpawned(result);
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
   it("classifies tampered lifecycle evidence as integrity failure", () => {
@@ -501,7 +520,7 @@ describe("quarantine cleanup CLI", () => {
     expectSpawned(result);
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
   it("keeps an injected journal adapter exception internal", () => {
@@ -578,7 +597,7 @@ describe("quarantine cleanup CLI", () => {
     expect(result.signal).toBeNull();
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
   it("classifies malformed manifest evidence as integrity failure", () => {
@@ -595,7 +614,7 @@ describe("quarantine cleanup CLI", () => {
     expectSpawned(result);
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
   it("classifies a missing manifest generation as integrity failure", () => {
@@ -612,7 +631,7 @@ describe("quarantine cleanup CLI", () => {
     expectSpawned(result);
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
   it("keeps an injected manifest adapter exception internal", () => {
@@ -671,7 +690,7 @@ describe("quarantine cleanup CLI", () => {
     expectSpawned(result);
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_INTEGRITY\",\"message\":\"Quarantine evidence failed integrity validation.\"}\n");
   });
 
   it("classifies an in-progress restore as explicit recovery required", async () => {
@@ -694,7 +713,7 @@ describe("quarantine cleanup CLI", () => {
     expectSpawned(result);
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"code\":\"ERR_RECOVERY_REQUIRED\",\"message\":\"Explicit quarantine recovery is required.\"}\n");
+    expect(result.stderr).toBe("{\"ok\":false,\"command\":\"restore\",\"schemaVersion\":2,\"code\":\"ERR_RECOVERY_REQUIRED\",\"message\":\"Explicit quarantine recovery is required.\"}\n");
   });
 
   it("rolls an interrupted restore back through the canonical recover form", async () => {
@@ -743,17 +762,18 @@ describe("quarantine cleanup CLI", () => {
       expect(result.stdout).toBe("");
       const failure = JSON.parse(result.stderr);
       expect(failure).toEqual({
-        ok: false, command: args[0] === "unknown" ? null : args[0], code: "ERR_USAGE", message: "Invalid quarantine request.",
+        ok: false, command: args[0] === "unknown" ? null : args[0], schemaVersion: 2, code: "ERR_USAGE", message: "Invalid quarantine request.",
       });
       expect(result.stderr).not.toContain(sensitive);
     }
   });
 
-  it("requires writers-stopped for every mutating command", () => {
+  it("requires writers-stopped for every attested command", () => {
     const fixture = createQuarantineFixture();
     bases.push(fixture.base);
     const missingAttestation = [
       applyArgs(fixture).slice(0, -1),
+      ["reconcile", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot, "--transaction-id", "tx-1"],
       ["recover", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot, "--transaction-id", "tx-1", "--action", "resume"],
       ["mark-validated", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot, "--transaction-id", "tx-1"],
       ["restore", "--repo-root", fixture.repoRoot, "--quarantine-root", fixture.quarantineRoot, "--transaction-id", "tx-1"],
@@ -763,7 +783,7 @@ describe("quarantine cleanup CLI", () => {
       expect(result.status).toBe(2);
       expect(result.stdout).toBe("");
       expect(JSON.parse(result.stderr)).toEqual({
-        ok: false, command: args[0], code: "ERR_USAGE", message: "Invalid quarantine request.",
+        ok: false, command: args[0], schemaVersion: 2, code: "ERR_USAGE", message: "Invalid quarantine request.",
       });
     }
   });

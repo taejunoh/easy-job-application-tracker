@@ -1,5 +1,11 @@
 # Quarantine Lifecycle Continuation Implementation Plan
 
+> **Completed historical record (2026-08-13).** The implementation and
+> hardening covered by this plan span `7f1f94b^..97c18ca`; aggregate static
+> gate evidence is recorded at `4e0ae7d`. Original steps and checkbox states
+> remain unchanged as execution evidence. Any unchecked box below is historical
+> plan text, not a live backlog or authorization to mutate retained payloads.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Finish quarantine lifecycle Slice 3 recovery, Slice 4 private-core validation and four-day retention, Slice 5 restore and restore recovery, Slice 6's exact facade and canonical npm CLI, then pass the aggregate verification gate.
