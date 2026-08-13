@@ -2,7 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { createProtectedRoute } from "@/lib/security/protected-route";
-import { readJsonBody } from "@/lib/security/request-body";
+import {
+  applicationContractErrorResponse,
+  parseUpdateApplicationRequest,
+} from "@/lib/applications/contract";
 
 const route = createProtectedRoute(["GET", "PATCH", "DELETE"]);
 
@@ -30,21 +33,19 @@ export const PATCH = route.handler(async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const body = await readJsonBody(request);
+  let input;
+  try {
+    input = await parseUpdateApplicationRequest(id, request);
+  } catch (error) {
+    const response = applicationContractErrorResponse(error);
+    if (response) return response;
+    throw error;
+  }
 
   try {
     const application = await prisma.application.update({
       where: { id },
-      data: {
-        ...(body.jobTitle !== undefined && { jobTitle: body.jobTitle }),
-        ...(body.company !== undefined && { company: body.company }),
-        ...(body.status !== undefined && { status: body.status }),
-        ...(body.description !== undefined && { description: body.description || null }),
-        ...(body.notes !== undefined && { notes: body.notes || null }),
-        ...(body.salary !== undefined && { salary: body.salary || null }),
-        ...(body.location !== undefined && { location: body.location || null }),
-        ...(body.jobType !== undefined && { jobType: body.jobType || null }),
-      },
+      data: input.data,
     });
     return NextResponse.json(application);
   } catch (error) {

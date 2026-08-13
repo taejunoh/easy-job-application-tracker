@@ -3,6 +3,7 @@ import { saveSettings } from "@/app/settings/page";
 import {
   deleteApplication,
   saveApplicationChanges,
+  serializeApplicationChanges,
 } from "@/components/ApplicationDetail";
 import { saveNewApplication } from "@/components/UrlInput";
 import { ClientApiError, type ClientApi } from "@/lib/client-api";
@@ -45,6 +46,30 @@ describe("client mutations", () => {
     ).rejects.toBeInstanceOf(ClientApiError);
 
     expect(markSaved).not.toHaveBeenCalled();
+  });
+
+  it("serializes nullable empty application fields as null", () => {
+    expect(
+      serializeApplicationChanges({
+        jobTitle: "Engineer",
+        company: "Example",
+        status: "Applied",
+        description: "",
+        notes: "  ",
+        salary: "",
+        location: "New York",
+        jobType: "",
+      }),
+    ).toEqual({
+      jobTitle: "Engineer",
+      company: "Example",
+      status: "Applied",
+      description: null,
+      notes: null,
+      salary: null,
+      location: "New York",
+      jobType: null,
+    });
   });
 
   it("does not navigate after a failed delete", async () => {

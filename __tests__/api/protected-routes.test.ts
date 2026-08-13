@@ -97,6 +97,93 @@ const EXTENSION_ORIGIN =
 const UNKNOWN_ORIGIN = "https://evil.example.com";
 const ACCESS_TOKEN = "access-token-" + "a".repeat(32);
 const SESSION_COOKIE = `${SESSION_COOKIE_NAME}=${createSessionToken()}`;
+const APPLICATION_ID = "018f9f72-f2e9-7c29-a6fc-001122334455";
+
+describe("application route contract enforcement", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("rejects unknown POST fields before Prisma", async () => {
+    const response = await applicationsRoute.POST(
+      new NextRequest(`${APP_ORIGIN}/api/applications`, {
+        method: "POST",
+        headers: {
+          Origin: APP_ORIGIN,
+          Cookie: SESSION_COOKIE,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          url: "https://example.test/job",
+          jobTitle: "Engineer",
+          company: "Example",
+          unexpected: true,
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Invalid request",
+      code: "invalid_request",
+    });
+    expect(prisma.application.findMany).not.toHaveBeenCalled();
+    expect(prisma.application.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects arbitrary GET sort fields before Prisma", async () => {
+    const response = await applicationsRoute.GET(
+      new NextRequest(`${APP_ORIGIN}/api/applications?sortBy=identityKey`, {
+        headers: { Origin: APP_ORIGIN, Cookie: SESSION_COOKIE },
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "invalid_request" });
+    expect(prisma.application.findMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid PATCH identifiers before Prisma", async () => {
+    const response = await applicationDetailRoute.PATCH(
+      new NextRequest(`${APP_ORIGIN}/api/applications/not-a-uuid`, {
+        method: "PATCH",
+        headers: {
+          Origin: APP_ORIGIN,
+          Cookie: SESSION_COOKIE,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ status: "Offer" }),
+      }),
+      { params: Promise.resolve({ id: "not-a-uuid" }) },
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "invalid_request" });
+    expect(prisma.application.update).not.toHaveBeenCalled();
+  });
+
+  it("returns the closed 413 response before Prisma", async () => {
+    const response = await applicationsRoute.POST(
+      new NextRequest(`${APP_ORIGIN}/api/applications`, {
+        method: "POST",
+        headers: {
+          Origin: APP_ORIGIN,
+          Cookie: SESSION_COOKIE,
+          "Content-Type": "application/json",
+          "Content-Length": String(256 * 1024 + 1),
+        },
+        body: "{}",
+      }),
+    );
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toEqual({
+      error: "Request too large",
+      code: "request_too_large",
+    });
+    expect(prisma.application.create).not.toHaveBeenCalled();
+  });
+});
 
 type RouteContext = { params: Promise<{ id: string }> };
 type RouteHandler = (
@@ -393,17 +480,22 @@ describe("protected product API actual requests", () => {
     const route = actualRoutes.find(
       ({ name }) => name === "applications POST",
     ) as ActualRouteCase;
-    const request = productRequest(route, {
-      origin: EXTENSION_ORIGIN,
-      authorization: `Bearer ${ACCESS_TOKEN}`,
+    const request = new NextRequest(`${APP_ORIGIN}/api/applications`, {
+      method: "POST",
+      headers: {
+        Origin: EXTENSION_ORIGIN,
+        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
     });
-    jest.spyOn(request, "json").mockResolvedValue({});
 
     const response = await invokeActual(route, request);
 
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({
-      error: "url, jobTitle, and company are required",
+      error: "Invalid request",
+      code: "invalid_request",
     });
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
       EXTENSION_ORIGIN,
@@ -933,7 +1025,7 @@ describe("protected product API preflights", () => {
 });
 
 function detailContext(): RouteContext {
-  return { params: Promise.resolve({ id: "app-1" }) };
+  return { params: Promise.resolve({ id: APPLICATION_ID }) };
 }
 
 function productRequest(
@@ -1098,7 +1190,7 @@ async function invokeOptions(
 
 function arrangeSuccessfulBusinessLogic(): void {
   const application = {
-    id: "app-1",
+    id: APPLICATION_ID,
     url: "https://example.com/jobs/1",
     jobTitle: "Engineer",
     company: "Example",

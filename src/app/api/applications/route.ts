@@ -1,49 +1,52 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { createProtectedRoute } from "@/lib/security/protected-route";
-import { readJsonBody } from "@/lib/security/request-body";
-
-const VALID_STATUSES = ["Applied", "Interview", "Offer", "Rejected"];
-const VALID_JOB_TYPES = ["Remote", "Hybrid", "Onsite"];
+import {
+  applicationContractErrorResponse,
+  parseCreateApplicationRequest,
+  parseListApplicationsRequest,
+} from "@/lib/applications/contract";
 
 const route = createProtectedRoute(["GET", "POST"]);
 
 export const OPTIONS = route.OPTIONS;
 
 export const GET = route.handler(async function GET(request: NextRequest) {
-  const { searchParams } = new URL(request.url);
-  const status = searchParams.get("status");
-  const jobType = searchParams.get("jobType");
-  const search = searchParams.get("search");
-  const sortBy = searchParams.get("sortBy") || "appliedDate";
-  const sortOrder = searchParams.get("sortOrder") || "desc";
+  let query;
+  try {
+    query = parseListApplicationsRequest(new URL(request.url));
+  } catch (error) {
+    const response = applicationContractErrorResponse(error);
+    if (response) return response;
+    throw error;
+  }
 
   const where: Record<string, unknown> = {};
-  if (status && VALID_STATUSES.includes(status)) where.status = status;
-  if (jobType && VALID_JOB_TYPES.includes(jobType)) where.jobType = jobType;
-  if (search) {
+  if (query.status) where.status = query.status;
+  if (query.jobType) where.jobType = query.jobType;
+  if (query.search) {
     where.OR = [
-      { jobTitle: { contains: search } },
-      { company: { contains: search } },
+      { jobTitle: { contains: query.search } },
+      { company: { contains: query.search } },
     ];
   }
 
   const applications = await prisma.application.findMany({
     where,
-    orderBy: { [sortBy]: sortOrder },
+    orderBy: { [query.sortBy]: query.sortOrder },
   });
 
   return NextResponse.json(applications);
 });
 
 export const POST = route.handler(async function POST(request: NextRequest) {
-  const body = await readJsonBody(request);
-
-  if (!body.url || !body.jobTitle || !body.company) {
-    return NextResponse.json(
-      { error: "url, jobTitle, and company are required" },
-      { status: 400 }
-    );
+  let body;
+  try {
+    body = await parseCreateApplicationRequest(request);
+  } catch (error) {
+    const response = applicationContractErrorResponse(error);
+    if (response) return response;
+    throw error;
   }
 
   // Check if an application with a matching URL already exists (match by currentJobId param)
@@ -81,13 +84,13 @@ export const POST = route.handler(async function POST(request: NextRequest) {
       url: body.url,
       jobTitle: body.jobTitle,
       company: body.company,
-      status: body.status || "Applied",
-      appliedDate: body.appliedDate ? new Date(body.appliedDate) : new Date(),
-      description: body.description || null,
-      notes: body.notes || null,
-      salary: body.salary || null,
-      location: body.location || null,
-      jobType: body.jobType || null,
+      status: body.status,
+      appliedDate: body.appliedDate ?? new Date(),
+      description: body.description,
+      notes: body.notes,
+      salary: body.salary,
+      location: body.location,
+      jobType: body.jobType,
     },
   });
 

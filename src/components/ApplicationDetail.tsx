@@ -396,9 +396,27 @@ export async function saveApplicationChanges(
   await api(`/api/applications/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(form),
+    body: JSON.stringify(serializeApplicationChanges(form)),
   });
   markSaved();
+}
+
+export function serializeApplicationChanges(
+  form: Record<string, string>,
+): Record<string, string | null> {
+  const nullableFields = new Set([
+    "description",
+    "notes",
+    "salary",
+    "location",
+    "jobType",
+  ]);
+  return Object.fromEntries(
+    Object.entries(form).map(([key, value]) => [
+      key,
+      nullableFields.has(key) && value.trim() === "" ? null : value,
+    ]),
+  );
 }
 
 export async function deleteApplication(
