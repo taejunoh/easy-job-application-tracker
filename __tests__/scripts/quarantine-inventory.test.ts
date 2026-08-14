@@ -828,6 +828,35 @@ try {
       failure = { message: error.message, code: error?.code };
     }
     result = { summary: result, failure };
+  } else if (request.operation === "reader-fsync-concurrency") {
+    let activeSyncs = 0;
+    let maxConcurrentSyncs = 0;
+    let activeHandles = 0;
+    let maxOpenHandles = 0;
+    let syncCount = 0;
+    const fsApi = {
+      ...baseFsApi,
+      open: async (path) => {
+        activeHandles += 1;
+        maxOpenHandles = Math.max(maxOpenHandles, activeHandles);
+        return {
+          stat: () => fsPromises.lstat(path),
+          sync: async () => {
+            activeSyncs += 1;
+            maxConcurrentSyncs = Math.max(maxConcurrentSyncs, activeSyncs);
+            syncCount += 1;
+            try {
+              await new Promise((resolve) => setTimeout(resolve, 100));
+            } finally {
+              activeSyncs -= 1;
+            }
+          },
+          close: async () => { activeHandles -= 1; },
+        };
+      },
+    };
+    await reader.fsyncVerifiedTree(request.root, { fsApi });
+    result = { maxConcurrentSyncs, maxOpenHandles, syncCount };
   } else if (request.operation === "total-byte-bound") {
     const virtualRoot = "/virtual-total-byte-root";
     const virtualChild = virtualRoot + "/oversized-link";
@@ -1776,6 +1805,29 @@ describe("bounded quarantine inventory", () => {
     expect(result.events.some(([, path]) => path === join(canonicalNested, "link"))).toBe(false);
     expect(result.events.some(([, path]) => path === external)).toBe(false);
     expect(result.metrics.maxOpenDirectoryHandles).toBeLessThanOrEqual(1);
+  });
+
+  it("bounds verified restore tree flushes and open handles in a nested wide tree", () => {
+    const root = join(fixture, "reader-fsync-wide");
+    privateDirectory(root);
+    for (let directory = 0; directory < 16; directory += 1) {
+      const child = join(root, `directory-${String(directory).padStart(2, "0")}`);
+      privateDirectory(child);
+      for (let file = 0; file < 16; file += 1) {
+        writeFileSync(join(child, `file-${String(file).padStart(2, "0")}`), "payload");
+      }
+    }
+    const result = runWorker({
+      operation: "reader-fsync-concurrency",
+      repoRoot,
+      quarantineRoot,
+      transactionId: "reader-fsync-concurrency",
+      root: realpathSync(root),
+    }).result as { maxConcurrentSyncs: number; maxOpenHandles: number; syncCount: number };
+    expect(result.syncCount).toBe(273);
+    expect(result.maxConcurrentSyncs).toBeGreaterThan(1);
+    expect(result.maxConcurrentSyncs).toBeLessThanOrEqual(16);
+    expect(result.maxOpenHandles).toBeLessThanOrEqual(16);
   });
 
   it("round-trips the same prefixed restore ID through capability path and inventory fsync", () => {

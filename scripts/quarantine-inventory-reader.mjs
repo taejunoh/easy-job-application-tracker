@@ -29,6 +29,7 @@ export class InventoryStructuralError extends Error {
 }
 const FILE_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
 const DIRECTORY_OPEN_FLAGS = FILE_OPEN_FLAGS | fsConstants.O_DIRECTORY;
+const VERIFIED_SYNC_CONCURRENCY = 16;
 
 function assertAbsolutePath(value, label) {
   if (typeof value !== "string" || !isAbsolute(value) || value.includes("\0")) {
@@ -543,7 +544,35 @@ export async function fsyncVerifiedTree(root, {
   fsApi, ancestorChain = Object.freeze([]), rootIdentity = undefined,
 }) {
   assertAbsolutePath(root, "verified sync root");
-  const syncFile = async (path, expected, chain) => {
+  let activeSyncs = 0;
+  const syncWaiters = [];
+  const withSyncPermit = async (callback) => {
+    if (activeSyncs >= VERIFIED_SYNC_CONCURRENCY) {
+      await new Promise((resolve) => syncWaiters.push(resolve));
+    }
+    activeSyncs += 1;
+    try {
+      return await callback();
+    } finally {
+      activeSyncs -= 1;
+      syncWaiters.shift()?.();
+    }
+  };
+  const mapVerifiedLeaves = async (leaves, callback) => {
+    let next = 0;
+    const worker = async () => {
+      while (next < leaves.length) {
+        const index = next;
+        next += 1;
+        await callback(leaves[index]);
+      }
+    };
+    await Promise.all(Array.from(
+      { length: Math.min(VERIFIED_SYNC_CONCURRENCY, leaves.length) },
+      () => worker(),
+    ));
+  };
+  const syncFile = async (path, expected, chain) => withSyncPermit(async () => {
     let handle;
     let primary;
     try {
@@ -562,8 +591,8 @@ export async function fsyncVerifiedTree(root, {
       primary = error;
     }
     await closeAll(undefined, handle, primary);
-  };
-  const syncDirectory = async (path, expected, chain) => {
+  });
+  const syncDirectory = async (path, expected, chain) => withSyncPermit(async () => {
     let handle;
     let primary;
     try {
@@ -580,7 +609,7 @@ export async function fsyncVerifiedTree(root, {
       await assertPathMatchesHandle(path, opened, "isDirectory", fsApi);
     } catch (error) { primary = error; }
     await closeAll(undefined, handle, primary);
-  };
+  });
   let visited = 0;
   const enumerateDirectory = async (path, expected, chain) => withVerifiedDirectory(
     path, expected, chain, fsApi,
@@ -626,10 +655,18 @@ export async function fsyncVerifiedTree(root, {
     if (expectedFile) return syncFile(path, expected, chain);
     const enumerated = await enumerateDirectory(path, expected, chain);
     const childChain = appendAncestorChain(chain, enumerated.identity);
+    const leaves = [];
+    const directories = [];
     for (const name of enumerated.names) {
       const child = join(path, name);
       await validateAncestorChain(childChain, fsApi);
       const childStat = await fsApi.lstat(child);
+      (childStat.isDirectory() ? directories : leaves).push(Object.freeze({ child, childStat }));
+    }
+    await mapVerifiedLeaves(leaves, async ({ child, childStat }) => {
+      await visit(child, childStat, childChain);
+    });
+    for (const { child, childStat } of directories) {
       await visit(child, childStat, childChain);
     }
     await syncDirectory(path, enumerated.identity, chain);

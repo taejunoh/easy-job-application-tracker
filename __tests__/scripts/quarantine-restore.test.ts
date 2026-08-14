@@ -526,7 +526,8 @@ describe("quarantine restore", () => {
       expect(result.phases).not.toContain("after-event:RESTORED_ENTRY:generated-next");
       expect(journalEvents(join(prepared.runRoot, "journal.log")).at(-1)).toBe("RESTORE_INTENT");
       expect(result.syncOpened).toBe(result.syncClosed);
-      expect(result.maxSyncHandles).toBeLessThanOrEqual(2);
+      expect(result.maxSyncHandles).toBeGreaterThan(1);
+      expect(result.maxSyncHandles).toBeLessThanOrEqual(16);
       expect(Date.now() - startedAt).toBeLessThan(60_000);
     } finally {
       rmSync(prepared.fixture.base, { recursive: true, force: true });
