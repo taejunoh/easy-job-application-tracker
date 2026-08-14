@@ -913,7 +913,6 @@ describe("quarantine restore real SIGKILL recovery", () => {
         killAt: "after-event:RESTORE_INTENT:generated-next",
       });
       expect(crashed.signal).toBe("SIGKILL");
-      const journal = join(prepared.runRoot, "journal.log");
       const resumed = await spawnLifecycleChild("recoverRestore", { ...options, action: "resume" });
       if (resumed.code !== 0) throw new Error(JSON.stringify(resumed));
       expect(JSON.parse(resumed.stdout)).toMatchObject({ status: "RESTORED", action: "resume", reconciledEntries: 3 });
