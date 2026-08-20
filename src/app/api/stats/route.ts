@@ -17,6 +17,21 @@ export const GET = route.handler(async function GET() {
       prisma.application.findMany({
         orderBy: { appliedDate: "desc" },
         take: 5,
+        select: {
+          id: true,
+          url: true,
+          jobTitle: true,
+          company: true,
+          status: true,
+          appliedDate: true,
+          description: true,
+          notes: true,
+          salary: true,
+          location: true,
+          jobType: true,
+          createdAt: true,
+          updatedAt: true,
+        },
       }),
     ]);
 
@@ -42,6 +57,20 @@ export const GET = route.handler(async function GET() {
     rejected,
     weeklyCount,
     monthlyCount,
-    recentApplications,
+    recentApplications: recentApplications.map((application) => ({
+      id: application.id,
+      url: application.url,
+      jobTitle: application.jobTitle,
+      company: application.company,
+      status: application.status,
+      appliedDate: application.appliedDate,
+      description: application.description,
+      notes: application.notes,
+      salary: application.salary,
+      location: application.location,
+      jobType: application.jobType,
+      createdAt: application.createdAt,
+      updatedAt: application.updatedAt,
+    })),
   });
 });
