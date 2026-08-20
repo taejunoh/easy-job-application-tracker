@@ -69,7 +69,9 @@ Generate two different secrets. Run this command twice and keep both outputs pri
 node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
 ```
 
-Use the first output for encryption and the second output for application access. Edit `.env` so the five core variables follow this local template:
+Use the first output for encryption and the second output for application
+access. Edit `.env` so the five required variables and optional rollout gate
+follow this local template:
 
 ```dotenv
 DATABASE_URL="postgresql://<db-user>:<db-password>@127.0.0.1:5432/<db-name>"
@@ -77,6 +79,7 @@ ENCRYPTION_SECRET="<first-generated-secret>"
 APP_ACCESS_TOKEN="<second-generated-secret>"
 APP_BASE_URL="http://localhost:3000"
 CORS_ALLOWED_ORIGINS="http://localhost:3000,chrome-extension://<extension-id>"
+APPLICATION_IDENTITY_WRITES_ENABLED="0"
 ```
 
 Reserved URL characters in the database username, password, or database name must be percent-encoded before you place those components in `DATABASE_URL`. For example, encode `@` as `%40`.
@@ -94,8 +97,16 @@ The variables serve these purposes:
 | `APP_ACCESS_TOKEN` | Private root credential used only by the web `/connect` page to create an administrator session. Never paste it into the Chrome extension. It is not a provider API key. |
 | `APP_BASE_URL` | Exact public origin of the JobTracker server, with no path. Use `http://localhost:3000` locally. |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins allowed to call the server. Include the app origin and the exact `chrome-extension://<extension-id>` origin. |
+| `APPLICATION_IDENTITY_WRITES_ENABLED` | Optional closed rollout gate. It accepts only `"0"` or `"1"` and defaults to `"0"`; keep it disabled until the identity migration and any required legacy-data backfill are verified. |
 
 Do not commit `.env`, reuse one generated value for both secrets, or paste either secret into screenshots or issue reports.
+
+For a new empty local database, leave the identity gate at `"0"` while you
+apply the checked-in migrations. You may enable it only after migration status
+is current and the `Application` table is confirmed empty. For an existing
+database, follow the maintenance rollout in the
+[production operations runbook](docs/operations/production-runbook.md); do not
+enable the gate before its dry run, backfill, and verification are complete.
 
 ### 3. Prepare the database
 
@@ -221,7 +232,7 @@ For production-only connection, deployment, backup, and recovery problems, use t
 
 ## Production Deployment
 
-The supported hosted topology is Vercel for the Next.js application and Neon, or another managed PostgreSQL provider, for the database. Start with an empty PostgreSQL database and configure the same five core server variables in the Production environment. Use a canonical HTTPS origin for `APP_BASE_URL` and include that origin plus only approved Chrome extension origins in `CORS_ALLOWED_ORIGINS`.
+The supported hosted topology is Vercel for the Next.js application and Neon, or another managed PostgreSQL provider, for the database. Start with an empty PostgreSQL database and configure the five required server variables plus the optional `APPLICATION_IDENTITY_WRITES_ENABLED` rollout gate in the Production environment. Use a canonical HTTPS origin for `APP_BASE_URL` and include that origin plus only approved Chrome extension origins in `CORS_ALLOWED_ORIGINS`.
 
 The **Vercel Next.js preset** runs `npm run build`; Vercel does not run `npm start`. When the build loads `next.config.ts`, JobTracker validates the complete server environment at **build time**. At **request-serving runtime**, `src/instrumentation.ts` validates it again before a new Node.js server instance handles requests. `npm start` pre-listen validation applies to **self-hosted Node only**.
 
@@ -238,6 +249,22 @@ Do not give Vercel Preview deployments Production database credentials. Preview 
 
 After deployment, open `/connect` on the canonical HTTPS origin and enter `APP_ACCESS_TOKEN`. In the authenticated Settings page, create a one-time pairing code for the exact allowed extension origin and use that code in the popup; never give the root token to the extension. Follow the [production operations runbook](docs/operations/production-runbook.md) for deployment verification, Chrome pairing, logs, Neon connectivity, backups, restore tests, incident response, and rollback.
 
+### Production health automation
+
+The hourly `Production monitor` workflow authenticates to the canonical HTTPS
+origin and requires an exact `200` response from `/api/stats`. It reads the
+origin from the `PRODUCTION_APP_URL` repository variable and the root monitor
+credential from the `PRODUCTION_APP_ACCESS_TOKEN` repository secret. A failed
+run is an incident signal; do not loosen authentication or the response
+contract to make it pass.
+
+The nightly production-backup workflow uses PostgreSQL 17 tools to create a
+custom-format dump, verifies a scratch restore and deterministic database
+fingerprints, and uploads only an age-encrypted artifact with sanitized
+evidence. Configuration, manual-dispatch verification, recovery-key handling,
+and restore rehearsal steps are defined in the
+[production operations runbook](docs/operations/production-runbook.md).
+
 ## Database Migration Notes
 
 For a new empty PostgreSQL database, apply only the checked-in migration history:
@@ -249,7 +276,10 @@ npx prisma migrate deploy
 npx prisma migrate status
 ```
 
-Confirm the `Application`, `Settings`, and `_prisma_migrations` tables exist before serving traffic. No seed is required; the Settings row is created on the first authenticated Settings request.
+Confirm the `Application`, `Settings`, `ExtensionInstallation`,
+`ExtensionPairingGrant`, and `_prisma_migrations` tables exist before serving
+traffic. No seed is required; the Settings row is created on the first
+authenticated Settings request.
 
 If an existing database was previously created with `prisma db push`, first take a verified backup and compare it with the current Prisma schema:
 
@@ -267,6 +297,27 @@ npx prisma migrate status
 
 Never use a destructive reset, `db push` data-loss acceptance, or an unreviewed down migration on a database containing records you need. A safe rollback restores a tested backup. Legacy data imports require a separately reviewed export/import process. See the [production operations runbook](docs/operations/production-runbook.md) and the [sanitized production cutover record](docs/operations/production-cutover-2026-07-14.md) before changing a production database.
 
+### Existing-database identity rollout
+
+Treat identity activation as an ordered maintenance operation, not as an
+ordinary application deploy:
+
+1. Deploy the additive migrations and application with
+   `APPLICATION_IDENTITY_WRITES_ENABLED="0"`.
+2. Stop every Application writer and keep it stopped through verification.
+3. Complete a PostgreSQL 17 backup and scratch-restore check.
+4. Run the privacy-safe identity backfill dry run and review its row counts,
+   state totals, and unique-index result.
+5. Apply the same backfill with `--apply --writers-stopped`, then recheck row
+   counts, migration status, schema diff, and the unique identity index.
+6. Set `APPLICATION_IDENTITY_WRITES_ENABLED="1"`, deploy the same reviewed
+   application commit, repeat authenticated create/read checks, and only then
+   resume writers.
+
+The exact commands, private report requirements, failure stops, and rollback
+rules are in
+[Application identity maintenance rollout](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
+
 ## Development and Verification
 
 Run the normal repository checks before opening a pull request:
@@ -282,6 +333,17 @@ npm run check:startup-env
 ```
 
 CI enforces the dependency-audit policy with `npm run check:audit`. The workflow uses Node.js 22.22.2 and a disposable PostgreSQL service. It validates and deploys migrations, checks schema parity and extension assets, runs tests, lints, typechecks, builds, and verifies invalid startup configuration is rejected.
+
+Changes to backup or restore behavior also require the digest-pinned real
+PostgreSQL 17 interruption proof:
+
+```bash
+npm run test:backup:docker
+```
+
+This guarded test requires Docker. It verifies successful fingerprinting and
+SIGINT/SIGTERM cleanup without leaving database sessions, locks, credentials,
+or temporary backup artifacts behind.
 
 ### Chrome extension E2E
 
