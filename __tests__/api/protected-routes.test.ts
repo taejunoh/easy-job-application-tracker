@@ -675,6 +675,46 @@ describe("protected product API actual requests", () => {
     },
   );
 
+  it("keeps internal application identity fields out of the public stats response", async () => {
+    jest
+      .mocked(prisma.application.findMany)
+      .mockResolvedValue([applicationFixture()] as never);
+
+    const response = await statsRoute.GET(
+      new NextRequest(`${APP_ORIGIN}/api/stats`, {
+        headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      total: 0,
+      applied: 0,
+      interview: 0,
+      offer: 0,
+      rejected: 0,
+      weeklyCount: 0,
+      monthlyCount: 0,
+      recentApplications: [
+        {
+          id: APPLICATION_ID,
+          url: "https://example.com/jobs/1",
+          jobTitle: "Engineer",
+          company: "Example",
+          status: "Applied",
+          appliedDate: "2026-08-13T14:00:00.000Z",
+          description: null,
+          notes: null,
+          salary: null,
+          location: null,
+          jobType: null,
+          createdAt: "2026-08-13T14:00:00.000Z",
+          updatedAt: "2026-08-13T14:00:00.000Z",
+        },
+      ],
+    });
+  });
+
   it("decorates a handler-owned error for an allowed extension Origin", async () => {
     const route = actualRoutes.find(
       ({ name }) => name === "applications POST",
