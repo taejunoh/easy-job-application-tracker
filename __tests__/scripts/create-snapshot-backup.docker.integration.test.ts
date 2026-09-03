@@ -34,7 +34,7 @@ function runProcess(
   command: string,
   args: readonly string[],
   environment: NodeJS.ProcessEnv = process.env,
-  input?: string,
+  input?: string | Uint8Array,
 ): RunningProcess {
   const child = spawn(command, args, {
     cwd: root,
@@ -57,7 +57,7 @@ function runProcess(
 
 async function runDocker(
   args: readonly string[],
-  input?: string,
+  input?: string | Uint8Array,
 ): Promise<ProcessResult> {
   const result = await runProcess(docker, args, process.env, input).result;
   if (result.code !== 0) {
@@ -111,6 +111,12 @@ async function boundedResult(
 
 function testDatabaseUrl(port: number): string {
   return `postgresql://jobtracker@127.0.0.1:${port}/jobtracker`;
+}
+
+function databaseUrl(baseUrl: string, databaseName: string): string {
+  const url = new URL(baseUrl);
+  url.pathname = `/${databaseName}`;
+  return url.toString();
 }
 
 function secretDatabaseUrl(port: number): string {
@@ -310,6 +316,112 @@ describeDocker("real PostgreSQL 17 Docker backup interruption", () => {
     expect(fingerprint.tables.ExtensionInstallation).toMatchObject({ count: 0 });
     expect(fingerprint.tables.ExtensionPairingGrant).toMatchObject({ count: 0 });
   });
+
+  it("completes a normal Docker snapshot after releasing the start gate", async () => {
+    const token = randomBytes(5).toString("hex");
+    const restoreDatabase = `jobtracker_restore_${token}`;
+    const dumpPath = join(runDirectory!, "normal.dump");
+    const fingerprintPath = join(runDirectory!, "normal.json");
+    let restoreDatabaseCreated = false;
+
+    coordinatorProcess = runProcess(
+      process.execPath,
+      [coordinator, dumpPath, fingerprintPath],
+      {
+        ...process.env,
+        BACKUP_CREDENTIAL_DIRECTORY: runDirectory,
+        DATABASE_URL: secretDatabaseUrl(port),
+        DOCKER_BIN: docker,
+        PASSWORD_SENTINEL: passwordSentinel,
+        PG_DUMP_DOCKER_CONTAINER: toolContainer,
+        PRODUCTION_DATABASE_URL: secretDatabaseUrl(port),
+        TZ: "UTC",
+      },
+    );
+
+    try {
+      const result = await boundedResult(coordinatorProcess.result, 15_000);
+      if (result === "timeout") {
+        const stoppedProcessState = await runDocker([
+          "exec",
+          toolContainer,
+          "sh",
+          "-c",
+          "set -eu; set -- /tmp/.jobtracker-pg-dump-*.pid; [ -f \"$1\" ]; pid=$(cat \"$1\"); awk '{ print $3 }' \"/proc/$pid/stat\"",
+        ]);
+        expect(stoppedProcessState.stdout.trim()).toBe("T");
+      }
+      expect(result).not.toBe("timeout");
+      expect(result).toEqual({
+        code: 0,
+        signal: null,
+        stdout: "Production backup snapshot created.\n",
+        stderr: "",
+      });
+      expect((await stat(dumpPath)).size).toBeGreaterThan(0);
+      expect((await stat(fingerprintPath)).size).toBeGreaterThan(0);
+
+      await runDocker([
+        "exec",
+        sourceContainer,
+        "createdb",
+        "--host=127.0.0.1",
+        `--port=${port}`,
+        "--username=jobtracker",
+        restoreDatabase,
+      ]);
+      restoreDatabaseCreated = true;
+      const dump = await readFile(dumpPath);
+      await runDocker(
+        [
+          "exec",
+          "--interactive",
+          toolContainer,
+          "pg_restore",
+          "--exit-on-error",
+          "--no-owner",
+          "--no-privileges",
+          "--host=127.0.0.1",
+          `--port=${port}`,
+          "--username=jobtracker",
+          `--dbname=${restoreDatabase}`,
+        ],
+        dump,
+      );
+      const restoredFingerprint = join(runDirectory!, "restored.json");
+      const fingerprintResult = await runProcess(
+        process.execPath,
+        [fingerprintScript, restoredFingerprint],
+        {
+          ...process.env,
+          DATABASE_URL: databaseUrl(testDatabaseUrl(port), restoreDatabase),
+          TZ: "UTC",
+        },
+      ).result;
+      expect(fingerprintResult).toMatchObject({ code: 0, stderr: "" });
+      expect(await readFile(restoredFingerprint, "utf8")).toBe(
+        await readFile(fingerprintPath, "utf8"),
+      );
+    } finally {
+      if (coordinatorProcess?.child.exitCode === null) {
+        coordinatorProcess.child.kill("SIGTERM");
+        const termination = await boundedResult(coordinatorProcess.result, 5_000);
+        if (termination === "timeout") coordinatorProcess.child.kill("SIGKILL");
+      }
+      if (restoreDatabaseCreated) {
+        await runDocker([
+          "exec",
+          sourceContainer,
+          "dropdb",
+          "--host=127.0.0.1",
+          `--port=${port}`,
+          "--username=jobtracker",
+          "--if-exists",
+          restoreDatabase,
+        ]);
+      }
+    }
+  }, 30_000);
 
   it.each([
     ["SIGINT", 130],
