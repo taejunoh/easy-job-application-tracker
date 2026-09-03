@@ -17,6 +17,7 @@ type Step = Readonly<{
   if?: string;
   uses?: string;
   run?: string;
+  "continue-on-error"?: boolean;
   env?: Record<string, string>;
   with?: Record<string, unknown>;
 }>;
@@ -33,6 +34,7 @@ type MaintenanceWorkflow = Readonly<{
       "runs-on": string;
       "timeout-minutes": number;
       if?: string;
+      permissions?: Record<string, string>;
       env?: Record<string, string>;
       steps: readonly Step[];
     }>;
@@ -160,6 +162,8 @@ describe("production identity maintenance workflow contract", () => {
         ),
     );
 
+    expect(job.permissions).toBeUndefined();
+    expect(job.steps.every((step) => step["continue-on-error"] !== true)).toBe(true);
     expect(job.env).toMatchObject({
       DATABASE_URL: "${{ secrets.PRODUCTION_DATABASE_URL }}",
     });
@@ -262,6 +266,32 @@ describe("production identity maintenance workflow contract", () => {
     expect(argumentAfter(prepareComparator?.run, "--actual")).toBe(prepareReport);
     expect(prepareComparatorRun).toContain("--actual-mode dry-run");
 
+    const prepareBackfillIndex = steps.indexOf(prepareBackfill as Step);
+    const prepareComparatorIndex = steps.indexOf(prepareComparator as Step);
+    const prepareUploadIndex = steps.indexOf(prepareUpload as Step);
+    const prepareUmask = prepareSteps.find((step) =>
+      normalizeRun(step.run).includes("umask 077"),
+    );
+    const prepareUmaskIndex = steps.indexOf(prepareUmask as Step);
+    expect(prepareUmask).toBeDefined();
+    expect(prepareUmaskIndex).toBeLessThanOrEqual(prepareBackfillIndex);
+    if (prepareUmaskIndex === prepareBackfillIndex) {
+      expect(normalizeRun(prepareUmask?.run).indexOf("umask 077")).toBeLessThan(
+        normalizeRun(prepareBackfill?.run).indexOf(
+          "npm run backfill:application-identities",
+        ),
+      );
+    }
+    expect(prepareBackfillIndex).toBeLessThanOrEqual(prepareComparatorIndex);
+    if (prepareBackfillIndex === prepareComparatorIndex) {
+      expect(normalizeRun(prepareBackfill?.run).indexOf(
+        "npm run backfill:application-identities",
+      )).toBeLessThan(prepareComparatorRun.indexOf(
+        "node scripts/compare-application-identity-reports.mjs",
+      ));
+    }
+    expect(prepareComparatorIndex).toBeLessThan(prepareUploadIndex);
+
     expect(prepareUpload).toMatchObject({
       uses: `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
       with: {
@@ -276,6 +306,9 @@ describe("production identity maintenance workflow contract", () => {
     expect(preparePaths[0]).toMatch(/(?:\$\{\{\s*runner\.temp\s*\}\}|\$RUNNER_TEMP)/u);
     expect(preparePaths[0]).toMatch(/\.json$/u);
     expect(canonicalPath(preparePaths[0])).toBe(canonicalPath(prepareReport));
+    const prepareReportBasename = canonicalPath(preparePaths[0])?.split("/").pop();
+    expect(prepareReportBasename).toBeDefined();
+    const approvedExtractedReport = `$RUNNER_TEMP/approved/${prepareReportBasename}`;
 
     expect(provenance?.env).toMatchObject({
       GH_TOKEN: "${{ github.token }}",
@@ -330,9 +363,10 @@ describe("production identity maintenance workflow contract", () => {
     const postApplyRun = normalizeRun(postApplyComparison?.run);
     const approvedReport = argumentAfter(preApplyComparison?.run, "--expected");
     expect(approvedReport).toBeDefined();
-    expect(approvedReport).toMatch(/approved/iu);
+    expect(canonicalPath(approvedReport)).toBe(approvedExtractedReport);
     expect(argumentAfter(preApplyComparison?.run, "--actual")).toBe(currentDryRunReport);
-    expect(argumentAfter(postApplyComparison?.run, "--expected")).toBe(approvedReport);
+    expect(canonicalPath(argumentAfter(postApplyComparison?.run, "--expected")))
+      .toBe(approvedExtractedReport);
     expect(argumentAfter(postApplyComparison?.run, "--actual")).toBe(applyReport);
     expect(preApplyRun).toContain("--actual-mode dry-run");
     expect(postApplyRun).toContain("--actual-mode apply");
@@ -342,11 +376,13 @@ describe("production identity maintenance workflow contract", () => {
     const preApplyComparisonIndex = steps.indexOf(preApplyComparison as Step);
     const applyBackfillIndex = steps.indexOf(applyBackfill as Step);
     const postApplyComparisonIndex = steps.indexOf(postApplyComparison as Step);
-    expect(provenanceIndex).toBeLessThan(currentDryRunIndex);
+    const applyUploadIndex = steps.indexOf(applyUpload as Step);
+    expect(provenanceIndex).toBeLessThan(downloadIndex);
     expect(downloadIndex).toBeLessThan(currentDryRunIndex);
     expect(currentDryRunIndex).toBeLessThan(preApplyComparisonIndex);
     expect(preApplyComparisonIndex).toBeLessThan(applyBackfillIndex);
     expect(applyBackfillIndex).toBeLessThan(postApplyComparisonIndex);
+    expect(postApplyComparisonIndex).toBeLessThan(applyUploadIndex);
 
     expect(applyUpload).toMatchObject({
       uses: `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
