@@ -32,6 +32,7 @@ type MaintenanceWorkflow = Readonly<{
     maintain: Readonly<{
       "runs-on": string;
       "timeout-minutes": number;
+      if?: string;
       env?: Record<string, string>;
       steps: readonly Step[];
     }>;
@@ -56,6 +57,27 @@ function normalizeCondition(condition: string | undefined): string {
     .replace(/^\$\{\{\s*/u, "")
     .replace(/\s*\}\}$/u, "")
     .replace(/\s+/gu, " ");
+}
+
+function hasShellCommand(run: string | undefined, command: string): boolean {
+  return (run ?? "").split(/\r?\n/gu).some((line) => {
+    const trimmed = line.trim();
+    return trimmed.startsWith(command)
+      && (trimmed.length === command.length || /\s/gu.test(trimmed[command.length]));
+  });
+}
+
+function argumentAfter(run: string | undefined, flag: string): string | undefined {
+  const normalized = normalizeRun(run);
+  const escapedFlag = flag.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const match = normalized.match(
+    new RegExp(`${escapedFlag}(?:\\s+|=)(?:"([^"]+)"|'([^']+)'|(\\S+))`, "u"),
+  );
+  return match?.[1] ?? match?.[2] ?? match?.[3];
+}
+
+function canonicalPath(path: string | undefined): string | undefined {
+  return path?.replace(/\$\{\{\s*runner\.temp\s*\}\}/gu, "$RUNNER_TEMP");
 }
 
 function artifactPaths(step: Step | undefined): string[] {
@@ -98,18 +120,17 @@ describe("production identity maintenance workflow contract", () => {
       group: "production-identity-maintenance",
       "cancel-in-progress": false,
     });
-    expect(workflow.jobs).toEqual(expect.objectContaining({
-      maintain: expect.objectContaining({
-        "runs-on": "ubuntu-latest",
-        "timeout-minutes": 15,
-      }),
-    }));
+    expect(Object.keys(workflow.jobs)).toEqual(["maintain"]);
+    expect(workflow.jobs.maintain).toMatchObject({
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 15,
+    });
+    expect(workflow.jobs.maintain.if).toBeUndefined();
   });
 
   it("pins the toolchain, keeps writers stopped, and runs only additive Prisma checks", () => {
     const { workflow } = readWorkflow();
     const job = workflow.jobs.maintain;
-    const runs = job.steps.map((step) => normalizeRun(step.run)).join("\n");
     const guard = job.steps.find((step) =>
       normalizeRun(step.run).includes('test "$CURRENT_REF" = "refs/heads/main"'),
     );
@@ -117,6 +138,26 @@ describe("production identity maintenance workflow contract", () => {
     const firstRunIndex = job.steps.findIndex((step) => Boolean(step.run));
     const setupNode = job.steps.find((step) =>
       step.uses?.startsWith("actions/setup-node@"),
+    );
+    const usesSteps = job.steps.filter((step) => step.uses !== undefined);
+    const uses = usesSteps.map((step) => step.uses ?? "");
+    const approvedUses = new Set([
+      `actions/checkout@${CHECKOUT_SHA}`,
+      `actions/setup-node@${SETUP_NODE_SHA}`,
+      `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
+    ]);
+    const unconditionalCommandIndex = (command: string): number => job.steps.findIndex(
+      (step) => step.if === undefined && hasShellCommand(step.run, command),
+    );
+    const npmCiIndex = unconditionalCommandIndex("npm ci");
+    const migrateDeployIndex = unconditionalCommandIndex("npx prisma migrate deploy");
+    const migrateStatusIndex = unconditionalCommandIndex("npx prisma migrate status");
+    const migrateDiffIndex = job.steps.findIndex(
+      (step) => step.if === undefined
+        && hasShellCommand(step.run, "npx prisma migrate diff")
+        && normalizeRun(step.run).includes(
+          "--from-config-datasource --to-schema prisma/schema.prisma --exit-code",
+        ),
     );
 
     expect(job.env).toMatchObject({
@@ -130,16 +171,14 @@ describe("production identity maintenance workflow contract", () => {
         uses: `actions/setup-node@${SETUP_NODE_SHA}`,
       }),
     ]));
+    expect(usesSteps).toHaveLength(4);
+    expect(uses.filter((value) => value.startsWith("actions/checkout@")).length).toBe(1);
+    expect(uses.filter((value) => value.startsWith("actions/setup-node@")).length).toBe(1);
+    expect(uses.filter((value) => value.startsWith("actions/upload-artifact@")).length).toBe(2);
+    expect(uses.every((value) => approvedUses.has(value))).toBe(true);
     expect(setupNode?.with).toMatchObject({
       "node-version": "22.22.2",
     });
-    expect(runs).toContain("npm ci");
-    expect(runs).toContain("npx prisma migrate deploy");
-    expect(runs).toContain("npx prisma migrate status");
-    expect(runs).toContain(
-      "npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code",
-    );
-
     expect(guard?.env).toMatchObject({
       PHASE: "${{ inputs.phase }}",
       WRITERS_STOPPED: "${{ inputs.writers_stopped }}",
@@ -147,6 +186,11 @@ describe("production identity maintenance workflow contract", () => {
       CURRENT_REF: "${{ github.ref }}",
     });
     expect(guardIndex).toBe(firstRunIndex);
+    expect(guard?.if).toBeUndefined();
+    expect(npmCiIndex).toBeGreaterThan(guardIndex);
+    expect(migrateDeployIndex).toBeGreaterThan(npmCiIndex);
+    expect(migrateStatusIndex).toBeGreaterThan(migrateDeployIndex);
+    expect(migrateDiffIndex).toBeGreaterThan(migrateStatusIndex);
     const guardRun = normalizeRun(guard?.run);
     expect(guardRun).toContain("set -euo pipefail");
     expect(guardRun).toContain('test "$CURRENT_REF" = "refs/heads/main"');
@@ -166,10 +210,25 @@ describe("production identity maintenance workflow contract", () => {
       (step) => normalizeCondition(step.if) === "inputs.phase == 'prepare'",
     );
     const prepareRuns = prepareSteps.map((step) => normalizeRun(step.run)).join("\n");
-    const applyRuns = steps
-      .filter((step) => normalizeCondition(step.if) === "inputs.phase == 'apply'")
-      .map((step) => normalizeRun(step.run))
-      .join("\n");
+    const applySteps = steps.filter(
+      (step) => normalizeCondition(step.if) === "inputs.phase == 'apply'",
+    );
+    const prepareBackfill = prepareSteps.find((step) =>
+      hasShellCommand(step.run, "npm run backfill:application-identities"),
+    );
+    const prepareComparator = prepareSteps.find((step) =>
+      normalizeRun(step.run).includes(
+        "node scripts/compare-application-identity-reports.mjs",
+      ) && normalizeRun(step.run).includes("--actual-mode dry-run"),
+    );
+    const currentDryRun = applySteps.find((step) =>
+      hasShellCommand(step.run, "npm run backfill:application-identities")
+        && !/(?:^|\s)--apply(?:\s|$)/u.test(normalizeRun(step.run)),
+    );
+    const applyBackfill = applySteps.find((step) =>
+      hasShellCommand(step.run, "npm run backfill:application-identities")
+        && /(?:^|\s)--apply(?:\s|$)/u.test(normalizeRun(step.run)),
+    );
     const prepareUpload = steps.find(
       (step) => step.uses === `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`
         && String(step.with?.name).includes("application-identity-prepare-"),
@@ -183,15 +242,25 @@ describe("production identity maintenance workflow contract", () => {
         'gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARE_RUN_ID"',
       ),
     );
+    const download = steps.find((step) =>
+      normalizeRun(step.run).includes(
+        'gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY"',
+      ),
+    );
 
     expect(prepareSteps.length).toBeGreaterThan(0);
     expect(prepareRuns).toContain("umask 077");
-    expect(prepareRuns).toContain("npm run backfill:application-identities");
-    expect(prepareRuns).toContain("--report");
-    expect(prepareRuns).toContain(
-      "node scripts/compare-application-identity-reports.mjs",
-    );
-    expect(prepareRuns).toContain("--actual-mode dry-run");
+    expect(prepareBackfill).toBeDefined();
+    const prepareBackfillRun = normalizeRun(prepareBackfill?.run);
+    expect(prepareBackfillRun).not.toMatch(/(?:^|\s)--apply(?:\s|$)/u);
+    expect(prepareBackfillRun).not.toMatch(/(?:^|\s)--writers-stopped(?:\s|$)/u);
+    const prepareReport = argumentAfter(prepareBackfill?.run, "--report");
+    expect(prepareReport).toBeDefined();
+    expect(prepareComparator).toBeDefined();
+    const prepareComparatorRun = normalizeRun(prepareComparator?.run);
+    expect(argumentAfter(prepareComparator?.run, "--expected")).toBe(prepareReport);
+    expect(argumentAfter(prepareComparator?.run, "--actual")).toBe(prepareReport);
+    expect(prepareComparatorRun).toContain("--actual-mode dry-run");
 
     expect(prepareUpload).toMatchObject({
       uses: `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
@@ -206,6 +275,7 @@ describe("production identity maintenance workflow contract", () => {
     expect(preparePaths).toHaveLength(1);
     expect(preparePaths[0]).toMatch(/(?:\$\{\{\s*runner\.temp\s*\}\}|\$RUNNER_TEMP)/u);
     expect(preparePaths[0]).toMatch(/\.json$/u);
+    expect(canonicalPath(preparePaths[0])).toBe(canonicalPath(prepareReport));
 
     expect(provenance?.env).toMatchObject({
       GH_TOKEN: "${{ github.token }}",
@@ -224,23 +294,30 @@ describe("production identity maintenance workflow contract", () => {
     ]) {
       expect(provenanceRun).toContain(check);
     }
-    expect(provenanceRun).toContain(
+    expect(download).toBeDefined();
+    expect(normalizeCondition(download?.if)).toBe("inputs.phase == 'apply'");
+    const downloadRun = normalizeRun(download?.run);
+    expect(downloadRun).toContain(
       'gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY"',
     );
-    expect(provenanceRun).toContain(
+    expect(downloadRun).toContain(
       '--name "application-identity-prepare-$PREPARE_RUN_ID"',
     );
-    expect(provenanceRun).toContain('--dir "$RUNNER_TEMP/approved"');
+    expect(downloadRun).toContain('--dir "$RUNNER_TEMP/approved"');
 
-    expect(applyRuns).toContain(
-      "node scripts/compare-application-identity-reports.mjs",
-    );
-    expect(applyRuns).toContain("--actual-mode dry-run");
-    expect(applyRuns).toContain("--actual-mode apply");
-    expect(applyRuns).toContain("--apply --writers-stopped");
-    expect(applyRuns).toMatch(
-      /npm run backfill:application-identities\s+--\s+(?!--apply\b)[^\n]*--report/iu,
-    );
+    expect(currentDryRun).toBeDefined();
+    const currentDryRunRun = normalizeRun(currentDryRun?.run);
+    expect(currentDryRunRun).not.toMatch(/(?:^|\s)--apply(?:\s|$)/u);
+    expect(currentDryRunRun).not.toMatch(/(?:^|\s)--writers-stopped(?:\s|$)/u);
+    const currentDryRunReport = argumentAfter(currentDryRun?.run, "--report");
+    expect(currentDryRunReport).toBeDefined();
+    expect(applyBackfill).toBeDefined();
+    const applyBackfillRun = normalizeRun(applyBackfill?.run);
+    expect(applyBackfillRun).toMatch(/(?:^|\s)--apply(?:\s|$)/u);
+    expect(applyBackfillRun).toMatch(/(?:^|\s)--writers-stopped(?:\s|$)/u);
+    const applyReport = argumentAfter(applyBackfill?.run, "--report");
+    expect(applyReport).toBeDefined();
+    expect(applyReport).not.toBe(currentDryRunReport);
     const preApplyComparison = steps.find(
       (step) => normalizeCondition(step.if) === "inputs.phase == 'apply'"
         && normalizeRun(step.run).includes("--actual-mode dry-run"),
@@ -251,14 +328,25 @@ describe("production identity maintenance workflow contract", () => {
     );
     const preApplyRun = normalizeRun(preApplyComparison?.run);
     const postApplyRun = normalizeRun(postApplyComparison?.run);
-    expect(preApplyRun).toMatch(/--expected\s+[^\s]*approved/iu);
-    expect(postApplyRun).toMatch(/--expected\s+[^\s]*approved/iu);
-    expect(applyRuns.indexOf("--actual-mode dry-run")).toBeLessThan(
-      applyRuns.indexOf("--apply --writers-stopped"),
-    );
-    expect(applyRuns.indexOf("--apply --writers-stopped")).toBeLessThan(
-      applyRuns.indexOf("--actual-mode apply"),
-    );
+    const approvedReport = argumentAfter(preApplyComparison?.run, "--expected");
+    expect(approvedReport).toBeDefined();
+    expect(approvedReport).toMatch(/approved/iu);
+    expect(argumentAfter(preApplyComparison?.run, "--actual")).toBe(currentDryRunReport);
+    expect(argumentAfter(postApplyComparison?.run, "--expected")).toBe(approvedReport);
+    expect(argumentAfter(postApplyComparison?.run, "--actual")).toBe(applyReport);
+    expect(preApplyRun).toContain("--actual-mode dry-run");
+    expect(postApplyRun).toContain("--actual-mode apply");
+    const provenanceIndex = steps.indexOf(provenance as Step);
+    const downloadIndex = steps.indexOf(download as Step);
+    const currentDryRunIndex = steps.indexOf(currentDryRun as Step);
+    const preApplyComparisonIndex = steps.indexOf(preApplyComparison as Step);
+    const applyBackfillIndex = steps.indexOf(applyBackfill as Step);
+    const postApplyComparisonIndex = steps.indexOf(postApplyComparison as Step);
+    expect(provenanceIndex).toBeLessThan(currentDryRunIndex);
+    expect(downloadIndex).toBeLessThan(currentDryRunIndex);
+    expect(currentDryRunIndex).toBeLessThan(preApplyComparisonIndex);
+    expect(preApplyComparisonIndex).toBeLessThan(applyBackfillIndex);
+    expect(applyBackfillIndex).toBeLessThan(postApplyComparisonIndex);
 
     expect(applyUpload).toMatchObject({
       uses: `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
@@ -272,6 +360,7 @@ describe("production identity maintenance workflow contract", () => {
     expect(applyPaths).toHaveLength(1);
     expect(applyPaths[0]).toMatch(/(?:\$\{\{\s*runner\.temp\s*\}\}|\$RUNNER_TEMP)/u);
     expect(applyPaths[0]).toMatch(/\.json$/u);
+    expect(canonicalPath(applyPaths[0])).toBe(canonicalPath(applyReport));
     expect(applyPaths.join("\n")).not.toMatch(
       /(?:raw|dump|backup|database|\.sql\b|\.csv\b|\.jsonl\b)/iu,
     );
@@ -280,23 +369,68 @@ describe("production identity maintenance workflow contract", () => {
   it("cleans every temporary report unconditionally and forbids production data leaks or destructive commands", () => {
     const { source, workflow } = readWorkflow();
     const steps = workflow.jobs.maintain.steps;
+    const guardIndex = steps.findIndex((step) =>
+      normalizeRun(step.run).includes('test "$CURRENT_REF" = "refs/heads/main"'),
+    );
     const cleanup = steps.find(
       (step) => normalizeCondition(step.if) === "always()",
     );
+    const cleanupIndex = steps.indexOf(cleanup as Step);
     const cleanupRun = normalizeRun(cleanup?.run);
     const uploadPaths = steps
       .filter((step) => step.uses === `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`)
       .flatMap(artifactPaths);
+    const unconditionalCommands = [
+      "npm ci",
+      "npx prisma migrate deploy",
+      "npx prisma migrate status",
+      "npx prisma migrate diff",
+    ];
+    const applySteps = steps.filter(
+      (step) => normalizeCondition(step.if) === "inputs.phase == 'apply'",
+    );
+    const currentDryRun = applySteps.find((step) =>
+      hasShellCommand(step.run, "npm run backfill:application-identities")
+        && !/(?:^|\s)--apply(?:\s|$)/u.test(normalizeRun(step.run)),
+    );
+    const applyBackfill = applySteps.find((step) =>
+      hasShellCommand(step.run, "npm run backfill:application-identities")
+        && /(?:^|\s)--apply(?:\s|$)/u.test(normalizeRun(step.run)),
+    );
+    const preApplyComparison = applySteps.find((step) =>
+      normalizeRun(step.run).includes("--actual-mode dry-run"),
+    );
+    const currentDryRunReport = argumentAfter(currentDryRun?.run, "--report");
+    const applyReport = argumentAfter(applyBackfill?.run, "--report");
+    const approvedReport = argumentAfter(preApplyComparison?.run, "--expected");
 
     expect(cleanup).toBeDefined();
+    expect(cleanupIndex).toBe(steps.length - 1);
     expect(cleanupRun).toMatch(/\brm\s+-r?f\b/iu);
     expect(cleanupRun).toMatch(/\$RUNNER_TEMP\/approved/u);
     expect(cleanupRun).toMatch(/(?:\$RUNNER_TEMP\/[^\n]*(?:dry-run|current)|CURRENT[^\s]*DRY[^\s]*RUN)/iu);
     expect(cleanupRun).toMatch(/(?:\$RUNNER_TEMP\/[^\n]*apply|APPLY[^\s]*REPORT)/iu);
+    expect(currentDryRunReport).toBeDefined();
+    expect(applyReport).toBeDefined();
+    expect(approvedReport).toBeDefined();
+    expect(cleanupRun).toContain(canonicalPath(currentDryRunReport));
+    expect(cleanupRun).toContain(canonicalPath(applyReport));
+    expect(cleanupRun).toContain("$RUNNER_TEMP/approved");
     expect(uploadPaths).toHaveLength(2);
     expect(uploadPaths.join("\n")).not.toMatch(
       /(?:raw|dump|backup|database|\.sql\b|\.csv\b|\.jsonl\b)/iu,
     );
+
+    for (const [index, step] of steps.entries()) {
+      if (index < guardIndex || index === guardIndex || index === cleanupIndex) continue;
+      if (unconditionalCommands.some((command) => hasShellCommand(step.run, command))) {
+        expect(step.if).toBeUndefined();
+      } else {
+        expect(normalizeCondition(step.if)).toMatch(
+          /^inputs\.phase == '(?:prepare|apply)'$/u,
+        );
+      }
+    }
 
     expect(source).not.toMatch(/(?:echo|printf)\b[^\n]*(?:DATABASE_URL|PRODUCTION_DATABASE_URL)/iu);
     expect(source).not.toMatch(/\bprisma\s+db\s+(?:push|reset)\b/iu);
