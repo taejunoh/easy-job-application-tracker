@@ -65,6 +65,11 @@
     "yaml": "^2.9.0"
   },
   "overrides": {
+    "@humanfs/node": "0.16.8",
+    "browserslist": "4.28.8",
+    "deepmerge-ts": "8.0.2",
+    "fast-uri": "3.1.6",
+    "mysql2": "3.24.3",
     "minimatch@3.1.5": {
       "brace-expansion": "1.1.18"
     }
