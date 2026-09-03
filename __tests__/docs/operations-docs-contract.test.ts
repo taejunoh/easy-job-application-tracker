@@ -49,6 +49,14 @@ describe("production operations documentation contract", () => {
     }
   });
 
+  it("keeps Application identity writes closed by default", () => {
+    const envExample = readFileSync(join(root, ".env.example"), "utf8");
+
+    expect(envExample.match(/^APPLICATION_IDENTITY_WRITES_ENABLED="0"$/gmu)).toEqual([
+      'APPLICATION_IDENTITY_WRITES_ENABLED="0"',
+    ]);
+  });
+
   it("documents the maintenance-gated Application identity rollout in exact order", () => {
     const runbook = readFileSync(
       join(root, "docs/operations/production-runbook.md"),
