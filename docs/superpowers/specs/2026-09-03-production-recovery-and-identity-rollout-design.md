@@ -126,12 +126,14 @@ Add a manually dispatched, non-scheduled workflow that uses the existing
 `PRODUCTION_DATABASE_URL` secret without printing or exporting it. It supports
 two explicit phases:
 
-1. `prepare`: apply checked-in additive migrations, verify migration status and
-   an empty schema diff, and produce a privacy-safe dry-run backfill report.
-2. `apply`: require a typed writer-stop attestation, apply the deterministic
-   backfill with `--writers-stopped`, verify migration status, schema diff, row
-   counts, state totals, and the unique identity index, and upload only the
-   privacy-safe apply report as restricted operational evidence.
+1. `prepare`: require a typed writer-stop attestation, apply checked-in additive
+   migrations, verify migration status and an empty schema diff, and produce a
+   privacy-safe dry-run backfill report.
+2. `apply`: require the same typed writer-stop attestation plus the approved
+   `prepare` run identity, retrieve its privacy-safe report, apply the
+   deterministic backfill with `--writers-stopped`, verify migration status,
+   schema diff, row counts, state totals, and the unique identity index, and
+   require the apply report invariants to match the approved dry run.
 
 The workflow will use concurrency control so two identity operations cannot run
 at once. It will have read-only repository permissions, bounded timeouts, exact
@@ -141,10 +143,12 @@ keys may enter logs or artifacts.
 
 The operator sequence is:
 
-1. Run `prepare` while the current identity write gate remains `0`.
-2. Review the dry-run report and the fresh backup evidence.
-3. Pause the Vercel project so all web and extension write paths are stopped.
-4. Run `apply` with the writer-stop attestation.
+1. Confirm the current identity write gate remains `0`, then pause the Vercel
+   project so all web and extension write paths are stopped.
+2. Run `prepare` with the writer-stop attestation and keep writers stopped.
+3. Review the dry-run report and the fresh backup evidence without resuming
+   writers.
+4. Run `apply` with the writer-stop attestation and approved `prepare` run ID.
 5. Require the apply report to match the approved dry-run invariants.
 6. Set `APPLICATION_IDENTITY_WRITES_ENABLED=1` in Production and redeploy the
    exact reviewed `main` commit.
