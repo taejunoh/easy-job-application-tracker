@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -56,6 +56,15 @@ async function writeRawReport(directory: string, name: string, content: string):
   return path;
 }
 
+async function withTempDirectory<T>(run: (directory: string) => Promise<T>): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), "identity-report-comparator-"));
+  try {
+    return await run(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 function report(mode: "dry-run" | "apply" = "dry-run"): Report {
   return {
     schemaVersion: 1,
@@ -87,12 +96,13 @@ function expectFailure(result: CliResult): void {
 
 describe("application identity report comparator", () => {
   it.each(["dry-run", "apply"] as const)("accepts identical invariant data for actual %s", async (actualMode) => {
-    const directory = await mkdtemp(join(tmpdir(), "identity-report-comparator-"));
-    const expected = await writeReport(directory, "expected.json", report());
-    const actual = await writeReport(directory, "actual.json", report(actualMode));
+    await withTempDirectory(async (directory) => {
+      const expected = await writeReport(directory, "expected.json", report());
+      const actual = await writeReport(directory, "actual.json", report(actualMode));
 
-    await expect(runComparator(["--expected", expected, "--actual", actual, "--actual-mode", actualMode]))
-      .resolves.toEqual({ code: 0, stdout: "Application identity reports match.\n", stderr: "" });
+      await expect(runComparator(["--expected", expected, "--actual", actual, "--actual-mode", actualMode]))
+        .resolves.toEqual({ code: 0, stdout: "Application identity reports match.\n", stderr: "" });
+    });
   });
 
   it.each([
@@ -101,11 +111,12 @@ describe("application identity report comparator", () => {
     ["unverified unique index", (value: Report) => ({ ...value, uniqueIndexVerified: false })],
     ["changed duplicate assignment", (value: Report) => ({ ...value, rows: [{ ...value.rows[0] }, { ...value.rows[1], duplicateOfIdHash: "c".repeat(64) }, { ...value.rows[2] }] })],
   ])("rejects %s", async (_, mutate) => {
-    const directory = await mkdtemp(join(tmpdir(), "identity-report-comparator-"));
-    const expected = await writeReport(directory, "expected.json", report());
-    const actual = await writeReport(directory, "actual.json", mutate(report()));
+    await withTempDirectory(async (directory) => {
+      const expected = await writeReport(directory, "expected.json", report());
+      const actual = await writeReport(directory, "actual.json", mutate(report()));
 
-    expectFailure(await runComparator(["--expected", expected, "--actual", actual, "--actual-mode", "dry-run"]));
+      expectFailure(await runComparator(["--expected", expected, "--actual", actual, "--actual-mode", "dry-run"]));
+    });
   });
 
   it.each([
@@ -118,9 +129,10 @@ describe("application identity report comparator", () => {
     ["extra raw report key", async (directory: string) => [await writeReport(directory, "expected.json", { ...report(), rawUrl: privateValue }), await writeReport(directory, "actual.json", report()), "dry-run"]],
     ["extra raw row key", async (directory: string) => [await writeReport(directory, "expected.json", report()), await writeReport(directory, "actual.json", { ...report(), rows: [{ ...report().rows[0], sourceUrl: privateValue }, ...report().rows.slice(1)] }), "dry-run"]],
   ])("fails safely for %s", async (_, prepare) => {
-    const directory = await mkdtemp(join(tmpdir(), "identity-report-comparator-"));
-    const [expected, actual, actualMode] = await prepare(directory);
-    expectFailure(await runComparator(["--expected", expected, "--actual", actual, "--actual-mode", actualMode]));
+    await withTempDirectory(async (directory) => {
+      const [expected, actual, actualMode] = await prepare(directory);
+      expectFailure(await runComparator(["--expected", expected, "--actual", actual, "--actual-mode", actualMode]));
+    });
   });
 
   it.each([
