@@ -315,61 +315,61 @@ The Settings singleton is created only on the first successful PUT /api/settings
 
 #### Rollout state and evidence summary
 
-The operator-state summary is: after database apply, the rollout is
-`PAUSED_AFTER_APPLY`; failed or ambiguous evidence enters `HOLD_PAUSED`, where
-there is no build, deploy, alias assignment, or promotion. After approval, the
-exact recorded `identity=1,writes=0` Ready deployment is resumed as
-`UNPAUSED_READONLY` for read-only and authenticated negative probes. A regression
-requires an exact Ready candidate ID and reviewed SHA or returns to
-`HOLD_PAUSED`. The private ledger retains exact owned IDs until bounded cleanup
-is verified and cleanup may remove only those IDs.
+This is a design and operator-state summary; it does not assert that the
+production rollout has occurred. The [production operations runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout)
+owns the real procedure and evidence. Its planned state model requires the
+rollout to enter `PAUSED_AFTER_APPLY` after database apply; failed or ambiguous
+evidence must enter `HOLD_PAUSED`, where no build, deploy, alias assignment, or
+promotion is permitted. After approval, the plan requires resuming the exact
+recorded `identity=1,writes=0` Ready deployment with no redeploy; it is the
+recorded same deployment for `UNPAUSED_READONLY` read-only and authenticated
+negative probes. A
+regression requires an exact Ready candidate ID and reviewed SHA or must return
+to `HOLD_PAUSED`. The private ledger must retain exact owned IDs until bounded
+cleanup is verified, and cleanup may remove only those IDs.
 
 Production identity maintenance is a manual, ordered two-gate operation. The
-historical evidence began with an `identity=0,writes=1` Ready canonical support
+plan requires starting from an `identity=0,writes=1` Ready canonical support
 deployment and private fixtures: one disposable Application, one installed
 extension credential, and a second unconsumed pairing grant. Their URL, IDs,
-tokens, pairing codes, and request/response bodies remained only in a private
-mode-0700 operator workspace and were absent from logs, artifacts, Actions
-output, shell history, PR/comments, and docs.
+tokens, pairing codes, and request/response bodies must remain only in a
+private mode-0700 operator workspace and must be absent from logs, artifacts,
+Actions output, shell history, PR/comments, and docs.
 
-The recorded Stage 1 evidence showed a Ready `identity=1,writes=0` Production
-candidate with the exact intended Git SHA and no canonical alias, followed by
-an unpaused promotion, a bounded drain of at least `2 × maxDuration` (at least
-60 seconds when modules had 30-second maximum duration), and an authenticated
-negative probe. The exact fixtures proved all eight persistent mutations
-returned `503 writes_stopped`: Application POST/PATCH/DELETE, Settings PUT,
-pairing creation, valid pair exchange, installation deletion, and self-revoke.
-The documented behavior is that Settings GET does not create a row, and
-installation-authenticated reads did not change
-`lastUsedAt/updatedAt`.
+Stage 1 acceptance requires a Ready `identity=1,writes=0` Production candidate
+with the exact intended Git SHA and no canonical alias. Operators must promote
+only while unpaused, after a bounded drain of at least `2 × maxDuration` (at
+least 60 seconds when modules have 30-second maximum duration) and an
+authenticated negative probe. The exact fixtures must prove that all eight
+persistent mutations return `503 writes_stopped`: Application POST/PATCH/DELETE,
+Settings PUT, pairing creation, valid pair exchange, installation deletion, and
+self-revoke. The required behavior is that Settings GET does not create a row,
+and installation-authenticated reads must not change `lastUsedAt/updatedAt`.
 
-The recorded Stage 2 evidence showed canonical `503 DEPLOYMENT_PAUSED` before
-prepare/apply, with the identity backfill prepared, privately reviewed, and
-applied only while paused. The evidence recorded that no build or promotion
-while paused occurred. The recorded same read-only `identity=1,writes=0`
-deployment resumed without redeploying, followed by a final Ready
-`identity=1,writes=1` candidate, unpaused
-promotion, smoke, bounded cleanup, and the recorded fact that external writers
-are resumed last. Cleanup
-deleted the disposable Application, consumed the still-unconsumed grant once,
-revoked both disposable installations, and retained only sanitized
-statuses/counts/hashes.
+Stage 2 requires canonical `503 DEPLOYMENT_PAUSED` before prepare/apply. The
+identity backfill must be prepared, privately reviewed, and applied only while
+paused. Acceptance requires evidence that no build or promotion occurred while
+paused. After apply evidence is approved and the pause is cleared, the same
+read-only `identity=1,writes=0` deployment may resume without redeploying,
+building, or promoting. A final Ready `identity=1,writes=1` candidate then
+requires unpaused promotion, smoke, bounded cleanup, and evidence that external
+writers are resumed last. Cleanup must delete the disposable Application,
+consume the still-unconsumed grant once, revoke both disposable installations,
+and retain only sanitized statuses/counts/hashes.
 
-Prepare and apply were dispatched from `main` only after writer-stop attestation
-and pause evidence. Evidence required capture and wait for numeric
-`PREPARE_RUN_ID`;
-numeric prepare/apply run identifiers, exact rollout SHA,
-private artifact review, and `writers_stopped=true` were recorded; apply used
-the approved numeric `prepare_run_id`. The authoritative [Production identity
-maintenance runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout)
-defines all executable dispatch, observation, promotion, rollback, fixture,
-and cleanup procedures. The rollout invariant was that writers remained stopped
-continuously until every post-resume smoke pass succeeds. Any failure means
-writers remain stopped; no `prisma db push`, `prisma db reset`, or destructive
-shortcut was used. The rollback target was the recorded Ready
-`identity=1,writes=0` deployment; the promotion occurred only while unpaused,
-rollback was allowed only while unpaused, and neither action targeted
-identity-unaware code.
+The plan requires prepare and apply to be dispatched from `main` only after
+writer-stop attestation and pause evidence. Evidence must capture and wait for
+numeric `PREPARE_RUN_ID`; numeric prepare/apply run identifiers, exact rollout
+SHA, private artifact review, and `writers_stopped=true` are required, with
+apply using the approved numeric `prepare_run_id`. The authoritative
+[Production identity maintenance runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout)
+defines all executable dispatch, observation, promotion, rollback, fixture, and
+cleanup procedures. The rollout invariant requires that writers remain stopped
+continuously until every post-resume smoke pass succeeds. Any failure must keep
+writers stopped; `prisma db push`, `prisma db reset`, and destructive shortcuts
+are forbidden. The rollback target must be a recorded Ready
+`identity=1,writes=0` deployment; promotion and rollback are allowed only while
+unpaused, and neither action may target identity-unaware code.
 
 ## Development and Verification
 

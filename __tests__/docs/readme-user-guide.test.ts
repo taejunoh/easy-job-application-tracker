@@ -434,4 +434,58 @@ describe("task-first README user guide", () => {
       /(?:build|deploy|deployment|promotion)[^.]{0,100}(?:while|remains) Vercel (?:was|remains) paused/iu,
     );
   });
+
+  test("keeps the Production identity summary factual and requirement-scoped", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const start = readme.indexOf("### Production identity maintenance");
+    const end = readme.indexOf("\n## Development and Verification", start);
+    const section = readme
+      .slice(start, end === -1 ? readme.length : end)
+      .replace(/\s+/gu, " ");
+    const sentences = section.split(/(?<=[.!?])\s+/u);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(section).toMatch(
+      /design and operator-state summary; it does not assert that the\s+production rollout has occurred/iu,
+    );
+    expect(section).toContain(
+      "owns the real procedure and evidence",
+    );
+
+    for (const requiredPhrase of [
+      "identity=0,writes=1",
+      "identity=1,writes=0",
+      "identity=1,writes=1",
+      "exact intended Git SHA",
+      "no canonical alias",
+      "all eight persistent mutations",
+      "Settings GET does not create a row",
+      "lastUsedAt/updatedAt",
+      "503 DEPLOYMENT_PAUSED",
+      "numeric `PREPARE_RUN_ID`",
+      "external writers are resumed last",
+      "rollback target",
+    ]) {
+      const sentence = sentences.find((candidate) =>
+        candidate.includes(requiredPhrase),
+      );
+      expect(sentence).toBeDefined();
+      expect(sentence).toMatch(
+        /\b(?:requires|required|must|may|permitted|acceptance|forbidden|allowed)\b/iu,
+      );
+    }
+
+    for (const forbiddenCompletionClaim of [
+      /\bhistorical evidence began\b/iu,
+      /\brecorded Stage [12] evidence showed\b/iu,
+      /\bexact fixtures proved\b/iu,
+      /\bbackfill was prepared\b/iu,
+      /\bthe promotion occurred\b/iu,
+      /\bcleanup (?:deleted|consumed|revoked)\b/iu,
+      /\b(?:prepare and apply|workflows?) were dispatched\b/iu,
+      /\b(?:shortcut|shortcuts) was used\b/iu,
+    ]) {
+      expect(section).not.toMatch(forbiddenCompletionClaim);
+    }
+  });
 });
