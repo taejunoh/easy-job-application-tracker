@@ -467,6 +467,8 @@ promotion. It is paused only across prepare/apply, and the actual platform
    [[ "$STAGE_ONE_LEDGER_ID" == "$STAGE_ONE_CANDIDATE_ID" ]] || exit 1
    STAGE_ONE_CANONICAL="$(vercel inspect "$APP_BASE_URL" --format=json --no-color | jq -ce '{id}')" || exit 1
    jq -e --arg id "$STAGE_ONE_LEDGER_ID" '.id == $id' <<<"$STAGE_ONE_CANONICAL" >/dev/null || exit 1
+   # Drain at least 2 × maxDuration (60 seconds) before observing stopped writes.
+   sleep 60 || exit 1
    PRODUCTION_APP_URL="$APP_BASE_URL" PRODUCTION_APP_ACCESS_TOKEN="$APP_ACCESS_TOKEN" npm run check:production:writes-stopped >/dev/null || exit 1
    STAGE_ONE_EVIDENCE_OBSERVED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
    STAGE_ONE_EVIDENCE_PROJECTION="$(jq -cnS --arg id "$STAGE_ONE_LEDGER_ID" --arg observedAt "$STAGE_ONE_EVIDENCE_OBSERVED_AT" '{schemaVersion: 1, deploymentId: $id, expectedStatus: 503, observedStatus: 503, cacheControl: "private, no-store", retryAfter: "60", code: "writes_stopped", observedAt: $observedAt}')" || exit 1
@@ -640,8 +642,8 @@ promotion. It is paused only across prepare/apply, and the actual platform
    `UNPAUSED_READONLY`. Every failure transition keeps ordinary and external
    writers stopped and retains the ledger.
 
-   Evidence approval resumes the recorded same-identity exact Stage 1 deployment
-   deployment ID without redeploying and enters `UNPAUSED_READONLY`. Run only
+   Evidence approval resumes the recorded same-identity exact Stage 1 deployment ID
+   without redeploying and enters `UNPAUSED_READONLY`. Run only
    read-only and authenticated negative probes after the resume. Never resume
    an identity-unaware, pre-apply, remembered URL, or environment-claim-only
    target. If a regression occurs after resume, remain unpaused only long
@@ -737,9 +739,10 @@ promotion. It is paused only across prepare/apply, and the actual platform
    }
 
    validate_stage1_write_stop_selector() {
-     local STAGE_ONE_EVIDENCE_PROJECTION="" STAGE_ONE_EVIDENCE_HASH=""
+     local SELECTOR_SHA="${TARGET_SHA:-}" STAGE_ONE_EVIDENCE_PROJECTION="" STAGE_ONE_EVIDENCE_HASH=""
+     [[ -n "$SELECTOR_SHA" ]] || return 1
      validate_evidence_root || return 1
-     jq -e --arg sha "$TARGET_SHA" --arg origin "$CANONICAL_ORIGIN" '
+     jq -e --arg sha "$SELECTOR_SHA" --arg origin "$CANONICAL_ORIGIN" '
        def valid_utc:
          type == "string" and
          (try (. as $timestamp | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ") == $timestamp) catch false);
@@ -776,8 +779,8 @@ promotion. It is paused only across prepare/apply, and the actual platform
      [[ "$STAGE_ONE_EVIDENCE_HASH" == "$STAGE_ONE_RECORDED_EVIDENCE_HASH" ]] || return 1
    }
 
-   validate_stage1_write_stop_selector || enter_hold_paused
    [[ -n "${TARGET_SHA:-}" ]] || enter_hold_paused
+   validate_stage1_write_stop_selector || enter_hold_paused
    [[ "${APP_BASE_URL:-}" == "$CANONICAL_ORIGIN" ]] || enter_hold_paused
    STAGE_ONE_INSPECT="$(vercel inspect "$STAGE_ONE_RECORD_ID" --wait --timeout 3m --format=json --no-color | jq -ce '{id,readyState,aliases}')" || enter_hold_paused
    jq -e --arg id "$STAGE_ONE_RECORD_ID" '(.id == $id) and (.readyState == "READY") and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$STAGE_ONE_INSPECT" >/dev/null || enter_hold_paused
@@ -809,6 +812,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
 
    ```bash
    [[ "${POST_RESUME_REGRESSION_CONFIRMED:-}" == "true" ]] || exit 1
+   [[ -n "${TARGET_SHA:-}" ]] || enter_hold_paused
    validate_stage1_write_stop_selector || enter_hold_paused
 
    ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")" || enter_hold_paused

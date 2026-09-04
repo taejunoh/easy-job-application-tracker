@@ -92,6 +92,12 @@ printf '%s' "$status"
 `, { mode: 0o700 });
   writeFileSync(join(directory, "npm"), `#!/usr/bin/env bash
 printf '%s\\n' "\$*" >> "\${NPM_LOG:?}"
+printf '%s\\n' npm >> "\${ORDER_LOG:?}"
+`, { mode: 0o700 });
+  writeFileSync(join(directory, "sleep"), `#!/usr/bin/env bash
+printf 'sleep %s\\n' "\${1:-}" >> "\${SLEEP_LOG:?}"
+printf '%s\\n' sleep >> "\${ORDER_LOG:?}"
+[[ "\${SLEEP_FAIL:-}" != "true" ]]
 `, { mode: 0o700 });
   return directory;
 }
@@ -110,6 +116,8 @@ function runMocked(source: string, variables: Record<string, string>, body: stri
         PROMOTE_LOG: join(directory, "promote.log"),
         CURL_LOG: join(directory, "curl.log"),
         NPM_LOG: join(directory, "npm.log"),
+        SLEEP_LOG: join(directory, "sleep.log"),
+        ORDER_LOG: join(directory, "order.log"),
         VERCEL_INSPECT_LOG: join(directory, "inspect.log"),
         MOCK_REPO_ROOT: root,
       },
@@ -134,6 +142,8 @@ function runMockedFailure(source: string, variables: Record<string, string>, bod
           PROMOTE_LOG: join(directory, "promote.log"),
           CURL_LOG: join(directory, "curl.log"),
           NPM_LOG: join(directory, "npm.log"),
+          SLEEP_LOG: join(directory, "sleep.log"),
+          ORDER_LOG: join(directory, "order.log"),
           VERCEL_INSPECT_LOG: join(directory, "inspect.log"),
           MOCK_REPO_ROOT: root,
         },
@@ -763,6 +773,41 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     }
   });
 
+  it("drains for 60 seconds before the authenticated Stage 1 stopped-write probe and never records evidence after a drain failure", () => {
+    const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-write-stop-drain-"));
+    try {
+      expectOrdered(stageOneWriteStopEvidenceBlock(), [
+        'jq -e --arg id "$STAGE_ONE_LEDGER_ID"',
+        "sleep 60 || exit 1",
+        "check:production:writes-stopped",
+        "STAGE_ONE_EVIDENCE_PROJECTION",
+        'mv -f -- "$STAGE_ONE_EVIDENCE_TMP" "$LEDGER"',
+      ]);
+      const ledger = join(temporaryRoot, "rollout-ledger.json");
+      const initialLedger = {
+        schemaVersion: 1,
+        fixtureOwnership: {
+          applicationIds: ["app_fixture"], ownedDeploymentIds: ["dpl_fixture"], pairingGrantIds: ["grant_fixture"], preProbeHash: "before", postProbeHash: "after",
+          settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" }, pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref" },
+          installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
+          cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
+        },
+      };
+      const source = `${stageOneLedgerBlock()}\n${stageOneWriteStopEvidenceBlock()}\n[[ "$(cat \"$SLEEP_LOG\")" == "sleep 60" ]] || exit 95\n[[ "$(cat \"$ORDER_LOG\")" == $'sleep\\nnpm' ]] || exit 96`;
+      const variables = { ...baseScenario(), EVIDENCE_ROOT: temporaryRoot, APP_ACCESS_TOKEN: "private-test-token", STAGE_ONE_CANDIDATE_ID: "dpl_valid" };
+      writeFileSync(ledger, JSON.stringify(initialLedger), { mode: 0o600 });
+      expect(runMocked(source, variables, "")).toBe("");
+
+      writeFileSync(ledger, JSON.stringify(initialLedger), { mode: 0o600 });
+      const failure = runMockedFailure(`${stageOneLedgerBlock()}\n${stageOneWriteStopEvidenceBlock()}`, { ...variables, SLEEP_FAIL: "true" }, "");
+      expect(failure.deploys).toBe("");
+      expect(failure.promotes).toBe("");
+      expect(JSON.parse(readFileSync(ledger, "utf8")).stage1.writeStopEvidence).toBeUndefined();
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("holds without a provider mutation when selector evidence or UTC record fields are missing, mismatched, or tampered", () => {
     const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-write-stop-selector-"));
     try {
@@ -795,6 +840,20 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         expect(failure.curlCalls).toBe(1);
         expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({ schemaVersion: 1, stage1: invalidStage1 });
       }
+
+      const original = { schemaVersion: 1, stage1 };
+      writeFileSync(ledger, JSON.stringify(original), { mode: 0o600 });
+      const withoutTargetSha = baseScenario();
+      delete withoutTargetSha.TARGET_SHA;
+      const missingTargetSha = runMockedFailure(source, {
+        ...withoutTargetSha, EVIDENCE_ROOT: temporaryRoot, ROLLBACK_READ_TOKEN: "private-test-token", CURL_STATUS_SEQUENCE: "503", CURL_BODY_SEQUENCE: "DEPLOYMENT_PAUSED",
+      }, "");
+      expect(missingTargetSha.stderr).toContain("HOLD_PAUSED");
+      expect(missingTargetSha.curlCalls).toBe(1);
+      expect(missingTargetSha.inspects).toBe("");
+      expect(missingTargetSha.deploys).toBe("");
+      expect(missingTargetSha.promotes).toBe("");
+      expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual(original);
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
