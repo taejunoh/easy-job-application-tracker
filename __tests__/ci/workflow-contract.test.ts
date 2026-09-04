@@ -194,6 +194,10 @@ describe("deployment verification contract", () => {
       },
       { name: "Install dependencies", run: "npm ci" },
       {
+        name: "Install Playwright headless shell",
+        run: "npx playwright install --with-deps --only-shell chromium",
+      },
+      {
         name: "Enforce dependency audit policy",
         run: "npm run check:audit",
       },
