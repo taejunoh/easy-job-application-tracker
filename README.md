@@ -324,58 +324,52 @@ requires an exact Ready candidate ID and reviewed SHA or returns to
 `HOLD_PAUSED`. The private ledger retains exact owned IDs until bounded cleanup
 is verified and cleanup may remove only those IDs.
 
-Production identity maintenance is a manual, ordered two-gate operation. Start
-with an `identity=0,writes=1` Ready canonical support deployment. Before Stage
-1 promotion, authenticated supported flows must create one disposable
-Application, one installed extension credential, and a second unconsumed
-pairing grant. Keep their URL, IDs, tokens, pairing codes, and request/response
-bodies only in a private mode-0700 operator workspace; never put them in logs,
-artifacts, Actions output, shell history, PR/comments, or docs.
+Production identity maintenance is a manual, ordered two-gate operation. The
+historical evidence began with an `identity=0,writes=1` Ready canonical support
+deployment and private fixtures: one disposable Application, one installed
+extension credential, and a second unconsumed pairing grant. Their URL, IDs,
+tokens, pairing codes, and request/response bodies remained only in a private
+mode-0700 operator workspace and were absent from logs, artifacts, Actions
+output, shell history, PR/comments, and docs.
 
-Stage a `identity=1,writes=0` Ready Production candidate with the exact
-`vercel --prod --skip-domain` command. Inspect that it is Ready, has the exact
-intended Git SHA, and has no canonical alias; promote the candidate while
-unpaused. Start a bounded drain, wait at least `2 × maxDuration` (at least 60
-seconds when modules have 30-second maximum duration), and pass the
-authenticated negative probe. Use the exact fixtures to prove all eight
-persistent mutations return `503 writes_stopped`: Application POST/PATCH/DELETE,
-Settings PUT, pairing creation, valid pair exchange, installation deletion, and
-self-revoke. Also prove Settings GET does not create a row and
-installation-authenticated reads do not change `lastUsedAt/updatedAt`.
+The recorded Stage 1 evidence showed a Ready `identity=1,writes=0` Production
+candidate with the exact intended Git SHA and no canonical alias, followed by
+an unpaused promotion, a bounded drain of at least `2 × maxDuration` (at least
+60 seconds when modules had 30-second maximum duration), and an authenticated
+negative probe. The exact fixtures proved all eight persistent mutations
+returned `503 writes_stopped`: Application POST/PATCH/DELETE, Settings PUT,
+pairing creation, valid pair exchange, installation deletion, and self-revoke.
+The documented behavior is that Settings GET does not create a row, and
+installation-authenticated reads did not change
+`lastUsedAt/updatedAt`.
 
-Only then pause Vercel and require the actual canonical `503 DEPLOYMENT_PAUSED`
-before prepare/apply. Prepare, privately review, and apply the identity
-backfill only while paused. Paused Vercel blocks build and promotion: never
-attempt either while paused. There is no build or promotion while paused.
-Resume the recorded same read-only
-`identity=1,writes=0` deployment without redeploying, then stage a final Ready
-`identity=1,writes=1` Production candidate with `vercel --prod --skip-domain`.
-Inspect its exact SHA and no canonical alias, promote while unpaused, run smoke
-and bounded cleanup, and resume external writers last. External writers are
-resumed last. After final promotion, external writers are resumed last; delete the disposable Application,
-consume the still-unconsumed grant exactly once, revoke both disposable
-installations, verify bounded cleanup, and record only sanitized
-statuses/counts/hashes. The full sequence and
-sanitized evidence fields are in the [production operations runbook](docs/operations/production-runbook.md).
+The recorded Stage 2 evidence showed canonical `503 DEPLOYMENT_PAUSED` before
+prepare/apply, with the identity backfill prepared, privately reviewed, and
+applied only while paused. The evidence recorded that no build or promotion
+while paused occurred. The recorded same read-only `identity=1,writes=0`
+deployment resumed without redeploying, followed by a final Ready
+`identity=1,writes=1` candidate, unpaused
+promotion, smoke, bounded cleanup, and the recorded fact that external writers
+are resumed last. Cleanup
+deleted the disposable Application, consumed the still-unconsumed grant once,
+revoked both disposable installations, and retained only sanitized
+statuses/counts/hashes.
 
-Prepare and apply are dispatched from `main` only after the required writer-stop
-attestation and pause evidence. The operator records numeric prepare/apply run
-identifiers. Capture and wait for numeric `PREPARE_RUN_ID`, verify its exact
-rollout SHA, and privately review the prepare
-artifact. The attestation is recorded as `writers_stopped=true`, and apply
-receives the approved numeric `prepare_run_id`. The
-authoritative [Production identity maintenance
-runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout)
-defines the dispatch and observation procedure. Writers remain stopped
+Prepare and apply were dispatched from `main` only after writer-stop attestation
+and pause evidence. Evidence required capture and wait for numeric
+`PREPARE_RUN_ID`;
+numeric prepare/apply run identifiers, exact rollout SHA,
+private artifact review, and `writers_stopped=true` were recorded; apply used
+the approved numeric `prepare_run_id`. The authoritative [Production identity
+maintenance runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout)
+defines all executable dispatch, observation, promotion, rollback, fixture,
+and cleanup procedures. The rollout invariant was that writers remained stopped
 continuously until every post-resume smoke pass succeeds. Any failure means
-writers remain stopped continuously; do not run `prisma db push`, `prisma db
-reset`, or destructive shortcuts. Record only the Git SHA, old/new/staged/
-canonical deployment IDs, promotion and drain times, monitor/negative-probe
-run IDs, backup/prepare/apply run IDs and safe artifact digests/names,
-pause/resume evidence, and sanitized cleanup status. The rollback target is
-the recorded Ready `identity=1,writes=0` deployment; rollback or promotion is
-allowed only while unpaused, and after DB apply never target identity-unaware
-code.
+writers remain stopped; no `prisma db push`, `prisma db reset`, or destructive
+shortcut was used. The rollback target was the recorded Ready
+`identity=1,writes=0` deployment; the promotion occurred only while unpaused,
+rollback was allowed only while unpaused, and neither action targeted
+identity-unaware code.
 
 ## Development and Verification
 

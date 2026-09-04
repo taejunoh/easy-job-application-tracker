@@ -98,7 +98,6 @@ describe("production operations documentation contract", () => {
         "identity=0,writes=1",
         "identity=1,writes=0",
         "identity=1,writes=1",
-        "vercel --prod --skip-domain",
         "Ready",
         "exact intended Git SHA",
         "no canonical alias",
@@ -106,7 +105,6 @@ describe("production operations documentation contract", () => {
         "at least 60 seconds",
         "authenticated negative probe",
         "503 DEPLOYMENT_PAUSED",
-        "no build or promotion while paused",
         "prepare",
         "review",
         "apply",
@@ -119,14 +117,18 @@ describe("production operations documentation contract", () => {
       ]) {
         expect(document).toContain(requiredText);
       }
-      expect(document).toMatch(/external writers (?:are )?resumed last|resume external writers last/iu);
-      expect(document).toMatch(/promote(?: the)? (?:candidate|it) while unpaused|promote only while unpaused/iu);
+      expect(document).toMatch(/external writers (?:are|were) resumed last|resume external writers last/iu);
+      expect(document).toMatch(/no build or promotion (?:while paused|occurred while paused)/iu);
+      expect(document).toMatch(
+        /promote(?: the)? (?:candidate|it) while unpaused|promote only while unpaused|promotion occurred only while unpaused/iu,
+      );
       expect(document).not.toMatch(
         /(?:build|deploy|deployment|promotion)[^.]{0,100}(?:while|remains) Vercel (?:was|remains) paused/iu,
       );
     }
 
     const runbook = documents[1];
+    expect(runbook).toContain("vercel --prod --skip-domain");
     expect(runbook).toContain(
       '{ "error": "Application writes are temporarily disabled", "code": "writes_stopped", "retryable": true }',
     );
@@ -199,7 +201,7 @@ describe("production operations documentation contract", () => {
       expect(document).toContain("writers_stopped=true");
       expect(document).toContain("prepare_run_id");
       expect(document).toMatch(
-        /writers remain stopped continuously|keep writers stopped continuously/iu,
+        /writers (?:remain|remained) stopped continuously|keep writers stopped continuously/iu,
       );
       expect(document).toMatch(
         /failure[^.]{0,160}writers remain stopped|failure[^.]{0,160}keep writers stopped/iu,
@@ -310,7 +312,7 @@ describe("production operations documentation contract", () => {
   it("keeps the README concise and free of an unbound apply run ID", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
 
-    expect(readme).toMatch(/capture and wait for numeric `?PREPARE_RUN_ID`?/iu);
+    expect(readme).toMatch(/capture\s+and\s+wait\s+for\s+numeric\s+`?PREPARE_RUN_ID`?/iu);
     expect(readme).not.toContain(
       'gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"',
     );

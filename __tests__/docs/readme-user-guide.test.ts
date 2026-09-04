@@ -410,7 +410,7 @@ describe("task-first README user guide", () => {
       "identity=0,writes=1",
       "identity=1,writes=0",
       "identity=1,writes=1",
-      "vercel --prod --skip-domain",
+      "Production candidate",
       "Ready",
       "exact intended Git SHA",
       "no canonical alias",

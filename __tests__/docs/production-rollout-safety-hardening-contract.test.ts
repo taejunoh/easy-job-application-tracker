@@ -26,38 +26,332 @@ function bashBlocks(section: string): string[] {
 }
 
 function executableVercelLines(document: string): string[] {
-  const blocks = fencedShellBlocks(document);
-  return blocks
-    .flatMap((block) => block.split(/\r?\n/u))
-    .filter((line) => {
-      const trimmed = line.trim();
-      return (
-        trimmed.length > 0 &&
-        !trimmed.startsWith("#") &&
-        /\bvercel\b/iu.test(trimmed)
-      );
-    });
+  return executableShellLines(document, /vercel/iu);
 }
 
 function fencedShellBlocks(document: string): string[] {
-  return [...document.matchAll(/```(?:bash|sh|shell)\r?\n([\s\S]*?)```/gu)].map(
-    ([, block]) => block ?? "",
-  );
+  const blocks: string[] = [];
+  const shellLanguages = new Set(["", "bash", "sh", "shell", "zsh", "console"]);
+  let active = false;
+  let capture = false;
+  let block: string[] = [];
+
+  for (const line of document.split(/\r?\n/u)) {
+    const fence = line.match(/^```([^\r\n]*)$/u);
+    if (fence) {
+      if (!active) {
+        active = true;
+        capture = shellLanguages.has((fence[1] ?? "").trim().toLowerCase());
+        block = [];
+      } else {
+        if (capture) blocks.push(block.join("\n"));
+        active = false;
+        capture = false;
+        block = [];
+      }
+      continue;
+    }
+    if (active && capture) block.push(line);
+  }
+  return blocks;
 }
 
 function executableGhProductionLines(document: string): string[] {
+  return executableShellLines(
+    document,
+    /gh\s+(?:workflow\s+run|run\s+(?:list|view|watch|download|cancel|rerun)|pr\s+(?:create|checks|merge))\b/iu,
+  );
+}
+
+function commandSegmentStarts(line: string): number[] {
+  const starts = [0];
+  let quote: "'" | '"' | null = null;
+  let inBackticks = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index] ?? "";
+    const next = line[index + 1] ?? "";
+
+    if (inBackticks) {
+      if (character === "`") {
+        inBackticks = false;
+      } else if (character === "$" && next === "(") {
+        starts.push(index + 2);
+        index += 1;
+      } else if (
+        character === ";" ||
+        character === "|" ||
+        character === "&"
+      ) {
+        starts.push(index + 1);
+      }
+      continue;
+    }
+
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = null;
+      } else if (character === "$" && next === "(") {
+        starts.push(index + 2);
+        index += 1;
+      } else if (character === "`") {
+        inBackticks = true;
+        starts.push(index + 1);
+      }
+      continue;
+    }
+
+    if (character === "'") {
+      quote = "'";
+    } else if (character === '"') {
+      quote = '"';
+    } else if (character === "`") {
+      inBackticks = true;
+      starts.push(index + 1);
+    } else if (character === "$" && next === "(") {
+      starts.push(index + 2);
+      index += 1;
+    } else if (
+      character === ";" ||
+      character === "|" ||
+      character === "&"
+    ) {
+      starts.push(index + 1);
+    } else if (
+      character === "#" &&
+      (index === 0 || /\s/u.test(line[index - 1] ?? ""))
+    ) {
+      break;
+    }
+  }
+
+  return starts;
+}
+
+function nestedShellSources(line: string): string[] {
+  const sources: string[] = [];
+  let quote: "'" | '"' | null = null;
+  let backtickStart = -1;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index] ?? "";
+    const next = line[index + 1] ?? "";
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = null;
+      } else if (character === "\\") {
+        index += 1;
+      } else if (character === "$" && next === "(") {
+        const end = findCommandSubstitutionEnd(line, index + 2);
+        if (end !== -1) {
+          sources.push(line.slice(index + 2, end));
+          index = end;
+        }
+      }
+      continue;
+    }
+    if (backtickStart !== -1) {
+      if (character === "\\") {
+        index += 1;
+      } else if (character === "`") {
+        sources.push(line.slice(backtickStart, index));
+        backtickStart = -1;
+      }
+      continue;
+    }
+    if (character === "'") {
+      quote = "'";
+    } else if (character === '"') {
+      quote = '"';
+    } else if (character === "`") {
+      backtickStart = index + 1;
+    } else if (character === "$" && next === "(") {
+      const end = findCommandSubstitutionEnd(line, index + 2);
+      if (end !== -1) {
+        sources.push(line.slice(index + 2, end));
+        index = end;
+      }
+    } else if (character === "\\") {
+      index += 1;
+    }
+  }
+  return sources;
+}
+
+function findCommandSubstitutionEnd(line: string, start: number): number {
+  let depth = 1;
+  let quote: "'" | '"' | null = null;
+  for (let index = start; index < line.length; index += 1) {
+    const character = line[index] ?? "";
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') quote = null;
+      else if (character === "\\") index += 1;
+      continue;
+    }
+    if (character === "'") quote = "'";
+    else if (character === '"') quote = '"';
+    else if (character === "\\") index += 1;
+    else if (character === "(") depth += 1;
+    else if (character === ")" && --depth === 0) return index;
+  }
+  return -1;
+}
+
+function executableShellWrapperLines(line: string, commandPattern: RegExp): boolean {
+  const wrapper = /(?:^|[;|&][ \t]*)(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+))[ \t]*)*(?:(?:env)(?:[ \t]+(?:--[^\s]+|-[^\s]+|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)))*)?[ \t]*(?:(?:sudo|doas)(?:[ \t]+-[^\s]+)*[ \t]+)?(?:command[ \t]+)?(?:bash|sh|zsh|dash|ksh|busybox[ \t]+(?:sh|ash))[ \t]+(?:--[^\s]+[ \t]+)*-[A-Za-z]*c[ \t]+(['"])([\s\S]*?)\1/gu;
+  for (const [,, wrapped] of line.matchAll(wrapper)) {
+    if (wrapped !== undefined && executableShellLine(wrapped, commandPattern)) return true;
+  }
+  return false;
+}
+
+function shellWords(segment: string): string[] {
+  return [...segment.matchAll(/"(?:\\.|[^"])*"|'[^']*'|\\[^\s][^\s]*|[^\s]+/gu)].map(
+    ([word]) => word ?? "",
+  );
+}
+
+function shellWordValue(word: string): string {
+  if (word.startsWith("\\") && word.length > 1) return word.slice(1);
+  if (
+    word.length >= 2 &&
+    ((word.startsWith("'") && word.endsWith("'")) ||
+      (word.startsWith('"') && word.endsWith('"')))
+  ) {
+    return word.slice(1, -1);
+  }
+  return word;
+}
+
+function isAssignment(word: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word);
+}
+
+function commandName(word: string): string {
+  const value = shellWordValue(word).replace(/\\(?=[A-Za-z])/gu, "");
+  return value.slice(value.lastIndexOf("/") + 1).toLowerCase();
+}
+
+function targetMatches(words: string[], index: number, commandPattern: RegExp): boolean {
+  const invocation = [commandName(words[index] ?? ""), ...words.slice(index + 1).map(shellWordValue)].join(" ");
+  const flags = commandPattern.flags.replace(/g/gu, "");
+  return new RegExp(`^${commandPattern.source}`, flags).test(invocation);
+}
+
+function commandIndex(words: string[]): number {
+  let index = 0;
+  while (index < words.length && isAssignment(words[index] ?? "")) index += 1;
+
+  const prefix = commandName(words[index] ?? "");
+  if (prefix === "env") {
+    index += 1;
+    while (index < words.length) {
+      const word = shellWordValue(words[index] ?? "");
+      if (word === "--") {
+        index += 1;
+        break;
+      }
+      if (isAssignment(word) || word.startsWith("-")) index += 1;
+      else break;
+    }
+  }
+
+  const privilege = commandName(words[index] ?? "");
+  if (privilege === "sudo" || privilege === "doas") {
+    index += 1;
+    while (index < words.length && shellWordValue(words[index] ?? "").startsWith("-")) index += 1;
+  }
+
+  if (commandName(words[index] ?? "") === "command") {
+    index += 1;
+    while (index < words.length && shellWordValue(words[index] ?? "").startsWith("-")) index += 1;
+  }
+  return index;
+}
+
+function executableCommandSegment(segment: string, commandPattern: RegExp): boolean {
+  const words = shellWords(segment);
+  const index = commandIndex(words);
+  const command = commandName(words[index] ?? "");
+  if (targetMatches(words, index, commandPattern)) return true;
+
+  if (command === "npx") {
+    let targetIndex = index + 1;
+    while (targetIndex < words.length && shellWordValue(words[targetIndex] ?? "").startsWith("-")) {
+      targetIndex += 1;
+    }
+    return targetMatches(words, targetIndex, commandPattern);
+  }
+  return false;
+}
+
+function shellCommentIndex(line: string): number {
+  let quote: "'" | '"' | null = null;
+  let inBackticks = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index] ?? "";
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') quote = null;
+      else if (character === "\\") index += 1;
+      continue;
+    }
+    if (inBackticks) {
+      if (character === "`") inBackticks = false;
+      else if (character === "\\") index += 1;
+      continue;
+    }
+    if (character === "'") quote = "'";
+    else if (character === '"') quote = '"';
+    else if (character === "`") inBackticks = true;
+    else if (character === "\\") index += 1;
+    else if (character === "#" && (index === 0 || /\s/u.test(line[index - 1] ?? ""))) return index;
+  }
+  return -1;
+}
+
+function executableShellLine(line: string, commandPattern: RegExp): boolean {
+  const trimmed = line.trim();
+  if (trimmed.length === 0 || trimmed.startsWith("#")) return false;
+
+  const source = line.replace(/^\s*\$\s+/u, "");
+  if (executableShellWrapperLines(source, commandPattern)) return true;
+  if (nestedShellSources(source).some((nested) => executableShellLine(nested, commandPattern))) return true;
+  const commentIndex = shellCommentIndex(source);
+  const starts = commandSegmentStarts(source);
+  for (let index = 0; index < starts.length; index += 1) {
+    const segmentStart = starts[index] ?? 0;
+    const segmentEnd = starts[index + 1] ?? source.length;
+    const segment = source.slice(segmentStart, segmentEnd);
+    if (commentIndex !== -1 && segmentStart >= commentIndex) continue;
+    const boundedSegment =
+      commentIndex !== -1 && segmentEnd > commentIndex
+        ? source.slice(segmentStart, commentIndex)
+        : segment;
+    if (executableCommandSegment(boundedSegment, commandPattern)) return true;
+  }
+  return false;
+}
+
+function executableShellLines(document: string, commandPattern: RegExp): string[] {
   return fencedShellBlocks(document)
     .flatMap((block) => block.split(/\r?\n/u))
-    .filter((line) => {
-      const trimmed = line.trim();
-      return (
-        trimmed.length > 0 &&
-        !trimmed.startsWith("#") &&
-        /\bgh\s+(?:workflow\s+run|run\s+(?:list|view|watch|download|cancel|rerun)|pr\s+(?:create|checks|merge))\b/iu.test(
-          trimmed,
-        )
-      );
-    });
+    .filter((line) => executableShellLine(line, commandPattern));
 }
 
 function readmeMaintenanceSection(): string {
@@ -391,9 +685,14 @@ describe("production rollout staged-candidate binding documentation contract", (
 
   it("rejects every executable Vercel invocation in fenced shell blocks", () => {
     const fixture = [
-      "```bash\n# vercel deploy is only a comment\nvercel env add SECRET production --value test\n```",
+      "```bash\n# vercel deploy is only a comment\necho 'vercel deploy is only text'\nprintf '%s' 'vercel inspect is only text'\nvercel env add SECRET production --value test\n```",
       "```sh\n$ vercel alias rm example.vercel.app\ncandidate=$(vercel deploy .)\ncommand vercel inspect deployment-id\n```",
       "```shell\n  env FOO=1 vercel env add SECRET production\nFOO=1 vercel promote deployment-id\nresult=`vercel alias ls`\necho ready && vercel rm deployment-id\n```",
+      "```shell\nprintf ready; vercel project ls\necho ready | vercel inspect deployment-id\n```",
+      "```zsh\nvercel rollback deployment-id\n```",
+      "```console\n$ vercel alias add example.vercel.app deployment-id\n```",
+      "```\nFOO=1 vercel env rm SECRET production\n```",
+      "```bash\nsudo -n vercel promote deployment-id\nnpx --yes vercel deploy .\nbash -lc \"vercel inspect deployment-id\"\nresult=$(bash -lc 'vercel alias ls')\n```",
     ].join("\n");
 
     expect(executableVercelLines(fixture)).toEqual([
@@ -405,6 +704,15 @@ describe("production rollout staged-candidate binding documentation contract", (
       "FOO=1 vercel promote deployment-id",
       "result=`vercel alias ls`",
       "echo ready && vercel rm deployment-id",
+      "printf ready; vercel project ls",
+      "echo ready | vercel inspect deployment-id",
+      "vercel rollback deployment-id",
+      "$ vercel alias add example.vercel.app deployment-id",
+      "FOO=1 vercel env rm SECRET production",
+      "sudo -n vercel promote deployment-id",
+      "npx --yes vercel deploy .",
+      "bash -lc \"vercel inspect deployment-id\"",
+      "result=$(bash -lc 'vercel alias ls')",
     ]);
   });
 
@@ -413,6 +721,10 @@ describe("production rollout staged-candidate binding documentation contract", (
       "```bash\n# gh workflow run is only a comment\ngh workflow run production.yml --ref main\n```",
       "```sh\n$ gh run watch 123\ncandidate=$(gh workflow run production.yml)\ncommand gh run list --workflow production.yml\n```",
       "```shell\n  env GH_TOKEN=test gh run view 123\nGH_TOKEN=test gh run download 123\n```",
+      "```zsh\n$ gh workflow run production.yml --ref main\n```",
+      "```console\nGH_TOKEN=test gh run watch 123\n```",
+      "```\nresult=$(gh run list --workflow production.yml)\n```",
+      "```bash\nsudo -n gh run cancel 123\nbash -lc \"gh workflow run production.yml --ref main\"\nresult=$(sh -c 'gh run view 123')\n```",
     ].join("\n");
 
     expect(executableGhProductionLines(fixture)).toEqual([
@@ -422,6 +734,37 @@ describe("production rollout staged-candidate binding documentation contract", (
       "command gh run list --workflow production.yml",
       "  env GH_TOKEN=test gh run view 123",
       "GH_TOKEN=test gh run download 123",
+      "$ gh workflow run production.yml --ref main",
+      "GH_TOKEN=test gh run watch 123",
+      "result=$(gh run list --workflow production.yml)",
+      "sudo -n gh run cancel 123",
+      "bash -lc \"gh workflow run production.yml --ref main\"",
+      "result=$(sh -c 'gh run view 123')",
+    ]);
+  });
+
+  it("does not treat quoted echo/printf mentions as executable commands", () => {
+    const fixture = [
+      "```bash\necho \"bash -lc 'vercel deploy .'\"\nprintf '%s' \"gh workflow run production.yml\"\n```",
+      "```console\necho '$(vercel inspect deployment-id)'\nprintf '%s' 'gh run view 123'\n```",
+    ].join("\n");
+    expect(executableVercelLines(fixture)).toEqual([]);
+    expect(executableGhProductionLines(fixture)).toEqual([]);
+  });
+
+  it("distinguishes command-position paths and shell-wrapper flags", () => {
+    const fixture = [
+      "```bash\necho vercel deploy is prohibited\nprintf '%s\\n' vercel deploy\necho ready && /usr/local/bin/vercel deploy .\n\\vercel deploy .\n```",
+      "```sh\nbash --noprofile -c 'vercel alias ls'\nenv bash -c \"gh workflow run production.yml --ref main\"\n```",
+    ].join("\n");
+
+    expect(executableVercelLines(fixture)).toEqual([
+      "echo ready && /usr/local/bin/vercel deploy .",
+      "\\vercel deploy .",
+      "bash --noprofile -c 'vercel alias ls'",
+    ]);
+    expect(executableGhProductionLines(fixture)).toEqual([
+      "env bash -c \"gh workflow run production.yml --ref main\"",
     ]);
   });
 
@@ -434,7 +777,12 @@ describe("production rollout staged-candidate binding documentation contract", (
       join(root, "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md"),
       "utf8",
     );
-    expect(fencedShellBlocks(plan)).toEqual([]);
+    expect(executableVercelLines(plan)).toEqual([]);
+    expect(executableGhProductionLines(plan)).toEqual([]);
+    const inlineOperationalRecipes = [...plan.matchAll(/`([^`\r\n]+)`/gu)]
+      .map(([, code]) => code ?? "")
+      .filter((code) => /^(?:(?:[A-Z_][A-Z0-9_]*=\S+)[ \t]+)*(?:git|gh|vercel|curl|npm|npx|node|docker|prisma|jq|chmod|mktemp|install|rm|mv|export|set|read|printf|echo)\b/iu.test(code));
+    expect(inlineOperationalRecipes).toEqual([]);
   });
 
   it("binds candidate data flow with explicit guards and safe projections", () => {
