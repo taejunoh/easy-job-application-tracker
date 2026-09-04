@@ -214,14 +214,14 @@ function findCommandSubstitutionEnd(line: string, start: number): number {
 
 function executableShellWrapperLines(line: string, commandPattern: RegExp): boolean {
   const assignment = String.raw`[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)`;
-  const executablePath = String.raw`(?:[^\s/]+\/|\/)*`;
+  const executablePath = String.raw`(?:[^\s/]+[/\\]|[/\\])*`;
   const envPrefix = String.raw`${executablePath}env(?:[ \t]+(?:--[^\s]+|-[^\s]+|${assignment}))*`;
   const shellWrapper = new RegExp(
-    String.raw`(?:^|[;|&][ \t]*)(?:${assignment}[ \t]*)*(?:${envPrefix}[ \t]+)?(?:(?:sudo|doas)(?:[ \t]+-[^\s]+)*[ \t]+)?(?:command[ \t]+)?${executablePath}(?:bash|sh|zsh|dash|ksh|fish|pwsh|powershell|busybox[ \t]+(?:sh|ash))(?:\.exe)?[ \t]+(?:--[^\s]+[ \t]+)*(?:-[A-Za-z]*c|-[Cc]ommand)[ \t]+(['"])([\s\S]*?)\1`,
+    String.raw`(?:^|[;|&][ \t]*)(?:${assignment}[ \t]*)*(?:${envPrefix}[ \t]+)?(?:(?:sudo|doas)(?:[ \t]+-[^\s]+)*[ \t]+)?(?:command[ \t]+)?${executablePath}(?:bash|sh|zsh|dash|ksh|fish|pwsh|powershell|busybox[ \t]+(?:sh|ash))(?:\.(?:exe|cmd|bat|com))?[ \t]+(?:--[^\s]+[ \t]+)*(?:-[A-Za-z]*c|-[Cc]ommand)[ \t]+(['"])([\s\S]*?)\1`,
     "gu",
   );
   const cmdWrapper = new RegExp(
-    String.raw`(?:^|[;|&][ \t]*)(?:${assignment}[ \t]*)*(?:${envPrefix}[ \t]+)?(?:(?:sudo|doas)(?:[ \t]+-[^\s]+)*[ \t]+)?(?:command[ \t]+)?${executablePath}cmd(?:\.exe)?[ \t]+\/[CcKk][ \t]+(['"])([\s\S]*?)\1`,
+    String.raw`(?:^|[;|&][ \t]*)(?:${assignment}[ \t]*)*(?:${envPrefix}[ \t]+)?(?:(?:sudo|doas)(?:[ \t]+-[^\s]+)*[ \t]+)?(?:command[ \t]+)?${executablePath}cmd(?:\.(?:exe|cmd|bat|com))?[ \t]+\/[CcKk][ \t]+(['"])([\s\S]*?)\1`,
     "gu",
   );
   for (const wrapper of [shellWrapper, cmdWrapper]) {
@@ -256,8 +256,9 @@ function isAssignment(word: string): boolean {
 }
 
 function commandName(word: string): string {
-  const value = shellWordValue(word).replace(/\\(?=[A-Za-z])/gu, "");
-  return value.slice(value.lastIndexOf("/") + 1).toLowerCase();
+  const value = shellWordValue(word).replace(/[\\/]+/gu, "/");
+  const basename = value.slice(value.lastIndexOf("/") + 1);
+  return basename.replace(/\.(?:exe|cmd|bat|com)$/iu, "").toLowerCase();
 }
 
 function targetMatches(words: string[], index: number, commandPattern: RegExp): boolean {
@@ -809,6 +810,24 @@ describe("production rollout staged-candidate binding documentation contract", (
       "/usr/bin/env sh -c 'gh run view 1'",
       "/usr/bin/pwsh -Command 'gh run list'",
       "/opt/powershell/powershell -Command 'gh run watch 1'",
+    ]);
+  });
+
+  it("normalizes Windows executable paths and PowerShell call operators", () => {
+    const fixture = [
+      "```powershell\nC:\\Tools\\vercel.exe deploy .\n\"C:\\Program Files\\Vercel\\vercel.cmd\" inspect deployment-id\nC:\\Tools\\gh.exe run view 1\nWrite-Output \"C:\\Tools\\vercel.exe deploy .\"\n& \"C:\\Tools\\vercel.exe\" alias ls\n```",
+      "```cmd\nC:\\Windows\\System32\\cmd.exe /c \"vercel inspect deployment-id\"\nC:\\Windows\\System32\\pwsh.exe -Command \"gh run list\"\n```",
+    ].join("\n");
+
+    expect(executableVercelLines(fixture)).toEqual([
+      "C:\\Tools\\vercel.exe deploy .",
+      "\"C:\\Program Files\\Vercel\\vercel.cmd\" inspect deployment-id",
+      "& \"C:\\Tools\\vercel.exe\" alias ls",
+      "C:\\Windows\\System32\\cmd.exe /c \"vercel inspect deployment-id\"",
+    ]);
+    expect(executableGhProductionLines(fixture)).toEqual([
+      "C:\\Tools\\gh.exe run view 1",
+      "C:\\Windows\\System32\\pwsh.exe -Command \"gh run list\"",
     ]);
   });
 
