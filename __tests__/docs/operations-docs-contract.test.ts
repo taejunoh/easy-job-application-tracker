@@ -357,6 +357,54 @@ describe("production operations documentation contract", () => {
     expect(runbook).toContain("continuously. Do not enable identity writes");
   });
 
+  it("keeps the rollout design aligned with the authoritative hosted runbook", () => {
+    const design = readFileSync(
+      join(
+        root,
+        "docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md",
+      ),
+      "utf8",
+    );
+    const phaseStart = design.indexOf("## Phase 4: Production identity maintenance workflow");
+    const phaseEnd = design.indexOf("## Phase 5: Extension and documentation closure", phaseStart);
+    expect(phaseStart).not.toBe(-1);
+    expect(phaseEnd).toBeGreaterThan(phaseStart);
+    const phase = design.slice(phaseStart, phaseEnd).replace(/\s+/gu, " ");
+
+    expect(phase).toContain(
+      "This is a design-level summary, not the executable operator procedure.",
+    );
+    expect(phase).toContain("production operations runbook");
+    expect(phase).toContain("is authoritative for the exact hosted commands and order");
+    const orderedRequirements = [
+      "keep Vercel Production paused",
+      "prepare",
+      "apply",
+      "APPLICATION_IDENTITY_WRITES_ENABLED=1",
+      "Ready",
+      "resume Vercel Production before any authenticated",
+      "production monitor",
+      "authenticated UI",
+      "one explicitly authorized bounded smoke actor/session at a time",
+      "resume Application writers LAST",
+    ];
+    let prior = -1;
+    for (const requirement of orderedRequirements) {
+      const next = phase.toLowerCase().indexOf(requirement.toLowerCase(), prior + 1);
+      expect(next).toBeGreaterThan(prior);
+      prior = next;
+    }
+    expect(phase).toMatch(
+      /ordinary, automated, and background(?: Application)? writers remain stopped/iu,
+    );
+    expect(phase).toMatch(/preserve the actual current gate and deployment state/iu);
+    expect(phase).toMatch(
+      /do not force[^.]{0,160}(?:gate|APPLICATION_IDENTITY_WRITES_ENABLED)[^.]{0,160}absent a reviewed hosted rollback/iu,
+    );
+    expect(phase).not.toMatch(/keep the write gate at `?0`?/iu);
+    expect(phase).not.toMatch(/resume the Vercel project only after every check passes/iu);
+  });
+
   it("publishes the complete quarantine operator workflow", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
     const runbook = readFileSync(

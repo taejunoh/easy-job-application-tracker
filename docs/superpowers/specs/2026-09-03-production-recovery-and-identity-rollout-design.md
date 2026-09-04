@@ -141,24 +141,40 @@ Node/PostgreSQL tooling, and cleanup steps for temporary reports. No database
 URL, application rows, URLs, titles, companies, notes, resume content, or API
 keys may enter logs or artifacts.
 
+This is a design-level summary, not the executable operator procedure. The
+[production operations runbook](../../operations/production-runbook.md#application-identity-maintenance-rollout)
+is authoritative for the exact hosted commands and order; this design must
+remain aligned with it.
+
 The operator sequence is:
 
-1. Confirm the current identity write gate remains `0`, then pause the Vercel
-   project so all web and extension write paths are stopped.
+1. Confirm the current identity write gate remains `0`, stop ordinary,
+   automated, and background Application writers, then pause Vercel Production
+   and require the canonical `503`. Keep Vercel Production paused continuously
+   through `prepare`, `apply`, gate `APPLICATION_IDENTITY_WRITES_ENABLED=1`,
+   and the exact reviewed deployment reaching `Ready`.
 2. Run `prepare` with the writer-stop attestation and keep writers stopped.
 3. Review the dry-run report and the fresh backup evidence without resuming
    writers.
 4. Run `apply` with the writer-stop attestation and approved `prepare` run ID.
 5. Require the apply report to match the approved dry-run invariants.
-6. Set `APPLICATION_IDENTITY_WRITES_ENABLED=1` in Production and redeploy the
-   exact reviewed `main` commit.
-7. Run authenticated create/read and monitor checks.
-8. Resume the Vercel project only after every check passes.
+6. Set `APPLICATION_IDENTITY_WRITES_ENABLED=1` in Production and deploy the
+   exact reviewed `main` commit while Vercel remains paused and the canonical
+   `503` is still observed. Require the assigned deployment to reach `Ready`.
+7. Resume Vercel Production before any authenticated monitor, UI, or extension
+   smoke. Confirm the canonical origin is no longer `503`, then run the
+   `production monitor`, authenticated UI create/read/delete, and extension
+   pairing/exchange/create/revoke/replay checks. Ordinary, automated, and
+   background Application writers remain stopped; only one explicitly
+   authorized bounded smoke actor/session at a time may run.
+8. Resume Application writers LAST, only after every post-resume check passes.
 
 If Vercel cannot be paused reliably, the apply phase stops. If any migration,
 backfill, index, row-count, or smoke assertion fails, leave writers stopped and
-do not enable the gate. Recovery uses the newly verified backup in an isolated
-target; no destructive reset, `db push`, or ad-hoc production repair is allowed.
+preserve the actual current gate and deployment state. Do not force the gate to
+`0` absent a reviewed hosted rollback. Recovery uses the newly verified backup
+in an isolated target; no destructive reset, `db push`, or ad-hoc production
+repair is allowed.
 
 ## Phase 5: Extension and documentation closure
 
@@ -191,11 +207,13 @@ verified, report that as an evidence gap and make no mutation.
   terminate owned processes, and keep the last verified artifact untouched.
 - CI audit failure: stop; do not add an exception or force a downgrade.
 - Hosted backup failure: stop before any production identity mutation.
-- Identity prepare failure: keep the write gate at `0`; the running application
-  continues on its legacy write path.
-- Identity apply or post-deploy failure: keep writers stopped, keep the gate
-  closed or return it to `0`, and rehearse recovery against an isolated restore
-  before deciding whether production restoration is necessary.
+- Identity prepare, apply, or pre-resume deployment failure: preserve the actual
+  current gate and deployment state, keep writers stopped, and do not force the
+  gate to `0` absent a reviewed hosted rollback. Rehearse recovery against an
+  isolated restore before deciding whether production restoration is necessary.
+- Post-resume smoke failure: keep writers stopped and pause Vercel again before
+  any further hosted change; preserve the actual current gate and deployment
+  state while following the reviewed rollback procedure.
 - Extension smoke failure: revoke any created installation or grant and keep the
   production service available only if identity verification itself passed.
 - Quarantine discrepancy: preserve all evidence and stop without mutation.
