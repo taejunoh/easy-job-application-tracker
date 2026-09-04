@@ -233,6 +233,29 @@ describe("extension E2E safety support", () => {
     ).toThrow("Invalid extension service worker URL");
   });
 
+  it("builds a canonical extension-owned wake URL only for a valid ID", () => {
+    const id = "abcdefghijklmnopabcdefghijklmnop";
+    expect(callSupport("extensionServiceWorkerWakeUrl", id)).toBe(
+      `chrome-extension://${id}/popup.html`,
+    );
+    for (const invalidId of ["", "not-an-extension-id", "https://example.com"]) {
+      expect(() => callSupport("extensionServiceWorkerWakeUrl", invalidId)).toThrow(
+        "Invalid extension ID for service worker wake URL",
+      );
+    }
+  });
+
+  it("provides a fixed ephemeral wake listener and acknowledgement", () => {
+    const source = callSupport<string>("extensionE2EWakeListenerSource");
+    expect(source).toContain('chrome.runtime.onConnect.addListener');
+    expect(source).toContain('"jobtracker-e2e-wake"');
+    expect(source).toContain('"wake-ack"');
+    expect(source).toContain("bootId");
+    expect(source).toContain("port.postMessage");
+    expect(source).not.toContain("process.env");
+    expect(source).not.toContain("error.message");
+  });
+
   it("selects only the live MV3 registration and version for the extension", () => {
     const id = "abcdefghijklmnopabcdefghijklmnop";
     expect(
@@ -397,9 +420,12 @@ describe("extension E2E safety support", () => {
     for (const requiredText of [
       "ServiceWorker.enable",
       "ServiceWorker.stopWorker",
-      "chrome.developerPrivate.openDevTools",
       "Target.getTargets",
       "Target.attachToTarget",
+      "extensionServiceWorkerWakeUrl",
+      "chrome.runtime.connect",
+      "EXTENSION_E2E_WAKE_CHANNEL",
+      "EXTENSION_E2E_WAKE_ACK",
       "MV3 worker restart and connection restoration",
       "assertSanitizedPopupSnapshot",
       "popupArtifactSensitiveValues",
