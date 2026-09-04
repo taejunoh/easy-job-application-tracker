@@ -11,6 +11,10 @@ import {
   resetVerifiedIntegrationDatabase,
   type LiveDatabaseIdentity,
 } from "./database-test-preflight";
+import {
+  createInstallationCredential,
+  type IssuedInstallationCredential,
+} from "@/lib/security/extension-credentials";
 
 jest.mock("@/lib/extract/llm-provider", () => ({
   createProvider: jest.fn(() => {
@@ -58,6 +62,7 @@ const describeDatabase = DATABASE_INTEGRATION_REQUESTED
 const APP_ORIGIN = "https://jobtracker.test";
 const EXTENSION_ORIGIN =
   "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+let installationCredentialForRequest: IssuedInstallationCredential | undefined;
 
 type ApplicationsRoute = typeof import("@/app/api/applications/route");
 type ApplicationDetailRoute =
@@ -114,11 +119,29 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       prisma,
       requiredDatabaseIdentity(),
     );
+
+    installationCredentialForRequest = createInstallationCredential({
+      encryptionSecret: requiredEncryptionSecret(),
+      origin: EXTENSION_ORIGIN,
+    });
+    await prisma.extensionInstallation.create({
+      data: {
+        id: installationCredentialForRequest.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: installationCredentialForRequest.digest,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      },
+    });
   });
 
   afterAll(async () => {
     if (prisma) {
       try {
+        if (installationCredentialForRequest) {
+          await prisma.extensionInstallation.deleteMany({
+            where: { id: installationCredentialForRequest.selector },
+          });
+        }
         await resetVerifiedIntegrationDatabase(
           prisma,
           requiredDatabaseIdentity(),
@@ -147,10 +170,18 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       EXTENSION_ORIGIN,
     );
 
+    const rootBearerDenied = await applications.GET(
+      request("/api/applications", {
+        origin: EXTENSION_ORIGIN,
+        auth: "root",
+      }),
+    );
+    expect(rootBearerDenied.status).toBe(401);
+
     const denied = await applications.GET(
       request("/api/applications", {
         origin: "https://attacker.test",
-        bearer: true,
+        auth: "root",
       }),
     );
     expect(denied.status).toBe(403);
@@ -162,7 +193,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request("/api/applications", {
         method: "POST",
         origin: EXTENSION_ORIGIN,
-        bearer: true,
+        auth: "installation",
         json: {
           url: "https://example.test/jobs/ci-fixture",
           jobTitle: "CI Engineer",
@@ -179,7 +210,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
     const created = (await createdResponse.json()) as { id: string };
 
     const listResponse = await applications.GET(
-      request("/api/applications", { bearer: true }),
+      request("/api/applications", { auth: "root" }),
     );
     const list = (await listResponse.json()) as Array<{ id: string }>;
     expect(list.map(({ id }) => id)).toContain(created.id);
@@ -188,7 +219,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request(`/api/applications/${created.id}`, {
         method: "PATCH",
         origin: APP_ORIGIN,
-        bearer: true,
+        auth: "root",
         json: { status: "Interview", notes: "CI fixture" },
       }),
       detailContext(created.id),
@@ -201,7 +232,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
     });
 
     const statsResponse = await stats.GET(
-      request("/api/stats", { bearer: true }),
+      request("/api/stats", { auth: "root" }),
     );
     await expect(statsResponse.json()).resolves.toMatchObject({
       total: 1,
@@ -212,7 +243,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request(`/api/applications/${created.id}`, {
         method: "DELETE",
         origin: APP_ORIGIN,
-        bearer: true,
+        auth: "root",
       }),
       detailContext(created.id),
     );
@@ -241,7 +272,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
           request("/api/applications", {
             method: "POST",
             origin: APP_ORIGIN,
-            bearer: true,
+            auth: "root",
             json: payload,
           }),
         ),
@@ -259,7 +290,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request("/api/applications", {
         method: "POST",
         origin: APP_ORIGIN,
-        bearer: true,
+        auth: "root",
         json: { ...payload, status: "Offer", notes: "Replacement notes" },
       }),
     );
@@ -341,7 +372,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request(`/api/applications/${winnerId}`, {
         method: "DELETE",
         origin: APP_ORIGIN,
-        bearer: true,
+        auth: "root",
       }),
       detailContext(winnerId),
     );
@@ -386,7 +417,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request("/api/settings", {
         method: "PUT",
         origin: APP_ORIGIN,
-        bearer: true,
+        auth: "root",
         json: {
           llmProvider: "openai",
           apiKey: "disposable-ci-provider-key",
@@ -428,7 +459,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request("/api/extract", {
         method: "POST",
         origin: EXTENSION_ORIGIN,
-        bearer: true,
+        auth: "installation",
         json: { url: "https://jobs.example.test/open-role" },
       }),
     );
@@ -460,7 +491,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request("/api/keyword-analysis", {
         method: "POST",
         origin: APP_ORIGIN,
-        bearer: true,
+        auth: "root",
         json: { description: "TypeScript PostgreSQL AWS" },
       }),
     );
@@ -532,7 +563,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       request("/api/extract", {
         method: "POST",
         origin: APP_ORIGIN,
-        bearer: true,
+        auth: "root",
         json: { url: "http://127.0.0.1/internal" },
       }),
     );
@@ -565,15 +596,17 @@ function request(
   options: Readonly<{
     method?: string;
     origin?: string;
-    bearer?: boolean;
+    auth?: "root" | "installation";
     cookie?: string;
     json?: unknown;
   }> = {},
 ): NextRequest {
   const headers = new Headers();
   if (options.origin) headers.set("Origin", options.origin);
-  if (options.bearer) {
+  if (options.auth === "root") {
     headers.set("Authorization", `Bearer ${accessToken()}`);
+  } else if (options.auth === "installation") {
+    headers.set("Authorization", `Bearer ${installationToken()}`);
   }
   if (options.cookie) headers.set("Cookie", options.cookie);
   if (options.json !== undefined) {
@@ -590,6 +623,19 @@ function request(
 
 function accessToken(): string {
   return process.env.APP_ACCESS_TOKEN ?? "";
+}
+
+function requiredEncryptionSecret(): string {
+  const value = process.env.ENCRYPTION_SECRET;
+  if (!value) throw new Error("ENCRYPTION_SECRET is required");
+  return value;
+}
+
+function installationToken(): string {
+  if (!installationCredentialForRequest) {
+    throw new Error("Installation credential was not seeded");
+  }
+  return installationCredentialForRequest.token;
 }
 
 function requiredDatabaseIdentity() {
