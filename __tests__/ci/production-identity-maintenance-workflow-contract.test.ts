@@ -407,7 +407,14 @@ describe("production identity maintenance workflow contract", () => {
     expect(applyBackfillCommand).toBeDefined();
     const applyReport = argumentAfter(applyBackfillCommand, "--report");
     expect(applyReport).toBeDefined();
-    expect(applyReport).not.toBe(currentDryRunReport);
+    const canonicalCurrentDryRunReport = canonicalPath(currentDryRunReport);
+    const canonicalApplyReport = canonicalPath(applyReport);
+    expect(canonicalCurrentDryRunReport).toMatch(/^\$RUNNER_TEMP\/.+\.json$/u);
+    expect(canonicalApplyReport).toMatch(/^\$RUNNER_TEMP\/.+\.json$/u);
+    expect(canonicalCurrentDryRunReport).not.toBe(approvedExtractedReport);
+    expect(canonicalApplyReport).not.toBe(approvedExtractedReport);
+    expect(canonicalApplyReport).not.toMatch(/^\$RUNNER_TEMP\/approved\//u);
+    expect(canonicalCurrentDryRunReport).not.toBe(canonicalApplyReport);
     const preApplyComparison = steps.find(
       (step) => normalizeCondition(step.if) === "inputs.phase == 'apply'"
         && hasCommandMatching(
