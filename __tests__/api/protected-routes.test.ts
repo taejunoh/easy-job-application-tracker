@@ -810,7 +810,7 @@ describe("protected product API actual requests", () => {
         error: "Internal server error",
         code: "internal_error",
       });
-      expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
       expect(text).not.toContain(code);
       expect(text).not.toContain("private database timeout detail");
       consoleError.mockRestore();
