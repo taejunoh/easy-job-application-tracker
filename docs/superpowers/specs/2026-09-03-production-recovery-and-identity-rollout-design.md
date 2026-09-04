@@ -148,11 +148,12 @@ remain aligned with it.
 
 The operator sequence is:
 
-1. Confirm the current identity write gate remains `0`, stop ordinary,
-   automated, and background Application writers, then pause Vercel Production
-   and require the canonical `503`. Keep Vercel Production paused continuously
-   through `prepare`, `apply`, gate `APPLICATION_IDENTITY_WRITES_ENABLED=1`,
-   and the exact reviewed deployment reaching `Ready`.
+1. Confirm the current identity write gate remains `0`, pause Vercel Production
+   and require the canonical `503` first. Then stop ordinary, automated, and
+   background Application writers and attest that they remain stopped. Keep
+   Vercel Production paused continuously through `prepare`, `apply`, gate
+   `APPLICATION_IDENTITY_WRITES_ENABLED=1`, and the exact reviewed deployment
+   reaching `Ready`.
 2. Run `prepare` with the writer-stop attestation and keep writers stopped.
 3. Review the dry-run report and the fresh backup evidence without resuming
    writers.
@@ -214,8 +215,11 @@ verified, report that as an evidence gap and make no mutation.
 - Post-resume smoke failure: keep writers stopped and pause Vercel again before
   any further hosted change; preserve the actual current gate and deployment
   state while following the reviewed rollback procedure.
-- Extension smoke failure: revoke any created installation or grant and keep the
-  production service available only if identity verification itself passed.
+- Extension smoke failure: keep all ordinary, automated, background, and
+  Application writers stopped; pause Vercel again before any further hosted
+  change, preserve the actual current gate and deployment state, and follow the
+  reviewed rollback procedure. Do not force the gate to `0` absent a reviewed
+  hosted rollback.
 - Quarantine discrepancy: preserve all evidence and stop without mutation.
 
 ## Success criteria

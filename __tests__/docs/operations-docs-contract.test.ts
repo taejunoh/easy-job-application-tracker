@@ -376,6 +376,17 @@ describe("production operations documentation contract", () => {
     );
     expect(phase).toContain("production operations runbook");
     expect(phase).toContain("is authoritative for the exact hosted commands and order");
+    const initialOrder = [
+      "pause Vercel Production",
+      "canonical `503`",
+      "stop ordinary, automated, and background Application writers",
+    ];
+    let initialPrior = -1;
+    for (const requirement of initialOrder) {
+      const next = phase.toLowerCase().indexOf(requirement.toLowerCase(), initialPrior + 1);
+      expect(next).toBeGreaterThan(initialPrior);
+      initialPrior = next;
+    }
     const orderedRequirements = [
       "keep Vercel Production paused",
       "prepare",
@@ -403,6 +414,16 @@ describe("production operations documentation contract", () => {
     );
     expect(phase).not.toMatch(/keep the write gate at `?0`?/iu);
     expect(phase).not.toMatch(/resume the Vercel project only after every check passes/iu);
+
+    const errorStart = design.indexOf("## Error handling and rollback");
+    const errorEnd = design.indexOf("## Success criteria", errorStart);
+    expect(errorStart).not.toBe(-1);
+    expect(errorEnd).toBeGreaterThan(errorStart);
+    const errors = design.slice(errorStart, errorEnd).replace(/\s+/gu, " ");
+    expect(errors).not.toMatch(/production service available only if identity verification itself passed/iu);
+    expect(errors).toMatch(
+      /extension smoke failure[^.]{0,240}keep all ordinary, automated, background, and Application writers stopped[^.]{0,240}pause Vercel again before any further hosted change[^.]{0,240}preserve the actual current gate and deployment state/iu,
+    );
   });
 
   it("publishes the complete quarantine operator workflow", () => {
