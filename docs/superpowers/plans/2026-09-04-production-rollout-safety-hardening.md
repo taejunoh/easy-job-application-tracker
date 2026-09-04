@@ -138,6 +138,10 @@ describe("DATABASE_URL timeout override protection", () => {
     "OPTIONS=-c%20lock_timeout%3D0",
     "statement_timeout=1&statement_timeout=2",
     "Statement_Timeout=1&statement_timeout=2",
+    "lock_timeout=1&lock_timeout=2",
+    "Lock_Timeout=1&lock_timeout=2",
+    "options=one&options=two",
+    "Options=one&options=two",
   ])("rejects reserved URL query %s", (query) => {
     const databaseUrl =
       "postgresql://jobtracker:database-password@db.example.com:5432/jobtracker?" +
@@ -209,7 +213,7 @@ git add src/lib/server-env-core.js __tests__/lib/server-env.test.ts
 git commit -m "fix: reject PostgreSQL timeout URL overrides"
 ~~~
 
-#### Runtime wiring and generic timeout errors
+### Task 3: Wire the factory and preserve generic timeout errors
 
 **Files:**
 - Modify: src/lib/prisma.ts
@@ -295,12 +299,13 @@ it.each(["57014", "55P03"])(
     );
 
     expect(response.status).toBe(500);
-    await expect(response.json()).resolves.toEqual({
+    const body = await response.text();
+    expect(JSON.parse(body)).toEqual({
       error: "Internal server error",
       code: "internal_error",
     });
     expect(response.headers.get("Cache-Control")).toBe("private, no-store");
-    expect(JSON.stringify(await response.clone().json())).not.toContain(code);
+    expect(body).not.toContain(code);
     logged.mockRestore();
   },
 );
@@ -324,7 +329,7 @@ git add src/lib/prisma.ts __tests__/lib/prisma.test.ts __tests__/api/protected-r
 git commit -m "feat: apply PostgreSQL timeout factory to Prisma"
 ~~~
 
-### Task 3: Prove all ten PostgreSQL 17 pool slots
+### Task 4: Prove all ten PostgreSQL 17 pool slots
 
 **Files:**
 - Create: __tests__/lib/prisma-timeouts.integration.test.ts
@@ -333,6 +338,7 @@ git commit -m "feat: apply PostgreSQL timeout factory to Prisma"
 
 ~~~ts
 import pg from "pg";
+import { PrismaPg } from "@prisma/adapter-pg";
 import { createPrismaPgPoolConfig } from "@/lib/database-timeouts";
 import { assertDatabaseTestSafety } from "../api/database-test-guard";
 
@@ -341,13 +347,17 @@ const identity = requested ? assertDatabaseTestSafety(process.env) : undefined;
 const describeDatabase = requested ? describe : describe.skip;
 
 describeDatabase("Prisma PostgreSQL startup timeout parameters", () => {
+  let factory: PrismaPg;
+  let adapter: Awaited<ReturnType<PrismaPg["connect"]>> | undefined;
   let pool: pg.Pool;
 
   beforeAll(async () => {
     if (!identity) throw new Error("database identity was not preflighted");
-    pool = new pg.Pool(
+    factory = new PrismaPg(
       createPrismaPgPoolConfig(process.env.DATABASE_URL ?? ""),
     );
+    adapter = await factory.connect();
+    pool = adapter.underlyingDriver();
     expect(pool.options.max).toBe(10);
     const version = await pool.query<{ server_version_num: string }>(
       "SHOW server_version_num",
@@ -359,7 +369,7 @@ describeDatabase("Prisma PostgreSQL startup timeout parameters", () => {
   });
 
   afterAll(async () => {
-    if (pool) await pool.end();
+    if (adapter) await adapter.dispose();
   });
 
   it("sets 25s and 5s on ten distinct backends", async () => {
@@ -369,11 +379,15 @@ describeDatabase("Prisma PostgreSQL startup timeout parameters", () => {
     try {
       const observations = await Promise.all(
         clients.map(async (client) => {
-          const [pid, statement, lock] = await Promise.all([
-            client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid"),
-            client.query<{ value: string }>("SHOW statement_timeout"),
-            client.query<{ value: string }>("SHOW lock_timeout"),
-          ]);
+          const pid = await client.query<{ pid: number }>(
+            "SELECT pg_backend_pid() AS pid",
+          );
+          const statement = await client.query<{ value: string }>(
+            "SHOW statement_timeout",
+          );
+          const lock = await client.query<{ value: string }>(
+            "SHOW lock_timeout",
+          );
           return {
             pid: pid.rows[0]?.pid,
             statement: statement.rows[0]?.value,
@@ -396,7 +410,7 @@ describeDatabase("Prisma PostgreSQL startup timeout parameters", () => {
 });
 ~~~
 
-The test must retain the existing sentinel, loopback address, canonical _ci/_test database-name, and PostgreSQL-version safety guard. It must never use a Production URL.
+The test must retain the existing sentinel, loopback address, canonical _ci/_test database-name, and PostgreSQL-version safety guard. It must never use a Production URL. The existing .github/workflows/ci.yml starts the digest-pinned PostgreSQL 17 service, exports RUN_DATABASE_INTEGRATION=1, ALLOW_DESTRUCTIVE_DATABASE_TESTS, DATABASE_URL, and EXPECTED_DATABASE_SERVER_ADDRESS, and runs npm run test:ci, which matches this file; no workflow change is needed.
 
 - [ ] **Step 2: Verify safe skip without integration variables**
 
@@ -424,7 +438,7 @@ EXPECTED_DATABASE_SERVER_ADDRESS=127.0.0.1 \
 npx jest --runInBand __tests__/lib/prisma-timeouts.integration.test.ts
 ~~~
 
-Expected: one passing integration test, major version 17, ten distinct backend PIDs, ten SHOW observations of 25s and 5s, and cleanup of only the named container.
+Expected: one passing integration test, major version 17, ten distinct backend PIDs, ten SHOW observations of 25s and 5s from the PrismaPg-owned pool, adapter.dispose() closes the pool, and cleanup removes only the named container.
 
 - [ ] **Step 4: Commit**
 
@@ -433,7 +447,7 @@ git add __tests__/lib/prisma-timeouts.integration.test.ts
 git commit -m "test: prove PostgreSQL pool timeout startup parameters"
 ~~~
 
-### Task 4: Add relationship-aware documentation tests and candidate binding
+### Task 5: Add relationship-aware documentation tests and candidate binding
 
 **Files:**
 - Create: __tests__/docs/production-rollout-safety-hardening-contract.test.ts
@@ -475,15 +489,18 @@ describe("production rollout safety hardening", () => {
       "## Backup and restore",
     );
     assertOrdered(section, [
+      "git status --porcelain",
+      "git rev-parse HEAD",
       "CANDIDATE_JSON=",
       "vercel deploy . --prod --skip-domain --yes --format=json --no-color",
       "CANDIDATE_ID=",
       "vercel inspect \"$CANDIDATE_ID\" --wait --timeout 3m --format=json --no-color",
+      "((.aliases // []) | length) == 0",
       "/v13/deployments/$CANDIDATE_ID",
       "githubCommitSha:.meta.githubCommitSha",
       ".readyState == \"READY\"",
       ".target == \"production\"",
-      ".aliases | length == 0",
+      "((.aliases | length) == 0)",
       "vercel promote \"$CANDIDATE_ID\" --yes",
       "canonical origin",
       ".id == $CANDIDATE_ID",
@@ -510,24 +527,26 @@ For Stage 1 and final candidates, use the same block, changing only the gate ass
 
 ~~~bash
 set -euo pipefail
-export TARGET_SHA="$(git rev-parse origin/main)"
-export CANDIDATE_JSON="$(vercel deploy . --prod --skip-domain --yes --format=json --no-color)"
-export CANDIDATE_ID="$(jq -er 'select(.id | test("^dpl_[A-Za-z0-9]+$")) | .id' <<<"$CANDIDATE_JSON")"
-export CANDIDATE_URL="$(jq -er 'select(.id == env.CANDIDATE_ID and (.url | type == "string") and (.url | length > 0)) | .url' <<<"$CANDIDATE_JSON")"
+TARGET_SHA="$(git rev-parse origin/main)"
+[[ -z "$(git status --porcelain)" ]]
+[[ "$(git rev-parse HEAD)" == "$TARGET_SHA" ]]
+CANDIDATE_JSON="$(vercel deploy . --prod --skip-domain --yes --format=json --no-color)"
+CANDIDATE_ID="$(jq -er 'select(.id | test("^dpl_[A-Za-z0-9]+$")) | .id' <<<"$CANDIDATE_JSON")"
+CANDIDATE_URL="$(jq -er --arg id "$CANDIDATE_ID" 'select(.id == $id and (.url | type == "string") and (.url | length > 0)) | .url' <<<"$CANDIDATE_JSON")"
 unset CANDIDATE_JSON
 [[ "$CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]]
 [[ "$CANDIDATE_URL" =~ ^https://[^[:space:]]+$ ]]
 
-export CANDIDATE_INSPECT="$(vercel inspect "$CANDIDATE_ID" --wait --timeout 3m --format=json --no-color)"
-jq -e --arg id "$CANDIDATE_ID" '.id == $id and .readyState == "READY" and ((.aliases // []) | length == 0)' <<<"$CANDIDATE_INSPECT" >/dev/null
+CANDIDATE_INSPECT="$(vercel inspect "$CANDIDATE_ID" --wait --timeout 3m --format=json --no-color)"
+jq -e --arg id "$CANDIDATE_ID" '.id == $id and .readyState == "READY" and ((.aliases // []) | length) == 0' <<<"$CANDIDATE_INSPECT" >/dev/null
 unset CANDIDATE_INSPECT
 
-export CANDIDATE_METADATA="$(vercel api "/v13/deployments/$CANDIDATE_ID" --raw | jq -ce '{id,readyState,target,url,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])}')"
+CANDIDATE_METADATA="$(vercel api "/v13/deployments/$CANDIDATE_ID" --raw | jq -ce '{id,readyState,target,url,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])}')"
 jq -e --arg id "$CANDIDATE_ID" --arg sha "$TARGET_SHA" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.url | type == "string") and (.url | length > 0) and (.githubCommitSha == $sha) and ((.aliases | length) == 0)' <<<"$CANDIDATE_METADATA" >/dev/null
 unset CANDIDATE_METADATA
 
 vercel promote "$CANDIDATE_ID" --yes
-export CANONICAL_METADATA="$(vercel inspect "$APP_BASE_URL" --format=json --no-color)"
+CANONICAL_METADATA="$(vercel inspect "$APP_BASE_URL" --format=json --no-color)"
 jq -e --arg id "$CANDIDATE_ID" '.id == $id' <<<"$CANONICAL_METADATA" >/dev/null
 unset CANONICAL_METADATA
 ~~~
@@ -539,7 +558,7 @@ The raw API response must flow directly to the exact projection
 
 ~~~bash
 npx jest --runInBand __tests__/docs/production-rollout-safety-hardening-contract.test.ts
-sed -n '/export CANDIDATE_JSON=/,/unset CANONICAL_METADATA/p' docs/operations/production-runbook.md | bash -n
+sed -n '/CANDIDATE_JSON=/,/unset CANONICAL_METADATA/p' docs/operations/production-runbook.md | bash -n
 ~~~
 
 Expected: test passes and bash -n exits 0 without executing Vercel.
@@ -551,7 +570,7 @@ git add docs/operations/production-runbook.md __tests__/docs/production-rollout-
 git commit -m "docs: bind staged rollout to inspected deployment IDs"
 ~~~
 
-#### Identity-aware rollback and private fixture ledger
+### Task 6: Add identity-aware rollback and private fixture ledger
 
 **Files:**
 - Modify: docs/operations/production-runbook.md
@@ -598,6 +617,7 @@ it("extracts private ledger ownership and retention", () => {
     "retained until cleanup has been verified",
     "exact owned Application IDs",
     "pre-stop unconsumed pairing grant",
+    "pairing code/reference only inside the private ledger",
     "every Application, pairing grant, or installation created after resume",
     "consume the recorded pre-stop unconsumed pairing grant exactly once",
     "credential receives 401",
@@ -673,19 +693,27 @@ touch "$FIXTURE_LEDGER"
 chmod 0600 "$FIXTURE_LEDGER"
 ~~~
 
+State explicitly that the private fixture directory has mode 0700, the ledger
+has mode 0600, and the ledger is retained until cleanup has been verified.
 The ledger records only rollout SHA, staged/promoted deployment IDs,
 canonical origin, exact owned row IDs and pre/post hashes, Settings existence
-and hash, the pre-stop unconsumed grant reference, opaque installation IDs,
-post-resume created IDs, actions, expected terminal states, timestamps, and
-sanitized results. It never records credentials, pairing codes, URLs, titles,
+and hash, the pre-stop unconsumed grant pairing code/reference only inside the
+private ledger, opaque installation IDs, every Application, pairing grant, or
+installation created after resume, actions, expected terminal states, timestamps, and
+sanitized results. It never records installation credentials or other secrets;
+the pre-stop pairing code/reference is confined to this private ledger. It
+never records URLs, titles,
 companies, notes, resume text, raw rows, database URLs, or request/response
 bodies; it is never copied to logs, Actions artifacts, pull requests,
 specifications, README, shell history, or deployment output.
 
 Cleanup reads exact IDs from the ledger only. It consumes the recorded grant
 once and verifies replay rejection, revokes each ledger-owned installation and
-verifies credential 401, removes only ledger-owned Applications through
-supported paths, and compares final counts and content hashes. The settings
+verifies the credential receives 401, removes only ledger-owned Applications through
+supported paths, and compares final counts and content hashes. A failed cleanup
+is a failure state, not permission to broaden ownership. The Settings singleton
+is created only on the first successful PUT /api/settings; an authenticated GET
+/api/settings never creates the row. The settings
 probe is a syntactically valid PUT /api/settings with private non-production
 canary values and no real provider credential; while stopped it must return the
 stopped response with unchanged Settings existence and hash. Any mismatch
@@ -698,10 +726,13 @@ passes.
 
 ~~~bash
 npx jest --runInBand __tests__/docs/production-rollout-safety-hardening-contract.test.ts
-rg -n "password|Bearer|pairing code|provider credential|raw row|GET /api/settings.*creates" docs/operations/production-runbook.md
+rg -n "raw API response|provider credential|pairing code/reference|private ledger" docs/operations/production-runbook.md
+if rg -n "Bearer [^[:space:]]+|raw row object|postgresql://[^[:space:]]+@|GET /api/settings[^.]{0,100}creates the row" docs/operations/production-runbook.md; then
+  exit 1
+fi
 ~~~
 
-Expected: suite passes and the privacy/stale-claim scan has no matches.
+Expected: suite passes; the first scan positively finds the required privacy-boundary wording, and the second scan produces no output and exits 0.
 
 - [ ] **Step 6: Commit**
 
@@ -710,7 +741,7 @@ git add docs/operations/production-runbook.md __tests__/docs/production-rollout-
 git commit -m "docs: make rollout rollback and fixture cleanup fail closed"
 ~~~
 
-### Task 5: Align README and all linked documents
+### Task 7: Align README, linked documents, and complete verification
 
 **Files:**
 - Modify: README.md
@@ -788,19 +819,54 @@ git add README.md \
 git commit -m "docs: align rollout references with authoritative runbook"
 ~~~
 
-#### Complete verification
+**Final verification steps:**
 
 **Files:**
-- Verify all files changed by Tasks 1–7.
-- Verify package.json, .github/workflows/ci.yml, and existing database guards.
+- Verify: src/lib/database-timeouts.ts
+- Verify: src/lib/prisma.ts
+- Verify: src/lib/server-env-core.js
+- Verify: __tests__/lib/database-timeouts.test.ts
+- Verify: __tests__/lib/prisma.test.ts
+- Verify: __tests__/lib/server-env.test.ts
+- Verify: __tests__/lib/prisma-timeouts.integration.test.ts
+- Verify: __tests__/api/protected-routes.test.ts
+- Verify: __tests__/docs/production-rollout-safety-hardening-contract.test.ts
+- Verify: docs/operations/production-runbook.md
+- Verify: README.md and the three linked historical/design documents
+- Verify: package.json, .github/workflows/ci.yml, and existing database guards.
 
 - [ ] **Step 1: Review diff and scan for unsafe artifacts**
 
 ~~~bash
-git diff --check HEAD~7..HEAD
+git diff --check -- \
+  src/lib/database-timeouts.ts src/lib/prisma.ts src/lib/server-env-core.js \
+  __tests__/lib/database-timeouts.test.ts __tests__/lib/prisma.test.ts \
+  __tests__/lib/server-env.test.ts __tests__/lib/prisma-timeouts.integration.test.ts \
+  __tests__/api/protected-routes.test.ts \
+  __tests__/docs/production-rollout-safety-hardening-contract.test.ts \
+  docs/operations/production-runbook.md README.md \
+  docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md \
+  docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md \
+  docs/superpowers/plans/2026-09-03-hosted-production-rollout.md
 git status --short
-git diff --stat HEAD~7..HEAD
-rg -n "TBD|TODO|Bearer|raw API" README.md src __tests__ docs/operations/production-runbook.md docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md docs/superpowers/plans/2026-09-03-hosted-production-rollout.md
+git diff --stat -- \
+  src/lib/database-timeouts.ts src/lib/prisma.ts src/lib/server-env-core.js \
+  __tests__/lib/database-timeouts.test.ts __tests__/lib/prisma.test.ts \
+  __tests__/lib/server-env.test.ts __tests__/lib/prisma-timeouts.integration.test.ts \
+  __tests__/api/protected-routes.test.ts \
+  __tests__/docs/production-rollout-safety-hardening-contract.test.ts \
+  docs/operations/production-runbook.md README.md \
+  docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md \
+  docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md \
+  docs/superpowers/plans/2026-09-03-hosted-production-rollout.md
+rg -n "raw API|provider credential|pairing code/reference|statement_timeout|lock_timeout|PAUSED_AFTER_APPLY|HOLD_PAUSED|UNPAUSED_READONLY" README.md docs/operations/production-runbook.md docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md docs/superpowers/plans/2026-09-03-hosted-production-rollout.md
+for marker in "T""BD" "TO""DO"; do
+  if rg -n "$marker|Bearer [^[:space:]]+|raw API JSON|postgresql://[^[:space:]]+@|GET /api/settings[^.]{0,100}creates the row" README.md docs/operations/production-runbook.md docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md docs/superpowers/plans/2026-09-03-hosted-production-rollout.md; then
+    exit 1
+  fi
+done
+  exit 1
+fi
 ~~~
 
 Expected: diff check exits 0, only intended files are changed, and no fixture ledger, raw Vercel JSON, private evidence, or unresolved marker exists.
@@ -834,7 +900,7 @@ Expected: every command exits 0; no Vercel, GitHub, Neon, or Production database
 
 - [ ] **Step 4: Repeat the disposable PostgreSQL 17 integration**
 
-Repeat Task 3 Step 3 with a fresh unused loopback port and the same image digest. Confirm one passing test, ten distinct PIDs, statement_timeout 25s, lock_timeout 5s, and removal of only the named container.
+Repeat Task 4 Step 3 with a fresh unused loopback port and the same image digest. Confirm one passing test, ten distinct PIDs, statement_timeout 25s, lock_timeout 5s, and removal of only the named container.
 
 - [ ] **Step 5: Run complete Jest with open-handle detection**
 
