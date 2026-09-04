@@ -84,24 +84,23 @@ describeDatabase("application write-stop PostgreSQL invariants", () => {
   beforeAll(async () => {
     process.env.APPLICATION_WRITES_ENABLED = "0";
 
-    const [{ prisma: database }, routeModules, authModule, cryptoModule] =
-      await Promise.all([
-        import("@/lib/prisma"),
-        Promise.all([
-          import("@/app/api/applications/route"),
-          import("@/app/api/applications/[id]/route"),
-          import("@/app/api/settings/route"),
-          import("@/app/api/extension/pairing/route"),
-          import("@/app/api/extension/pair/route"),
-          import("@/app/api/extension/revoke/route"),
-          import("@/app/api/extension/installations/[id]/route"),
-          import("@/app/api/extension/installations/route"),
-        ]),
-        import("@/lib/security/auth"),
-        import("@/lib/crypto"),
-      ]);
+    const { prisma: database } = await import("@/lib/prisma");
     prisma = database;
     activePrisma = database;
+    const [routeModules, authModule, cryptoModule] = await Promise.all([
+      Promise.all([
+        import("@/app/api/applications/route"),
+        import("@/app/api/applications/[id]/route"),
+        import("@/app/api/settings/route"),
+        import("@/app/api/extension/pairing/route"),
+        import("@/app/api/extension/pair/route"),
+        import("@/app/api/extension/revoke/route"),
+        import("@/app/api/extension/installations/[id]/route"),
+        import("@/app/api/extension/installations/route"),
+      ]),
+      import("@/lib/security/auth"),
+      import("@/lib/crypto"),
+    ]);
     [
       applications,
       applicationDetail,
@@ -405,70 +404,78 @@ async function snapshotDurableState(
     settingsCount,
     pairingGrantCount,
     installationCount,
-    applicationDigest: createHash("sha256")
-      .update(
-        JSON.stringify(
-          applicationRows
-            .map((row) => ({
-      id: row.id,
-      url: row.url,
-      jobTitle: row.jobTitle,
-      company: row.company,
-      status: row.status,
-      appliedDate: row.appliedDate.toISOString(),
-      description: row.description,
-      notes: row.notes,
-      salary: row.salary,
-      location: row.location,
-      jobType: row.jobType,
-      createdAt: row.createdAt.toISOString(),
-      updatedAt: row.updatedAt.toISOString(),
-      identityKey: row.identityKey,
-      canonicalUrl: row.canonicalUrl,
-      duplicateOfId: row.duplicateOfId,
-      identityState: row.identityState,
-            }))
-            .sort((left, right) => left.id.localeCompare(right.id)),
-        ),
-        "utf8",
-      )
-      .digest("hex"),
+    applicationDigest: sha256(
+      JSON.stringify(
+        applicationRows
+          .map((row) => ({
+            id: row.id,
+            url: row.url,
+            jobTitle: row.jobTitle,
+            company: row.company,
+            status: row.status,
+            appliedDate: row.appliedDate.toISOString(),
+            description: row.description,
+            notes: row.notes,
+            salary: row.salary,
+            location: row.location,
+            jobType: row.jobType,
+            createdAt: row.createdAt.toISOString(),
+            updatedAt: row.updatedAt.toISOString(),
+            identityKey: row.identityKey,
+            canonicalUrl: row.canonicalUrl,
+            duplicateOfId: row.duplicateOfId,
+            identityState: row.identityState,
+          }))
+          .sort((left, right) => left.id.localeCompare(right.id)),
+      ),
+    ),
     settings:
       settingsRow === null
         ? null
         : {
-            id: settingsRow.id,
-            contentHash: createHash("sha256")
-              .update(
-                JSON.stringify({
-                  llmProvider: settingsRow.llmProvider,
-                  apiKey: settingsRow.apiKey,
-                  linkedinUrl: settingsRow.linkedinUrl,
-                  githubUrl: settingsRow.githubUrl,
-                  resumeText: settingsRow.resumeText,
-                }),
-                "utf8",
-              )
-              .digest("hex"),
+            id: sha256(settingsRow.id),
+            contentHash: sha256(
+              JSON.stringify({
+                llmProvider: settingsRow.llmProvider,
+                apiKey: settingsRow.apiKey,
+                linkedinUrl: settingsRow.linkedinUrl,
+                githubUrl: settingsRow.githubUrl,
+                resumeText: settingsRow.resumeText,
+              }),
+            ),
           },
-    pairingGrants: pairingGrantRows.map((row) => ({
-      id: row.id,
-      origin: row.origin,
+    pairingGrants: [...pairingGrantRows]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((row) => ({
+      idHash: sha256(row.id),
+      originHash: sha256(row.origin),
+      codeDigestHash: sha256(row.codeDigest),
       expiresAt: row.expiresAt.toISOString(),
       consumedAt: row.consumedAt?.toISOString() ?? null,
-      installationId: row.installationId,
+      installationIdHash: hashNullable(row.installationId),
       createdAt: row.createdAt.toISOString(),
-    })),
-    installations: installationRows.map((row) => ({
-      id: row.id,
-      origin: row.origin,
+      })),
+    installations: [...installationRows]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((row) => ({
+      idHash: sha256(row.id),
+      originHash: sha256(row.origin),
+      tokenDigestHash: sha256(row.tokenDigest),
       expiresAt: row.expiresAt.toISOString(),
       revokedAt: row.revokedAt?.toISOString() ?? null,
       lastUsedAt: row.lastUsedAt?.toISOString() ?? null,
       createdAt: row.createdAt.toISOString(),
       updatedAt: row.updatedAt.toISOString(),
-    })),
+      })),
   };
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function hashNullable(value: string | null): string | null {
+  return value === null ? null : sha256(value);
 }
 
 function request(
