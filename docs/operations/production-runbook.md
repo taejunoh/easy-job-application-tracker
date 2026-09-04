@@ -351,14 +351,15 @@ promotion. It is paused only across prepare/apply, and the actual platform
      (.fixtureOwnership | type == "object") and
      (.fixtureOwnership.applicationIds | type == "array" and length > 0) and
      all(.fixtureOwnership.applicationIds[]; (type == "string") and length > 0) and
+     ((.fixtureOwnership.applicationIds | unique | length) == (.fixtureOwnership.applicationIds | length)) and
      (.fixtureOwnership.ownedDeploymentIds | type == "array" and length > 0) and
      all(.fixtureOwnership.ownedDeploymentIds[]; (type == "string") and length > 0) and
      ((.fixtureOwnership.ownedDeploymentIds | unique | length) == (.fixtureOwnership.ownedDeploymentIds | length)) and
-     (if (.fixtureOwnership | has("pairingGrantIds")) then (.fixtureOwnership.pairingGrantIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
-     (if (.fixtureOwnership | has("installationIds")) then (.fixtureOwnership.installationIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
-     (if (.fixtureOwnership | has("postResumeApplicationIds")) then (.fixtureOwnership.postResumeApplicationIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
-     (if (.fixtureOwnership | has("postResumePairingGrantIds")) then (.fixtureOwnership.postResumePairingGrantIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
-     (if (.fixtureOwnership | has("postResumeInstallationIds")) then (.fixtureOwnership.postResumeInstallationIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
+     (if (.fixtureOwnership | has("pairingGrantIds")) then (.fixtureOwnership.pairingGrantIds as $ids | ($ids | type == "array" and all(.[]; (type == "string") and length > 0)) and (($ids | unique | length) == ($ids | length))) else true end) and
+     (if (.fixtureOwnership | has("installationIds")) then (.fixtureOwnership.installationIds as $ids | ($ids | type == "array" and all(.[]; (type == "string") and length > 0)) and (($ids | unique | length) == ($ids | length))) else true end) and
+     (if (.fixtureOwnership | has("postResumeApplicationIds")) then (.fixtureOwnership.postResumeApplicationIds as $ids | ($ids | type == "array" and all(.[]; (type == "string") and length > 0)) and (($ids | unique | length) == ($ids | length))) else true end) and
+     (if (.fixtureOwnership | has("postResumePairingGrantIds")) then (.fixtureOwnership.postResumePairingGrantIds as $ids | ($ids | type == "array" and all(.[]; (type == "string") and length > 0)) and (($ids | unique | length) == ($ids | length))) else true end) and
+     (if (.fixtureOwnership | has("postResumeInstallationIds")) then (.fixtureOwnership.postResumeInstallationIds as $ids | ($ids | type == "array" and all(.[]; (type == "string") and length > 0)) and (($ids | unique | length) == ($ids | length))) else true end) and
      (.fixtureOwnership.preProbeHash | type == "string" and length > 0) and
      (.fixtureOwnership.postProbeHash | type == "string" and length > 0) and
      (.fixtureOwnership.settings | type == "object") and
@@ -703,6 +704,18 @@ promotion. It is paused only across prepare/apply, and the actual platform
    [[ "$READONLY_STATUS" =~ ^2[0-9]{2}$ ]] || enter_hold_paused
    PRODUCTION_APP_URL="$CANONICAL_ORIGIN" PRODUCTION_APP_ACCESS_TOKEN="$ROLLBACK_READ_TOKEN" npm run check:production:writes-stopped >/dev/null || enter_hold_paused
    unset RESUMED_CANONICAL READONLY_STATUS
+   validate_evidence_root || enter_hold_paused
+   # Normal UNPAUSED_READONLY verification ends here: never deploy or promote.
+   ```
+
+   Run this separate regression block only after an explicit reviewed regression
+   declaration. It must be pasted into the same verified shell as the normal
+   block so `validate_evidence_root`, `enter_hold_paused`, and the exact
+   Stage 1 selector helpers remain defined. It is the sole path that may call
+   `stage_candidate` after normal resume.
+
+   ```bash
+   [[ "${POST_RESUME_REGRESSION_CONFIRMED:-}" == "true" ]] || exit 1
    validate_evidence_root || enter_hold_paused
 
    ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")" || enter_hold_paused

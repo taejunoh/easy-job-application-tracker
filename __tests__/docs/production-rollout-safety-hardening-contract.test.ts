@@ -184,10 +184,11 @@ function regressionBlock(): string {
 }
 
 function normalResumeBlock(): string {
-  const block = regressionBlock();
-  const end = block.indexOf('ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"');
-  expect(end).toBeGreaterThan(-1);
-  return block.slice(0, end);
+  const block = bashBlocks(rolloutSection()).find((candidate) =>
+    normalize(candidate).includes("Normal PAUSED_AFTER_APPLY -> UNPAUSED_READONLY"),
+  );
+  expect(block).toBeDefined();
+  return block ?? "";
 }
 
 function stageOneLedgerBlock(): string {
@@ -402,31 +403,14 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     const normalizedBlock = normalize(block);
     expectOrdered(normalizedBlock, [
       "validate_evidence_root || enter_hold_paused",
-      'jq -e --arg sha "$TARGET_SHA"',
-      "STAGE_ONE_RECORD_ID=\"$(jq -er '.stage1.deploymentId' \"$LEDGER\")\"",
-      'STAGE_ONE_INSPECT="$(vercel inspect "$STAGE_ONE_RECORD_ID"',
-      'STAGE_ONE_METADATA="$(vercel api "/v13/deployments/$STAGE_ONE_RECORD_ID"',
-      'STAGE_ONE_CANONICAL="$(vercel inspect "$CANONICAL_ORIGIN"',
-      'assert_canonical_unpaused "$CANONICAL_ORIGIN" || enter_hold_paused',
       'ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"',
       "sleep 60",
       'READONLY_STATUS="$(curl',
       'NEGATIVE_STATUS="$(curl',
       'unset ROLLBACK_READ_TOKEN',
     ]);
-    expect(normalizedBlock).toContain("gates.identity == \"1\"");
-    expect(normalizedBlock).toContain("gates.writes == \"0\"");
-    expect(normalizedBlock).toContain("canonicalPromotionVerified == true");
-    expect(normalizedBlock).toContain("compatibilityVerified == true");
-    expect(normalizedBlock).toContain("readyState == \"READY\"");
-    expect(normalizedBlock).toContain("target == \"production\"");
-    expect(normalizedBlock).toContain("After the provider pause is complete");
-    expect(normalizedBlock).toContain("PAUSE_STATUS");
-    expect(normalizedBlock).toContain("$PAUSE_STATUS\" != \"503\"");
-    expect(normalizedBlock).toContain("DEPLOYMENT_PAUSED");
-    expect(normalizedBlock).toContain("printf '%s\\n' 'HOLD_PAUSED'");
+    expect(normalizedBlock).toContain("POST_RESUME_REGRESSION_CONFIRMED");
     expect(normalizedBlock).not.toContain("VERCEL_UNPAUSED_ATTESTED");
-    expect(normalizedBlock).toMatch(/writers remain stopped|ledger retained/iu);
   });
 
   it("executes PAUSED_AFTER_APPLY to UNPAUSED_READONLY through the exact recorded selector", () => {
@@ -448,7 +432,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
           compatibilityVerified: true, timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
         },
       }), { mode: 0o600 });
-      const source = `${candidateFunction()}\n${normalResumeBlock().replace(/^[ \t]*read -r -p .*$/gmu, "     :")}\n[[ "$(cat \"$NPM_LOG\")" == "run check:production:writes-stopped" ]] || exit 90`;
+      const source = `${candidateFunction()}\n${normalResumeBlock().replace(/^[ \t]*read -r -p .*$/gmu, "     :")}\n[[ "$(cat \"$NPM_LOG\")" == "run check:production:writes-stopped" ]] || exit 90\n[[ ! -s "$DEPLOY_LOG" && ! -s "$PROMOTE_LOG" ]] || exit 91`;
       expect(runMocked(source, { ...baseScenario(), EVIDENCE_ROOT: temporaryRoot, ROLLBACK_READ_TOKEN: "private-test-token", CURL_STATUS_SEQUENCE: "401,200" }, "")).toBe("");
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
@@ -460,11 +444,14 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
       .replace(/^[ \t]*read -r -p 'After the provider pause is complete, press Enter: ' _ <\/dev\/tty \|\| return 1$/mu, "     :")
       .replace(/   # Normal PAUSED_AFTER_APPLY -> UNPAUSED_READONLY:[\s\S]*?   validate_evidence_root \|\| enter_hold_paused\n\n/u, "")
       .replace("sleep 60 || enter_hold_paused", ":");
-    const source = `${candidateFunction()}\n${testableBlock}`;
+    const helperBlock = normalResumeBlock().slice(0, normalResumeBlock().indexOf("validate_evidence_root || enter_hold_paused"))
+      .replace(/^[ \t]*read -r -p 'After the provider pause is complete, press Enter: ' _ <\/dev\/tty \|\| return 1$/mu, "     :");
+    const source = `${candidateFunction()}\n${helperBlock}\n${testableBlock}`;
     const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-regression-"));
     try {
       const missingEvidence = runMockedFailure(source, {
         ...baseScenario(),
+        POST_RESUME_REGRESSION_CONFIRMED: "true",
         EVIDENCE_ROOT: temporaryRoot,
         CURL_STATUS_SEQUENCE: "503",
         CURL_BODY_SEQUENCE: "DEPLOYMENT_PAUSED",
@@ -492,6 +479,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
       }), { mode: 0o600 });
       const failedProbe = runMockedFailure(source, {
         ...baseScenario(),
+        POST_RESUME_REGRESSION_CONFIRMED: "true",
         EVIDENCE_ROOT: temporaryRoot,
         ROLLBACK_READ_TOKEN: "private-test-token",
         CURL_STATUS_SEQUENCE: "401,401,401,500,503",
@@ -637,6 +625,8 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [null] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [""] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, pairingGrantIds: [17] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: ["app_fixture_1", "app_fixture_1"] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, pairingGrantIds: ["grant_fixture", "grant_fixture"] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, ownedDeploymentIds: ["dpl_fixture_1", "dpl_fixture_1"] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, cleanup: [{ action: "delete_application", targetId: "app_unowned", expectedTerminalState: "deleted", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, cleanup: [{ action: "unknown_action", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }] } },
