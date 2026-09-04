@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -469,7 +469,20 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-stage1-ledger-"));
     try {
       const ledger = join(temporaryRoot, "rollout-ledger.json");
-      writeFileSync(ledger, "", { mode: 0o600 });
+      const preStageLedger = {
+        schemaVersion: 1,
+        fixtureOwnership: {
+          applicationIds: ["app_fixture_1", "app_fixture_2"],
+          preProbeHash: "sha256:before",
+          postProbeHash: "sha256:after",
+          settings: { existedBefore: true, contentHashBefore: "sha256:settings-before", contentHashAfter: "sha256:settings-after" },
+          pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref" },
+          installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
+          cleanup: [{ action: "revoke", expectedTerminalState: "401", observedResult: "pending" }],
+        },
+        extraPrivateRecord: { nested: ["preserve", { every: "value" }] },
+      };
+      writeFileSync(ledger, JSON.stringify(preStageLedger), { mode: 0o600 });
       execFileSync("bash", ["-c", block], {
         env: {
           ...process.env,
@@ -482,6 +495,8 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         stdio: ["pipe", "pipe", "pipe"],
       });
       const record = JSON.parse(readFileSync(ledger, "utf8"));
+      expect(record.fixtureOwnership).toEqual(preStageLedger.fixtureOwnership);
+      expect(record.extraPrivateRecord).toEqual(preStageLedger.extraPrivateRecord);
       expect(record).toMatchObject({
         schemaVersion: 1,
         stage1: {
@@ -514,6 +529,66 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         },
         stdio: ["pipe", "pipe", "pipe"],
       })).toThrow();
+
+      const invalidLedger = "{not-valid-json";
+      writeFileSync(ledger, invalidLedger, { mode: 0o600 });
+      expect(() => execFileSync("bash", ["-c", block], {
+        env: {
+          ...process.env,
+          EVIDENCE_ROOT: temporaryRoot,
+          LEDGER: ledger,
+          TARGET_SHA: "sha-reviewed",
+          APP_BASE_URL: expectedOrigin,
+          STAGE_ONE_CANDIDATE_ID: "dpl_stageone",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+      expect(readFileSync(ledger, "utf8")).toBe(invalidLedger);
+
+      const nonObjectLedger = JSON.stringify(["not", "a", "ledger"]);
+      writeFileSync(ledger, nonObjectLedger, { mode: 0o600 });
+      expect(() => execFileSync("bash", ["-c", block], {
+        env: {
+          ...process.env,
+          EVIDENCE_ROOT: temporaryRoot,
+          LEDGER: ledger,
+          TARGET_SHA: "sha-reviewed",
+          APP_BASE_URL: expectedOrigin,
+          STAGE_ONE_CANDIDATE_ID: "dpl_stageone",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+      expect(readFileSync(ledger, "utf8")).toBe(nonObjectLedger);
+
+      writeFileSync(ledger, JSON.stringify(preStageLedger), { mode: 0o600 });
+      chmodSync(ledger, 0o644);
+      expect(() => execFileSync("bash", ["-c", block], {
+        env: {
+          ...process.env,
+          EVIDENCE_ROOT: temporaryRoot,
+          LEDGER: ledger,
+          TARGET_SHA: "sha-reviewed",
+          APP_BASE_URL: expectedOrigin,
+          STAGE_ONE_CANDIDATE_ID: "dpl_stageone",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+      expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual(preStageLedger);
+
+      writeFileSync(ledger, JSON.stringify({ ...preStageLedger, stage1: { deploymentId: "dpl_existing" } }), { mode: 0o600 });
+      chmodSync(ledger, 0o600);
+      expect(() => execFileSync("bash", ["-c", block], {
+        env: {
+          ...process.env,
+          EVIDENCE_ROOT: temporaryRoot,
+          LEDGER: ledger,
+          TARGET_SHA: "sha-reviewed",
+          APP_BASE_URL: expectedOrigin,
+          STAGE_ONE_CANDIDATE_ID: "dpl_stageone",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+      expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({ ...preStageLedger, stage1: { deploymentId: "dpl_existing" } });
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }

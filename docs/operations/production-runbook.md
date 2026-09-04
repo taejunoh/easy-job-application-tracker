@@ -309,25 +309,57 @@ promotion. It is paused only across prepare/apply, and the actual platform
 
    Immediately bind the reviewed Stage 1 evidence to that exact promoted
    deployment in the private ledger. This writes no provider response body and
-   replaces only the empty ledger created in step 2; do not continue if the
-   ledger is missing, a symlink, or does not validate after the atomic rename.
+   merges only the new `stage1` object into the pre-populated ledger; it never
+   replaces fixture or cleanup ownership. Before this block, the private ledger
+   must be a JSON object with `schemaVersion: 1` and `fixtureOwnership` records
+   for exact Application IDs, pre/post hashes, Settings state/hashes, the
+   pre-stop pairing grant/code reference, installed credential/installation,
+   and at least one cleanup action. Do not continue if the ledger is missing,
+   a symlink, has a conflicting `stage1`, or does not validate after the atomic
+   rename.
 
    ```bash
    set -euo pipefail
-   LEDGER="${EVIDENCE_ROOT:?private ledger path is required}/rollout-ledger.json"
+   : "${EVIDENCE_ROOT:?private ledger path is required}"
+   [[ -d "$EVIDENCE_ROOT" && ! -L "$EVIDENCE_ROOT" ]] || exit 1
+   EVIDENCE_ROOT="$(cd -- "$EVIDENCE_ROOT" && pwd -P)" || exit 1
+   LEDGER="$EVIDENCE_ROOT/rollout-ledger.json"
    [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
+   [[ "$(stat -f '%Lp' "$EVIDENCE_ROOT")" == "700" ]] || exit 1
+   [[ "$(stat -f '%Lp' "$LEDGER")" == "600" ]] || exit 1
    [[ "${TARGET_SHA:-}" != "" ]] || exit 1
    [[ "${APP_BASE_URL:-}" == "https://easy-job-application-tracker.vercel.app" ]] || exit 1
    [[ "$STAGE_ONE_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
    STAGE_ONE_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+   # mktemp performs exclusive noclobber creation in this verified physical directory.
    STAGE_ONE_LEDGER_TMP="$(mktemp "$EVIDENCE_ROOT/.rollout-ledger.stage1.XXXXXX")" || exit 1
-   jq -n \
+   [[ -f "$STAGE_ONE_LEDGER_TMP" && ! -L "$STAGE_ONE_LEDGER_TMP" ]] || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   chmod 0600 "$STAGE_ONE_LEDGER_TMP" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   jq -e '
+     type == "object" and (.schemaVersion == 1) and (.stage1? == null) and
+     (.fixtureOwnership | type == "object") and
+     (.fixtureOwnership.applicationIds | type == "array" and length > 0) and
+     (.fixtureOwnership.preProbeHash | type == "string" and length > 0) and
+     (.fixtureOwnership.postProbeHash | type == "string" and length > 0) and
+     (.fixtureOwnership.settings | type == "object") and
+     (.fixtureOwnership.settings.existedBefore | type == "boolean") and
+     (.fixtureOwnership.settings.contentHashBefore | type == "string" and length > 0) and
+     (.fixtureOwnership.settings.contentHashAfter | type == "string" and length > 0) and
+     (.fixtureOwnership.pairing | type == "object") and
+     (.fixtureOwnership.pairing.preStopUnconsumedGrantId | type == "string" and length > 0) and
+     (.fixtureOwnership.pairing.codeReference | type == "string" and length > 0) and
+     (.fixtureOwnership.installation | type == "object") and
+     (.fixtureOwnership.installation.credentialReference | type == "string" and length > 0) and
+     (.fixtureOwnership.installation.installationId | type == "string" and length > 0) and
+     (.fixtureOwnership.cleanup | type == "array" and length > 0) and
+     all(.fixtureOwnership.cleanup[]; (.action | type == "string" and length > 0) and (.expectedTerminalState | type == "string" and length > 0) and (.observedResult | type == "string" and length > 0))
+   ' "$LEDGER" >/dev/null || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   jq \
      --arg id "$STAGE_ONE_CANDIDATE_ID" \
      --arg sha "$TARGET_SHA" \
      --arg origin "$APP_BASE_URL" \
      --arg observedAt "$STAGE_ONE_RECORDED_AT" \
-     '{
-       schemaVersion: 1,
+     '. + {
        stage1: {
          deploymentId: $id,
          targetSha: $sha,
@@ -341,12 +373,14 @@ promotion. It is paused only across prepare/apply, and the actual platform
          compatibilityVerified: true,
          timestamps: {recordedAt: $observedAt, readyObservedAt: $observedAt, canonicalPromotionVerifiedAt: $observedAt}
        }
-     }' > "$STAGE_ONE_LEDGER_TMP" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
-   chmod 0600 "$STAGE_ONE_LEDGER_TMP" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+     }' "$LEDGER" > "$STAGE_ONE_LEDGER_TMP" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   [[ -f "$LEDGER" && ! -L "$LEDGER" && "$(stat -f '%Lp' "$LEDGER")" == "600" ]] || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    mv -f -- "$STAGE_ONE_LEDGER_TMP" "$LEDGER" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
+   [[ "$(stat -f '%Lp' "$LEDGER")" == "600" ]] || exit 1
    jq -e --arg id "$STAGE_ONE_CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg origin "$APP_BASE_URL" '
-     .schemaVersion == 1 and
+     type == "object" and .schemaVersion == 1 and
+     (.fixtureOwnership | type == "object") and
      .stage1.deploymentId == $id and .stage1.targetSha == $sha and
      .stage1.gates == {identity: "1", writes: "0"} and
      .stage1.reviewedGateConfig.identity == "1" and .stage1.reviewedGateConfig.writes == "0" and
