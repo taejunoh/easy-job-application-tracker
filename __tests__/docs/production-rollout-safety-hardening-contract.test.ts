@@ -29,7 +29,14 @@ function executableVercelLines(document: string): string[] {
   const blocks = [...document.matchAll(/```(?:bash|sh|shell)\r?\n([\s\S]*?)```/gu)];
   return blocks
     .flatMap(([, block]) => (block ?? "").split(/\r?\n/u))
-    .filter((line) => /^\s*(?:\$\s*)?vercel\b/iu.test(line));
+    .filter((line) => {
+      const trimmed = line.trim();
+      return (
+        trimmed.length > 0 &&
+        !trimmed.startsWith("#") &&
+        /\bvercel\b/iu.test(trimmed)
+      );
+    });
 }
 
 function expectOrderedMatches(source: string, requirements: RegExp[]): void {
@@ -352,15 +359,20 @@ describe("production rollout staged-candidate binding documentation contract", (
 
   it("rejects every executable Vercel invocation in fenced shell blocks", () => {
     const fixture = [
-      "```bash\nvercel env add SECRET production --value test\n```",
-      "```sh\n$ vercel alias rm example.vercel.app\n```",
-      "```shell\n  vercel inspect deployment-id\n```",
+      "```bash\n# vercel deploy is only a comment\nvercel env add SECRET production --value test\n```",
+      "```sh\n$ vercel alias rm example.vercel.app\ncandidate=$(vercel deploy .)\ncommand vercel inspect deployment-id\n```",
+      "```shell\n  env FOO=1 vercel env add SECRET production\nFOO=1 vercel promote deployment-id\nresult=`vercel alias ls`\necho ready && vercel rm deployment-id\n```",
     ].join("\n");
 
     expect(executableVercelLines(fixture)).toEqual([
       "vercel env add SECRET production --value test",
       "$ vercel alias rm example.vercel.app",
-      "  vercel inspect deployment-id",
+      "candidate=$(vercel deploy .)",
+      "command vercel inspect deployment-id",
+      "  env FOO=1 vercel env add SECRET production",
+      "FOO=1 vercel promote deployment-id",
+      "result=`vercel alias ls`",
+      "echo ready && vercel rm deployment-id",
     ]);
   });
 
