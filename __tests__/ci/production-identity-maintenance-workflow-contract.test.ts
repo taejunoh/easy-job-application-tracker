@@ -53,6 +53,32 @@ function normalizeRun(run: string | undefined): string {
   return (run ?? "").replace(/\s+/gu, " ").trim();
 }
 
+function effectiveCommandLines(run: string | undefined): string[] {
+  const commands: string[] = [];
+  let continuation = "";
+  for (const rawLine of (run ?? "").split(/\r?\n/gu)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const combined = continuation ? `${continuation} ${line}` : line;
+    if (combined.endsWith("\\")) {
+      continuation = combined.slice(0, -1).trim();
+    } else {
+      commands.push(combined);
+      continuation = "";
+    }
+  }
+  if (continuation) commands.push(continuation);
+  return commands;
+}
+
+function hasExactCommand(run: string | undefined, expected: string): boolean {
+  return effectiveCommandLines(run).includes(expected);
+}
+
+function hasCommandMatching(run: string | undefined, pattern: RegExp): boolean {
+  return effectiveCommandLines(run).some((command) => pattern.test(command));
+}
+
 function normalizeCondition(condition: string | undefined): string {
   return (condition ?? "")
     .trim()
@@ -134,7 +160,7 @@ describe("production identity maintenance workflow contract", () => {
     const { workflow } = readWorkflow();
     const job = workflow.jobs.maintain;
     const guard = job.steps.find((step) =>
-      normalizeRun(step.run).includes('test "$CURRENT_REF" = "refs/heads/main"'),
+      hasExactCommand(step.run, 'test "$CURRENT_REF" = "refs/heads/main"'),
     );
     const guardIndex = job.steps.indexOf(guard as Step);
     const firstRunIndex = job.steps.findIndex((step) => Boolean(step.run));
@@ -149,21 +175,29 @@ describe("production identity maintenance workflow contract", () => {
       `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
     ]);
     const unconditionalCommandIndex = (command: string): number => job.steps.findIndex(
-      (step) => step.if === undefined && hasShellCommand(step.run, command),
+      (step) => step.if === undefined && hasExactCommand(step.run, command),
     );
     const npmCiIndex = unconditionalCommandIndex("npm ci");
     const migrateDeployIndex = unconditionalCommandIndex("npx prisma migrate deploy");
     const migrateStatusIndex = unconditionalCommandIndex("npx prisma migrate status");
     const migrateDiffIndex = job.steps.findIndex(
       (step) => step.if === undefined
-        && hasShellCommand(step.run, "npx prisma migrate diff")
-        && normalizeRun(step.run).includes(
-          "--from-config-datasource --to-schema prisma/schema.prisma --exit-code",
+        && hasExactCommand(
+          step.run,
+          "npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code",
         ),
     );
 
     expect(job.permissions).toBeUndefined();
-    expect(job.steps.every((step) => step["continue-on-error"] !== true)).toBe(true);
+    expect(job.steps.every((step) => step["continue-on-error"] === undefined)).toBe(true);
+    for (const step of job.steps) {
+      if (step.run === undefined) continue;
+      expect(effectiveCommandLines(step.run)[0]).toBe("set -euo pipefail");
+      expect(step.run).not.toMatch(/\bset\s+\+e\b/iu);
+      expect(step.run).not.toMatch(/\bset\s+\+o\s+errexit\b/iu);
+      expect(step.run).not.toMatch(/\|\|\s*(?:true|:|exit\s+0|continue|return(?:\s+0)?)\b/iu);
+      expect(step.run).not.toMatch(/\btrap\b[^\n]*\bERR\b/iu);
+    }
     expect(job.env).toMatchObject({
       DATABASE_URL: "${{ secrets.PRODUCTION_DATABASE_URL }}",
     });
@@ -195,16 +229,16 @@ describe("production identity maintenance workflow contract", () => {
     expect(migrateDeployIndex).toBeGreaterThan(npmCiIndex);
     expect(migrateStatusIndex).toBeGreaterThan(migrateDeployIndex);
     expect(migrateDiffIndex).toBeGreaterThan(migrateStatusIndex);
-    const guardRun = normalizeRun(guard?.run);
-    expect(guardRun).toContain("set -euo pipefail");
-    expect(guardRun).toContain('test "$CURRENT_REF" = "refs/heads/main"');
-    expect(guardRun).toContain('test "$WRITERS_STOPPED" = "true"');
-    expect(guardRun).toContain('case "$PHASE" in');
-    expect(guardRun).toContain('prepare) test -z "$PREPARE_RUN_ID" ;;');
-    expect(guardRun).toContain(
+    expect(effectiveCommandLines(guard?.run)[0]).toBe("set -euo pipefail");
+    expect(hasExactCommand(guard?.run, 'test "$CURRENT_REF" = "refs/heads/main"')).toBe(true);
+    expect(hasExactCommand(guard?.run, 'test "$WRITERS_STOPPED" = "true"')).toBe(true);
+    expect(hasExactCommand(guard?.run, 'case "$PHASE" in')).toBe(true);
+    expect(hasExactCommand(guard?.run, 'prepare) test -z "$PREPARE_RUN_ID" ;;')).toBe(true);
+    expect(hasExactCommand(
+      guard?.run,
       'apply) [[ "$PREPARE_RUN_ID" =~ ^[1-9][0-9]*$ ]] ;;',
-    );
-    expect(guardRun).toContain("*) exit 1 ;;");
+    )).toBe(true);
+    expect(hasExactCommand(guard?.run, "*) exit 1 ;;")).toBe(true);
   });
 
   it("requires approved prepare provenance and compares dry-run evidence before apply", () => {
@@ -213,25 +247,32 @@ describe("production identity maintenance workflow contract", () => {
     const prepareSteps = steps.filter(
       (step) => normalizeCondition(step.if) === "inputs.phase == 'prepare'",
     );
-    const prepareRuns = prepareSteps.map((step) => normalizeRun(step.run)).join("\n");
     const applySteps = steps.filter(
       (step) => normalizeCondition(step.if) === "inputs.phase == 'apply'",
     );
     const prepareBackfill = prepareSteps.find((step) =>
-      hasShellCommand(step.run, "npm run backfill:application-identities"),
+      hasCommandMatching(
+        step.run,
+        /^npm run backfill:application-identities -- --report (?:"[^"]+"|'[^']+'|\S+)$/u,
+      ),
     );
     const prepareComparator = prepareSteps.find((step) =>
-      normalizeRun(step.run).includes(
-        "node scripts/compare-application-identity-reports.mjs",
-      ) && normalizeRun(step.run).includes("--actual-mode dry-run"),
+      hasCommandMatching(
+        step.run,
+        /^node scripts\/compare-application-identity-reports\.mjs --expected (?:"[^"]+"|'[^']+'|\S+) --actual (?:"[^"]+"|'[^']+'|\S+) --actual-mode dry-run$/u,
+      ),
     );
     const currentDryRun = applySteps.find((step) =>
-      hasShellCommand(step.run, "npm run backfill:application-identities")
-        && !/(?:^|\s)--apply(?:\s|$)/u.test(normalizeRun(step.run)),
+      hasCommandMatching(
+        step.run,
+        /^npm run backfill:application-identities -- --report (?:"[^"]+"|'[^']+'|\S+)$/u,
+      ),
     );
     const applyBackfill = applySteps.find((step) =>
-      hasShellCommand(step.run, "npm run backfill:application-identities")
-        && /(?:^|\s)--apply(?:\s|$)/u.test(normalizeRun(step.run)),
+      hasCommandMatching(
+        step.run,
+        /^npm run backfill:application-identities -- --apply --writers-stopped --report (?:"[^"]+"|'[^']+'|\S+)$/u,
+      ),
     );
     const prepareUpload = steps.find(
       (step) => step.uses === `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`
@@ -242,18 +283,20 @@ describe("production identity maintenance workflow contract", () => {
         && String(step.with?.name).includes("application-identity-apply-"),
     );
     const provenance = steps.find((step) =>
-      normalizeRun(step.run).includes(
-        'gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARE_RUN_ID"',
+      hasExactCommand(
+        step.run,
+        'metadata="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARE_RUN_ID")"',
       ),
     );
     const download = steps.find((step) =>
-      normalizeRun(step.run).includes(
-        'gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY"',
+      hasExactCommand(
+        step.run,
+        'gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-prepare-$PREPARE_RUN_ID" --dir "$RUNNER_TEMP/approved"',
       ),
     );
 
     expect(prepareSteps.length).toBeGreaterThan(0);
-    expect(prepareRuns).toContain("umask 077");
+    expect(prepareSteps.some((step) => hasExactCommand(step.run, "umask 077"))).toBe(true);
     expect(prepareBackfill).toBeDefined();
     const prepareBackfillRun = normalizeRun(prepareBackfill?.run);
     expect(prepareBackfillRun).not.toMatch(/(?:^|\s)--apply(?:\s|$)/u);
@@ -264,13 +307,12 @@ describe("production identity maintenance workflow contract", () => {
     const prepareComparatorRun = normalizeRun(prepareComparator?.run);
     expect(argumentAfter(prepareComparator?.run, "--expected")).toBe(prepareReport);
     expect(argumentAfter(prepareComparator?.run, "--actual")).toBe(prepareReport);
-    expect(prepareComparatorRun).toContain("--actual-mode dry-run");
 
     const prepareBackfillIndex = steps.indexOf(prepareBackfill as Step);
     const prepareComparatorIndex = steps.indexOf(prepareComparator as Step);
     const prepareUploadIndex = steps.indexOf(prepareUpload as Step);
     const prepareUmask = prepareSteps.find((step) =>
-      normalizeRun(step.run).includes("umask 077"),
+      hasExactCommand(step.run, "umask 077"),
     );
     const prepareUmaskIndex = steps.indexOf(prepareUmask as Step);
     expect(prepareUmask).toBeDefined();
@@ -314,10 +356,10 @@ describe("production identity maintenance workflow contract", () => {
       GH_TOKEN: "${{ github.token }}",
     });
     expect(normalizeCondition(provenance?.if)).toBe("inputs.phase == 'apply'");
-    const provenanceRun = normalizeRun(provenance?.run);
-    expect(provenanceRun).toContain(
+    expect(hasExactCommand(
+      provenance?.run,
       'metadata="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARE_RUN_ID")"',
-    );
+    )).toBe(true);
     for (const check of [
       'test "$(jq -r .conclusion <<<"$metadata")" = "success"',
       'test "$(jq -r .event <<<"$metadata")" = "workflow_dispatch"',
@@ -325,18 +367,10 @@ describe("production identity maintenance workflow contract", () => {
       'test "$(jq -r .head_sha <<<"$metadata")" = "$GITHUB_SHA"',
       'test "$(jq -r .path <<<"$metadata")" = ".github/workflows/production-identity-maintenance.yml"',
     ]) {
-      expect(provenanceRun).toContain(check);
+      expect(hasExactCommand(provenance?.run, check)).toBe(true);
     }
     expect(download).toBeDefined();
     expect(normalizeCondition(download?.if)).toBe("inputs.phase == 'apply'");
-    const downloadRun = normalizeRun(download?.run);
-    expect(downloadRun).toContain(
-      'gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY"',
-    );
-    expect(downloadRun).toContain(
-      '--name "application-identity-prepare-$PREPARE_RUN_ID"',
-    );
-    expect(downloadRun).toContain('--dir "$RUNNER_TEMP/approved"');
 
     expect(currentDryRun).toBeDefined();
     const currentDryRunRun = normalizeRun(currentDryRun?.run);
@@ -353,14 +387,18 @@ describe("production identity maintenance workflow contract", () => {
     expect(applyReport).not.toBe(currentDryRunReport);
     const preApplyComparison = steps.find(
       (step) => normalizeCondition(step.if) === "inputs.phase == 'apply'"
-        && normalizeRun(step.run).includes("--actual-mode dry-run"),
+        && hasCommandMatching(
+          step.run,
+          /^node scripts\/compare-application-identity-reports\.mjs --expected (?:"[^"]+"|'[^']+'|\S+) --actual (?:"[^"]+"|'[^']+'|\S+) --actual-mode dry-run$/u,
+        ),
     );
     const postApplyComparison = steps.find(
       (step) => normalizeCondition(step.if) === "inputs.phase == 'apply'"
-        && normalizeRun(step.run).includes("--actual-mode apply"),
+        && hasCommandMatching(
+          step.run,
+          /^node scripts\/compare-application-identity-reports\.mjs --expected (?:"[^"]+"|'[^']+'|\S+) --actual (?:"[^"]+"|'[^']+'|\S+) --actual-mode apply$/u,
+        ),
     );
-    const preApplyRun = normalizeRun(preApplyComparison?.run);
-    const postApplyRun = normalizeRun(postApplyComparison?.run);
     const approvedReport = argumentAfter(preApplyComparison?.run, "--expected");
     expect(approvedReport).toBeDefined();
     expect(canonicalPath(approvedReport)).toBe(approvedExtractedReport);
@@ -368,8 +406,6 @@ describe("production identity maintenance workflow contract", () => {
     expect(canonicalPath(argumentAfter(postApplyComparison?.run, "--expected")))
       .toBe(approvedExtractedReport);
     expect(argumentAfter(postApplyComparison?.run, "--actual")).toBe(applyReport);
-    expect(preApplyRun).toContain("--actual-mode dry-run");
-    expect(postApplyRun).toContain("--actual-mode apply");
     const provenanceIndex = steps.indexOf(provenance as Step);
     const downloadIndex = steps.indexOf(download as Step);
     const currentDryRunIndex = steps.indexOf(currentDryRun as Step);
@@ -406,7 +442,7 @@ describe("production identity maintenance workflow contract", () => {
     const { source, workflow } = readWorkflow();
     const steps = workflow.jobs.maintain.steps;
     const guardIndex = steps.findIndex((step) =>
-      normalizeRun(step.run).includes('test "$CURRENT_REF" = "refs/heads/main"'),
+      hasExactCommand(step.run, 'test "$CURRENT_REF" = "refs/heads/main"'),
     );
     const cleanup = steps.find(
       (step) => normalizeCondition(step.if) === "always()",
