@@ -462,7 +462,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
       expect(failedProbe.stderr).toContain("PAUSE_REQUIRED");
       expect(failedProbe.deploys).toBe("deploy\n");
       expect(failedProbe.promotes).toBe("dpl_valid\n");
-      expect(failedProbe.curlCalls).toBe(5);
+      expect(failedProbe.curlCalls).toBe(4);
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
