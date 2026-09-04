@@ -783,6 +783,40 @@ describe("protected product API actual requests", () => {
     consoleError.mockRestore();
   });
 
+  it.each(["57014", "55P03"] as const)(
+    "normalizes PostgreSQL timeout error %s without leaking database details",
+    async (code) => {
+      const route = actualRoutes.find(
+        ({ name }) => name === "stats GET",
+      ) as ActualRouteCase;
+      jest.mocked(prisma.application.count).mockRejectedValueOnce(
+        Object.assign(new Error("private database timeout detail"), { code }),
+      );
+      const consoleError = jest
+        .spyOn(console, "error")
+        .mockImplementation(() => undefined);
+
+      const response = await invokeActual(
+        route,
+        productRequest(route, {
+          origin: APP_ORIGIN,
+          cookie: SESSION_COOKIE,
+        }),
+      );
+
+      expect(response.status).toBe(500);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual({
+        error: "Internal server error",
+        code: "internal_error",
+      });
+      expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+      expect(text).not.toContain(code);
+      expect(text).not.toContain("private database timeout detail");
+      consoleError.mockRestore();
+    },
+  );
+
   it.each([
     [
       "applications POST",
