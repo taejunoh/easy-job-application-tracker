@@ -280,28 +280,36 @@ and canonical `503` must be established before either workflow phase runs.
    create a new commit, deploy an unreviewed working tree, or run authenticated
    smoke checks while paused.
 8. Resume Vercel Production, confirm the pause is cleared and the canonical
-   origin is no longer `503`, but keep every Application writer stopped. Only
-   after this resume run the `production monitor` and require its authenticated
-   `200` result.
-9. With Vercel online and writers still stopped, run the post-resume smoke
-   sequence: authenticated UI create/read/delete cleanup; then extension
-   pairing/exchange/create and read using a one-time pairing code; revoke the
-   ExtensionInstallation; verify replay rejection and 401 from the revoked
-   credential. These checks must not run while Vercel is paused.
-10. The final action is `resume Application writers LAST`, only after every
-    post-resume smoke pass succeeds. Retain only privacy-safe prepare/apply reports and approved
+   origin is no longer `503`, but keep ordinary, automated, and background
+   Application writers stopped. Ordinary, automated, and background Application
+   writers remain stopped for every smoke check. Only after this resume run the
+   `production monitor` and require its authenticated `200` result.
+9. With Vercel online and all ordinary, automated, and background writers still
+   stopped, only one explicitly authorized bounded smoke actor/session at a
+   time may run. That actor runs the post-resume smoke sequence: authenticated UI
+   create/read/delete cleanup, using unique smoke rows and immediate cleanup;
+   then extension pairing/exchange/create and read using a one-time pairing
+   code, unique smoke rows, and immediate cleanup. Revoke the
+   ExtensionInstallation server-side, then verify replay rejection and 401 from
+   the revoked credential. No other session, automation, background job, or
+   writer may perform these operations, and these checks must not run while
+   Vercel is paused.
+10. The final action is `resume Application writers LAST`; general Application
+    writer resume is last and occurs only after every post-resume smoke pass
+    succeeds. Retain only privacy-safe prepare/apply reports and approved
     backup evidence.
 
 Abort behavior is part of the procedure. A pre-resume failure leaves Vercel
-paused with canonical `503`; keep the gate at `0` unless a reviewed hosted
-rollback explicitly changes it, and keep writers stopped. A post-resume smoke
-failure leaves Application writers stopped; pause Vercel again before any
-further hosted change, preserve sanitized evidence, and recover through an
-isolated restore target and reviewed rollback. Any failure means writers remain
-stopped continuously. do not enable identity writes, resume writers, or retry
-apply with a different commit or report. Do not run `prisma db push`, `prisma
-db reset`, or `prisma migrate reset`, or use other destructive shortcuts against
-Production.
+paused with canonical `503`; preserve the actual current gate and deployment
+state. Do not change either state absent a reviewed hosted rollback, and keep
+ordinary, automated, background, and Application writers stopped. A
+post-resume smoke failure leaves Application writers stopped; pause Vercel
+again before any further hosted change, preserve sanitized evidence, and recover
+through an isolated restore target and reviewed rollback. Any failure means
+   writers remain stopped continuously; do not enable identity writes, resume
+writers, or retry apply with a different commit or report. Do not run `prisma db
+push`, `prisma db reset`, or `prisma migrate reset`, or use other destructive
+shortcuts against Production.
 
 ## Backup and restore
 

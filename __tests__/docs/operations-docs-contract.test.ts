@@ -205,6 +205,45 @@ describe("production operations documentation contract", () => {
     );
   });
 
+  it("constrains post-resume smoke writes and preserves hosted state on abort", () => {
+    const runbook = readFileSync(
+      join(root, "docs/operations/production-runbook.md"),
+      "utf8",
+    );
+    const sectionStart = runbook.indexOf(
+      "## Application identity maintenance rollout",
+    );
+    const sectionEnd = runbook.indexOf("## Backup and restore", sectionStart);
+    expect(sectionStart).not.toBe(-1);
+    expect(sectionEnd).toBeGreaterThan(sectionStart);
+    const section = runbook.slice(sectionStart, sectionEnd).replace(/\s+/gu, " ");
+    const orderedRequirements = [
+      "resume Vercel Production",
+      "ordinary, automated, and background Application writers remain stopped",
+      "only one explicitly authorized bounded smoke actor/session at a time",
+      "unique smoke rows",
+      "immediate cleanup",
+      "general Application writer resume is last",
+    ];
+    let prior = -1;
+    for (const requirement of orderedRequirements) {
+      const next = section.toLowerCase().indexOf(requirement.toLowerCase(), prior + 1);
+      expect(next).toBeGreaterThan(prior);
+      prior = next;
+    }
+
+    const abortStart = section.indexOf("Abort behavior");
+    expect(abortStart).not.toBe(-1);
+    const abort = section.slice(abortStart);
+    expect(abort).toMatch(
+      /preserve the actual current gate and deployment state/iu,
+    );
+    expect(abort).toMatch(
+      /do not change either[^.]{0,120}absent a reviewed hosted rollback/iu,
+    );
+    expect(abort).not.toMatch(/keep the gate at `?0`?/iu);
+  });
+
   it("publishes the complete quarantine operator workflow", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
     const runbook = readFileSync(
