@@ -55,18 +55,18 @@ describeDatabase("PrismaPg PostgreSQL startup timeouts", () => {
 
     expect(activePool.options.max).toBe(10);
 
-    const versionResult = await activePool.query<{
-      server_version_num: string;
-    }>("SHOW server_version_num");
-    const serverVersion = Number(versionResult.rows[0]?.server_version_num);
-    expect(serverVersion).toBeGreaterThanOrEqual(170_000);
-    expect(serverVersion).toBeLessThan(180_000);
-
     const connectionPromises = Array.from({ length: 10 }, () =>
       activePool.connect(),
     );
     try {
       const clients = await Promise.all(connectionPromises);
+      const versionResult = await clients[0]!.query<{
+        server_version_num: string;
+      }>("SHOW server_version_num");
+      const serverVersion = Number(versionResult.rows[0]?.server_version_num);
+      expect(serverVersion).toBeGreaterThanOrEqual(170_000);
+      expect(serverVersion).toBeLessThan(180_000);
+
       const observations = await Promise.all(
         clients.map(async (client): Promise<TimeoutObservation> => {
           const pidResult = await client.query<{ pid: number }>(
