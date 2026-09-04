@@ -169,6 +169,47 @@ existing database. Do not combine or reorder the stages. The workflow is
 manual-only and requires `writers_stopped=true` on both dispatches. Writers
 remain stopped continuously until every post-resume smoke pass succeeds.
 
+The stages below call one parameterized candidate procedure. It is the
+explicit form of the existing `vercel --prod --skip-domain` Production
+operation: it never assigns the canonical domain during staging. Call it
+only from an unpaused flow. The candidate procedure is unpaused-only. The raw
+API response is never stored, echoed, uploaded, added to the ledger, or used
+as evidence; only its allow-listed projection is retained, and temporary JSON
+variables are unset after validation.
+
+```bash
+set -euo pipefail
+
+stage_candidate() {
+  local stage_name="$1"
+  : "$stage_name"
+  [[ "${VERCEL_UNPAUSED_ATTESTED:-}" == "true" ]]
+  [[ -n "$TARGET_SHA" ]]
+  [[ -z "$(git status --porcelain)" ]]
+  [[ "$(git rev-parse HEAD)" == "$TARGET_SHA" ]]
+  CANDIDATE_JSON="$(vercel deploy . --prod --skip-domain --yes --format=json --no-color)"
+  CANDIDATE_ID="$(jq -er 'select(.id | type == "string") | select(.id | test("^dpl_[A-Za-z0-9]+$")) | .id' <<<"$CANDIDATE_JSON")"
+  CANDIDATE_URL="$(jq -er --arg id "$CANDIDATE_ID" 'select(.id == $id and (.url | type == "string") and (.url | length > 0)) | .url' <<<"$CANDIDATE_JSON")"
+  unset CANDIDATE_JSON
+  [[ "$CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]]
+  [[ -n "$CANDIDATE_URL" ]]
+
+  CANDIDATE_INSPECT="$(vercel inspect "$CANDIDATE_ID" --wait --timeout 3m --format=json --no-color)"
+  jq -e --arg id "$CANDIDATE_ID" '(.id == $id) and (.readyState == "READY") and (((.aliases // []) | length) == 0)' <<<"$CANDIDATE_INSPECT" >/dev/null
+  unset CANDIDATE_INSPECT
+
+  CANDIDATE_METADATA="$(vercel api "/v13/deployments/$CANDIDATE_ID" --raw | jq -ce '{id,readyState,target,url,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])}')"
+  jq -e --arg id "$CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg url "$CANDIDATE_URL" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.url == $url) and ((.aliases | length) == 0)' <<<"$CANDIDATE_METADATA" >/dev/null
+  unset CANDIDATE_METADATA
+
+  # Promotion is reachable only in this unpaused procedure.
+  vercel promote "$CANDIDATE_ID" --yes
+  CANONICAL_METADATA="$(vercel inspect "$APP_BASE_URL" --format=json --no-color)"
+  jq -e --arg id "$CANDIDATE_ID" '.id == $id' <<<"$CANONICAL_METADATA" >/dev/null
+  unset CANONICAL_METADATA CANDIDATE_ID CANDIDATE_URL
+}
+```
+
 Capture the reviewed application commit before starting:
 
 ```bash
@@ -201,21 +242,24 @@ promotion. It is paused only across prepare/apply, and the actual platform
    pairing grant. Keep their URL, IDs, tokens, pairing codes, and request/
    response bodies only in a private mode-0700 workspace; never put them in
    logs, artifacts, Actions output, shell history, PR/comments, or docs.
-3. Stage the Stage 1 `identity=1,writes=0` Ready Production candidate with:
+3. Stage the Stage 1 `identity=1,writes=0` candidate while unpaused:
 
    ```bash
+   VERCEL_UNPAUSED_ATTESTED=true
    vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "1" --yes --force
    vercel env add APPLICATION_WRITES_ENABLED production --value "0" --yes --force
-   vercel --prod --skip-domain --yes
+   stage_candidate "identity=1,writes=0"
    ```
 
    This stage sets `APPLICATION_IDENTITY_WRITES_ENABLED="1"` while keeping
-   `APPLICATION_WRITES_ENABLED="0"`.
-
-   Inspect the candidate before promotion: require `Ready`, the exact
-   intended Git SHA, and no canonical alias. Record its staged deployment ID,
-   then promote the candidate while unpaused. Record promotion time, start a
-   bounded drain, wait at least `2 × maxDuration` (at least 60 seconds when
+   `APPLICATION_WRITES_ENABLED="0"`. The procedure inspects the candidate
+   before promotion, proves the exact intended Git SHA, no aliases, and no
+   canonical alias, and
+   promotes that same ID while unpaused. Promote the candidate while unpaused
+   only after every identity and provenance check passes. Record its staged
+   deployment ID and
+   promotion time, start a bounded drain, and wait at least
+   `2 × maxDuration` (at least 60 seconds when
    modules have a 30-second maximum duration), and pass an authenticated
    negative probe. Use the exact fixtures to prove all eight persistent
    mutations return HTTP `503` with code `writes_stopped`: Application
@@ -229,7 +273,15 @@ promotion. It is paused only across prepare/apply, and the actual platform
    prepare/apply. Record pause evidence and the observation. The operator must
    stop every Application writer, including web, extension, monitoring, background, and
    operator writers. Keep writers stopped continuously; pausing traffic alone
-   is not an attestation. There is no build or promotion while paused.
+   is not an attestation. There is no build or promotion while paused. While
+   paused, only observation and maintenance commands are allowed: no build,
+   deploy, alias, or promote command may be run while paused, queued, or made
+   reachable through the candidate procedure. In the shell used for the
+   rollout, clear the unpaused attestation before entering this state:
+
+   ```bash
+   unset VERCEL_UNPAUSED_ATTESTED
+   ```
 5. Dispatch the prepare phase from `main` with the required writer-stop
    attestation:
 
@@ -340,18 +392,24 @@ promotion. It is paused only across prepare/apply, and the actual platform
    pause is cleared and the canonical origin is no longer the platform `503`;
    do not build or promote as part of this resume.
 9. After resume, stage the final `identity=1,writes=1` Ready Production
-   candidate with the same exact TARGET_SHA:
+   candidate with the same exact TARGET_SHA, using the same canonical
+   procedure while unpaused:
 
    ```bash
+   VERCEL_UNPAUSED_ATTESTED=true
    vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force
-   vercel --prod --skip-domain --yes
+   stage_candidate "identity=1,writes=1"
    ```
 
-   Inspect the candidate before promotion: require `Ready`, the exact
-   intended Git SHA, and no canonical alias. Record the new/staged deployment
-   ID and promote it while unpaused. Do not create a new commit or deploy an
-   unreviewed working tree. Run the authenticated `production monitor` only
-   after Vercel is serving again and require its success.
+   Record the new/staged deployment ID after the procedure proves its exact
+   ID, `Ready` state, Production target, exact SHA, zero aliases, and no
+   canonical alias. Do not
+   create a new commit or deploy an unreviewed working tree. Run the
+   authenticated `production monitor` only after Vercel is serving again and
+   require its success. This remains the explicit `vercel --prod --skip-domain`
+   operation, with promotion only while unpaused. The final candidate has no
+   canonical alias before promotion. Require the production monitor to pass
+   before beginning the bounded smoke sequence.
 10. With Vercel online and ordinary, automated, and background Application
    writers remain stopped, only one explicitly authorized bounded smoke
    actor/session at a
