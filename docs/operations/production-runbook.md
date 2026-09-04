@@ -180,37 +180,40 @@ variables are unset after validation.
 ```bash
 set -euo pipefail
 
-stage_candidate() {
-  local stage_name="$1"
-  local CANDIDATE_JSON="" CANDIDATE_INSPECT="" CANDIDATE_METADATA="" CANONICAL_METADATA="" CANDIDATE_ID="" CANDIDATE_URL=""
-  trap 'unset CANDIDATE_JSON CANDIDATE_INSPECT CANDIDATE_METADATA CANONICAL_METADATA CANDIDATE_ID CANDIDATE_URL; trap - RETURN' RETURN
-  : "$stage_name"
-  [[ "${VERCEL_UNPAUSED_ATTESTED:-}" == "true" ]]
-  [[ -n "$TARGET_SHA" ]]
-  [[ -n "${APP_BASE_URL:-}" ]]
-  [[ -z "$(git status --porcelain)" ]]
-  [[ "$(git rev-parse HEAD)" == "$TARGET_SHA" ]]
-  CANDIDATE_JSON="$(vercel deploy . --prod --skip-domain --yes --format=json --no-color)"
-  CANDIDATE_ID="$(jq -er 'select(.id | type == "string") | select(.id | test("^dpl_[A-Za-z0-9]+$")) | .id' <<<"$CANDIDATE_JSON")"
-  CANDIDATE_URL="$(jq -er --arg id "$CANDIDATE_ID" 'select(.id == $id and (.url | type == "string") and (.url | length > 0)) | .url' <<<"$CANDIDATE_JSON")"
-  unset CANDIDATE_JSON
-  [[ "$CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]]
-  [[ -n "$CANDIDATE_URL" ]]
+stage_candidate() (
+  local stage_name="${1:-}"
+  local EXPECTED_PRODUCTION_ORIGIN="https://easy-job-application-tracker.vercel.app"
+  local WORKTREE_STATUS="" CURRENT_SHA=""
+  local CANDIDATE_DEPLOYMENT="" CANDIDATE_INSPECT="" CANDIDATE_METADATA="" CANONICAL_METADATA=""
+  local CANDIDATE_ID="" CANDIDATE_URL=""
+  set -o pipefail || return 1
+  [[ "$stage_name" == "identity=1,writes=0" || "$stage_name" == "identity=1,writes=1" ]] || return 1
+  [[ "${VERCEL_UNPAUSED_ATTESTED:-}" == "true" ]] || return 1
+  [[ -n "${TARGET_SHA:-}" ]] || return 1
+  [[ -n "${APP_BASE_URL:-}" ]] || return 1
+  [[ "$APP_BASE_URL" == "$EXPECTED_PRODUCTION_ORIGIN" ]] || return 1
+  WORKTREE_STATUS="$(git status --porcelain)" || return 1
+  [[ -z "$WORKTREE_STATUS" ]] || return 1
+  CURRENT_SHA="$(git rev-parse HEAD)" || return 1
+  [[ "$CURRENT_SHA" == "$TARGET_SHA" ]] || return 1
 
-  CANDIDATE_INSPECT="$(vercel inspect "$CANDIDATE_ID" --wait --timeout 3m --format=json --no-color)"
-  jq -e --arg id "$CANDIDATE_ID" '(.id == $id) and (.readyState == "READY") and (((.aliases // []) | type == "array") and (((.aliases // []) | length) == 0))' <<<"$CANDIDATE_INSPECT" >/dev/null
-  unset CANDIDATE_INSPECT
+  CANDIDATE_DEPLOYMENT="$(vercel deploy . --prod --skip-domain --yes --format=json --no-color | jq -ce '{id,url}')" || return 1
+  jq -e '(.id | type == "string") and (.id | test("^dpl_[A-Za-z0-9]+$")) and (.url | type == "string") and (.url | length > 0)' <<<"$CANDIDATE_DEPLOYMENT" >/dev/null || return 1
+  CANDIDATE_ID="$(jq -er '.id' <<<"$CANDIDATE_DEPLOYMENT")" || return 1
+  CANDIDATE_URL="$(jq -er '.url' <<<"$CANDIDATE_DEPLOYMENT")" || return 1
 
-  CANDIDATE_METADATA="$(vercel api "/v13/deployments/$CANDIDATE_ID" --raw | jq -ce '{id,readyState,target,url,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])}')"
-  jq -e --arg id "$CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg url "$CANDIDATE_URL" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.url == $url) and ((.aliases | type == "array") and ((.aliases | length) == 0))' <<<"$CANDIDATE_METADATA" >/dev/null
-  unset CANDIDATE_METADATA
+  CANDIDATE_INSPECT="$(vercel inspect "$CANDIDATE_ID" --wait --timeout 3m --format=json --no-color | jq -ce '{id,readyState,aliases}')" || return 1
+  jq -e --arg id "$CANDIDATE_ID" '(.id == $id) and (.readyState == "READY") and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$CANDIDATE_INSPECT" >/dev/null || return 1
+
+  CANDIDATE_METADATA="$(vercel api "/v13/deployments/$CANDIDATE_ID" --raw | jq -ce 'if (.alias | type) == "array" then {id,readyState,target,url,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])} else error("deployment alias shape is not an array") end')" || return 1
+  jq -e --arg id "$CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg url "$CANDIDATE_URL" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.url == $url) and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$CANDIDATE_METADATA" >/dev/null || return 1
 
   # Promotion is reachable only in this unpaused procedure.
-  vercel promote "$CANDIDATE_ID" --yes
-  CANONICAL_METADATA="$(vercel inspect "$APP_BASE_URL" --format=json --no-color)"
-  jq -e --arg id "$CANDIDATE_ID" '.id == $id' <<<"$CANONICAL_METADATA" >/dev/null
-  unset CANONICAL_METADATA CANDIDATE_ID CANDIDATE_URL
-}
+  vercel promote "$CANDIDATE_ID" --yes >/dev/null || return 1
+  CANONICAL_METADATA="$(vercel inspect "$APP_BASE_URL" --format=json --no-color | jq -ce '{id}')" || return 1
+  jq -e --arg id "$CANDIDATE_ID" '.id == $id' <<<"$CANONICAL_METADATA" >/dev/null || return 1
+  printf '%s\n' "$CANDIDATE_ID" || return 1
+)
 ```
 
 Capture the reviewed application commit before starting:
@@ -249,9 +252,10 @@ promotion. It is paused only across prepare/apply, and the actual platform
 
    ```bash
    VERCEL_UNPAUSED_ATTESTED=true
-   vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "1" --yes --force
-   vercel env add APPLICATION_WRITES_ENABLED production --value "0" --yes --force
-   stage_candidate "identity=1,writes=0"
+   vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "1" --yes --force || exit 1
+   vercel env add APPLICATION_WRITES_ENABLED production --value "0" --yes --force || exit 1
+   STAGE_ONE_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")" || exit 1
+   [[ "$STAGE_ONE_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
    ```
 
    This stage sets `APPLICATION_IDENTITY_WRITES_ENABLED="1"` while keeping
@@ -400,8 +404,9 @@ promotion. It is paused only across prepare/apply, and the actual platform
 
    ```bash
    VERCEL_UNPAUSED_ATTESTED=true
-   vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force
-   stage_candidate "identity=1,writes=1"
+   vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force || exit 1
+   FINAL_CANDIDATE_ID="$(stage_candidate "identity=1,writes=1")" || exit 1
+   [[ "$FINAL_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
    ```
 
    Record the new/staged deployment ID after the procedure proves its exact
