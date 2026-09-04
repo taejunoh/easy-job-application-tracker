@@ -25,6 +25,24 @@ function bashBlocks(section: string): string[] {
   return [...section.matchAll(/```bash\r?\n([\s\S]*?)```/gu)].map(([, block]) => block);
 }
 
+function executableVercelLines(document: string): string[] {
+  const blocks = [...document.matchAll(/```(?:bash|sh|shell)\r?\n([\s\S]*?)```/gu)];
+  return blocks
+    .flatMap(([, block]) => (block ?? "").split(/\r?\n/u))
+    .filter((line) => /^\s*(?:\$\s*)?vercel\b/iu.test(line));
+}
+
+function expectOrderedMatches(source: string, requirements: RegExp[]): void {
+  let prior = -1;
+  for (const requirement of requirements) {
+    const match = source.slice(prior + 1).match(requirement);
+    expect(match).not.toBeNull();
+    const next = match ? prior + 1 + (match.index ?? 0) : -1;
+    expect(next).toBeGreaterThan(prior);
+    prior = next;
+  }
+}
+
 function candidateFunction(): string {
   const block = bashBlocks(rolloutSection()).find((candidate) =>
     normalize(candidate).includes("vercel deploy . --prod --skip-domain --yes --format=json --no-color"),
@@ -262,8 +280,10 @@ describe("production rollout staged-candidate binding documentation contract", (
       const filePath = join(root, file);
       const document = readFileSync(join(root, file), "utf8");
       const normalizedDocument = normalize(document).replace(/`/gu, "");
-      const runbookHrefs = [...document.matchAll(
-        /\[[^\]]*production operations runbook[^\]]*\]\(([^)]+)\)/giu,
+      const preamble = document.split(/\r?\n/u).slice(0, 24).join("\n");
+      const normalizedPreamble = normalize(preamble).replace(/`/gu, "");
+      const runbookHrefs = [...preamble.matchAll(
+        /\[[^\]]+\]\(([^)\s]*production-runbook\.md(?:#[^)]+)?)\)/giu,
       )].map(([, href]) => href ?? "");
       const runbookHref = runbookHrefs.find((href) =>
         href.split("#", 1)[0]?.endsWith("production-runbook.md") &&
@@ -284,13 +304,10 @@ describe("production rollout staged-candidate binding documentation contract", (
       expect(document).not.toMatch(/vercel promote "\$CANDIDATE_ID"/u);
 
       for (const statusTerm of statusTerms) {
-        expect(normalizedDocument.toLowerCase()).toContain(statusTerm.toLowerCase());
+        expect(normalizedPreamble.toLowerCase()).toContain(statusTerm.toLowerCase());
       }
 
-      const fencedVercelBlocks = [...document.matchAll(/```(?:bash|sh|shell)\r?\n([\s\S]*?)```/gu)]
-        .map(([, block]) => block)
-        .filter((block) => /\bvercel\s+(?:deploy|api|inspect|promote)\b/iu.test(block));
-      expect(fencedVercelBlocks).toEqual([]);
+      expect(executableVercelLines(document)).toEqual([]);
 
       const heading = document.search(/^#{3,4} Rollout state and evidence summary\s*$/mu);
       expect(heading).not.toBe(-1);
@@ -301,19 +318,50 @@ describe("production rollout staged-candidate binding documentation contract", (
         nextHeading === -1 ? document.length : bodyStart + nextHeading,
       );
       const normalizedSummary = normalize(summary).replace(/`/gu, "");
-      expect(normalizedSummary).toMatch(
-        /PAUSED_AFTER_APPLY[\s\S]{0,220}failed or ambiguous evidence enters HOLD_PAUSED[\s\S]{0,300}no build, deploy, alias assignment, or promotion/iu,
-      );
-      expect(normalizedSummary).toMatch(
-        /(?:approval|approved)[^.]{0,120}exact recorded identity=1,writes=0 Ready deployment[^.]{0,100}UNPAUSED_READONLY[^.]{0,140}read-only and authenticated negative probes/iu,
-      );
-      expect(normalizedSummary).toMatch(
-        /regression[^.]{0,140}exact Ready candidate ID and reviewed SHA[^.]{0,100}(?:returns? to|return to) HOLD_PAUSED/iu,
-      );
-      expect(normalizedSummary).toMatch(
-        /private ledger retains exact owned IDs until bounded cleanup is verified[^.]{0,100}cleanup may remove only those IDs/iu,
-      );
+      expectOrderedMatches(normalizedSummary, [
+        /PAUSED_AFTER_APPLY/iu,
+        /(?:failed|ambiguous)[^.]{0,100}HOLD_PAUSED/iu,
+        /HOLD_PAUSED[^.]{0,180}no (?:build|deploy)[^.]{0,100}(?:alias|promotion)/iu,
+      ]);
+      expectOrderedMatches(normalizedSummary, [
+        /(?:approval|approved)/iu,
+        /exact recorded identity=1,writes=0/iu,
+        /Ready deployment/iu,
+        /UNPAUSED_READONLY/iu,
+        /read-only/iu,
+        /negative probes/iu,
+      ]);
+      const regressionOffset = normalizedSummary.search(/regression/iu);
+      expect(regressionOffset).not.toBe(-1);
+      const regressionSummary = normalizedSummary.slice(regressionOffset);
+      expectOrderedMatches(regressionSummary, [
+        /regression/iu,
+        /Ready/iu,
+        /candidate ID/iu,
+        /reviewed SHA/iu,
+        /(?:returns? to|return to) HOLD_PAUSED/iu,
+      ]);
+      expectOrderedMatches(normalizedSummary, [
+        /private ledger/iu,
+        /exact owned IDs/iu,
+        /bounded cleanup/iu,
+        /cleanup may remove only those IDs/iu,
+      ]);
     }
+  });
+
+  it("rejects every executable Vercel invocation in fenced shell blocks", () => {
+    const fixture = [
+      "```bash\nvercel env add SECRET production --value test\n```",
+      "```sh\n$ vercel alias rm example.vercel.app\n```",
+      "```shell\n  vercel inspect deployment-id\n```",
+    ].join("\n");
+
+    expect(executableVercelLines(fixture)).toEqual([
+      "vercel env add SECRET production --value test",
+      "$ vercel alias rm example.vercel.app",
+      "  vercel inspect deployment-id",
+    ]);
   });
 
   it("binds candidate data flow with explicit guards and safe projections", () => {

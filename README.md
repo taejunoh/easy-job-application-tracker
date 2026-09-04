@@ -4,6 +4,10 @@ JobTracker is a self-hosted job application tracker with a Chrome extension. The
 
 This guide starts with a local setup so you can verify the complete workflow before deploying it.
 
+> Production identity maintenance follows the [authoritative production
+> operations runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout),
+> which is the sole source of executable operator commands and ordering.
+
 ## What You Can Do
 
 - Save jobs from LinkedIn, Indeed, Glassdoor, Lever, Greenhouse, Workday, and other career pages.
