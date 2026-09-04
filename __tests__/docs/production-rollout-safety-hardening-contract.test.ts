@@ -31,28 +31,31 @@ function executableVercelLines(document: string): string[] {
 
 function fencedShellBlocks(document: string): string[] {
   const blocks: string[] = [];
-  const shellLanguages = new Set(["", "bash", "sh", "shell", "zsh", "console"]);
-  let active = false;
-  let capture = false;
+  let activeMarker: "`" | "~" | null = null;
+  let activeLength = 0;
   let block: string[] = [];
 
   for (const line of document.split(/\r?\n/u)) {
-    const fence = line.match(/^```([^\r\n]*)$/u);
+    const fence = line.match(/^\s{0,3}(`{3,}|~{3,})([^\r\n]*)$/u);
     if (fence) {
-      if (!active) {
-        active = true;
-        capture = shellLanguages.has((fence[1] ?? "").trim().toLowerCase());
+      const marker = (fence[1] ?? "")[0] as "`" | "~" | undefined;
+      const length = (fence[1] ?? "").length;
+      const info = fence[2] ?? "";
+      if (activeMarker === null) {
+        activeMarker = marker ?? null;
+        activeLength = length;
         block = [];
-      } else {
-        if (capture) blocks.push(block.join("\n"));
-        active = false;
-        capture = false;
+      } else if (marker === activeMarker && length >= activeLength && info.trim() === "") {
+        blocks.push(block.join("\n"));
+        activeMarker = null;
+        activeLength = 0;
         block = [];
       }
       continue;
     }
-    if (active && capture) block.push(line);
+    if (activeMarker !== null) block.push(line);
   }
+  if (activeMarker !== null) blocks.push(block.join("\n"));
   return blocks;
 }
 
@@ -210,9 +213,22 @@ function findCommandSubstitutionEnd(line: string, start: number): number {
 }
 
 function executableShellWrapperLines(line: string, commandPattern: RegExp): boolean {
-  const wrapper = /(?:^|[;|&][ \t]*)(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+))[ \t]*)*(?:(?:env)(?:[ \t]+(?:--[^\s]+|-[^\s]+|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)))*)?[ \t]*(?:(?:sudo|doas)(?:[ \t]+-[^\s]+)*[ \t]+)?(?:command[ \t]+)?(?:bash|sh|zsh|dash|ksh|busybox[ \t]+(?:sh|ash))[ \t]+(?:--[^\s]+[ \t]+)*-[A-Za-z]*c[ \t]+(['"])([\s\S]*?)\1/gu;
-  for (const [,, wrapped] of line.matchAll(wrapper)) {
-    if (wrapped !== undefined && executableShellLine(wrapped, commandPattern)) return true;
+  const assignment = String.raw`[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)`;
+  const executablePath = String.raw`(?:[^\s/]+\/|\/)*`;
+  const envPrefix = String.raw`${executablePath}env(?:[ \t]+(?:--[^\s]+|-[^\s]+|${assignment}))*`;
+  const shellWrapper = new RegExp(
+    String.raw`(?:^|[;|&][ \t]*)(?:${assignment}[ \t]*)*(?:${envPrefix}[ \t]+)?(?:(?:sudo|doas)(?:[ \t]+-[^\s]+)*[ \t]+)?(?:command[ \t]+)?${executablePath}(?:bash|sh|zsh|dash|ksh|fish|pwsh|powershell|busybox[ \t]+(?:sh|ash))(?:\.exe)?[ \t]+(?:--[^\s]+[ \t]+)*(?:-[A-Za-z]*c|-[Cc]ommand)[ \t]+(['"])([\s\S]*?)\1`,
+    "gu",
+  );
+  const cmdWrapper = new RegExp(
+    String.raw`(?:^|[;|&][ \t]*)(?:${assignment}[ \t]*)*(?:${envPrefix}[ \t]+)?(?:(?:sudo|doas)(?:[ \t]+-[^\s]+)*[ \t]+)?(?:command[ \t]+)?${executablePath}cmd(?:\.exe)?[ \t]+\/[CcKk][ \t]+(['"])([\s\S]*?)\1`,
+    "gu",
+  );
+  for (const wrapper of [shellWrapper, cmdWrapper]) {
+    for (const match of line.matchAll(wrapper)) {
+      const wrapped = match[2];
+      if (wrapped !== undefined && executableShellLine(wrapped, commandPattern)) return true;
+    }
   }
   return false;
 }
@@ -765,6 +781,34 @@ describe("production rollout staged-candidate binding documentation contract", (
     ]);
     expect(executableGhProductionLines(fixture)).toEqual([
       "env bash -c \"gh workflow run production.yml --ref main\"",
+    ]);
+  });
+
+  it("scans every fence style and normalizes wrapper executable paths", () => {
+    const fixture = [
+      "```shell-session\necho vercel deploy is prose\n```",
+      "````text\necho '%s\\n' vercel deploy\n/usr/local/bin/vercel deploy .\n````",
+      "~~~terminal\n/usr/bin/env sh -c 'gh run view 1'\n~~~",
+      "~~~zsh\n/bin/bash -c 'vercel deploy .'\n/usr/bin/zsh -c 'vercel inspect deployment-id'\n~~~",
+      "~~~~fish\n/usr/bin/fish -c 'vercel alias ls'\n~~~~",
+      "```text\nbusybox sh -c 'vercel rm deployment-id'\n```",
+      "```powershell\n/usr/bin/pwsh -Command 'gh run list'\n/opt/powershell/powershell -Command 'gh run watch 1'\n```",
+      "```cmd\n/usr/bin/cmd /c \"vercel inspect deployment-id\"\n```",
+      "outside prose: vercel deploy and gh workflow run are not shell commands",
+    ].join("\n");
+
+    expect(executableVercelLines(fixture)).toEqual([
+      "/usr/local/bin/vercel deploy .",
+      "/bin/bash -c 'vercel deploy .'",
+      "/usr/bin/zsh -c 'vercel inspect deployment-id'",
+      "/usr/bin/fish -c 'vercel alias ls'",
+      "busybox sh -c 'vercel rm deployment-id'",
+      "/usr/bin/cmd /c \"vercel inspect deployment-id\"",
+    ]);
+    expect(executableGhProductionLines(fixture)).toEqual([
+      "/usr/bin/env sh -c 'gh run view 1'",
+      "/usr/bin/pwsh -Command 'gh run list'",
+      "/opt/powershell/powershell -Command 'gh run watch 1'",
     ]);
   });
 
