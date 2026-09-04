@@ -241,23 +241,27 @@ function stageOneWriteStopEvidenceBlock(): string {
 describe("production rollout staged-candidate binding documentation contract", () => {
   it("keeps non-runbook documents design-level and fixes Settings wording", () => {
     const files = [
-      { file: "README.md", historicalLabel: false },
+      {
+        file: "README.md",
+        statusTerms: [],
+      },
       {
         file: "docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md",
-        historicalLabel: true,
+        statusTerms: ["design-level", "approved for implementation"],
       },
       {
         file: "docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md",
-        historicalLabel: true,
+        statusTerms: ["historical", "superseded"],
       },
       {
         file: "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md",
-        historicalLabel: true,
+        statusTerms: ["historical", "superseded"],
       },
     ];
-    for (const { file, historicalLabel } of files) {
+    for (const { file, statusTerms } of files) {
       const filePath = join(root, file);
       const document = readFileSync(join(root, file), "utf8");
+      const normalizedDocument = normalize(document).replace(/`/gu, "");
       const runbookHrefs = [...document.matchAll(
         /\[[^\]]*production operations runbook[^\]]*\]\(([^)]+)\)/giu,
       )].map(([, href]) => href ?? "");
@@ -272,12 +276,15 @@ describe("production rollout staged-candidate binding documentation contract", (
       );
       expect(runbookAnchor).toBe("application-identity-maintenance-rollout");
       expect(document).toContain("first successful PUT /api/settings");
+      expect(normalizedDocument).toMatch(
+        /authenticated GET \/api\/settings is read-only and (?:never|does not) create(?:s)? the row/iu,
+      );
       expect(document).not.toContain("authenticated GET /api/settings creates");
       expect(document).not.toMatch(/vercel api \/v13\/deployments\//u);
       expect(document).not.toMatch(/vercel promote "\$CANDIDATE_ID"/u);
 
-      if (historicalLabel) {
-        expect(document).toMatch(/historical|superseded|design-level/iu);
+      for (const statusTerm of statusTerms) {
+        expect(normalizedDocument.toLowerCase()).toContain(statusTerm.toLowerCase());
       }
 
       const fencedVercelBlocks = [...document.matchAll(/```(?:bash|sh|shell)\r?\n([\s\S]*?)```/gu)]
