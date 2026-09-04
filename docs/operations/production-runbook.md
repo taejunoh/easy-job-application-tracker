@@ -187,8 +187,14 @@ stage_candidate() (
   local CANDIDATE_DEPLOYMENT="" CANDIDATE_INSPECT="" CANDIDATE_METADATA="" CANONICAL_METADATA=""
   local CANDIDATE_ID="" CANDIDATE_URL=""
   set -o pipefail || return 1
+  assert_canonical_unpaused() {
+    local origin="${1:-}" HTTP_STATUS=""
+    [[ "$origin" == "$EXPECTED_PRODUCTION_ORIGIN" ]] || return 1
+    HTTP_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$origin")" || return 1
+    [[ "$HTTP_STATUS" != "000" && "$HTTP_STATUS" != "503" ]] || return 1
+    [[ "$HTTP_STATUS" =~ ^(2[0-9]{2}|3[0-9]{2}|401)$ ]] || return 1
+  }
   [[ "$stage_name" == "identity=1,writes=0" || "$stage_name" == "identity=1,writes=1" ]] || return 1
-  [[ "${VERCEL_UNPAUSED_ATTESTED:-}" == "true" ]] || return 1
   [[ -n "${TARGET_SHA:-}" ]] || return 1
   [[ -n "${APP_BASE_URL:-}" ]] || return 1
   [[ "$APP_BASE_URL" == "$EXPECTED_PRODUCTION_ORIGIN" ]] || return 1
@@ -197,6 +203,7 @@ stage_candidate() (
   CURRENT_SHA="$(git rev-parse HEAD)" || return 1
   [[ "$CURRENT_SHA" == "$TARGET_SHA" ]] || return 1
 
+  assert_canonical_unpaused "$APP_BASE_URL" || return 1
   CANDIDATE_DEPLOYMENT="$(vercel deploy . --prod --skip-domain --yes --format=json --no-color | jq -ce '{id,url}')" || return 1
   jq -e '(.id | type == "string") and (.id | test("^dpl_[A-Za-z0-9]+$")) and (.url | type == "string") and (.url | length > 0)' <<<"$CANDIDATE_DEPLOYMENT" >/dev/null || return 1
   CANDIDATE_ID="$(jq -er '.id' <<<"$CANDIDATE_DEPLOYMENT")" || return 1
@@ -208,7 +215,7 @@ stage_candidate() (
   CANDIDATE_METADATA="$(vercel api "/v13/deployments/$CANDIDATE_ID" --raw | jq -ce 'if (.alias | type) == "array" then {id,readyState,target,url,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])} else error("deployment alias shape is not an array") end')" || return 1
   jq -e --arg id "$CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg url "$CANDIDATE_URL" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.url == $url) and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$CANDIDATE_METADATA" >/dev/null || return 1
 
-  # Promotion is reachable only in this unpaused procedure.
+  assert_canonical_unpaused "$APP_BASE_URL" || return 1
   vercel promote "$CANDIDATE_ID" --yes >/dev/null || return 1
   CANONICAL_METADATA="$(vercel inspect "$APP_BASE_URL" --format=json --no-color | jq -ce '{id}')" || return 1
   jq -e --arg id "$CANDIDATE_ID" '.id == $id' <<<"$CANONICAL_METADATA" >/dev/null || return 1
@@ -256,15 +263,28 @@ promotion. It is paused only across prepare/apply, and the actual platform
    ```bash
    set -euo pipefail
    : "${EVIDENCE_ROOT:?set EVIDENCE_ROOT to a private path outside the repository}"
-   REPO_ROOT="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
    [[ "$EVIDENCE_ROOT" == /* ]] || exit 1
-   case "$EVIDENCE_ROOT" in
+   EVIDENCE_PARENT="$(dirname -- "$EVIDENCE_ROOT")"
+   EVIDENCE_BASENAME="$(basename -- "$EVIDENCE_ROOT")"
+   [[ "$EVIDENCE_BASENAME" != "." && "$EVIDENCE_BASENAME" != ".." && -n "$EVIDENCE_BASENAME" ]] || exit 1
+   [[ -d "$EVIDENCE_PARENT" ]] || exit 1
+   EVIDENCE_PARENT_REAL="$(cd -- "$EVIDENCE_PARENT" && pwd -P)" || exit 1
+   EVIDENCE_CANDIDATE="$EVIDENCE_PARENT_REAL/$EVIDENCE_BASENAME"
+   REPO_ROOT="$(cd -- "$(git rev-parse --show-toplevel)" && pwd -P)"
+   case "$EVIDENCE_CANDIDATE" in
      "$REPO_ROOT"|"$REPO_ROOT"/*) exit 1 ;;
    esac
+   [[ ! -L "$EVIDENCE_CANDIDATE" ]] || exit 1
    umask 077
-   install -d -m 0700 "$EVIDENCE_ROOT"
-   touch "$EVIDENCE_ROOT/rollout-ledger.json"
-   chmod 0600 "$EVIDENCE_ROOT/rollout-ledger.json"
+   install -d -m 0700 -- "$EVIDENCE_CANDIDATE" || exit 1
+   EVIDENCE_ROOT="$EVIDENCE_CANDIDATE"
+   [[ -d "$EVIDENCE_ROOT" && ! -L "$EVIDENCE_ROOT" ]] || exit 1
+   [[ "$(cd -- "$EVIDENCE_ROOT" && pwd -P)" == "$EVIDENCE_CANDIDATE" ]] || exit 1
+   LEDGER="$EVIDENCE_ROOT/rollout-ledger.json"
+   [[ ! -e "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
+   (set -o noclobber; : > "$LEDGER") || exit 1
+   [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
+   chmod 0600 "$LEDGER" || exit 1
    ```
 
    Run this setup block locally before any fixture request; it contains no
@@ -281,11 +301,62 @@ promotion. It is paused only across prepare/apply, and the actual platform
 3. Stage the Stage 1 `identity=1,writes=0` candidate while unpaused:
 
    ```bash
-   VERCEL_UNPAUSED_ATTESTED=true
    vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "1" --yes --force || exit 1
    vercel env add APPLICATION_WRITES_ENABLED production --value "0" --yes --force || exit 1
    STAGE_ONE_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")" || exit 1
    [[ "$STAGE_ONE_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
+   ```
+
+   Immediately bind the reviewed Stage 1 evidence to that exact promoted
+   deployment in the private ledger. This writes no provider response body and
+   replaces only the empty ledger created in step 2; do not continue if the
+   ledger is missing, a symlink, or does not validate after the atomic rename.
+
+   ```bash
+   set -euo pipefail
+   LEDGER="${EVIDENCE_ROOT:?private ledger path is required}/rollout-ledger.json"
+   [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
+   [[ "${TARGET_SHA:-}" != "" ]] || exit 1
+   [[ "${APP_BASE_URL:-}" == "https://easy-job-application-tracker.vercel.app" ]] || exit 1
+   [[ "$STAGE_ONE_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
+   STAGE_ONE_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+   STAGE_ONE_LEDGER_TMP="$(mktemp "$EVIDENCE_ROOT/.rollout-ledger.stage1.XXXXXX")" || exit 1
+   jq -n \
+     --arg id "$STAGE_ONE_CANDIDATE_ID" \
+     --arg sha "$TARGET_SHA" \
+     --arg origin "$APP_BASE_URL" \
+     --arg observedAt "$STAGE_ONE_RECORDED_AT" \
+     '{
+       schemaVersion: 1,
+       stage1: {
+         deploymentId: $id,
+         targetSha: $sha,
+         gates: {identity: "1", writes: "0"},
+         reviewedGateConfig: {identity: "1", writes: "0", reviewedAt: $observedAt},
+         ready: true,
+         readyState: "READY",
+         readyEvidence: {deploymentId: $id, state: "READY", observedAt: $observedAt},
+         canonicalPromotionVerified: true,
+         canonicalPromotion: {origin: $origin, deploymentId: $id, verified: true, verifiedAt: $observedAt},
+         compatibilityVerified: true,
+         timestamps: {recordedAt: $observedAt, readyObservedAt: $observedAt, canonicalPromotionVerifiedAt: $observedAt}
+       }
+     }' > "$STAGE_ONE_LEDGER_TMP" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   chmod 0600 "$STAGE_ONE_LEDGER_TMP" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   mv -f -- "$STAGE_ONE_LEDGER_TMP" "$LEDGER" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
+   jq -e --arg id "$STAGE_ONE_CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg origin "$APP_BASE_URL" '
+     .schemaVersion == 1 and
+     .stage1.deploymentId == $id and .stage1.targetSha == $sha and
+     .stage1.gates == {identity: "1", writes: "0"} and
+     .stage1.reviewedGateConfig.identity == "1" and .stage1.reviewedGateConfig.writes == "0" and
+     .stage1.ready == true and .stage1.readyState == "READY" and
+     .stage1.readyEvidence.deploymentId == $id and .stage1.readyEvidence.state == "READY" and
+     .stage1.canonicalPromotionVerified == true and
+     .stage1.canonicalPromotion.origin == $origin and .stage1.canonicalPromotion.deploymentId == $id and
+     .stage1.canonicalPromotion.verified == true and .stage1.compatibilityVerified == true
+   ' "$LEDGER" >/dev/null || exit 1
+   unset STAGE_ONE_LEDGER_TMP STAGE_ONE_RECORDED_AT
    ```
 
    This stage sets `APPLICATION_IDENTITY_WRITES_ENABLED="1"` while keeping
@@ -316,12 +387,9 @@ promotion. It is paused only across prepare/apply, and the actual platform
    is not an attestation. There is no build or promotion while paused. While
    paused, only observation and maintenance commands are allowed: no build,
    deploy, alias, or promote command may be run while paused, queued, or made
-   reachable through the candidate procedure. In the shell used for the
-   rollout, clear the unpaused attestation before entering this state:
-
-   ```bash
-   unset VERCEL_UNPAUSED_ATTESTED
-   ```
+   reachable through the candidate procedure. The candidate procedure
+   performs a fresh canonical-origin check before each deploy and promotion;
+   no shell attestation or remembered unpaused state is authoritative.
 5. Dispatch the prepare phase from `main` with the required writer-stop
    attestation:
 
@@ -450,16 +518,18 @@ promotion. It is paused only across prepare/apply, and the actual platform
    target. If a regression occurs after resume, remain unpaused only long
    enough to reuse the existing `stage_candidate` procedure with stage name
    `identity=1,writes=0`; its Ready, inspected Production candidate must prove
-   the recorded identity `identity=1,writes=0`, reviewed compatible exact SHA,
-   and exact deployment ID before that exact ID is promoted. Execute the same
+   the recorded identity `identity=1,writes=0`, reviewed compatible exact SHA
+   and exact ID before that exact ID is promoted. Execute the same
    guarded procedure only while unpaused; do not
    add a second deploy or promotion procedure. Drain at least 60 seconds and
    probe again. If absent, pause and enter `HOLD_PAUSED` with writers stopped.
 
-   Cleanup or rejection failure also returns to `HOLD_PAUSED`; ledger retained
-   with all evidence and the safe paused/read-only state is preserved. Ordinary
-   and external writers remain stopped. Cleanup failure never permits an
-   unbounded delete or a second unrecorded credential attempt.
+   Cleanup or rejection failure first requires the provider Production pause
+   control, followed by a bounded canonical-origin curl that proves HTTP `503`
+   and `DEPLOYMENT_PAUSED`; only then is the state labeled `HOLD_PAUSED`.
+   ledger retained with all evidence and the safe paused/read-only state is
+   preserved. Ordinary and external writers remain stopped. Cleanup failure
+   never permits an unbounded delete or a second unrecorded credential attempt.
    There is
    no build, deploy, alias, or promote command reachable from a paused state.
 
@@ -467,17 +537,90 @@ promotion. It is paused only across prepare/apply, and the actual platform
    is approved. Resume the recorded same-identity exact Stage 1 deployment
    without redeploying. Confirm the pause is cleared and the canonical origin
    is no longer the platform `503`; do not build or promote as part of this
-   resume. If a read-only regression is observed after resume, execute the same
-   guarded procedure as `ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"`
-   only while unpaused; its Ready, inspected Production candidate must prove
-   the reviewed compatible exact SHA and exact ID before its exact ID is
-   promoted.
+   resume. The private Stage 1 record is the resume target selector; validate
+   it before using the provider's manual/UI resume control. If a read-only
+   regression is observed after resume, run the following ordered transition
+   while unpaused. It validates the same record before creating a new candidate
+   with the existing guarded procedure; no environment-only target claim is
+   accepted. The provider's Production pause control is manual/UI-only on this
+   CLI version. Every missing/rejected record, candidate, evidence, or probe
+   stops for that control, proves the exact canonical paused response, and only
+   then labels the state `HOLD_PAUSED`. The block never prints ledger values or
+   response bodies.
+
+   ```bash
+   set -euo pipefail
+   # Writers remain stopped and the ledger is retained on every failure.
+
+   enter_hold_paused() {
+     local PAUSE_BODY="" PAUSE_STATUS=""
+     printf '%s\n' 'STOP: use the provider Production pause control now; no CLI pause/resume command is supported.' >&2
+     read -r -p 'After the provider pause is complete, press Enter: ' _ </dev/tty || return 1
+     PAUSE_BODY="$(mktemp "$EVIDENCE_ROOT/pause-probe.XXXXXX")" || return 1
+     PAUSE_STATUS="$(curl --silent --show-error --output "$PAUSE_BODY" --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$APP_BASE_URL")" || { rm -f -- "$PAUSE_BODY"; return 1; }
+     if [[ "$PAUSE_STATUS" != "503" ]] || ! grep -Fq 'DEPLOYMENT_PAUSED' "$PAUSE_BODY"; then
+       rm -f -- "$PAUSE_BODY"
+       return 1
+     fi
+     rm -f -- "$PAUSE_BODY" || return 1
+     printf '%s\n' 'HOLD_PAUSED' >&2
+     return 1
+   }
+
+   assert_canonical_unpaused() {
+     local ORIGIN="${1:-}" HTTP_STATUS=""
+     [[ "$ORIGIN" == "https://easy-job-application-tracker.vercel.app" ]] || return 1
+     HTTP_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$ORIGIN")" || return 1
+     [[ "$HTTP_STATUS" != "000" && "$HTTP_STATUS" != "503" ]] || return 1
+     [[ "$HTTP_STATUS" =~ ^(2[0-9]{2}|3[0-9]{2}|401)$ ]] || return 1
+   }
+
+   LEDGER="${EVIDENCE_ROOT:?private ledger path is required}/rollout-ledger.json"
+   [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || enter_hold_paused
+   [[ -n "${TARGET_SHA:-}" ]] || enter_hold_paused
+   [[ "${APP_BASE_URL:-}" == "https://easy-job-application-tracker.vercel.app" ]] || enter_hold_paused
+   jq -e --arg sha "$TARGET_SHA" --arg origin "$APP_BASE_URL" '
+     .stage1 as $s |
+     (.schemaVersion == 1) and
+     ($s.deploymentId | type == "string" and test("^dpl_[A-Za-z0-9]+$")) and
+     ($s.targetSha == $sha) and
+     ($s.gates.identity == "1") and ($s.gates.writes == "0") and
+     ($s.reviewedGateConfig.identity == "1") and ($s.reviewedGateConfig.writes == "0") and
+     ($s.ready == true) and ($s.readyState == "READY") and
+     ($s.readyEvidence.deploymentId == $s.deploymentId) and ($s.readyEvidence.state == "READY") and
+     ($s.readyEvidence.observedAt | type == "string" and length > 0) and
+     ($s.canonicalPromotionVerified == true) and
+     ($s.canonicalPromotion.origin == $origin) and ($s.canonicalPromotion.deploymentId == $s.deploymentId) and
+     ($s.canonicalPromotion.verified == true) and ($s.canonicalPromotion.verifiedAt | type == "string" and length > 0) and
+     ($s.compatibilityVerified == true) and
+     ($s.timestamps | type == "object") and
+     ($s.timestamps.readyObservedAt | type == "string" and length > 0) and
+     ($s.timestamps.canonicalPromotionVerifiedAt | type == "string" and length > 0)
+   ' "$LEDGER" >/dev/null || enter_hold_paused
+   STAGE_ONE_RECORD_ID="$(jq -er '.stage1.deploymentId' "$LEDGER")" || enter_hold_paused
+   STAGE_ONE_INSPECT="$(vercel inspect "$STAGE_ONE_RECORD_ID" --wait --timeout 3m --format=json --no-color | jq -ce '{id,readyState,aliases}')" || enter_hold_paused
+   jq -e --arg id "$STAGE_ONE_RECORD_ID" '(.id == $id) and (.readyState == "READY") and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$STAGE_ONE_INSPECT" >/dev/null || enter_hold_paused
+   STAGE_ONE_METADATA="$(vercel api "/v13/deployments/$STAGE_ONE_RECORD_ID" --raw | jq -ce 'if (.alias | type) == "array" then {id,readyState,target,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])} else error("deployment alias shape is not an array") end')" || enter_hold_paused
+   jq -e --arg id "$STAGE_ONE_RECORD_ID" --arg sha "$TARGET_SHA" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$STAGE_ONE_METADATA" >/dev/null || enter_hold_paused
+   STAGE_ONE_CANONICAL="$(vercel inspect "$APP_BASE_URL" --format=json --no-color | jq -ce '{id}')" || enter_hold_paused
+   jq -e --arg id "$STAGE_ONE_RECORD_ID" '.id == $id' <<<"$STAGE_ONE_CANONICAL" >/dev/null || enter_hold_paused
+   assert_canonical_unpaused "$APP_BASE_URL" || enter_hold_paused
+
+   ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")" || enter_hold_paused
+   [[ "$ROLLBACK_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || enter_hold_paused
+   sleep 60 || enter_hold_paused
+   READONLY_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -H "Authorization: Bearer ${ROLLBACK_READ_TOKEN:?private read token is required}" -- "$APP_BASE_URL/api/settings")" || enter_hold_paused
+   [[ "$READONLY_STATUS" =~ ^2[0-9]{2}$ ]] || enter_hold_paused
+   NEGATIVE_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$APP_BASE_URL/api/applications")" || enter_hold_paused
+   [[ "$NEGATIVE_STATUS" == "401" ]] || enter_hold_paused
+   unset ROLLBACK_READ_TOKEN STAGE_ONE_RECORD_ID STAGE_ONE_INSPECT STAGE_ONE_METADATA STAGE_ONE_CANONICAL ROLLBACK_CANDIDATE_ID READONLY_STATUS NEGATIVE_STATUS
+   ```
+
 9. After resume, stage the final `identity=1,writes=1` Ready Production
    candidate with the same exact TARGET_SHA, using the same canonical
    procedure while unpaused:
 
    ```bash
-   VERCEL_UNPAUSED_ATTESTED=true
    vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force || exit 1
    FINAL_CANDIDATE_ID="$(stage_candidate "identity=1,writes=1")" || exit 1
    [[ "$FINAL_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
@@ -523,6 +666,12 @@ promotion. It is paused only across prepare/apply, and the actual platform
     pairing code, URL, title, company, note, resume text, and raw row/body
     values only inside the private directory and ledger. Never make a second
     unrecorded credential attempt.
+
+    The Stage 1 ledger record binds one exact deployment ID to the exact
+    `TARGET_SHA`, reviewed gate configuration `identity=1,writes=0`, `Ready`
+    evidence, canonical-promotion proof, compatibility proof, and timestamps.
+    Resume and regression must read and validate this record; an environment
+    variable or operator claim alone is never a target selector.
 
     The stopped-write Settings check is a syntactically valid
     `PUT /api/settings` containing only a private, non-production canary and no

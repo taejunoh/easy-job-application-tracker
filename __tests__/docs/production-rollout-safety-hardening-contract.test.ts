@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -66,6 +66,28 @@ case "\${1:-}" in
   *) exit 2 ;;
 esac
 `, { mode: 0o700 });
+  writeFileSync(join(directory, "curl"), `#!/usr/bin/env bash
+call_number=0
+if [[ -f "\${CURL_LOG:?}" ]]; then call_number="$(wc -l < "\${CURL_LOG:?}")"; fi
+printf '%s\\n' curl >> "\${CURL_LOG:?}"
+output=/dev/null
+while (($#)); do
+  case "\${1:-}" in
+    --output|-o) output="\${2:?}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+IFS=',' read -r -a statuses <<< "\${CURL_STATUS_SEQUENCE:-401,401}"
+if (( call_number < \${#statuses[@]} )); then
+  status="\${statuses[$call_number]}"
+else
+  status="\${statuses[\${#statuses[@]}-1]}"
+fi
+IFS=',' read -r -a bodies <<< "\${CURL_BODY_SEQUENCE:-}"
+if (( call_number < \${#bodies[@]} )); then body="\${bodies[$call_number]}"; else body="\${bodies[\${#bodies[@]}-1]}"; fi
+[[ "$output" == /dev/null ]] || printf '%s' "$body" > "$output"
+printf '%s' "$status"
+`, { mode: 0o700 });
   return directory;
 }
 
@@ -81,8 +103,41 @@ function runMocked(source: string, variables: Record<string, string>, body: stri
         PATH: `${directory}:${process.env.PATH ?? ""}`,
         DEPLOY_LOG: join(directory, "deploy.log"),
         PROMOTE_LOG: join(directory, "promote.log"),
+        CURL_LOG: join(directory, "curl.log"),
       },
     });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function runMockedFailure(source: string, variables: Record<string, string>, body: string): { stderr: string; deploys: string; promotes: string; curlCalls: number } {
+  const directory = mockBin();
+  try {
+    try {
+      execFileSync("bash", ["-c", `${source}\n${body}`], {
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          ...variables,
+          PATH: `${directory}:${process.env.PATH ?? ""}`,
+          DEPLOY_LOG: join(directory, "deploy.log"),
+          PROMOTE_LOG: join(directory, "promote.log"),
+          CURL_LOG: join(directory, "curl.log"),
+        },
+      });
+      throw new Error("expected mocked rollout failure");
+    } catch (error) {
+      if (error instanceof Error && error.message === "expected mocked rollout failure") throw error;
+      const failure = error as { stderr?: string | Buffer };
+      return {
+        stderr: String(failure.stderr ?? ""),
+        deploys: existsSync(join(directory, "deploy.log")) ? readFileSync(join(directory, "deploy.log"), "utf8") : "",
+        promotes: existsSync(join(directory, "promote.log")) ? readFileSync(join(directory, "promote.log"), "utf8") : "",
+        curlCalls: existsSync(join(directory, "curl.log")) ? readFileSync(join(directory, "curl.log"), "utf8").trim().split("\n").filter(Boolean).length : 0,
+      };
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -92,7 +147,6 @@ function baseScenario(): Record<string, string> {
   return {
     TARGET_SHA: "sha-reviewed",
     APP_BASE_URL: expectedOrigin,
-    VERCEL_UNPAUSED_ATTESTED: "true",
     DEPLOY_JSON: JSON.stringify({ id: "dpl_valid", url: "https://candidate.example" }),
     INSPECT_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", aliases: [] }),
     API_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", target: "production", url: "https://candidate.example", meta: { githubCommitSha: "sha-reviewed" }, alias: [] }),
@@ -107,7 +161,23 @@ function aliasJson(alias: string): string {
 
 function ledgerSetupBlock(): string {
   const block = bashBlocks(rolloutSection()).find((candidate) =>
-    normalize(candidate).includes('touch "$EVIDENCE_ROOT/rollout-ledger.json"'),
+    normalize(candidate).includes('(set -o noclobber; : > "$LEDGER")'),
+  );
+  expect(block).toBeDefined();
+  return block ?? "";
+}
+
+function regressionBlock(): string {
+  const block = bashBlocks(rolloutSection()).find((candidate) =>
+    normalize(candidate).includes('ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"'),
+  );
+  expect(block).toBeDefined();
+  return block ?? "";
+}
+
+function stageOneLedgerBlock(): string {
+  const block = bashBlocks(rolloutSection()).find((candidate) =>
+    normalize(candidate).includes('STAGE_ONE_LEDGER_TMP="$(mktemp "$EVIDENCE_ROOT/.rollout-ledger.stage1.XXXXXX")"'),
   );
   expect(block).toBeDefined();
   return block ?? "";
@@ -154,14 +224,18 @@ describe("production rollout staged-candidate binding documentation contract", (
     expect(canonical).toContain("| jq -ce '{id}'");
     expect(canonicalCheck).toContain('--arg id "$CANDIDATE_ID"');
 
+    const liveChecks = lines.filter((line) => line === 'assert_canonical_unpaused "$APP_BASE_URL" || return 1');
+    expect(liveChecks).toHaveLength(2);
+    expect(procedure).toContain("curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15");
+    expect(procedure).not.toContain("VERCEL_UNPAUSED_ATTESTED");
     expectOrdered(procedure, [
       '[[ "$stage_name" == "identity=1,writes=0" || "$stage_name" == "identity=1,writes=1" ]] || return 1',
-      '[[ "${VERCEL_UNPAUSED_ATTESTED:-}" == "true" ]] || return 1',
       '[[ -n "${TARGET_SHA:-}" ]] || return 1',
       '[[ -n "${APP_BASE_URL:-}" ]] || return 1',
       '[[ "$APP_BASE_URL" == "$EXPECTED_PRODUCTION_ORIGIN" ]] || return 1',
       'WORKTREE_STATUS="$(git status --porcelain)" || return 1',
       'CURRENT_SHA="$(git rev-parse HEAD)" || return 1',
+      'assert_canonical_unpaused "$APP_BASE_URL" || return 1',
       deploy,
       id,
       url,
@@ -169,6 +243,7 @@ describe("production rollout staged-candidate binding documentation contract", (
       inspectCheck,
       api,
       metadataCheck,
+      'assert_canonical_unpaused "$APP_BASE_URL" || return 1',
       promote,
       canonical,
       canonicalCheck,
@@ -183,7 +258,8 @@ describe("production rollout staged-candidate binding documentation contract", (
     const pauseStart = section.indexOf("4. Pause Vercel Production");
     const resumeStart = section.indexOf("8. Resume Vercel Production", pauseStart);
     const paused = section.slice(pauseStart, resumeStart);
-    expect(paused).toContain("unset VERCEL_UNPAUSED_ATTESTED");
+    expect(paused).toContain("fresh canonical-origin check before each deploy and promotion");
+    expect(paused).not.toContain("VERCEL_UNPAUSED_ATTESTED");
     for (const block of bashBlocks(paused)) expect(block).not.toMatch(/\bvercel\s+(?:deploy|promote|alias)\b/iu);
   });
 
@@ -226,7 +302,29 @@ ${noLeak}`)).toBe("");
 ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
     expect(runMocked(source, { ...baseScenario(), APP_BASE_URL: "https://preview.example" }, `if stage_candidate "identity=1,writes=0"; then exit 66; fi
 [[ ! -s "\${DEPLOY_LOG:?}" ]] || exit 67
-[[ ! -s "\${PROMOTE_LOG:?}" ]] || exit 68`)).toBe("");
+    [[ ! -s "\${PROMOTE_LOG:?}" ]] || exit 68`)).toBe("");
+  });
+
+  it("requires fresh live canonical status before deploy and promotion", () => {
+    const source = candidateFunction();
+    const staleAttestation = { ...baseScenario(), VERCEL_UNPAUSED_ATTESTED: "true", CURL_STATUS_SEQUENCE: "503,401" };
+    expect(runMocked(source, staleAttestation, `
+if stage_candidate "identity=1,writes=0"; then exit 69; fi
+[[ ! -s "\${DEPLOY_LOG:?}" ]] || exit 70
+[[ ! -s "\${PROMOTE_LOG:?}" ]] || exit 71
+[[ "$(wc -l < "\${CURL_LOG:?}")" -eq 1 ]] || exit 72`)).toBe("");
+
+    const pausesAfterInspect = { ...baseScenario(), VERCEL_UNPAUSED_ATTESTED: "true", CURL_STATUS_SEQUENCE: "401,503" };
+    expect(runMocked(source, pausesAfterInspect, `
+if stage_candidate "identity=1,writes=0"; then exit 73; fi
+[[ -s "\${DEPLOY_LOG:?}" ]] || exit 74
+[[ ! -s "\${PROMOTE_LOG:?}" ]] || exit 75
+[[ "$(wc -l < "\${CURL_LOG:?}")" -eq 2 ]] || exit 76`)).toBe("");
+
+    expect(runMocked(source, { ...baseScenario(), CURL_STATUS_SEQUENCE: "401,401" }, `
+captured="$(stage_candidate "identity=1,writes=0")" || exit 77
+[[ "$captured" == "dpl_valid" ]] || exit 78
+[[ "$(wc -l < "\${CURL_LOG:?}")" -eq 2 ]] || exit 79`)).toBe("");
   });
 
   it("binds paused-after-apply rollback to the recorded identity-aware deployment", () => {
@@ -284,17 +382,169 @@ ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
     ]);
   });
 
+  it("makes post-resume regression recovery executable and fail closed", () => {
+    const block = regressionBlock();
+    const normalizedBlock = normalize(block);
+    expectOrdered(normalizedBlock, [
+      'LEDGER="${EVIDENCE_ROOT:?private ledger path is required}/rollout-ledger.json"',
+      'jq -e --arg sha "$TARGET_SHA"',
+      "STAGE_ONE_RECORD_ID=\"$(jq -er '.stage1.deploymentId' \"$LEDGER\")\"",
+      'STAGE_ONE_INSPECT="$(vercel inspect "$STAGE_ONE_RECORD_ID"',
+      'STAGE_ONE_METADATA="$(vercel api "/v13/deployments/$STAGE_ONE_RECORD_ID"',
+      'STAGE_ONE_CANONICAL="$(vercel inspect "$APP_BASE_URL"',
+      'assert_canonical_unpaused "$APP_BASE_URL" || enter_hold_paused',
+      'ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"',
+      "sleep 60",
+      'READONLY_STATUS="$(curl',
+      'NEGATIVE_STATUS="$(curl',
+      'unset ROLLBACK_READ_TOKEN',
+    ]);
+    expect(normalizedBlock).toContain("gates.identity == \"1\"");
+    expect(normalizedBlock).toContain("gates.writes == \"0\"");
+    expect(normalizedBlock).toContain("canonicalPromotionVerified == true");
+    expect(normalizedBlock).toContain("compatibilityVerified == true");
+    expect(normalizedBlock).toContain("readyState == \"READY\"");
+    expect(normalizedBlock).toContain("target == \"production\"");
+    expect(normalizedBlock).toContain("After the provider pause is complete");
+    expect(normalizedBlock).toContain("PAUSE_STATUS");
+    expect(normalizedBlock).toContain("$PAUSE_STATUS\" != \"503\"");
+    expect(normalizedBlock).toContain("DEPLOYMENT_PAUSED");
+    expect(normalizedBlock).toContain("printf '%s\\n' 'HOLD_PAUSED'");
+    expect(normalizedBlock).not.toContain("VERCEL_UNPAUSED_ATTESTED");
+    expect(normalizedBlock).toMatch(/writers remain stopped|ledger retained/iu);
+  });
+
+  it("requires observed provider pause evidence before HOLD_PAUSED on missing evidence or a failed probe", () => {
+    const testableBlock = regressionBlock()
+      .replace(/^[ \t]*read -r -p 'After the provider pause is complete, press Enter: ' _ <\/dev\/tty \|\| return 1$/mu, "     :")
+      .replace("sleep 60 || enter_hold_paused", ":");
+    const source = `${candidateFunction()}\n${testableBlock}`;
+    const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-regression-"));
+    try {
+      const missingEvidence = runMockedFailure(source, {
+        ...baseScenario(),
+        EVIDENCE_ROOT: temporaryRoot,
+        CURL_STATUS_SEQUENCE: "503",
+        CURL_BODY_SEQUENCE: "DEPLOYMENT_PAUSED",
+      }, "");
+      expect(missingEvidence.stderr).toContain("HOLD_PAUSED");
+      expect(missingEvidence.deploys).toBe("");
+      expect(missingEvidence.promotes).toBe("");
+      expect(missingEvidence.curlCalls).toBe(1);
+
+      writeFileSync(join(temporaryRoot, "rollout-ledger.json"), JSON.stringify({
+        schemaVersion: 1,
+        stage1: {
+          deploymentId: "dpl_valid",
+          targetSha: "sha-reviewed",
+          gates: { identity: "1", writes: "0" },
+          reviewedGateConfig: { identity: "1", writes: "0", reviewedAt: "2026-09-04T00:00:00Z" },
+          ready: true,
+          readyState: "READY",
+          readyEvidence: { deploymentId: "dpl_valid", state: "READY", observedAt: "2026-09-04T00:00:00Z" },
+          canonicalPromotionVerified: true,
+          canonicalPromotion: { origin: expectedOrigin, deploymentId: "dpl_valid", verified: true, verifiedAt: "2026-09-04T00:00:00Z" },
+          compatibilityVerified: true,
+          timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
+        },
+      }), { mode: 0o600 });
+      const failedProbe = runMockedFailure(source, {
+        ...baseScenario(),
+        EVIDENCE_ROOT: temporaryRoot,
+        ROLLBACK_READ_TOKEN: "private-test-token",
+        CURL_STATUS_SEQUENCE: "401,401,401,500,503",
+        CURL_BODY_SEQUENCE: "ignored,ignored,ignored,ignored,DEPLOYMENT_PAUSED",
+      }, "");
+      expect(failedProbe.stderr).toContain("HOLD_PAUSED");
+      expect(failedProbe.deploys).toBe("deploy\n");
+      expect(failedProbe.promotes).toBe("dpl_valid\n");
+      expect(failedProbe.curlCalls).toBe(5);
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("writes the Stage 1 ledger schema that the resume and rollback gate consumes", () => {
+    const block = stageOneLedgerBlock();
+    const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-stage1-ledger-"));
+    try {
+      const ledger = join(temporaryRoot, "rollout-ledger.json");
+      writeFileSync(ledger, "", { mode: 0o600 });
+      execFileSync("bash", ["-c", block], {
+        env: {
+          ...process.env,
+          EVIDENCE_ROOT: temporaryRoot,
+          LEDGER: ledger,
+          TARGET_SHA: "sha-reviewed",
+          APP_BASE_URL: expectedOrigin,
+          STAGE_ONE_CANDIDATE_ID: "dpl_stageone",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const record = JSON.parse(readFileSync(ledger, "utf8"));
+      expect(record).toMatchObject({
+        schemaVersion: 1,
+        stage1: {
+          deploymentId: "dpl_stageone",
+          targetSha: "sha-reviewed",
+          gates: { identity: "1", writes: "0" },
+          ready: true,
+          readyState: "READY",
+          canonicalPromotionVerified: true,
+          compatibilityVerified: true,
+        },
+      });
+      expect(record.stage1.canonicalPromotion).toMatchObject({
+        origin: expectedOrigin,
+        deploymentId: "dpl_stageone",
+        verified: true,
+      });
+      expect(record.stage1.timestamps.readyObservedAt).toEqual(expect.any(String));
+      expect(record.stage1.timestamps.canonicalPromotionVerifiedAt).toEqual(expect.any(String));
+      expect(statSync(ledger).mode & 0o777).toBe(0o600);
+
+      expect(() => execFileSync("bash", ["-c", block], {
+        env: {
+          ...process.env,
+          EVIDENCE_ROOT: temporaryRoot,
+          LEDGER: ledger,
+          TARGET_SHA: "sha-reviewed",
+          APP_BASE_URL: expectedOrigin,
+          STAGE_ONE_CANDIDATE_ID: "not-a-deployment",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+
+    expect(execFileSync("bash", ["-n"], { input: block, encoding: "utf8" })).toBe("");
+  });
+
   it("defines a fail-closed private ledger setup with restrictive modes", () => {
     const block = ledgerSetupBlock();
     const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
     expectOrdered(block, [
       ': "${EVIDENCE_ROOT:?set EVIDENCE_ROOT to a private path outside the repository}"',
       '[[ "$EVIDENCE_ROOT" == /* ]]',
-      'case "$EVIDENCE_ROOT" in',
+      'EVIDENCE_PARENT="$(dirname -- "$EVIDENCE_ROOT")"',
+      'EVIDENCE_BASENAME="$(basename -- "$EVIDENCE_ROOT")"',
+      '[[ "$EVIDENCE_BASENAME" != "." && "$EVIDENCE_BASENAME" != ".." && -n "$EVIDENCE_BASENAME" ]]',
+      '[[ -d "$EVIDENCE_PARENT" ]]',
+      'EVIDENCE_PARENT_REAL="$(cd -- "$EVIDENCE_PARENT" && pwd -P)" || exit 1',
+      'EVIDENCE_CANDIDATE="$EVIDENCE_PARENT_REAL/$EVIDENCE_BASENAME"',
+      'case "$EVIDENCE_CANDIDATE" in',
+      '[[ ! -L "$EVIDENCE_CANDIDATE" ]] || exit 1',
       'umask 077',
-      'install -d -m 0700 "$EVIDENCE_ROOT"',
-      'touch "$EVIDENCE_ROOT/rollout-ledger.json"',
-      'chmod 0600 "$EVIDENCE_ROOT/rollout-ledger.json"',
+      'install -d -m 0700 -- "$EVIDENCE_CANDIDATE" || exit 1',
+      'EVIDENCE_ROOT="$EVIDENCE_CANDIDATE"',
+      '[[ -d "$EVIDENCE_ROOT" && ! -L "$EVIDENCE_ROOT" ]] || exit 1',
+      '[[ "$(cd -- "$EVIDENCE_ROOT" && pwd -P)" == "$EVIDENCE_CANDIDATE" ]] || exit 1',
+      'LEDGER="$EVIDENCE_ROOT/rollout-ledger.json"',
+      '[[ ! -e "$LEDGER" && ! -L "$LEDGER" ]] || exit 1',
+      '(set -o noclobber; : > "$LEDGER") || exit 1',
+      '[[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1',
+      'chmod 0600 "$LEDGER" || exit 1',
     ]);
     expect(lines.some((line) => line.includes('EVIDENCE_ROOT="/'))).toBe(false);
 
@@ -310,6 +560,27 @@ ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
 
       expect(() => execFileSync("bash", ["-c", block], {
         env: { ...process.env, EVIDENCE_ROOT: root },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+
+      const traversal = join(root, "docs", "..", "ledger-traversal");
+      expect(() => execFileSync("bash", ["-c", block], {
+        env: { ...process.env, EVIDENCE_ROOT: traversal },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+
+      const repoLink = join(tempRoot, "repo-link");
+      symlinkSync(root, repoLink);
+      expect(() => execFileSync("bash", ["-c", block], {
+        env: { ...process.env, EVIDENCE_ROOT: join(repoLink, "ledger") },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+
+      const existingRoot = join(tempRoot, "existing");
+      mkdirSync(existingRoot, { mode: 0o700 });
+      symlinkSync(root, join(existingRoot, "rollout-ledger.json"));
+      expect(() => execFileSync("bash", ["-c", block], {
+        env: { ...process.env, EVIDENCE_ROOT: existingRoot },
         stdio: ["pipe", "pipe", "pipe"],
       })).toThrow();
     } finally {
@@ -386,5 +657,12 @@ ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
     expect(failure).toContain("ledger retained");
     expect(failure).toContain("unbounded delete");
     expect(failure).toContain("second unrecorded credential attempt");
+    expectOrdered(failure, [
+      "provider Production pause control",
+      "bounded canonical-origin curl",
+      "HTTP `503`",
+      "DEPLOYMENT_PAUSED",
+      "state labeled `HOLD_PAUSED`",
+    ]);
   });
 });
