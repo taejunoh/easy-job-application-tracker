@@ -263,6 +263,9 @@ promotion. It is paused only across prepare/apply, and the actual platform
    ```bash
    set -euo pipefail
    : "${EVIDENCE_ROOT:?set EVIDENCE_ROOT to a private path outside the repository}"
+   file_mode() {
+     stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1"
+   }
    [[ "$EVIDENCE_ROOT" == /* ]] || exit 1
    EVIDENCE_PARENT="$(dirname -- "$EVIDENCE_ROOT")"
    EVIDENCE_BASENAME="$(basename -- "$EVIDENCE_ROOT")"
@@ -280,11 +283,13 @@ promotion. It is paused only across prepare/apply, and the actual platform
    EVIDENCE_ROOT="$EVIDENCE_CANDIDATE"
    [[ -d "$EVIDENCE_ROOT" && ! -L "$EVIDENCE_ROOT" ]] || exit 1
    [[ "$(cd -- "$EVIDENCE_ROOT" && pwd -P)" == "$EVIDENCE_CANDIDATE" ]] || exit 1
+   [[ "$(file_mode "$EVIDENCE_ROOT")" == "700" ]] || exit 1
    LEDGER="$EVIDENCE_ROOT/rollout-ledger.json"
    [[ ! -e "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
    (set -o noclobber; : > "$LEDGER") || exit 1
    [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
    chmod 0600 "$LEDGER" || exit 1
+   [[ "$(file_mode "$LEDGER")" == "600" ]] || exit 1
    ```
 
    Run this setup block locally before any fixture request; it contains no
@@ -323,13 +328,16 @@ promotion. It is paused only across prepare/apply, and the actual platform
 
    ```bash
    set -euo pipefail
+   file_mode() {
+     stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1"
+   }
    : "${EVIDENCE_ROOT:?private ledger path is required}"
    [[ -d "$EVIDENCE_ROOT" && ! -L "$EVIDENCE_ROOT" ]] || exit 1
    EVIDENCE_ROOT="$(cd -- "$EVIDENCE_ROOT" && pwd -P)" || exit 1
    LEDGER="$EVIDENCE_ROOT/rollout-ledger.json"
    [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
-   [[ "$(stat -f '%Lp' "$EVIDENCE_ROOT")" == "700" ]] || exit 1
-   [[ "$(stat -f '%Lp' "$LEDGER")" == "600" ]] || exit 1
+   [[ "$(file_mode "$EVIDENCE_ROOT")" == "700" ]] || exit 1
+   [[ "$(file_mode "$LEDGER")" == "600" ]] || exit 1
    [[ "${TARGET_SHA:-}" != "" ]] || exit 1
    [[ "${APP_BASE_URL:-}" == "https://easy-job-application-tracker.vercel.app" ]] || exit 1
    [[ "$STAGE_ONE_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
@@ -383,10 +391,10 @@ promotion. It is paused only across prepare/apply, and the actual platform
          timestamps: {recordedAt: $observedAt, readyObservedAt: $observedAt, canonicalPromotionVerifiedAt: $observedAt}
        }
      }' "$LEDGER" > "$STAGE_ONE_LEDGER_TMP" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
-   [[ -f "$LEDGER" && ! -L "$LEDGER" && "$(stat -f '%Lp' "$LEDGER")" == "600" ]] || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   [[ -f "$LEDGER" && ! -L "$LEDGER" && "$(file_mode "$LEDGER")" == "600" ]] || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    mv -f -- "$STAGE_ONE_LEDGER_TMP" "$LEDGER" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
-   [[ "$(stat -f '%Lp' "$LEDGER")" == "600" ]] || exit 1
+   [[ "$(file_mode "$LEDGER")" == "600" ]] || exit 1
    jq -e --arg id "$STAGE_ONE_CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg origin "$APP_BASE_URL" '
      type == "object" and .schemaVersion == 1 and
      (.fixtureOwnership | type == "object") and
@@ -594,35 +602,59 @@ promotion. It is paused only across prepare/apply, and the actual platform
    ```bash
    set -euo pipefail
    # Writers remain stopped and the ledger is retained on every failure.
+   CANONICAL_ORIGIN="https://easy-job-application-tracker.vercel.app"
+
+   file_mode() {
+     stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1"
+   }
+
+   validate_evidence_root() {
+     local REPO_ROOT="" EVIDENCE_PARENT="" EVIDENCE_BASENAME="" EVIDENCE_PARENT_REAL="" EVIDENCE_CANDIDATE=""
+     [[ -n "${EVIDENCE_ROOT:-}" && "$EVIDENCE_ROOT" == /* ]] || return 1
+     EVIDENCE_PARENT="$(dirname -- "$EVIDENCE_ROOT")" || return 1
+     EVIDENCE_BASENAME="$(basename -- "$EVIDENCE_ROOT")" || return 1
+     [[ -d "$EVIDENCE_PARENT" && -n "$EVIDENCE_BASENAME" && "$EVIDENCE_BASENAME" != "." && "$EVIDENCE_BASENAME" != ".." ]] || return 1
+     EVIDENCE_PARENT_REAL="$(cd -- "$EVIDENCE_PARENT" && pwd -P)" || return 1
+     EVIDENCE_CANDIDATE="$EVIDENCE_PARENT_REAL/$EVIDENCE_BASENAME"
+     REPO_ROOT="$(cd -- "$(git rev-parse --show-toplevel)" && pwd -P)" || return 1
+     case "$EVIDENCE_CANDIDATE" in "$REPO_ROOT"|"$REPO_ROOT"/*) return 1 ;; esac
+     [[ -d "$EVIDENCE_CANDIDATE" && ! -L "$EVIDENCE_CANDIDATE" ]] || return 1
+     [[ "$(cd -- "$EVIDENCE_CANDIDATE" && pwd -P)" == "$EVIDENCE_CANDIDATE" ]] || return 1
+     [[ "$(file_mode "$EVIDENCE_CANDIDATE")" == "700" ]] || return 1
+     EVIDENCE_ROOT="$EVIDENCE_CANDIDATE"
+     LEDGER="$EVIDENCE_ROOT/rollout-ledger.json"
+     [[ -f "$LEDGER" && ! -L "$LEDGER" && "$(file_mode "$LEDGER")" == "600" ]] || return 1
+   }
 
    enter_hold_paused() {
-     local PAUSE_BODY="" PAUSE_STATUS=""
+     local PAUSE_DIR="" PAUSE_BODY="" PAUSE_STATUS=""
      printf '%s\n' 'STOP: use the provider Production pause control now; no CLI pause/resume command is supported.' >&2
      read -r -p 'After the provider pause is complete, press Enter: ' _ </dev/tty || return 1
-     PAUSE_BODY="$(mktemp "$EVIDENCE_ROOT/pause-probe.XXXXXX")" || return 1
-     PAUSE_STATUS="$(curl --silent --show-error --output "$PAUSE_BODY" --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$APP_BASE_URL")" || { rm -f -- "$PAUSE_BODY"; return 1; }
+     PAUSE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/production-pause-probe.XXXXXX")" || { printf '%s\n' 'PAUSE_REQUIRED: unable to create a private pause probe.' >&2; return 1; }
+     PAUSE_BODY="$PAUSE_DIR/body"
+     PAUSE_STATUS="$(curl --silent --show-error --output "$PAUSE_BODY" --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$CANONICAL_ORIGIN")" || { rm -f -- "$PAUSE_BODY"; rmdir -- "$PAUSE_DIR"; return 1; }
      if [[ "$PAUSE_STATUS" != "503" ]] || ! grep -Fq 'DEPLOYMENT_PAUSED' "$PAUSE_BODY"; then
-       rm -f -- "$PAUSE_BODY"
+       rm -f -- "$PAUSE_BODY"; rmdir -- "$PAUSE_DIR"
+       printf '%s\n' 'PAUSE_REQUIRED: canonical 503 DEPLOYMENT_PAUSED was not verified; writers remain stopped.' >&2
        return 1
      fi
-     rm -f -- "$PAUSE_BODY" || return 1
+     rm -f -- "$PAUSE_BODY"; rmdir -- "$PAUSE_DIR" || return 1
      printf '%s\n' 'HOLD_PAUSED' >&2
      return 1
    }
 
    assert_canonical_unpaused() {
      local ORIGIN="${1:-}" HTTP_STATUS=""
-     [[ "$ORIGIN" == "https://easy-job-application-tracker.vercel.app" ]] || return 1
+     [[ "$ORIGIN" == "$CANONICAL_ORIGIN" ]] || return 1
      HTTP_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$ORIGIN")" || return 1
      [[ "$HTTP_STATUS" != "000" && "$HTTP_STATUS" != "503" ]] || return 1
      [[ "$HTTP_STATUS" =~ ^(2[0-9]{2}|3[0-9]{2}|401)$ ]] || return 1
    }
 
-   LEDGER="${EVIDENCE_ROOT:?private ledger path is required}/rollout-ledger.json"
-   [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || enter_hold_paused
+   validate_evidence_root || enter_hold_paused
    [[ -n "${TARGET_SHA:-}" ]] || enter_hold_paused
-   [[ "${APP_BASE_URL:-}" == "https://easy-job-application-tracker.vercel.app" ]] || enter_hold_paused
-   jq -e --arg sha "$TARGET_SHA" --arg origin "$APP_BASE_URL" '
+   [[ "${APP_BASE_URL:-}" == "$CANONICAL_ORIGIN" ]] || enter_hold_paused
+   jq -e --arg sha "$TARGET_SHA" --arg origin "$CANONICAL_ORIGIN" '
      .stage1 as $s |
      (.schemaVersion == 1) and
      ($s.deploymentId | type == "string" and test("^dpl_[A-Za-z0-9]+$")) and
@@ -645,16 +677,29 @@ promotion. It is paused only across prepare/apply, and the actual platform
    jq -e --arg id "$STAGE_ONE_RECORD_ID" '(.id == $id) and (.readyState == "READY") and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$STAGE_ONE_INSPECT" >/dev/null || enter_hold_paused
    STAGE_ONE_METADATA="$(vercel api "/v13/deployments/$STAGE_ONE_RECORD_ID" --raw | jq -ce 'if (.alias | type) == "array" then {id,readyState,target,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])} else error("deployment alias shape is not an array") end')" || enter_hold_paused
    jq -e --arg id "$STAGE_ONE_RECORD_ID" --arg sha "$TARGET_SHA" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$STAGE_ONE_METADATA" >/dev/null || enter_hold_paused
-   STAGE_ONE_CANONICAL="$(vercel inspect "$APP_BASE_URL" --format=json --no-color | jq -ce '{id}')" || enter_hold_paused
+   STAGE_ONE_CANONICAL="$(vercel inspect "$CANONICAL_ORIGIN" --format=json --no-color | jq -ce '{id}')" || enter_hold_paused
    jq -e --arg id "$STAGE_ONE_RECORD_ID" '.id == $id' <<<"$STAGE_ONE_CANONICAL" >/dev/null || enter_hold_paused
-   assert_canonical_unpaused "$APP_BASE_URL" || enter_hold_paused
+   # Normal PAUSED_AFTER_APPLY -> UNPAUSED_READONLY: prove the selector while
+   # paused, then stop for the manual provider resume checkpoint.
+   printf '%s\n' 'STOP: resume the recorded Stage 1 deployment with the provider manual/UI control, then press Enter.' >&2
+   read -r -p 'After resume is complete, press Enter: ' _ </dev/tty || enter_hold_paused
+   assert_canonical_unpaused "$CANONICAL_ORIGIN" || enter_hold_paused
+   RESUMED_CANONICAL="$(vercel inspect "$CANONICAL_ORIGIN" --format=json --no-color | jq -ce '{id}')" || enter_hold_paused
+   jq -e --arg id "$STAGE_ONE_RECORD_ID" '.id == $id' <<<"$RESUMED_CANONICAL" >/dev/null || enter_hold_paused
+   [[ -n "${ROLLBACK_READ_TOKEN:-}" ]] || enter_hold_paused
+   READONLY_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -H "Authorization: Bearer $ROLLBACK_READ_TOKEN" -- "$CANONICAL_ORIGIN/api/settings")" || enter_hold_paused
+   [[ "$READONLY_STATUS" =~ ^2[0-9]{2}$ ]] || enter_hold_paused
+   PRODUCTION_APP_URL="$CANONICAL_ORIGIN" PRODUCTION_APP_ACCESS_TOKEN="$ROLLBACK_READ_TOKEN" npm run check:production:writes-stopped >/dev/null || enter_hold_paused
+   unset RESUMED_CANONICAL READONLY_STATUS
+   validate_evidence_root || enter_hold_paused
 
    ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")" || enter_hold_paused
    [[ "$ROLLBACK_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || enter_hold_paused
    sleep 60 || enter_hold_paused
-   READONLY_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -H "Authorization: Bearer ${ROLLBACK_READ_TOKEN:?private read token is required}" -- "$APP_BASE_URL/api/settings")" || enter_hold_paused
+   [[ -n "${ROLLBACK_READ_TOKEN:-}" ]] || enter_hold_paused
+   READONLY_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -H "Authorization: Bearer $ROLLBACK_READ_TOKEN" -- "$CANONICAL_ORIGIN/api/settings")" || enter_hold_paused
    [[ "$READONLY_STATUS" =~ ^2[0-9]{2}$ ]] || enter_hold_paused
-   NEGATIVE_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$APP_BASE_URL/api/applications")" || enter_hold_paused
+   NEGATIVE_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$CANONICAL_ORIGIN/api/applications")" || enter_hold_paused
    [[ "$NEGATIVE_STATUS" == "401" ]] || enter_hold_paused
    unset ROLLBACK_READ_TOKEN STAGE_ONE_RECORD_ID STAGE_ONE_INSPECT STAGE_ONE_METADATA STAGE_ONE_CANONICAL ROLLBACK_CANDIDATE_ID READONLY_STATUS NEGATIVE_STATUS
    ```

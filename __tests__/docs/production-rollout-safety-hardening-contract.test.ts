@@ -55,6 +55,7 @@ function mockBin(): string {
   writeFileSync(join(directory, "git"), `#!/usr/bin/env bash
 if [[ "\${1:-} \${2:-}" == "status --porcelain" ]]; then exit 0; fi
 if [[ "\${1:-} \${2:-}" == "rev-parse HEAD" ]]; then printf '%s\\n' "\${TARGET_SHA:-}"; exit 0; fi
+if [[ "\${1:-} \${2:-}" == "rev-parse --show-toplevel" ]]; then printf '%s\\n' "\${MOCK_REPO_ROOT:?}"; exit 0; fi
 exit 2
 `, { mode: 0o700 });
   writeFileSync(join(directory, "vercel"), `#!/usr/bin/env bash
@@ -104,6 +105,7 @@ function runMocked(source: string, variables: Record<string, string>, body: stri
         DEPLOY_LOG: join(directory, "deploy.log"),
         PROMOTE_LOG: join(directory, "promote.log"),
         CURL_LOG: join(directory, "curl.log"),
+        MOCK_REPO_ROOT: root,
       },
     });
   } finally {
@@ -125,6 +127,7 @@ function runMockedFailure(source: string, variables: Record<string, string>, bod
           DEPLOY_LOG: join(directory, "deploy.log"),
           PROMOTE_LOG: join(directory, "promote.log"),
           CURL_LOG: join(directory, "curl.log"),
+          MOCK_REPO_ROOT: root,
         },
       });
       throw new Error("expected mocked rollout failure");
@@ -386,13 +389,13 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     const block = regressionBlock();
     const normalizedBlock = normalize(block);
     expectOrdered(normalizedBlock, [
-      'LEDGER="${EVIDENCE_ROOT:?private ledger path is required}/rollout-ledger.json"',
+      "validate_evidence_root || enter_hold_paused",
       'jq -e --arg sha "$TARGET_SHA"',
       "STAGE_ONE_RECORD_ID=\"$(jq -er '.stage1.deploymentId' \"$LEDGER\")\"",
       'STAGE_ONE_INSPECT="$(vercel inspect "$STAGE_ONE_RECORD_ID"',
       'STAGE_ONE_METADATA="$(vercel api "/v13/deployments/$STAGE_ONE_RECORD_ID"',
-      'STAGE_ONE_CANONICAL="$(vercel inspect "$APP_BASE_URL"',
-      'assert_canonical_unpaused "$APP_BASE_URL" || enter_hold_paused',
+      'STAGE_ONE_CANONICAL="$(vercel inspect "$CANONICAL_ORIGIN"',
+      'assert_canonical_unpaused "$CANONICAL_ORIGIN" || enter_hold_paused',
       'ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"',
       "sleep 60",
       'READONLY_STATUS="$(curl',
@@ -417,6 +420,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
   it("requires observed provider pause evidence before HOLD_PAUSED on missing evidence or a failed probe", () => {
     const testableBlock = regressionBlock()
       .replace(/^[ \t]*read -r -p 'After the provider pause is complete, press Enter: ' _ <\/dev\/tty \|\| return 1$/mu, "     :")
+      .replace(/   # Normal PAUSED_AFTER_APPLY -> UNPAUSED_READONLY:[\s\S]*?   validate_evidence_root \|\| enter_hold_paused\n\n/u, "")
       .replace("sleep 60 || enter_hold_paused", ":");
     const source = `${candidateFunction()}\n${testableBlock}`;
     const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-regression-"));
@@ -455,7 +459,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         CURL_STATUS_SEQUENCE: "401,401,401,500,503",
         CURL_BODY_SEQUENCE: "ignored,ignored,ignored,ignored,DEPLOYMENT_PAUSED",
       }, "");
-      expect(failedProbe.stderr).toContain("HOLD_PAUSED");
+      expect(failedProbe.stderr).toContain("PAUSE_REQUIRED");
       expect(failedProbe.deploys).toBe("deploy\n");
       expect(failedProbe.promotes).toBe("dpl_valid\n");
       expect(failedProbe.curlCalls).toBe(5);
