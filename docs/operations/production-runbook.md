@@ -821,9 +821,8 @@ promotion. It is paused only across prepare/apply, and the actual platform
    [[ -n "${ROLLBACK_READ_TOKEN:-}" ]] || enter_hold_paused
    READONLY_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -H "Authorization: Bearer $ROLLBACK_READ_TOKEN" -- "$CANONICAL_ORIGIN/api/settings")" || enter_hold_paused
    [[ "$READONLY_STATUS" =~ ^2[0-9]{2}$ ]] || enter_hold_paused
-   NEGATIVE_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$CANONICAL_ORIGIN/api/applications")" || enter_hold_paused
-   [[ "$NEGATIVE_STATUS" == "401" ]] || enter_hold_paused
-   unset ROLLBACK_READ_TOKEN STAGE_ONE_RECORD_ID STAGE_ONE_INSPECT STAGE_ONE_METADATA STAGE_ONE_CANONICAL ROLLBACK_CANDIDATE_ID READONLY_STATUS NEGATIVE_STATUS
+   PRODUCTION_APP_URL="$CANONICAL_ORIGIN" PRODUCTION_APP_ACCESS_TOKEN="$ROLLBACK_READ_TOKEN" npm run check:production:writes-stopped >/dev/null || enter_hold_paused
+   unset ROLLBACK_READ_TOKEN STAGE_ONE_RECORD_ID STAGE_ONE_INSPECT STAGE_ONE_METADATA STAGE_ONE_CANONICAL ROLLBACK_CANDIDATE_ID READONLY_STATUS
    ```
 
 9. After resume, stage the final `identity=1,writes=1` Ready Production
@@ -836,8 +835,8 @@ promotion. It is paused only across prepare/apply, and the actual platform
    [[ "$FINAL_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
    ```
 
-   Record the new/staged deployment ID after the procedure proves its exact
-   ID, `Ready` state, Production target, exact SHA, zero aliases, and no
+   Record the new/staged deployment after the procedure proves its exact ID,
+   `Ready` state, Production target, exact SHA, zero aliases, and no
    canonical alias. Do not
    create a new commit or deploy an unreviewed working tree. Run the
    authenticated `production monitor` only after Vercel is serving again and

@@ -115,9 +115,10 @@ if (( call_number < \${#bodies[@]} )); then body="\${bodies[$call_number]}"; els
 [[ "$output" == /dev/null ]] || printf '%s' "$body" > "$output"
 printf '%s' "$status"
 `, { mode: 0o700 });
-  writeFileSync(join(directory, "npm"), `#!/usr/bin/env bash
+writeFileSync(join(directory, "npm"), `#!/usr/bin/env bash
 printf '%s\\n' "\$*" >> "\${NPM_LOG:?}"
 printf '%s\\n' npm >> "\${ORDER_LOG:?}"
+[[ "\${NPM_FAIL:-}" != "true" ]]
 `, { mode: 0o700 });
   writeFileSync(join(directory, "sleep"), `#!/usr/bin/env bash
 printf 'sleep %s\\n' "\${1:-}" >> "\${SLEEP_LOG:?}"
@@ -582,11 +583,12 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
       'ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"',
       "sleep 60",
       'READONLY_STATUS="$(curl',
-      'NEGATIVE_STATUS="$(curl',
+      "check:production:writes-stopped",
       'unset ROLLBACK_READ_TOKEN',
     ]);
     expect(normalizedBlock).toContain("POST_RESUME_REGRESSION_CONFIRMED");
     expect(normalizedBlock).not.toContain("VERCEL_UNPAUSED_ATTESTED");
+    expect(normalizedBlock).not.toContain("NEGATIVE_STATUS");
   });
 
   it("executes PAUSED_AFTER_APPLY to UNPAUSED_READONLY through the exact recorded selector", () => {
@@ -619,7 +621,6 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     const testableBlock = regressionBlock()
       .replace(/^[ \t]*read -r -p 'After the provider pause is complete, press Enter: ' _ <\/dev\/tty \|\| return 1$/mu, "     :")
       .replace(/   # Normal PAUSED_AFTER_APPLY -> UNPAUSED_READONLY:[\s\S]*?   validate_stage1_write_stop_selector \|\| enter_hold_paused\n\n/u, "")
-      .replace("sleep 60 || enter_hold_paused", ":");
     const helperBlock = normalResumeBlock().slice(0, normalResumeBlock().indexOf("validate_stage1_write_stop_selector || enter_hold_paused"))
       .replace(/^[ \t]*read -r -p 'After the provider pause is complete, press Enter: ' _ <\/dev\/tty \|\| return 1$/mu, "     :");
     const source = `${candidateFunction()}\n${helperBlock}\n${testableBlock}`;
@@ -654,18 +655,29 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
           writeStopEvidence: writeStopEvidence("dpl_valid"),
         },
       }), { mode: 0o600 });
+      expect(runMocked(source, {
+        ...baseScenario(),
+        POST_RESUME_REGRESSION_CONFIRMED: "true",
+        EVIDENCE_ROOT: temporaryRoot,
+        ROLLBACK_READ_TOKEN: "private-test-token",
+        CURL_STATUS_SEQUENCE: "401,401,200",
+      }, '[[ "$(cat "$NPM_LOG")" == "run check:production:writes-stopped" ]] || exit 92')).toBe("");
+
+      const unchangedLedger = readFileSync(join(temporaryRoot, "rollout-ledger.json"), "utf8");
       const failedProbe = runMockedFailure(source, {
         ...baseScenario(),
         POST_RESUME_REGRESSION_CONFIRMED: "true",
         EVIDENCE_ROOT: temporaryRoot,
         ROLLBACK_READ_TOKEN: "private-test-token",
-        CURL_STATUS_SEQUENCE: "401,401,401,500,503",
-        CURL_BODY_SEQUENCE: "ignored,ignored,ignored,ignored,DEPLOYMENT_PAUSED",
+        NPM_FAIL: "true",
+        CURL_STATUS_SEQUENCE: "401,401,200,503",
+        CURL_BODY_SEQUENCE: "ignored,ignored,ignored,DEPLOYMENT_PAUSED",
       }, "");
-      expect(failedProbe.stderr).toContain("PAUSE_REQUIRED");
+      expect(failedProbe.stderr).toContain("HOLD_PAUSED");
       expect(failedProbe.deploys).toBe("deploy\n");
       expect(failedProbe.promotes).toBe("dpl_valid\n");
       expect(failedProbe.curlCalls).toBe(4);
+      expect(readFileSync(join(temporaryRoot, "rollout-ledger.json"), "utf8")).toBe(unchangedLedger);
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
