@@ -404,6 +404,73 @@ describe("authenticateApiRequest", () => {
     expect(touch).not.toHaveBeenCalled();
   });
 
+  it("rejects an installation with an invalid secret while writes are stopped", async () => {
+    const credential = createInstallationCredential({
+      encryptionSecret: ENCRYPTION_SECRET,
+      origin: EXTENSION_ORIGIN,
+    });
+    const touch = jest.fn().mockResolvedValue(true);
+    const installationStore = {
+      findForAuthentication: jest.fn().mockResolvedValue({
+        id: credential.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: credential.digest,
+        expiresAt: new Date(NOW + 60_000),
+        revokedAt: null,
+      }),
+      touch,
+    };
+    const invalidToken = tokenWithWrongSecret(credential.token);
+
+    await expect(
+      authenticateApiRequestAsync(
+        apiRequest("POST", {
+          authorization: `Bearer ${invalidToken}`,
+          origin: EXTENSION_ORIGIN,
+        }),
+        {
+          config: { ...config, applicationWritesEnabled: false },
+          now: NOW,
+          installationStore,
+        },
+      ),
+    ).resolves.toEqual(unauthorized);
+    expect(installationStore.findForAuthentication).toHaveBeenCalledWith(
+      credential.selector,
+    );
+    expect(touch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a valid installation when open-mode touch fails", async () => {
+    const credential = createInstallationCredential({
+      encryptionSecret: ENCRYPTION_SECRET,
+      origin: EXTENSION_ORIGIN,
+    });
+    const touch = jest.fn().mockResolvedValue(false);
+    const installationStore = {
+      findForAuthentication: jest.fn().mockResolvedValue({
+        id: credential.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: credential.digest,
+        expiresAt: new Date(NOW + 60_000),
+        revokedAt: null,
+      }),
+      touch,
+    };
+
+    await expect(
+      authenticateApiRequestAsync(
+        apiRequest("POST", {
+          authorization: `Bearer ${credential.token}`,
+          origin: EXTENSION_ORIGIN,
+        }),
+        { config, now: NOW, installationStore },
+      ),
+    ).resolves.toEqual(unauthorized);
+    expect(touch).toHaveBeenCalledTimes(1);
+    expect(touch).toHaveBeenCalledWith(credential.selector, new Date(NOW));
+  });
+
   it.each([
     ["revoked", new Date(NOW - 1), new Date(NOW + 60_000)],
     ["expired", null, new Date(NOW)],
@@ -684,4 +751,10 @@ function sessionFingerprint(token: string): string {
   const [encodedPayload] = token.split(".");
   return JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"))
     .fp;
+}
+
+function tokenWithWrongSecret(token: string): string {
+  const [prefix, selector, secret] = token.split(".");
+  const replacement = secret[0] === "A" ? "B" : "A";
+  return `${prefix}.${selector}.${replacement}${secret.slice(1)}`;
 }
