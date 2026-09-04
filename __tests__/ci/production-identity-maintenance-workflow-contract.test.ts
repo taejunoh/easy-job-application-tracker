@@ -12,10 +12,12 @@ const SETUP_NODE_SHA = "249970729cb0ef3589644e2896645e5dc5ba9c38";
 const UPLOAD_ARTIFACT_SHA =
   "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const PREPARE_REPORT_PATH = "$RUNNER_TEMP/application-identity-prepare.json";
+const PREPARE_ARTIFACT_PATH = "${{ runner.temp }}/application-identity-prepare.json";
 const APPROVED_REPORT_PATH = "$RUNNER_TEMP/approved/application-identity-prepare.json";
 const CURRENT_DRY_RUN_REPORT_PATH =
   "$RUNNER_TEMP/application-identity-current-dry-run.json";
 const APPLY_REPORT_PATH = "$RUNNER_TEMP/application-identity-apply.json";
+const APPLY_ARTIFACT_PATH = "${{ runner.temp }}/application-identity-apply.json";
 
 type Step = Readonly<{
   name: string;
@@ -367,8 +369,7 @@ describe("production identity maintenance workflow contract", () => {
     expect(normalizeCondition(prepareUpload?.if)).toBe("inputs.phase == 'prepare'");
     const preparePaths = artifactPaths(prepareUpload);
     expect(preparePaths).toHaveLength(1);
-    expect(preparePaths[0]).toMatch(/(?:\$\{\{\s*runner\.temp\s*\}\}|\$RUNNER_TEMP)/u);
-    expect(preparePaths[0]).toMatch(/\.json$/u);
+    expect(preparePaths[0]).toBe(PREPARE_ARTIFACT_PATH);
     expect(canonicalPath(preparePaths[0])).toBe(canonicalPath(prepareReport));
     expect(canonicalPath(preparePaths[0])).toBe(PREPARE_REPORT_PATH);
     const approvedExtractedReport = APPROVED_REPORT_PATH;
@@ -518,8 +519,7 @@ describe("production identity maintenance workflow contract", () => {
     expect(normalizeCondition(applyUpload?.if)).toBe("inputs.phase == 'apply'");
     const applyPaths = artifactPaths(applyUpload);
     expect(applyPaths).toHaveLength(1);
-    expect(applyPaths[0]).toMatch(/(?:\$\{\{\s*runner\.temp\s*\}\}|\$RUNNER_TEMP)/u);
-    expect(applyPaths[0]).toMatch(/\.json$/u);
+    expect(applyPaths[0]).toBe(APPLY_ARTIFACT_PATH);
     expect(canonicalPath(applyPaths[0])).toBe(APPLY_REPORT_PATH);
     expect(applyPaths.join("\n")).not.toMatch(
       /(?:raw|dump|backup|database|\.sql\b|\.csv\b|\.jsonl\b)/iu,
