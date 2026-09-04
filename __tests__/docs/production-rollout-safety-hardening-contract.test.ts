@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -105,6 +105,14 @@ function aliasJson(alias: string): string {
   return JSON.stringify({ id: "dpl_valid", readyState: "READY", aliases: JSON.parse(alias) });
 }
 
+function ledgerSetupBlock(): string {
+  const block = bashBlocks(rolloutSection()).find((candidate) =>
+    normalize(candidate).includes('touch "$EVIDENCE_ROOT/rollout-ledger.json"'),
+  );
+  expect(block).toBeDefined();
+  return block ?? "";
+}
+
 describe("production rollout staged-candidate binding documentation contract", () => {
   it("binds candidate data flow with explicit guards and safe projections", () => {
     const section = rolloutSection();
@@ -188,7 +196,10 @@ describe("production rollout staged-candidate binding documentation contract", (
     expect(stageOne).toBeGreaterThan(-1);
     expect(stageOne).toBeLessThan(pauseStart);
     expect(final).toBeGreaterThan(resumeStart);
-    expect(section.match(/stage_candidate "identity=1,writes=(?:0|1)"/gu)).toHaveLength(2);
+    expect(section.match(/stage_candidate "identity=1,writes=(?:0|1)"/gu)).toHaveLength(3);
+    const rollback = section.indexOf('stage_candidate "identity=1,writes=0"', resumeStart);
+    expect(rollback).toBeGreaterThan(resumeStart);
+    expect(rollback).toBeLessThan(final);
     expect(section.match(/vercel deploy \. --prod --skip-domain --yes --format=json --no-color/gu)).toHaveLength(1);
   });
 
@@ -216,5 +227,123 @@ ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
     expect(runMocked(source, { ...baseScenario(), APP_BASE_URL: "https://preview.example" }, `if stage_candidate "identity=1,writes=0"; then exit 66; fi
 [[ ! -s "\${DEPLOY_LOG:?}" ]] || exit 67
 [[ ! -s "\${PROMOTE_LOG:?}" ]] || exit 68`)).toBe("");
+  });
+
+  it("binds paused-after-apply rollback to the recorded identity-aware deployment", () => {
+    const section = rolloutSection();
+    const apply = section.indexOf('gh run watch "$APPLY_RUN_ID" --exit-status');
+    const paused = section.indexOf("PAUSED_AFTER_APPLY", apply);
+    const hold = section.indexOf("HOLD_PAUSED", paused);
+    const readonly = section.indexOf("Evidence approval resumes", hold);
+    const regression = section.indexOf("regression", readonly);
+    expect(apply).toBeGreaterThan(-1);
+    expect(paused).toBeGreaterThan(apply);
+    expect(hold).toBeGreaterThan(paused);
+    expect(readonly).toBeGreaterThan(hold);
+    expect(regression).toBeGreaterThan(readonly);
+
+    const pausedState = section.slice(paused, hold);
+    expect(pausedState).toContain("apply completed");
+    expect(pausedState).toContain("project is paused");
+    expect(pausedState).toContain('identity=1,writes=0');
+    expect(pausedState).toMatch(/recorded[^.\n]*Stage 1[^.\n]*deployment[^.\n]*Ready/iu);
+    expect(pausedState).toContain("apply, migration, schema, identity, and private fixture evidence");
+
+    const holdState = section.slice(hold, readonly);
+    expect(section.slice(paused, readonly)).toContain("missing or ambiguous");
+    expect(holdState).toContain("writers stopped");
+    expect(holdState).toMatch(/no (?:build, )?deploy, alias, or promote/iu);
+    expect(holdState).toContain("preserve");
+
+    const resumeState = section.slice(readonly, regression);
+    expect(normalize(resumeState)).toMatch(/resume[^.]*recorded[^.]*same-identity[^.]*exact[^.]*deployment[^.]*without redeploy/iu);
+    expect(resumeState).toContain("read-only");
+    expect(resumeState).toContain("negative probes");
+    expect(resumeState).not.toMatch(/vercel\s+(?:build|deploy|alias|promote)/iu);
+
+    const regressionState = section.slice(regression);
+    expect(regressionState).toContain('stage_candidate "identity=1,writes=0"');
+    expect(normalize(regressionState)).toContain("Ready, inspected Production candidate");
+    expect(normalize(regressionState)).toContain("reviewed compatible exact SHA and exact ID");
+    expect(regressionState).toContain("only while unpaused");
+    expect(regressionState).toContain("drain");
+    expect(regressionState).toContain("at least 60 seconds");
+    expect(regressionState).toContain("If absent");
+    expect(regressionState).toContain("HOLD_PAUSED");
+
+    expect(normalize(section)).toMatch(/never resume[^.]*identity-unaware[^.]*pre-apply[^.]*remembered URL[^.]*environment[^.]*claim/iu);
+    expect(normalize(section)).toMatch(/never enable writers merely to recover/iu);
+    expect(normalize(section)).toMatch(/no state[^.]*permits promotion while paused/iu);
+    expect(section.match(/vercel\s+promote\b/giu)).toHaveLength(1);
+  });
+
+  it("defines a fail-closed private ledger setup with restrictive modes", () => {
+    const block = ledgerSetupBlock();
+    const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
+    expectOrdered(block, [
+      ': "${EVIDENCE_ROOT:?set EVIDENCE_ROOT to a private path outside the repository}"',
+      '[[ "$EVIDENCE_ROOT" == /* ]]',
+      'case "$EVIDENCE_ROOT" in',
+      'umask 077',
+      'install -d -m 0700 "$EVIDENCE_ROOT"',
+      'touch "$EVIDENCE_ROOT/rollout-ledger.json"',
+      'chmod 0600 "$EVIDENCE_ROOT/rollout-ledger.json"',
+    ]);
+    expect(lines.some((line) => line.includes('EVIDENCE_ROOT="/'))).toBe(false);
+
+    const tempRoot = mkdtempSync(join(tmpdir(), "production-rollout-ledger-"));
+    try {
+      const privateRoot = join(tempRoot, "private");
+      execFileSync("bash", ["-c", `${block}\n[[ -d "$EVIDENCE_ROOT" ]] && [[ -f "$EVIDENCE_ROOT/rollout-ledger.json" ]]`], {
+        env: { ...process.env, EVIDENCE_ROOT: privateRoot },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      expect(statSync(privateRoot).mode & 0o777).toBe(0o700);
+      expect(statSync(join(privateRoot, "rollout-ledger.json")).mode & 0o777).toBe(0o600);
+
+      expect(() => execFileSync("bash", ["-c", block], {
+        env: { ...process.env, EVIDENCE_ROOT: root },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("records ownership-limited fixture cleanup and safe Settings semantics", () => {
+    const section = rolloutSection();
+    const normalizedSection = normalize(section);
+    for (const requirement of [
+      "rollout SHA",
+      "staged candidate ID",
+      "promoted deployment ID",
+      "canonical origin",
+      "exact owned Application IDs",
+      "pre- and post-probe hashes",
+      "Settings singleton existed before",
+      "pre-stop unconsumed pairing grant",
+      "installed credential",
+      "installation ID",
+      "every Application, pairing grant, or installation created after resume",
+      "expected terminal state",
+      "observed result",
+    ]) expect(normalizedSection).toContain(requirement);
+    expect(normalizedSection).toMatch(/private[^.]*directory[^.]*0700/iu);
+    expect(normalizedSection).toMatch(/ledger[^.]*0600/iu);
+    expect(normalizedSection).toContain("never committed or uploaded");
+    expect(normalizedSection).toMatch(/only exact ledger-owned Application IDs/iu);
+    expect(normalizedSection).toMatch(/never search or delete by broad (?:name|timestamp|origin|user)/iu);
+    expect(normalizedSection).toContain("exactly once");
+    expect(normalizedSection).toContain("replay rejection");
+    expect(normalizedSection).toContain("credential returns `401`");
+    expect(normalizedSection).toContain("final counts and content hashes");
+    expect(normalizedSection).toContain("ledger retained");
+    expect(normalizedSection).toContain("second unrecorded credential attempt");
+    expect(normalizedSection).toContain("syntactically valid `PUT /api/settings`");
+    expect(normalizedSection).toContain("private, non-production canary");
+    expect(normalizedSection).toContain("stopped-write response");
+    expect(normalizedSection).toContain("unchanged Settings existence and content hash");
+    expect(normalizedSection).toContain("Settings singleton is created only on the first successful `PUT /api/settings`");
+    expect(normalizedSection).toContain("authenticated `GET /api/settings` never creates the row");
   });
 });

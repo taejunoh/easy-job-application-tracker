@@ -248,6 +248,29 @@ promotion. It is paused only across prepare/apply, and the actual platform
    pairing grant. Keep their URL, IDs, tokens, pairing codes, and request/
    response bodies only in a private mode-0700 workspace; never put them in
    logs, artifacts, Actions output, shell history, PR/comments, or docs.
+   Create the private fixture ledger before creating or using any fixture. This
+   creates a private directory with mode `0700` and a ledger with mode `0600`.
+   The path is supplied by the operator and must be absolute and outside this
+   repository; a missing, relative, or repository-local path fails closed:
+
+   ```bash
+   set -euo pipefail
+   : "${EVIDENCE_ROOT:?set EVIDENCE_ROOT to a private path outside the repository}"
+   REPO_ROOT="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
+   [[ "$EVIDENCE_ROOT" == /* ]] || exit 1
+   case "$EVIDENCE_ROOT" in
+     "$REPO_ROOT"|"$REPO_ROOT"/*) exit 1 ;;
+   esac
+   umask 077
+   install -d -m 0700 "$EVIDENCE_ROOT"
+   touch "$EVIDENCE_ROOT/rollout-ledger.json"
+   chmod 0600 "$EVIDENCE_ROOT/rollout-ledger.json"
+   ```
+
+   Retain `rollout-ledger.json` until cleanup verification succeeds. It is
+   private operator material: never committed or uploaded; never echo or copy it to logs,
+   Actions artifacts, pull requests, specifications, README files, shell
+   history, or deployment output.
 3. Stage the Stage 1 `identity=1,writes=0` candidate while unpaused:
 
    ```bash
@@ -271,10 +294,13 @@ promotion. It is paused only across prepare/apply, and the actual platform
    negative probe. Use the exact fixtures to prove all eight persistent
    mutations return HTTP `503` with code `writes_stopped`: Application
    POST/PATCH/DELETE; Settings PUT; pairing creation; valid pair exchange;
-   installation deletion; and self-revoke. Also prove Settings GET does not
-   create a row and installation-authenticated reads do not touch
-   `lastUsedAt/updatedAt`. Compare only sanitized counts/hashes before and
-   after, and record sanitized results.
+   installation deletion; and self-revoke. The Settings singleton is created
+   only on the first successful `PUT /api/settings`; Settings GET does not
+   create a row, and an authenticated `GET /api/settings` never creates the
+   row. Also prove
+   installation-authenticated reads do not touch `lastUsedAt/updatedAt`.
+   Compare only sanitized counts/hashes before and after, and record sanitized
+   results in the private ledger.
 4. Pause Vercel Production using the provider's Production project pause
    control and REQUIRE the actual canonical `503 DEPLOYMENT_PAUSED` before any
    prepare/apply. Record pause evidence and the observation. The operator must
@@ -327,7 +353,6 @@ promotion. It is paused only across prepare/apply, and the actual platform
    backfill directly.
 
    ```bash
-   EVIDENCE_ROOT="/absolute/private/application-identity-maintenance"
    install -d -m 0700 "$EVIDENCE_ROOT/prepare"
    PREPARE_REPORT="$EVIDENCE_ROOT/prepare/application-identity-prepare.json"
    gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-prepare-$PREPARE_RUN_ID" --dir "$EVIDENCE_ROOT/prepare"
@@ -394,10 +419,42 @@ promotion. It is paused only across prepare/apply, and the actual platform
 7. After the apply report, migration status, empty schema diff, row counts, and
    unique identity index are approved, keep Vercel paused and confirm the
    actual `503 DEPLOYMENT_PAUSED`. Do not build or promote while paused.
-8. Resume Vercel Production; resume the recorded same
-   `identity=1,writes=0` read-only deployment without redeploying. Confirm the
-   pause is cleared and the canonical origin is no longer the platform `503`;
-   do not build or promote as part of this resume.
+
+   **Paused-after-apply state machine.** Enter `PAUSED_AFTER_APPLY` only after
+   apply completed, the project is paused, and the recorded Stage 1 `identity=1,writes=0` deployment is known `Ready`. Review apply, migration, schema, identity, and private fixture evidence before any resume action.
+   Any failure, or a missing or ambiguous compatible candidate, enters
+   `HOLD_PAUSED`: preserve all evidence, keep ordinary and external writers stopped, and perform no build, deploy, alias, or promote. No paused state
+   permits promotion, and never enable writers merely to recover. No state
+   permits promotion while paused.
+
+   Evidence approval resumes the recorded same-identity exact Stage 1 deployment
+   without redeploying and enters `UNPAUSED_READONLY`. Run only
+   read-only and authenticated negative probes after the resume. Never resume
+   an identity-unaware, pre-apply, remembered URL, or environment-claim-only
+   target. If a regression occurs after resume, remain unpaused only long
+   enough to reuse the existing `stage_candidate` procedure with stage name
+   `identity=1,writes=0`; its Ready, inspected Production candidate must prove
+   the reviewed compatible exact SHA and exact ID before its exact ID is
+   promoted. Execute the same guarded procedure only while unpaused; do not
+   add a second deploy or promotion procedure. Drain at least 60 seconds and
+   probe again. If absent, pause and enter `HOLD_PAUSED` with writers stopped.
+
+   Cleanup or rejection failure also returns to `HOLD_PAUSED`; ledger retained
+   with all evidence and the safe paused/read-only state is preserved. Cleanup
+   failure never permits an unbounded delete or a second unrecorded credential
+   attempt.
+   There is
+   no build, deploy, alias, or promote command reachable from a paused state.
+
+8. Resume Vercel Production only after the `PAUSED_AFTER_APPLY` evidence gate
+   is approved. Resume the recorded same-identity exact Stage 1 deployment
+   without redeploying. Confirm the pause is cleared and the canonical origin
+   is no longer the platform `503`; do not build or promote as part of this
+   resume. If a read-only regression is observed after resume, execute the same
+   guarded procedure as `ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"`
+   only while unpaused; its Ready, inspected Production candidate must prove
+   the reviewed compatible exact SHA and exact ID before its exact ID is
+   promoted.
 9. After resume, stage the final `identity=1,writes=1` Ready Production
    candidate with the same exact TARGET_SHA, using the same canonical
    procedure while unpaused:
@@ -431,13 +488,33 @@ promotion. It is paused only across prepare/apply, and the actual platform
    revoked credential. No other
    session, automation, background job, or writer may perform these operations,
    and these checks must not run while Vercel is paused.
-11. After the final write-enabled promotion and successful smoke, delete the
-    disposable Application, consume the still-unconsumed pairing grant exactly
-    once, revoke both disposable installations, and verify bounded cleanup.
-    Record only sanitized statuses/counts/hashes. Finally, resume external writers last;
-    external writers are resumed last, after every cleanup check;
-    `resume Application writers LAST` is the final action and occurs only after
-    every cleanup and smoke pass succeeds.
+11. After the final write-enabled promotion and successful smoke, perform
+    ownership-limited cleanup from the private ledger. Delete only exact ledger-owned Application IDs through supported application paths; never
+    search or delete by broad name, timestamp, origin, or user. Consume the
+    recorded pre-stop unconsumed pairing grant exactly once, then prove replay
+    rejection. Revoke every ledger-owned installation, then prove the exact
+    stored credential returns `401`. Reconcile final counts and content hashes
+    with the ledger and record each action, expected terminal state, timestamp,
+    and observed result without recording private values.
+
+    The ledger records the exact rollout SHA, staged candidate ID(s), promoted deployment ID values, canonical origin, exact owned Application IDs with
+    pre- and post-probe hashes, whether the Settings singleton existed before the probe and its
+    pre/post content hashes, the pre-stop unconsumed pairing grant and its
+    pairing code/reference only inside the private ledger, the installed credential needed for the later
+    `401` proof and its installation ID, and every Application, pairing grant,
+    or installation created after resume before it is used. Keep credential,
+    pairing code, URL, title, company, note, resume text, and raw row/body
+    values only inside the private directory and ledger. Never make a second
+    unrecorded credential attempt.
+
+    The stopped-write Settings check is a syntactically valid
+    `PUT /api/settings` containing only a private, non-production canary. It
+    must return the exact HTTP `503` stopped-write response while preserving unchanged
+    Settings existence and content hash. Any unexpected response or hash/
+    existence change stops the operation immediately; do not overwrite the
+    row for cleanup. Record only sanitized statuses/counts/hashes. Finally,
+    resume external writers last; `resume Application writers LAST` is the
+    final action and occurs only after every cleanup check succeeds.
 12. The final action is `resume Application writers LAST`; general Application
    writer resume is last and occurs only after every post-resume smoke pass
    succeeds. Retain only privacy-safe prepare/apply reports and approved
