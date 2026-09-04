@@ -1,10 +1,18 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { access, chmod, rename, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
 import pg from "pg";
 import {
   fingerprintClient,
@@ -46,16 +54,11 @@ const SIGNAL_EXIT_CODES = new Map([
 ]);
 const TERMINATION_GRACE_MS = 2_000;
 const CLEANUP_CONTROL_TIMEOUT_MS = 2_500;
-const DOCKER_DUMP_WRAPPER = [
-  "set -u",
+export const DOCKER_DUMP_WRAPPER = [
+  "set -eu",
   "pidfile=$1; startfile=$2; cancelfile=$3; shift 3",
   "umask 077",
-  "child=",
   "terminate() {",
-  "  if [ -n \"$child\" ]; then",
-  "    kill -TERM \"$child\" 2>/dev/null || true",
-  "    wait \"$child\" 2>/dev/null || true",
-  "  fi",
   "  exit 143",
   "}",
   "trap terminate INT TERM HUP",
@@ -65,15 +68,7 @@ const DOCKER_DUMP_WRAPPER = [
   "  sleep 0.05",
   "done",
   "[ -e \"$cancelfile\" ] && exit 143",
-  "sh -c 'kill -STOP \"$$\"; exec pg_dump \"$@\"' jobtracker-pg-dump \"$@\" &",
-  "child=$!",
-  "printf '%s\\n' \"$child\" > \"$pidfile\"",
-  "[ -e \"$cancelfile\" ] && terminate",
-  "kill -CONT \"$child\"",
-  "wait \"$child\"",
-  "status=$?",
-  "trap - INT TERM HUP",
-  "exit \"$status\"",
+  "exec pg_dump \"$@\"",
 ].join("\n");
 const DOCKER_STOP_WRAPPER = [
   "set -eu",
@@ -655,11 +650,25 @@ async function main() {
   return supervisor.interruption;
 }
 
-try {
-  const interruption = await main();
-  if (interruption) process.exitCode = interruption.exitCode;
-  else process.stdout.write("Production backup snapshot created.\n");
-} catch {
-  process.stderr.write("Production backup failed.\n");
-  process.exitCode = 1;
+async function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    return (
+      (await realpath(process.argv[1])) ===
+      (await realpath(fileURLToPath(import.meta.url)))
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (await isMainModule()) {
+  try {
+    const interruption = await main();
+    if (interruption) process.exitCode = interruption.exitCode;
+    else process.stdout.write("Production backup snapshot created.\n");
+  } catch {
+    process.stderr.write("Production backup failed.\n");
+    process.exitCode = 1;
+  }
 }

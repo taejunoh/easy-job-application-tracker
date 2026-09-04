@@ -147,7 +147,7 @@ describe("deployment verification contract", () => {
       "cancel-in-progress": true,
     });
     expect(job["runs-on"]).toBe("ubuntu-latest");
-    expect(job["timeout-minutes"]).toBe(25);
+    expect(job["timeout-minutes"]).toBe(40);
     expect(job.services).toEqual({
       postgres: {
         image:
@@ -193,6 +193,10 @@ describe("deployment verification contract", () => {
         run: "address=\"$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \"$POSTGRES_SERVICE_CONTAINER_ID\")\"\nprintf 'EXPECTED_DATABASE_SERVER_ADDRESS=%s\\n' \"$address\" >> \"$GITHUB_ENV\"\n",
       },
       { name: "Install dependencies", run: "npm ci" },
+      {
+        name: "Install Playwright headless shell",
+        run: "npx playwright install --with-deps --only-shell chromium",
+      },
       {
         name: "Enforce dependency audit policy",
         run: "npm run check:audit",

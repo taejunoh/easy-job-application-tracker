@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -158,6 +159,130 @@ describe("npm audit exception policy", () => {
     }
   });
 
+  it("retries transient full and production audit responses before applying policy", () => {
+    const logPath = join(temporaryDirectory, "npm-calls.jsonl");
+    const fakeNpm = writeFakeNpm({
+      logPath,
+      fullFixturePath: join(fixtures, "audit-allowed.json"),
+      productionFixturePath: join(temporaryDirectory, "production.json"),
+      firstResponse: "error-json",
+    });
+    const policy = structuredClone(allowedExceptions);
+    policy.reviewBy = "2099-01-01";
+    const policyPath = writeFixture("live-exceptions.json", policy);
+    writeFileSync(
+      join(temporaryDirectory, "production.json"),
+      JSON.stringify({
+        auditReportVersion: 2,
+        vulnerabilities: {},
+        metadata: {
+          vulnerabilities: {
+            info: 0,
+            low: 0,
+            moderate: 0,
+            high: 0,
+            critical: 0,
+            total: 0,
+          },
+        },
+      }),
+    );
+
+    const result = runLivePolicy(
+      policyPath,
+      fakeNpm,
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(
+      readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line)),
+    ).toEqual([
+      ["audit", "--json"],
+      ["audit", "--json"],
+      ["audit", "--json", "--omit=dev"],
+      ["audit", "--json", "--omit=dev"],
+    ]);
+  });
+
+  it("fails closed after exhausting transient audit attempts without leaking npm output", () => {
+    const logPath = join(temporaryDirectory, "npm-calls.jsonl");
+    const fakeNpm = writeFakeNpm({
+      logPath,
+      fullFixturePath: join(fixtures, "audit-allowed.json"),
+      productionFixturePath: join(fixtures, "audit-allowed.json"),
+      firstResponse: "exit-2",
+    });
+
+    const startedAt = Date.now();
+    const result = runLivePolicy(
+      join(fixtures, "exceptions-allowed.json"),
+      fakeNpm,
+    );
+
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr.trim()).toBe("Audit policy failed: counts unavailable");
+    expect(`${result.stdout}${result.stderr}`).not.toContain("registry-private-error");
+    expect(readFileSync(logPath, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  it("does not retry a valid v2 high-severity full audit report", () => {
+    const clean = emptyAuditReport();
+    const high = withHighSeverity(clean);
+    const highFixturePath = writeFixture("high-full.json", high);
+    const logPath = join(temporaryDirectory, "npm-calls.jsonl");
+    const fakeNpm = writeFakeNpm({
+      logPath,
+      fullFixturePath: writeFixture("clean-full.json", clean),
+      productionFixturePath: writeFixture("clean-production.json", clean),
+      highFixturePath,
+      firstResponse: "high-full",
+    });
+
+    const result = runLivePolicy(
+      writeFixture("clean-exceptions.json", emptyPolicy()),
+      fakeNpm,
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr.trim()).toBe(
+      "Audit policy failed: full critical=0 high=1 moderate=0 low=0 production critical=0 high=0 moderate=0 low=0 exceptions=0",
+    );
+    expect(readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line))).toEqual([
+      ["audit", "--json"],
+      ["audit", "--json", "--omit=dev"],
+    ]);
+  });
+
+  it("does not retry a valid v2 high-severity production audit report", () => {
+    const clean = emptyAuditReport();
+    const highFixturePath = writeFixture("high-production.json", withHighSeverity(clean));
+    const logPath = join(temporaryDirectory, "npm-calls.jsonl");
+    const fakeNpm = writeFakeNpm({
+      logPath,
+      fullFixturePath: writeFixture("clean-full.json", clean),
+      productionFixturePath: writeFixture("clean-production.json", clean),
+      highFixturePath,
+      firstResponse: "high-production",
+    });
+
+    const result = runLivePolicy(
+      writeFixture("clean-exceptions.json", emptyPolicy()),
+      fakeNpm,
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr.trim()).toBe(
+      "Audit policy failed: full critical=0 high=0 moderate=0 low=0 production critical=0 high=1 moderate=0 low=0 exceptions=0",
+    );
+    expect(readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line))).toEqual([
+      ["audit", "--json"],
+      ["audit", "--json", "--omit=dev"],
+    ]);
+  });
+
   it("rejects expired and stale exceptions", () => {
     const expired = structuredClone(allowedExceptions);
     expired.reviewBy = "2026-07-13";
@@ -204,6 +329,97 @@ describe("npm audit exception policy", () => {
     writeFileSync(path, JSON.stringify(value));
     return path;
   }
+
+  function emptyAuditReport(): AuditFixture {
+    return {
+      auditReportVersion: 2,
+      vulnerabilities: {},
+      metadata: {
+        vulnerabilities: {
+          info: 0,
+          low: 0,
+          moderate: 0,
+          high: 0,
+          critical: 0,
+          total: 0,
+        },
+      },
+    };
+  }
+
+  function withHighSeverity(audit: ReturnType<typeof emptyAuditReport>) {
+    const high = structuredClone(audit);
+    high.vulnerabilities["high-package"] = concreteVulnerability(
+      "high-package",
+      "GHSA-aaaa-bbbb-cccc",
+      "high",
+    );
+    high.metadata.vulnerabilities.high = 1;
+    high.metadata.vulnerabilities.total = 1;
+    return high;
+  }
+
+  function emptyPolicy() {
+    return {
+      schemaVersion: 1,
+      reviewedOn: "2026-01-01",
+      reviewBy: "2099-01-01",
+      exceptions: [],
+    };
+  }
+
+  function writeFakeNpm(options: {
+    logPath: string;
+    fullFixturePath: string;
+    productionFixturePath: string;
+    highFixturePath?: string;
+    firstResponse: "error-json" | "exit-2" | "high-full" | "high-production";
+  }) {
+    const path = join(temporaryDirectory, "npm");
+    writeFileSync(
+      path,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const calls = fs.existsSync(${JSON.stringify(options.logPath)})
+  ? fs.readFileSync(${JSON.stringify(options.logPath)}, "utf8").trim().split("\\n").filter(Boolean)
+  : [];
+fs.appendFileSync(${JSON.stringify(options.logPath)}, JSON.stringify(args) + "\\n");
+if (${JSON.stringify(options.firstResponse)} === "exit-2") {
+  process.stderr.write("registry-private-error");
+  process.exit(2);
+}
+const production = args.includes("--omit=dev");
+const priorAttempts = calls.filter((call) => JSON.parse(call).includes("--omit=dev") === production).length;
+if (priorAttempts === 0) {
+  const highFirst = ${JSON.stringify(options.firstResponse)} === "high-full"
+    ? !production
+    : ${JSON.stringify(options.firstResponse)} === "high-production"
+      ? production
+      : false;
+  if (highFirst) {
+    process.stdout.write(fs.readFileSync(${JSON.stringify(options.highFixturePath ?? "")}, "utf8"));
+    process.exit(1);
+  }
+  if (${JSON.stringify(options.firstResponse)} === "high-full" || ${JSON.stringify(options.firstResponse)} === "high-production") {
+    const cleanFixturePath = production
+      ? ${JSON.stringify(options.productionFixturePath)}
+      : ${JSON.stringify(options.fullFixturePath)};
+    process.stdout.write(fs.readFileSync(cleanFixturePath, "utf8"));
+    process.exit(0);
+  }
+  process.stdout.write(JSON.stringify({ error: { code: "ENOAUDIT", summary: "registry-private-error" } }));
+  process.exit(1);
+}
+const fixturePath = production
+  ? ${JSON.stringify(options.productionFixturePath)}
+  : ${JSON.stringify(options.fullFixturePath)};
+process.stdout.write(fs.readFileSync(fixturePath, "utf8"));
+`,
+    );
+    chmodSync(path, 0o755);
+    return path;
+  }
 });
 
 function runPolicy(
@@ -227,6 +443,22 @@ function runPolicy(
     process.execPath,
     args,
     { cwd: root, encoding: "utf8" },
+  );
+}
+
+function runLivePolicy(exceptionsPath: string, fakeNpm: string) {
+  return spawnSync(
+    process.execPath,
+    [script, "--exceptions-file", exceptionsPath],
+    {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${join(fakeNpm, "..")}:${process.env.PATH ?? ""}`,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
   );
 }
 

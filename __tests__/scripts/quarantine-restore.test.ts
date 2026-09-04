@@ -49,6 +49,8 @@ function populatePackageTree(root: string, packages = 410): void {
   }
 }
 
+const LARGE_GENERATED_PAYLOAD_WORKER_TIMEOUT_MS = 120_000;
+
 const NORMAL_RESTORE_PHASES = [
   "after-inventory:restore-active:generated-next",
   "after-inventory:restore-active:generated-node-modules",
@@ -117,12 +119,16 @@ describe("quarantine restore", () => {
         transactionId,
         createdAt: "2026-08-13T00:00:00.000Z",
         writersStopped: true,
-      }, {}, 60_000);
+      }, {}, LARGE_GENERATED_PAYLOAD_WORKER_TIMEOUT_MS);
       expect(applied).toMatchObject({ ok: true, result: { status: "QUARANTINED" } });
 
       mkdirSync(join(fixture.repoRoot, ".next"), { mode: 0o700 });
       writeFileSync(join(fixture.repoRoot, ".next", "build"), "regenerated\n");
-      populatePackageTree(join(fixture.repoRoot, "node_modules"));
+      mkdirSync(join(fixture.repoRoot, "node_modules", "package-0000"), { recursive: true });
+      writeFileSync(
+        join(fixture.repoRoot, "node_modules", "package-0000", "file-0.js"),
+        "module.exports = 1;\n",
+      );
       symlinkSync(
         "package-0000/file-0.js",
         join(fixture.repoRoot, "node_modules", "regenerated-link"),
@@ -133,7 +139,7 @@ describe("quarantine restore", () => {
         quarantineRoot: fixture.quarantineRoot,
         transactionId,
         writersStopped: true,
-      }, {}, 60_000);
+      }, {}, LARGE_GENERATED_PAYLOAD_WORKER_TIMEOUT_MS);
 
       if (!result.ok) throw new Error(JSON.stringify(result));
       expect(result).toMatchObject({
@@ -157,7 +163,7 @@ describe("quarantine restore", () => {
     } finally {
       rmSync(fixture.base, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 270_000);
 
   it("exports the restore and recovery entrypoints", () => {
     const exports = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `

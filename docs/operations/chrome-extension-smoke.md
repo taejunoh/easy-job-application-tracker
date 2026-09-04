@@ -111,15 +111,59 @@ Perform the smoke:
    pairing-code input is cleared after successful pairing by design; verify retention
    through connected status and reopen restoration, not visible code
    persistence.
-6. Delete the temporary application from the dashboard and confirm the unique
-   marker no longer appears.
-7. Select **Disconnect** and confirm no cleanup warning is shown in the popup
+6. Keep the paired popup/session available and complete the [revocation and
+   consumed-code replay lifecycle](#revocation-and-consumed-code-replay-lifecycle)
+   before using **Disconnect**. Do not use **Disconnect** as proof of server-side
+   revocation: it deletes the local credential as part of local cleanup.
+7. After the lifecycle, confirm the unique marker no longer appears in the
+   dashboard. The only durable cleanup targets are the uniquely created smoke
+   row and the exact smoke installation; leave no unrelated data changed.
+8. If local cleanup is still pending after the lifecycle, select
+   **Disconnect** and confirm no cleanup warning is shown in the popup
    connection-status area. Reload the extension in `chrome://extensions`,
    return to the job tab, and click the JobTracker toolbar icon. The reopened
    popup after reload must remain disconnected; confirm that it does. The exact
    runtime-requested origin may remain listed under Site access after removal
    in Chrome 150 (the verified version); its toggle must be off. Mere list
    presence does not mean host access remains granted.
+
+### Revocation and consumed-code replay lifecycle
+
+Run this lifecycle with the same dedicated profile and unique smoke data used
+above. Keep the paired popup/session available until the server-side revoke and
+the extension's 401 handling are both confirmed.
+
+1. In the authenticated **Settings → Chrome extension installations** view,
+   select the exact smoke installation created for this check and revoke the
+   exact smoke installation server-side. Confirm the installation is marked
+   revoked in Settings; do not
+   use **Disconnect** as this confirmation because it deletes the local
+   credential before the server-side check.
+2. Trigger an extension authenticated request after revocation by reloading the
+   extension in `chrome://extensions` and reopening the paired popup. Its
+   startup `/api/auth/verify` request must receive `401`; confirm the popup shows
+   the expired/disconnected state and that local credential cleanup (including
+   the installation credential) completed. Do not expose or log the credential
+   or response body.
+3. After the 401 handler leaves the original extension disconnected and
+   credential-free, keep using that original extension popup/profile for the
+   replay check. Before entering the code, verify that its extension origin
+   exactly equals the original approved origin (`chrome-extension://...`) and
+   that the installed extension ID is unchanged. Do not reinstall/load another
+   copy: this unpacked manifest has no stable key, so doing so changes the
+   extension ID. If a second context is used for troubleshooting, it must
+   preserve the exact same extension origin; an origin mismatch is invalid
+   evidence.
+4. In that same original extension popup/context, attempt to reuse the exact
+   already-consumed one-time code from the successful pairing. Keep the code
+   only in private operator memory while entering it; do not expose or log the
+   code. The `/api/extension/pair` request must be rejected with `401`, no new
+   installation may be created, and the popup must report that the pairing code
+   was not accepted.
+5. Confirm cleanup targets only the unique smoke row and unique smoke
+   installation: delete the row, leave the exact installation revoked, and
+   discard the transient code. Do not disconnect or revoke any unrelated
+   installation or delete any unrelated application row.
 
 Cleanup is unconditional, including when an earlier step fails: delete the
 unique-marker row, disconnect the extension, remove the exact site permission,

@@ -240,6 +240,47 @@ export function extensionServiceWorkerStateFromCdp(state, extensionId) {
   });
 }
 
+// Fixed protocol used only by the runner's ephemeral copy of the extension.
+export const EXTENSION_E2E_WAKE_CHANNEL = "jobtracker-e2e-wake";
+export const EXTENSION_E2E_WAKE_MESSAGE = "wake";
+export const EXTENSION_E2E_WAKE_ACK = "wake-ack";
+
+/**
+ * @param {string} extensionId
+ * @returns {string}
+ */
+export function extensionServiceWorkerWakeUrl(extensionId) {
+  if (!EXTENSION_ID_PATTERN.test(extensionId)) {
+    throw new Error("Invalid extension ID for service worker wake URL");
+  }
+  return `chrome-extension://${extensionId}/popup.html`;
+}
+
+/**
+ * This source is appended only to the copied extension used by the E2E runner.
+ * It is intentionally fixed and contains no application data.
+ *
+ * @returns {string}
+ */
+export function extensionE2EWakeListenerSource() {
+  return `
+const __jobtrackerE2EWakePorts = new Set();
+const __jobtrackerE2EWakeBootId = crypto.randomUUID();
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== ${JSON.stringify(EXTENSION_E2E_WAKE_CHANNEL)}) return;
+  __jobtrackerE2EWakePorts.add(port);
+  port.onDisconnect.addListener(() => __jobtrackerE2EWakePorts.delete(port));
+  port.onMessage.addListener((message) => {
+    if (message?.type !== ${JSON.stringify(EXTENSION_E2E_WAKE_MESSAGE)}) return;
+    port.postMessage({
+      type: ${JSON.stringify(EXTENSION_E2E_WAKE_ACK)},
+      bootId: __jobtrackerE2EWakeBootId,
+    });
+  });
+});
+`.trim();
+}
+
 /**
  * Clear extension popup content before a failure screenshot. This function is
  * serialized into the popup execution context, so it must remain self-contained.
