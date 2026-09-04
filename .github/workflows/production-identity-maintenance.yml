@@ -99,7 +99,7 @@ jobs:
           test "$(jq -r .event <<<"$metadata")" = "workflow_dispatch"
           test "$(jq -r .head_branch <<<"$metadata")" = "main"
           test "$(jq -r .head_sha <<<"$metadata")" = "$GITHUB_SHA"
-          test "$(jq -r .path <<<"$metadata")" = ".github/workflows/production-identity-maintenance.yml"
+          test "$(jq -r .path <<<"$metadata")" = ".github/workflows/production-identity-maintenance.yml@main"
       - name: Download approved prepare evidence
         if: inputs.phase == 'apply'
         env:
