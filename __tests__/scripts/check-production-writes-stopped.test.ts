@@ -115,6 +115,40 @@ async function readRequestBody(request: import("node:http").IncomingMessage): Pr
   return body;
 }
 
+type PredicateCase = Readonly<{
+  name: string;
+  body: string;
+  sentinels: readonly string[];
+}>;
+
+const canonicalError = "Application writes are temporarily disabled";
+const exactPredicateCases: readonly PredicateCase[] = [
+  {
+    name: "wrong canonical error",
+    body: JSON.stringify({ code: "writes_stopped", error: "wrong-error-sentinel", retryable: true }),
+    sentinels: ["wrong-error-sentinel"],
+  },
+  {
+    name: "retryable false",
+    body: '{"code":"writes_stopped","error":"\\u0041pplication writes are temporarily disabled","retryable":false}',
+    sentinels: ["\\u0041"],
+  },
+  {
+    name: "missing error key",
+    body: JSON.stringify({ code: "writes_stopped", retryable: true, missing_error_sentinel: "missing-error-sentinel" }),
+    sentinels: ["missing-error-sentinel"],
+  },
+  {
+    name: "extra key",
+    body: JSON.stringify({ code: "writes_stopped", error: canonicalError, retryable: true, extra: "extra-key-sentinel" }),
+    sentinels: ["extra-key-sentinel"],
+  },
+  { name: "primitive string", body: JSON.stringify("primitive-string-sentinel"), sentinels: ["primitive-string-sentinel"] },
+  { name: "primitive number", body: "987654321", sentinels: ["987654321"] },
+  { name: "primitive boolean", body: "false", sentinels: ["false"] },
+  { name: "null", body: "null", sentinels: ["null"] },
+];
+
 describe("authenticated production write-stop probe", () => {
   it("performs authenticated stats, a valid negative POST, and unchanged stats", async () => {
     const requests: { method: string; path: string; headers: import("node:http").IncomingHttpHeaders; body: string }[] = [];
@@ -169,6 +203,55 @@ describe("authenticated production write-stop probe", () => {
     }
   });
 
+  it("fails generically when the write-stop response body stalls", async () => {
+    const sentinel = "stalled-body-sentinel-never-print";
+    let stalledResponse: import("node:http").ServerResponse | undefined;
+    const { server, url } = await listen((_request, response) => {
+      stalledResponse = response;
+      response.writeHead(503, {
+        "content-type": "application/json",
+        "cache-control": "private, no-store",
+        "retry-after": "60",
+      });
+      response.write(`{"code":"writes_stopped","error":"${sentinel}`);
+    });
+
+    try {
+      expectGenericFailure(await runMonitor(url, "50"), url, [sentinel]);
+    } finally {
+      stalledResponse?.destroy();
+      await close(server);
+    }
+  });
+
+  it("fails generically and cancels an oversized write-stop response body", async () => {
+    const sentinel = "oversized-body-sentinel-never-print";
+    let oversizedResponse: import("node:http").ServerResponse | undefined;
+    const oversizedBody = `${"x".repeat(256 * 1024)}${sentinel}`;
+    const { server, url } = await listen(async (request, response) => {
+      if (request.method === "POST") {
+        await readRequestBody(request);
+        oversizedResponse = response;
+        response.writeHead(503, {
+          "content-type": "application/json",
+          "cache-control": "private, no-store",
+          "retry-after": "60",
+        });
+        response.end(oversizedBody);
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(validStats));
+    });
+
+    try {
+      expectGenericFailure(await runMonitor(url, "500"), url, [sentinel]);
+    } finally {
+      oversizedResponse?.destroy();
+      await close(server);
+    }
+  });
+
   it.each([
     ["unexpected 200", 200, JSON.stringify({ id: "550e8400-e29b-41d4-a716-446655440000", error: secretBody })],
     ["unexpected 201", 201, JSON.stringify({ id: "550e8400-e29b-41d4-a716-446655440000", error: secretBody })],
@@ -200,6 +283,34 @@ describe("authenticated production write-stop probe", () => {
       );
       expectGenericFailure(result, url, capturedValues);
       expect(methods).not.toContain("DELETE");
+    } finally {
+      await close(server);
+    }
+  });
+
+  it.each(exactPredicateCases)("fails generically on exact response predicate case: $name", async ({ body, sentinels }) => {
+    const postedBodies: string[] = [];
+    const { server, url } = await listen(async (request, response) => {
+      if (request.method === "POST") {
+        postedBodies.push(await readRequestBody(request));
+        response.writeHead(503, {
+          "content-type": "application/json",
+          "cache-control": "private, no-store",
+          "retry-after": "60",
+        });
+        response.end(body);
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(validStats));
+    });
+    try {
+      const result = await runMonitor(url);
+      const posted = JSON.parse(postedBodies[0]) as Record<string, unknown>;
+      const syntheticValues = [posted.url, posted.jobTitle, posted.company].filter(
+        (value): value is string => typeof value === "string",
+      );
+      expectGenericFailure(result, url, [...sentinels, ...syntheticValues]);
     } finally {
       await close(server);
     }
