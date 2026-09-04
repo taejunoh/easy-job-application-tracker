@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -63,6 +63,37 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 describe("Docker snapshot dump wrapper", () => {
+  it.each([
+    ["relative", "scripts/create-snapshot-backup.mjs"],
+    ["absolute", coordinator],
+  ])("runs the coordinator through a %s path", async (_label, entrypoint) => {
+    const execution = run(process.execPath, [entrypoint], process.env);
+    await expect(execution.result).resolves.toEqual({
+      code: 1,
+      signal: null,
+      stdout: "",
+      stderr: "Production backup failed.\n",
+    });
+  });
+
+  it("runs the coordinator when invoked through a symlink", async () => {
+    const runDirectory = await mkdtemp(join(tmpdir(), "jobtracker-symlink-"));
+    const symlinkPath = join(runDirectory, "create-snapshot-backup.mjs");
+    await symlink(coordinator, symlinkPath);
+
+    try {
+      const execution = run(process.execPath, [symlinkPath], process.env);
+      await expect(execution.result).resolves.toEqual({
+        code: 1,
+        signal: null,
+        stdout: "",
+        stderr: "Production backup failed.\n",
+      });
+    } finally {
+      await rm(runDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed when its control-loop command cannot run", async () => {
     const wrapperModule = pathToFileURL(coordinator).href;
     const wrapperExecution = run(

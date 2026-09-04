@@ -1,11 +1,18 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { access, chmod, rename, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import pg from "pg";
 import {
   fingerprintClient,
@@ -643,7 +650,19 @@ async function main() {
   return supervisor.interruption;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+async function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    return (
+      (await realpath(process.argv[1])) ===
+      (await realpath(fileURLToPath(import.meta.url)))
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (await isMainModule()) {
   try {
     const interruption = await main();
     if (interruption) process.exitCode = interruption.exitCode;
