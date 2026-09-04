@@ -85,6 +85,67 @@ describe("production operations documentation contract", () => {
     expect(runbook).toContain("do not enable identity writes");
   });
 
+  it("publishes the guarded Production identity maintenance operator workflow", () => {
+    const documents = [
+      readFileSync(join(root, "README.md"), "utf8"),
+      readFileSync(
+        join(root, "docs/operations/production-runbook.md"),
+        "utf8",
+      ),
+    ].map((document) => document.replace(/\s+/gu, " "));
+    const prepareDispatch =
+      "gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare -f writers_stopped=true";
+    const applyDispatch =
+      'gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"';
+
+    for (const document of documents) {
+      expect(document).toContain("Production identity maintenance");
+      expect(document).toContain(prepareDispatch);
+      expect(document).toContain(applyDispatch);
+      expect(document).toContain("writers_stopped=true");
+      expect(document).toContain("prepare_run_id");
+      expect(document).toMatch(
+        /writers remain stopped continuously|keep writers stopped continuously/iu,
+      );
+      expect(document).toMatch(
+        /failure[^.]{0,160}writers remain stopped|failure[^.]{0,160}keep writers stopped/iu,
+      );
+      expect(document).toMatch(
+        /do not (?:run|use)[^.]{0,160}(?:prisma db push|prisma db reset|destructive)/iu,
+      );
+    }
+  });
+
+  it("keeps identity maintenance in the exact safe operator sequence", () => {
+    const runbookDocument = readFileSync(
+      join(root, "docs/operations/production-runbook.md"),
+      "utf8",
+    );
+    const sectionStart = runbookDocument.indexOf(
+      "## Application identity maintenance rollout",
+    );
+    expect(sectionStart).not.toBe(-1);
+    const runbook = runbookDocument.slice(sectionStart).replace(/\s+/gu, " ");
+    const requiredSteps = [
+      "verified backup prerequisite",
+      "APPLICATION_IDENTITY_WRITES_ENABLED=0",
+      "pause Vercel",
+      "download and review the prepare report",
+      "numeric prepare run id",
+      "review the apply report",
+      "APPLICATION_IDENTITY_WRITES_ENABLED=1",
+      "deploy the same exact commit while Vercel remains paused",
+      "authenticated checks",
+      "resume Application writers",
+    ];
+    let prior = -1;
+    for (const text of requiredSteps) {
+      const next = runbook.toLowerCase().indexOf(text.toLowerCase(), prior + 1);
+      expect(next).toBeGreaterThan(prior);
+      prior = next;
+    }
+  });
+
   it("publishes the complete quarantine operator workflow", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
     const runbook = readFileSync(

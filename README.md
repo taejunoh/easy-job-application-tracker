@@ -297,26 +297,27 @@ npx prisma migrate status
 
 Never use a destructive reset, `db push` data-loss acceptance, or an unreviewed down migration on a database containing records you need. A safe rollback restores a tested backup. Legacy data imports require a separately reviewed export/import process. See the [production operations runbook](docs/operations/production-runbook.md) and the [sanitized production cutover record](docs/operations/production-cutover-2026-07-14.md) before changing a production database.
 
-### Existing-database identity rollout
+### Production identity maintenance
 
-Treat identity activation as an ordered maintenance operation, not as an
-ordinary application deploy:
+Production identity maintenance is a manual, ordered operation: verify a
+backup and scratch restore, set `APPLICATION_IDENTITY_WRITES_ENABLED=0`, pause
+Vercel, and stop every Application writer. Dispatch both phases with the
+required writer-stop attestation:
 
-1. Deploy the additive migrations and application with
-   `APPLICATION_IDENTITY_WRITES_ENABLED="0"`.
-2. Stop every Application writer and keep it stopped through verification.
-3. Complete a PostgreSQL 17 backup and scratch-restore check.
-4. Run the privacy-safe identity backfill dry run and review its row counts,
-   state totals, and unique-index result.
-5. Apply the same backfill with `--apply --writers-stopped`, then recheck row
-   counts, migration status, schema diff, and the unique identity index.
-6. Set `APPLICATION_IDENTITY_WRITES_ENABLED="1"`, deploy the same reviewed
-   application commit, repeat authenticated create/read checks, and only then
-   resume writers.
+```bash
+gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare -f writers_stopped=true
+gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"
+```
 
-The exact commands, private report requirements, failure stops, and rollback
-rules are in
-[Application identity maintenance rollout](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
+Use only an approved numeric `prepare_run_id`; download and review the
+privacy-safe prepare and apply reports. Set
+`APPLICATION_IDENTITY_WRITES_ENABLED=1`, deploy the same exact commit while
+Vercel remains paused, run authenticated checks, then resume Vercel and
+Application writers. Writers remain stopped continuously until those checks
+pass. Any failure means writers remain stopped continuously; do not run `prisma
+db push`, `prisma db reset`, or destructive shortcuts. The exact commands,
+report requirements, and rollback rules are in the [Production identity
+maintenance rollout](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
 
 ## Development and Verification
 

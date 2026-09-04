@@ -137,19 +137,31 @@ row editing, or a restore with destructive cleanup against Production.
 
 ## Application identity maintenance rollout
 
-This is a one-time, ordered rollout for an existing database. Do not combine or
-reorder the stages. First deploy the additive migration and the gated
-application release with `APPLICATION_IDENTITY_WRITES_ENABLED="0"`; this keeps
-the legacy Application write path active while the new nullable columns and
-indexes become available.
+This is the one-time **Production identity maintenance** procedure for an
+existing database. Do not combine or reorder the stages. The workflow is
+manual-only and requires `writers_stopped=true` on both dispatches. Writers
+remain stopped continuously from the Vercel pause through the final
+authenticated checks and resume step.
 
-1. Enter maintenance mode and stop every Application writer, including the web
-   service, extension installations, monitoring writes, background work, and
-   operator sessions. Keep them stopped through the final verification.
-2. Complete [Backup and restore](#backup-and-restore) verification, including a
-   scratch restore, and record only approved checksums, counts, and migration
-   identity.
-3. Create a private report directory outside the repository. The report paths
+Follow this exact sequence. Capture the reviewed application commit as
+`TARGET_SHA` before starting; the prepare and apply runs must be on `main` and
+must use that same SHA.
+
+1. Verify the backup prerequisite before changing Production: complete
+   [Backup and restore](#backup-and-restore), including a successful scratch
+   restore, and record only the approved checksum, counts, schema, and
+   migration identity. A verified backup prerequisite is mandatory.
+2. Confirm the deployed candidate has the closed gate
+   `APPLICATION_IDENTITY_WRITES_ENABLED=0` (the environment-file spelling is
+   `APPLICATION_IDENTITY_WRITES_ENABLED="0"`). Do not proceed if the value is
+   absent or enabled.
+3. Pause Vercel Production using the provider's Production project pause
+   control, confirm the pause is active, and record the pause confirmation.
+   Then stop every Application writer, including the web service, extension
+   installations, monitoring writes, background work, and operator sessions.
+   Keep writers stopped continuously; pausing traffic alone is not an
+   attestation.
+4. Create a private report directory outside the repository. The report paths
    must not already exist; the backfill creates each report once with mode
    `0600`.
 
@@ -159,31 +171,86 @@ indexes become available.
    install -d -m 0700 "$BACKFILL_REPORT_ROOT"
    DRY_RUN_REPORT="$BACKFILL_REPORT_ROOT/dry-run.json"
    APPLY_REPORT="$BACKFILL_REPORT_ROOT/apply.json"
+   ```
+
+   After the **Backup and restore** prerequisite is confirmed and writers are
+   stopped, the prepare job runs the following exact backfill command:
+
+   ```bash
    npm run backfill:application-identities -- --report "$DRY_RUN_REPORT"
    ```
 
-4. Inspect the privacy-safe dry-run report. Require `rowCountBefore` and
-   `rowCountAfter` to match, require the state totals to sum to that count, and
-   require `uniqueIndexVerified` to be `true`. The report must contain no raw
-   URLs, titles, companies, bodies, or connection values.
-5. With the same writer stop still in force, apply the deterministic backfill:
+5. Dispatch the prepare phase from the reviewed commit with the required
+   writer-stop attestation:
+
+   ```bash
+   gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare -f writers_stopped=true
+   ```
+
+   Wait for the run to complete successfully. The workflow creates a
+   privacy-safe `application-identity-prepare-$RUN_ID` artifact. Download and
+   review the prepare report without printing row bodies or URLs:
+
+   ```bash
+   gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-prepare-$PREPARE_RUN_ID" --dir "$BACKFILL_REPORT_ROOT/prepare"
+   jq '{schemaVersion, mode, rowCountBefore, rowCountAfter, stateTotals, uniqueIndexVerified}' "$BACKFILL_REPORT_ROOT/prepare/application-identity-prepare.json"
+   ```
+
+   Require `rowCountBefore` and `rowCountAfter` to match, state totals to sum
+   to that count, and `uniqueIndexVerified` to be `true`. The prepare report
+   must contain no raw URLs, titles, companies, bodies, credentials, or
+   connection values. Use a numeric prepare run ID only; reject empty, signed,
+   decimal, or otherwise non-numeric input.
+6. After the prepare report is approved, dispatch apply with that exact numeric
+   prepare run ID and the same writer-stop attestation:
+
+   ```bash
+   PREPARE_RUN_ID=123456789 # replace with the approved run ID; digits only
+   gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"
+   ```
+
+   The workflow verifies that the prepare run succeeded, was manually
+   dispatched from `main`, and has the same commit SHA before it downloads the
+   approved artifact. It then runs this deterministic apply command with the
+   writer lock:
 
    ```bash
    npm run backfill:application-identities -- --apply --writers-stopped --report "$APPLY_REPORT"
    ```
 
-6. Require the apply report's `rowCountBefore`, `rowCountAfter`, state totals,
-   and `uniqueIndexVerified` values to match the approved dry run. Run
-   `npx prisma migrate status`, verify an empty schema diff, and independently
-   verify row counts and the unique identity index. On any mismatch, keep
-   writers stopped and restore into an isolated target; do not enable identity
-   writes.
-7. Change the rollout gate to
-   `APPLICATION_IDENTITY_WRITES_ENABLED="1"`, deploy the same reviewed
-   application commit, and repeat the authenticated create/read checks.
-8. Only after those checks pass, resume Application writers. Retain the two
-   privacy-safe reports and backup evidence under the approved private evidence
-   policy.
+   Download and review the apply report using the same privacy-safe `jq`
+   projection; require its counts, state totals, and `uniqueIndexVerified` to
+   match the approved prepare report.
+
+   ```bash
+   gh run download "$APPLY_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-apply-$APPLY_RUN_ID" --dir "$BACKFILL_REPORT_ROOT/apply"
+   jq '{schemaVersion, mode, rowCountBefore, rowCountAfter, stateTotals, uniqueIndexVerified}' "$BACKFILL_REPORT_ROOT/apply/application-identity-apply.json"
+   ```
+
+7. If the apply report is approved, run `npx prisma migrate status`, verify an
+   empty schema diff, and independently verify row counts and the unique
+   identity index. Set the Production gate to
+   `APPLICATION_IDENTITY_WRITES_ENABLED=1` (environment-file spelling:
+   `APPLICATION_IDENTITY_WRITES_ENABLED="1"`) while Vercel remains paused.
+8. Deploy the same exact commit while Vercel remains paused (`TARGET_SHA`).
+   Promote only the Vercel deployment whose commit SHA equals `TARGET_SHA`; do
+   not create a new commit or deploy an unreviewed working tree. Then run the
+   authenticated checks for `/api/applications`, `/api/settings`, and one reversible
+   create/read operation, and inspect Vercel logs for related errors. These are
+   the authenticated checks that must pass before traffic resumes.
+9. Resume Vercel Production, confirm the pause is cleared, and only then
+   resume Application writers. Retain the privacy-safe prepare/apply reports
+   and backup evidence under the approved private evidence policy.
+
+Abort behavior is part of the procedure. If any dispatch, provenance check,
+download, report review, migration check, schema check, authenticated check,
+or deployment check fails, leave Vercel paused and writers stopped
+continuously. Do not set the gate to `1`, resume writers, or retry apply with a
+different commit or report. Any failure means writers remain stopped
+continuously. do not enable identity writes. Preserve the sanitized evidence
+and recover only through an isolated restore target and a reviewed rollback.
+Do not run `prisma db push`, `prisma db reset`, or `prisma migrate reset`, or use
+other destructive shortcuts against Production.
 
 ## Backup and restore
 
