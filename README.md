@@ -309,6 +309,17 @@ Never use a destructive reset, `db push` data-loss acceptance, or an unreviewed 
 
 The Settings singleton is created only on the first successful PUT /api/settings; an authenticated GET /api/settings is read-only and does not create the row. The complete staged candidate, rollback, fixture-ledger, and cleanup procedure is the [production operations runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
 
+#### Rollout state and evidence summary
+
+The operator-state summary is: after database apply, the rollout is
+`PAUSED_AFTER_APPLY`; failed or ambiguous evidence enters `HOLD_PAUSED`, where
+there is no build, deploy, alias assignment, or promotion. After approval, the
+exact recorded `identity=1,writes=0` Ready deployment is resumed as
+`UNPAUSED_READONLY` for read-only and authenticated negative probes. A regression
+requires an exact Ready candidate ID and reviewed SHA or returns to
+`HOLD_PAUSED`. The private ledger retains exact owned IDs until bounded cleanup
+is verified and cleanup may remove only those IDs.
+
 Production identity maintenance is a manual, ordered two-gate operation. Start
 with an `identity=0,writes=1` Ready canonical support deployment. Before Stage
 1 promotion, authenticated supported flows must create one disposable

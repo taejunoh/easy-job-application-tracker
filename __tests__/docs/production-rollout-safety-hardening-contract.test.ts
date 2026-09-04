@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const root = join(__dirname, "../..");
 const expectedOrigin = "https://easy-job-application-tracker.vercel.app";
@@ -241,32 +241,71 @@ function stageOneWriteStopEvidenceBlock(): string {
 describe("production rollout staged-candidate binding documentation contract", () => {
   it("keeps non-runbook documents design-level and fixes Settings wording", () => {
     const files = [
-      ["README.md", "docs/operations/production-runbook.md"],
-      [
-        "docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md",
-        "../../operations/production-runbook.md",
-      ],
-      [
-        "docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md",
-        "../../operations/production-runbook.md",
-      ],
-      [
-        "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md",
-        "../../operations/production-runbook.md",
-      ],
+      { file: "README.md", historicalLabel: false },
+      {
+        file: "docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md",
+        historicalLabel: true,
+      },
+      {
+        file: "docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md",
+        historicalLabel: true,
+      },
+      {
+        file: "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md",
+        historicalLabel: true,
+      },
     ];
-    for (const [file, runbookLink] of files) {
+    for (const { file, historicalLabel } of files) {
+      const filePath = join(root, file);
       const document = readFileSync(join(root, file), "utf8");
-      expect(document).toContain(runbookLink);
+      const runbookHrefs = [...document.matchAll(
+        /\[[^\]]*production operations runbook[^\]]*\]\(([^)]+)\)/giu,
+      )].map(([, href]) => href ?? "");
+      const runbookHref = runbookHrefs.find((href) =>
+        href.split("#", 1)[0]?.endsWith("production-runbook.md") &&
+        href.split("#", 2)[1] === "application-identity-maintenance-rollout",
+      );
+      expect(runbookHref).toBeDefined();
+      const [runbookPath, runbookAnchor] = (runbookHref ?? "").split("#");
+      expect(resolve(dirname(filePath), runbookPath ?? "")).toBe(
+        join(root, "docs/operations/production-runbook.md"),
+      );
+      expect(runbookAnchor).toBe("application-identity-maintenance-rollout");
       expect(document).toContain("first successful PUT /api/settings");
       expect(document).not.toContain("authenticated GET /api/settings creates");
       expect(document).not.toMatch(/vercel api \/v13\/deployments\//u);
       expect(document).not.toMatch(/vercel promote "\$CANDIDATE_ID"/u);
 
+      if (historicalLabel) {
+        expect(document).toMatch(/historical|superseded|design-level/iu);
+      }
+
       const fencedVercelBlocks = [...document.matchAll(/```(?:bash|sh|shell)\r?\n([\s\S]*?)```/gu)]
         .map(([, block]) => block)
         .filter((block) => /\bvercel\s+(?:deploy|api|inspect|promote)\b/iu.test(block));
       expect(fencedVercelBlocks).toEqual([]);
+
+      const heading = document.search(/^#{3,4} Rollout state and evidence summary\s*$/mu);
+      expect(heading).not.toBe(-1);
+      const bodyStart = document.indexOf("\n", heading) + 1;
+      const nextHeading = document.slice(bodyStart).search(/^#{2,4} \S/mu);
+      const summary = document.slice(
+        bodyStart,
+        nextHeading === -1 ? document.length : bodyStart + nextHeading,
+      );
+      const normalizedSummary = normalize(summary).replace(/`/gu, "");
+      expect(normalizedSummary).toMatch(
+        /PAUSED_AFTER_APPLY[\s\S]{0,220}failed or ambiguous evidence enters HOLD_PAUSED[\s\S]{0,300}no build, deploy, alias assignment, or promotion/iu,
+      );
+      expect(normalizedSummary).toMatch(
+        /(?:approval|approved)[^.]{0,120}exact recorded identity=1,writes=0 Ready deployment[^.]{0,100}UNPAUSED_READONLY[^.]{0,140}read-only and authenticated negative probes/iu,
+      );
+      expect(normalizedSummary).toMatch(
+        /regression[^.]{0,140}exact Ready candidate ID and reviewed SHA[^.]{0,100}(?:returns? to|return to) HOLD_PAUSED/iu,
+      );
+      expect(normalizedSummary).toMatch(
+        /private ledger retains exact owned IDs until bounded cleanup is verified[^.]{0,100}cleanup may remove only those IDs/iu,
+      );
     }
   });
 

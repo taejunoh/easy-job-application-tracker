@@ -174,7 +174,7 @@ cannot silently escape the gate.
 | `PATCH /api/applications/:id` | Updates any mutable Application fields. | Guard before update. |
 | `DELETE /api/applications/:id` | Deletes an Application; the duplicate-preservation check is read-only but belongs to this guarded operation. | Guard before delete. A blocked request performs no count or delete query. |
 | `PUT /api/settings` | Creates the singleton `Settings` row when absent or updates provider, encrypted API key, profile URLs, and resume text. | Guard before body processing and before create/update. |
-| `GET /api/settings` when the singleton is absent | Current implementation has a hidden read-path write. | Change read behavior so it returns empty/default values without creating a row while closed. If creation remains supported while open, guard it explicitly. |
+| `GET /api/settings` when the singleton is absent | Superseded pre-implementation behavior could perform a hidden read-path write. | The current invariant is read-only GET behavior: return empty/default values without creating a row. Singleton creation occurs only on the first successful PUT /api/settings. |
 | `POST /api/extension/pairing` | Creates a one-time `ExtensionPairingGrant`. | Guard before grant creation. Session principal and origin validation remain required. |
 | `POST /api/extension/pair` | Consumes a pairing grant and inserts an `ExtensionInstallation` in one transaction. | Guard before exchange and again around the transaction. A rejected exchange must not consume the grant or create an installation. |
 | `DELETE /api/extension/installations/:id` | Revokes an installation by setting `revokedAt` and `updatedAt`. | Guard before revoke. |
@@ -186,7 +186,7 @@ The following are not durable application writes and remain available in
 read-only mode, subject to existing auth and rate/deadline controls:
 
 - `GET /api/applications`, `GET /api/applications/:id`, and `GET /api/stats`;
-- `GET /api/settings` after removing or guarding the hidden singleton create;
+- `GET /api/settings`, which returns empty/default values when the singleton is absent without creating a row;
 - `GET /api/extension/installations` and `GET /api/extension/profile`;
 - `POST /api/extract`, `POST /api/keyword-analysis`, and
   `POST /api/parse-resume` when they only fetch, compute, call an LLM, or
@@ -316,6 +316,18 @@ Do not resume writers merely to make a deployment reachable.
 The old identity gate-0 runtime is never restored merely because a new
 deployment is delayed. After Stage 1, the safe live state is the recorded
 Ready `identity=1,writes=0` Production deployment.
+
+### Rollout state and evidence summary
+
+After database apply, the rollout is `PAUSED_AFTER_APPLY`. Failed or ambiguous
+evidence enters `HOLD_PAUSED`, where there is no build, deploy, alias assignment,
+or promotion. Once evidence is approved, resume only the exact recorded
+`identity=1,writes=0` Ready deployment as `UNPAUSED_READONLY` and run read-only
+and authenticated negative probes. A regression requires an exact Ready
+candidate ID and reviewed SHA; without that evidence, return to `HOLD_PAUSED`.
+The private ledger retains exact owned IDs until bounded cleanup is verified and
+cleanup may remove only those IDs. The runbook linked above contains the
+operator commands for these transitions.
 
 ## Drain and request lifetime
 

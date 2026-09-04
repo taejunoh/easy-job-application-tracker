@@ -158,6 +158,17 @@ an authenticated GET /api/settings is read-only and does not create the row. The
 runbook linked above owns the executable candidate, rollback, fixture-ledger,
 and cleanup procedure.
 
+### Rollout state and evidence summary
+
+For the retained state/evidence summary, after database apply the rollout is
+`PAUSED_AFTER_APPLY`; failed or ambiguous evidence enters `HOLD_PAUSED`, where
+there is no build, deploy, alias assignment, or promotion. Approved evidence
+resumes the exact recorded `identity=1,writes=0` Ready deployment as
+`UNPAUSED_READONLY` for read-only and authenticated negative probes. A regression
+requires an exact Ready candidate ID and reviewed SHA or returns to
+`HOLD_PAUSED`. The private ledger retains exact owned IDs until bounded cleanup
+is verified and cleanup may remove only those IDs.
+
 The hosted operator sequence from this historical design is superseded. For
 reference, the approved sequence is:
 
