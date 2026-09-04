@@ -316,7 +316,10 @@ promotion. It is paused only across prepare/apply, and the actual platform
    pre-stop pairing grant/code reference, installed credential/installation,
    and at least one cleanup action. Do not continue if the ledger is missing,
    a symlink, has a conflicting `stage1`, or does not validate after the atomic
-   rename.
+   rename. Every owned-ID list contains only non-empty strings; optional
+   pairing, installation, and post-resume ID lists use the same rule. Each
+   cleanup record includes a non-empty action, expected terminal state,
+   timestamp, and observed result; `pending` is valid before cleanup succeeds.
 
    ```bash
    set -euo pipefail
@@ -339,6 +342,12 @@ promotion. It is paused only across prepare/apply, and the actual platform
      type == "object" and (.schemaVersion == 1) and (.stage1? == null) and
      (.fixtureOwnership | type == "object") and
      (.fixtureOwnership.applicationIds | type == "array" and length > 0) and
+     all(.fixtureOwnership.applicationIds[]; (type == "string") and length > 0) and
+     (if (.fixtureOwnership | has("pairingGrantIds")) then (.fixtureOwnership.pairingGrantIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
+     (if (.fixtureOwnership | has("installationIds")) then (.fixtureOwnership.installationIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
+     (if (.fixtureOwnership | has("postResumeApplicationIds")) then (.fixtureOwnership.postResumeApplicationIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
+     (if (.fixtureOwnership | has("postResumePairingGrantIds")) then (.fixtureOwnership.postResumePairingGrantIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
+     (if (.fixtureOwnership | has("postResumeInstallationIds")) then (.fixtureOwnership.postResumeInstallationIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
      (.fixtureOwnership.preProbeHash | type == "string" and length > 0) and
      (.fixtureOwnership.postProbeHash | type == "string" and length > 0) and
      (.fixtureOwnership.settings | type == "object") and
@@ -352,7 +361,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
      (.fixtureOwnership.installation.credentialReference | type == "string" and length > 0) and
      (.fixtureOwnership.installation.installationId | type == "string" and length > 0) and
      (.fixtureOwnership.cleanup | type == "array" and length > 0) and
-     all(.fixtureOwnership.cleanup[]; (.action | type == "string" and length > 0) and (.expectedTerminalState | type == "string" and length > 0) and (.observedResult | type == "string" and length > 0))
+     all(.fixtureOwnership.cleanup[]; (type == "object") and (.action | type == "string" and length > 0) and (.expectedTerminalState | type == "string" and length > 0) and (.timestamp | type == "string" and length > 0) and (.observedResult | type == "string" and length > 0))
    ' "$LEDGER" >/dev/null || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    jq \
      --arg id "$STAGE_ONE_CANDIDATE_ID" \

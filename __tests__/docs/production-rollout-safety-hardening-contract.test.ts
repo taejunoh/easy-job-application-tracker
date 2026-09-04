@@ -478,7 +478,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
           settings: { existedBefore: true, contentHashBefore: "sha256:settings-before", contentHashAfter: "sha256:settings-after" },
           pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref" },
           installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
-          cleanup: [{ action: "revoke", expectedTerminalState: "401", observedResult: "pending" }],
+          cleanup: [{ action: "revoke", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
         },
         extraPrivateRecord: { nested: ["preserve", { every: "value" }] },
       };
@@ -589,6 +589,30 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         stdio: ["pipe", "pipe", "pipe"],
       })).toThrow();
       expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({ ...preStageLedger, stage1: { deploymentId: "dpl_existing" } });
+
+      for (const malformedLedger of [
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [null] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [""] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, pairingGrantIds: [17] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, cleanup: [{ action: "revoke", expectedTerminalState: "401", observedResult: "pending" }] } },
+      ]) {
+        const original = JSON.stringify(malformedLedger);
+        writeFileSync(ledger, original, { mode: 0o600 });
+        chmodSync(ledger, 0o600);
+        expect(() => execFileSync("bash", ["-c", block], {
+          env: {
+            ...process.env,
+            EVIDENCE_ROOT: temporaryRoot,
+            LEDGER: ledger,
+            TARGET_SHA: "sha-reviewed",
+            APP_BASE_URL: expectedOrigin,
+            STAGE_ONE_CANDIDATE_ID: "dpl_stageone",
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        })).toThrow();
+        expect(readFileSync(ledger, "utf8")).toBe(original);
+        expect(JSON.parse(readFileSync(ledger, "utf8")).stage1).toBeUndefined();
+      }
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
