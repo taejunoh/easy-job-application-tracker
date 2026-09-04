@@ -12,6 +12,9 @@ import {
 
 export const PAIRING_GRANT_LIFETIME_MS = 10 * 60 * 1000;
 export const INSTALLATION_LIFETIME_MS = 90 * 24 * 60 * 60 * 1000;
+export const PAIRING_PERSISTENCE_STOPPED = Symbol(
+  "pairing_persistence_stopped",
+);
 
 export type PairingGrantRecord = {
   id: string;
@@ -61,6 +64,16 @@ type ServiceOptions = Readonly<{
   randomBytes?: (size: number) => Buffer;
 }>;
 
+type PairingExchange = Readonly<{
+  installationId: string;
+  token: string;
+  expiresAt: Date;
+}>;
+
+type PairingExchangeOptions = Readonly<{
+  beforePersist: () => boolean;
+}>;
+
 export function createExtensionInstallationService(options: ServiceOptions) {
   const now = options.now ?? Date.now;
   const credentialOptions = (origin: string) => ({
@@ -76,6 +89,83 @@ export function createExtensionInstallationService(options: ServiceOptions) {
       (options.allowedOrigins === undefined ||
         options.allowedOrigins.includes(origin))
     );
+  }
+
+  async function validPairingGrant(code: unknown, origin: string) {
+    if (!allowedOrigin(origin)) return null;
+    const parsed = parsePairingCode(code);
+    if (parsed === null) return null;
+    const grant = await options.store.findPairingGrant(parsed.selector);
+    const observedAt = new Date(now());
+    if (
+      grant === null ||
+      grant.origin !== origin ||
+      grant.consumedAt !== null ||
+      grant.expiresAt.getTime() <= observedAt.getTime()
+    ) {
+      return null;
+    }
+    const digest = digestPairingSecret(
+      parsed.selector,
+      parsed.secret,
+      origin,
+      options.encryptionSecret,
+    );
+    return verifyCredentialDigest(grant.codeDigest, digest)
+      ? { grant, observedAt }
+      : null;
+  }
+
+  function exchangePairingCode(
+    code: unknown,
+    origin: string,
+  ): Promise<PairingExchange | null>;
+  function exchangePairingCode(
+    code: unknown,
+    origin: string,
+    options: PairingExchangeOptions,
+  ): Promise<PairingExchange | null | typeof PAIRING_PERSISTENCE_STOPPED>;
+  async function exchangePairingCode(
+    code: unknown,
+    origin: string,
+    beforePersistOptions?: PairingExchangeOptions,
+  ): Promise<PairingExchange | null | typeof PAIRING_PERSISTENCE_STOPPED> {
+    const validGrant = await validPairingGrant(code, origin);
+    if (validGrant === null) return null;
+    const { grant, observedAt } = validGrant;
+
+    const credential = createInstallationCredential(credentialOptions(origin));
+    const expiresAt = new Date(
+      observedAt.getTime() + INSTALLATION_LIFETIME_MS,
+    );
+    const installation: PersistedInstallation = {
+      id: credential.selector,
+      origin,
+      tokenDigest: credential.digest,
+      expiresAt,
+      revokedAt: null,
+      lastUsedAt: null,
+      createdAt: observedAt,
+      updatedAt: observedAt,
+    };
+    if (
+      beforePersistOptions !== undefined &&
+      !beforePersistOptions.beforePersist()
+    ) {
+      return PAIRING_PERSISTENCE_STOPPED;
+    }
+    const consumed = await options.store.consumePairingGrant({
+      grantId: grant.id,
+      expectedDigest: grant.codeDigest,
+      consumedAt: observedAt,
+      installation,
+    });
+    if (!consumed) return null;
+    return Object.freeze({
+      installationId: installation.id,
+      token: credential.token,
+      expiresAt,
+    });
   }
 
   return Object.freeze({
@@ -103,57 +193,11 @@ export function createExtensionInstallationService(options: ServiceOptions) {
       });
     },
 
-    async exchangePairingCode(code: unknown, origin: string) {
-      if (!allowedOrigin(origin)) return null;
-      const parsed = parsePairingCode(code);
-      if (parsed === null) return null;
-      const grant = await options.store.findPairingGrant(parsed.selector);
-      const consumedAt = new Date(now());
-      if (
-        grant === null ||
-        grant.origin !== origin ||
-        grant.consumedAt !== null ||
-        grant.expiresAt.getTime() <= consumedAt.getTime()
-      ) {
-        return null;
-      }
-      const digest = digestPairingSecret(
-        parsed.selector,
-        parsed.secret,
-        origin,
-        options.encryptionSecret,
-      );
-      if (!verifyCredentialDigest(grant.codeDigest, digest)) return null;
-
-      const credential = createInstallationCredential(
-        credentialOptions(origin),
-      );
-      const expiresAt = new Date(
-        consumedAt.getTime() + INSTALLATION_LIFETIME_MS,
-      );
-      const installation: PersistedInstallation = {
-        id: credential.selector,
-        origin,
-        tokenDigest: credential.digest,
-        expiresAt,
-        revokedAt: null,
-        lastUsedAt: null,
-        createdAt: consumedAt,
-        updatedAt: consumedAt,
-      };
-      const consumed = await options.store.consumePairingGrant({
-        grantId: grant.id,
-        expectedDigest: grant.codeDigest,
-        consumedAt,
-        installation,
-      });
-      if (!consumed) return null;
-      return Object.freeze({
-        installationId: installation.id,
-        token: credential.token,
-        expiresAt,
-      });
+    async validatePairingCode(code: unknown, origin: string) {
+      return (await validPairingGrant(code, origin)) !== null;
     },
+
+    exchangePairingCode,
 
     revoke(id: string): Promise<boolean> {
       return options.store.revoke(id, new Date(now()));

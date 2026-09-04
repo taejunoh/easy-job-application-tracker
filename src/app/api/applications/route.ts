@@ -12,9 +12,13 @@ import {
 } from "@/lib/applications/atomic-create";
 import { createPrismaApplicationIdentityStore } from "@/lib/applications/prisma-identity-store";
 import { getServerEnv } from "@/lib/server-env";
+import { applicationWriteGuard } from "@/lib/security/application-writes";
+
+export const maxDuration = 30;
 
 const route = createProtectedRoute(["GET", "POST"], {
   installationMethods: ["POST"],
+  writeMethods: ["POST"],
 });
 const identityStore = createPrismaApplicationIdentityStore(prisma);
 
@@ -59,6 +63,8 @@ export const POST = route.handler(async function POST(request: NextRequest) {
   }
 
   if (!getServerEnv().applicationIdentityWritesEnabled) {
+    const stopped = applicationWriteGuard();
+    if (stopped) return stopped;
     const application = await prisma.application.create({
       data: {
         url: body.url,
@@ -77,6 +83,8 @@ export const POST = route.handler(async function POST(request: NextRequest) {
   }
 
   try {
+    const stopped = applicationWriteGuard();
+    if (stopped) return stopped;
     const created = await createApplicationAtomically(body, { store: identityStore });
     return NextResponse.json(
       { ...created.application, result: created.result },

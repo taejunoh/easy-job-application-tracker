@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
+    inputs:
+      expect_writes_stopped:
+        description: "Require the authenticated write-stop probe"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,3 +30,9 @@ jobs:
           PRODUCTION_APP_URL: ${{ vars.PRODUCTION_APP_URL }}
           PRODUCTION_APP_ACCESS_TOKEN: ${{ secrets.PRODUCTION_APP_ACCESS_TOKEN }}
         run: npm run check:production
+      - name: Check authenticated production write stop
+        if: ${{ inputs.expect_writes_stopped == true }}
+        env:
+          PRODUCTION_APP_URL: ${{ vars.PRODUCTION_APP_URL }}
+          PRODUCTION_APP_ACCESS_TOKEN: ${{ secrets.PRODUCTION_APP_ACCESS_TOKEN }}
+        run: npm run check:production:writes-stopped

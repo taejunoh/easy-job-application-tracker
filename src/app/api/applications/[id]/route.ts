@@ -2,12 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import { applicationWriteGuard } from "@/lib/security/application-writes";
 import {
   applicationContractErrorResponse,
   parseUpdateApplicationRequest,
 } from "@/lib/applications/contract";
 
-const route = createProtectedRoute(["GET", "PATCH", "DELETE"]);
+export const maxDuration = 30;
+
+const route = createProtectedRoute(["GET", "PATCH", "DELETE"], {
+  writeMethods: ["PATCH", "DELETE"],
+});
 
 export const OPTIONS = route.OPTIONS;
 
@@ -42,6 +47,9 @@ export const PATCH = route.handler(async function PATCH(
     throw error;
   }
 
+  const stopped = applicationWriteGuard();
+  if (stopped) return stopped;
+
   try {
     const application = await prisma.application.update({
       where: { id },
@@ -64,6 +72,9 @@ export const DELETE = route.handler(async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+
+  const stopped = applicationWriteGuard();
+  if (stopped) return stopped;
 
   try {
     await prisma.application.delete({ where: { id } });

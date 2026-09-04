@@ -11,6 +11,7 @@
  *   appOrigin: string,
  *   corsAllowedOrigins: readonly string[],
  *   applicationIdentityWritesEnabled: boolean,
+ *   applicationWritesEnabled: boolean,
  * }>} ServerEnv
  */
 
@@ -28,6 +29,12 @@ const SECRET_PLACEHOLDER_PHRASES = [
 
 const DATABASE_URL_PLACEHOLDERS = new Set([
   "postgresql://user:password@host:5432/dbname?sslmode=require",
+]);
+
+const RESERVED_DATABASE_URL_KEYS = new Set([
+  "statement_timeout",
+  "lock_timeout",
+  "options",
 ]);
 
 const TEMPLATE_MARKER_PATTERN = /<[^<>]+>/;
@@ -58,6 +65,10 @@ function parseServerEnv(source, nodeEnv) {
     source,
     "APPLICATION_IDENTITY_WRITES_ENABLED",
   );
+  const applicationWritesEnabled = parseOptionalBinaryFlag(
+    source,
+    "APPLICATION_WRITES_ENABLED",
+  );
 
   return Object.freeze({
     databaseUrl,
@@ -67,6 +78,7 @@ function parseServerEnv(source, nodeEnv) {
     appOrigin,
     corsAllowedOrigins,
     applicationIdentityWritesEnabled,
+    applicationWritesEnabled,
   });
 }
 
@@ -120,6 +132,8 @@ function parseDatabaseUrl(value) {
     invalid(name, "must be a valid PostgreSQL connection URL");
   }
 
+  rejectReservedDatabaseUrlKeys(url);
+
   const databaseName = url.pathname.slice(1);
   if (
     (url.protocol !== "postgres:" && url.protocol !== "postgresql:") ||
@@ -131,6 +145,18 @@ function parseDatabaseUrl(value) {
   }
 
   return value;
+}
+
+/** @param {URL} url @returns {void} */
+function rejectReservedDatabaseUrlKeys(url) {
+  for (const key of url.searchParams.keys()) {
+    if (RESERVED_DATABASE_URL_KEYS.has(key.toLowerCase())) {
+      invalid(
+        "DATABASE_URL",
+        "must not contain reserved PostgreSQL timeout parameters",
+      );
+    }
+  }
 }
 
 /** @param {string} name @param {string} value @returns {string} */

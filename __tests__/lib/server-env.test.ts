@@ -9,6 +9,7 @@ const productionSource = {
   CORS_ALLOWED_ORIGINS:
     "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
   APPLICATION_IDENTITY_WRITES_ENABLED: "1",
+  APPLICATION_WRITES_ENABLED: "1",
 };
 
 describe("parseServerEnv", () => {
@@ -26,6 +27,7 @@ describe("parseServerEnv", () => {
         "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
       ],
       applicationIdentityWritesEnabled: true,
+      applicationWritesEnabled: true,
     });
     expect(config).not.toHaveProperty("corsAllowedOriginSet");
     expect(Object.isFrozen(config.corsAllowedOrigins)).toBe(true);
@@ -116,6 +118,31 @@ describe("parseServerEnv", () => {
     }
   });
 
+  it("defaults application writes off and accepts only exact binary values", () => {
+    const disabled = parseServerEnv({
+      ...productionSource,
+      APPLICATION_WRITES_ENABLED: undefined,
+    }, "production");
+    const explicitDisabled = parseServerEnv({
+      ...productionSource,
+      APPLICATION_WRITES_ENABLED: "0",
+    }, "production");
+    const enabled = parseServerEnv({
+      ...productionSource,
+      APPLICATION_WRITES_ENABLED: "1",
+    }, "production");
+
+    expect(disabled.applicationWritesEnabled).toBe(false);
+    expect(explicitDisabled.applicationWritesEnabled).toBe(false);
+    expect(enabled.applicationWritesEnabled).toBe(true);
+    for (const value of ["true", "yes", " 1 ", "2", ""]) {
+      expect(() => parseServerEnv({
+        ...productionSource,
+        APPLICATION_WRITES_ENABLED: value,
+      }, "production")).toThrow("APPLICATION_WRITES_ENABLED");
+    }
+  });
+
   it.each(["production", "test", "staging"])(
     "rejects local HTTP origins outside development (%s)",
     (nodeEnv) => {
@@ -161,6 +188,44 @@ describe("parseServerEnv", () => {
   it("accepts a non-placeholder database URL with a conventional username", () => {
     const databaseUrl =
       "postgresql://user:secure-password@db.company.com/jobtracker";
+
+    const config = parseServerEnv(
+      { ...productionSource, DATABASE_URL: databaseUrl },
+      "production",
+    );
+
+    expect(config.databaseUrl).toBe(databaseUrl);
+  });
+
+  it.each([
+    "statement_timeout=1",
+    "STATEMENT_TIMEOUT=1",
+    "lock_timeout=1",
+    "LOCK_TIMEOUT=1",
+    "options=-c%20statement_timeout%3D0",
+    "OPTIONS=-c%20lock_timeout%3D0",
+    "statement_timeout=1&statement_timeout=2",
+    "Statement_Timeout=1&statement_timeout=2",
+    "lock_timeout=1&lock_timeout=2",
+    "Lock_Timeout=1&lock_timeout=2",
+    "options=one&options=two",
+    "Options=one&options=two",
+  ])("rejects reserved PostgreSQL timeout URL query %s", (query) => {
+    const databaseUrl =
+      `postgresql://jobtracker:database-password@db.example.com:5432/jobtracker?${query}`;
+
+    expectInvalidWithoutValue(
+      "DATABASE_URL",
+      databaseUrl,
+      { DATABASE_URL: databaseUrl },
+      "production",
+      "must not contain reserved PostgreSQL timeout parameters",
+    );
+  });
+
+  it("accepts supported non-timeout PostgreSQL URL query parameters unchanged", () => {
+    const databaseUrl =
+      "postgresql://jobtracker:database-password@db.example.com:5432/jobtracker?sslmode=require&sslcert=client-cert.pem&sslkey=client-key.pem&sslrootcert=ca.pem&schema=public&application_name=jobtracker";
 
     const config = parseServerEnv(
       { ...productionSource, DATABASE_URL: databaseUrl },
@@ -393,6 +458,7 @@ function expectInvalidWithoutValue(
   invalidValue: string,
   overrides: Partial<typeof productionSource>,
   nodeEnv: string | undefined = "production",
+  expectedMessage?: string,
 ): void {
   try {
     parseServerEnv({ ...productionSource, ...overrides }, nodeEnv);
@@ -401,5 +467,8 @@ function expectInvalidWithoutValue(
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain(variableName);
     expect((error as Error).message).not.toContain(invalidValue);
+    if (expectedMessage !== undefined) {
+      expect((error as Error).message).toContain(expectedMessage);
+    }
   }
 }

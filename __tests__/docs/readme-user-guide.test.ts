@@ -393,4 +393,118 @@ describe("task-first README user guide", () => {
       "CI enforces the dependency-audit policy",
     );
   });
+
+  test("summarizes the staged two-gate Production rollout", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8").replace(
+      /\s+/gu,
+      " ",
+    );
+
+    for (const requiredText of [
+      "APPLICATION_IDENTITY_WRITES_ENABLED",
+      "APPLICATION_WRITES_ENABLED",
+      "server-only",
+      "missing value defaults closed",
+      "invalid value",
+      "Production must set it explicitly",
+      "identity=0,writes=1",
+      "identity=1,writes=0",
+      "identity=1,writes=1",
+      "Production candidate",
+      "Ready",
+      "exact intended Git SHA",
+      "no canonical alias",
+      "while unpaused",
+      "2 × maxDuration",
+      "at least 60 seconds",
+      "authenticated negative probe",
+      "503 DEPLOYMENT_PAUSED",
+      "without redeploying",
+      "all eight persistent mutations",
+      "Settings GET does not create a row",
+      "lastUsedAt/updatedAt",
+      "smoke",
+      "bounded cleanup",
+      "external writers are resumed last",
+      "rollback target",
+    ]) {
+      expect(readme).toContain(requiredText);
+    }
+    expect(readme).not.toMatch(
+      /(?:build|deploy|deployment|promotion)[^.]{0,100}(?:while|remains) Vercel (?:was|remains) paused/iu,
+    );
+  });
+
+  test("keeps the Production identity summary factual and requirement-scoped", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const start = readme.indexOf("### Production identity maintenance");
+    const end = readme.indexOf("\n## Development and Verification", start);
+    const section = readme
+      .slice(start, end === -1 ? readme.length : end)
+      .replace(/\s+/gu, " ");
+    const sentences = section.split(/(?<=[.!?])\s+/u);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(section).toMatch(
+      /design and operator-state summary; it does not assert that the\s+production rollout has occurred/iu,
+    );
+    expect(section).toContain(
+      "owns the real procedure and evidence",
+    );
+
+    for (const requiredPhrase of [
+      "identity=0,writes=1",
+      "identity=1,writes=0",
+      "identity=1,writes=1",
+      "exact intended Git SHA",
+      "no canonical alias",
+      "all eight persistent mutations",
+      "Settings GET does not create a row",
+      "lastUsedAt/updatedAt",
+      "503 DEPLOYMENT_PAUSED",
+      "numeric `PREPARE_RUN_ID`",
+      "external writers are resumed last",
+      "rollback target",
+    ]) {
+      const sentence = sentences.find((candidate) =>
+        candidate.includes(requiredPhrase),
+      );
+      expect(sentence).toBeDefined();
+      expect(sentence).toMatch(
+        /\b(?:requires|required|must|may|permitted|acceptance|forbidden|allowed)\b/iu,
+      );
+    }
+
+    for (const forbiddenCompletionClaim of [
+      /\bhistorical evidence began\b/iu,
+      /\brecorded Stage [12] evidence showed\b/iu,
+      /\b(?:the )?(?:exact )?fixtures proved\b/iu,
+      /\b(?:the )?(?:identity )?backfill (?:was )?prepared,[^.]{0,120}\bapplied\b/iu,
+      /\bthe promotion occurred\b/iu,
+      /\bcleanup (?:deleted|consumed|revoked)\b/iu,
+      /\b(?:prepare and apply|workflows?) were dispatched\b/iu,
+      /\b(?:shortcut|shortcuts) was used\b/iu,
+    ]) {
+      expect(section).not.toMatch(forbiddenCompletionClaim);
+    }
+  });
+
+  test("keeps the Stage 1 promotion, drain, and probe order explicit", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const start = readme.indexOf("### Production identity maintenance");
+    const end = readme.indexOf("\n## Development and Verification", start);
+    const section = readme
+      .slice(start, end === -1 ? readme.length : end)
+      .replace(/\s+/gu, " ");
+    const promotion = section.indexOf("promote only while unpaused");
+    const drain = section.indexOf("post-promotion acceptance gate");
+    const probe = section.indexOf("post-drain authenticated negative probe");
+
+    expect(promotion).toBeGreaterThanOrEqual(0);
+    expect(drain).toBeGreaterThan(promotion);
+    expect(probe).toBeGreaterThan(drain);
+    expect(section.slice(drain, probe)).toContain("bounded drain");
+    expect(section.slice(probe)).toContain("all eight persistent mutations");
+    expect(section.slice(probe)).toContain("503 writes_stopped");
+  });
 });

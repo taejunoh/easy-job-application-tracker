@@ -55,6 +55,110 @@ describe("production operations documentation contract", () => {
     expect(envExample.match(/^APPLICATION_IDENTITY_WRITES_ENABLED="0"$/gmu)).toEqual([
       'APPLICATION_IDENTITY_WRITES_ENABLED="0"',
     ]);
+    expect(envExample.match(/^APPLICATION_WRITES_ENABLED="0"$/gmu)).toEqual([
+      'APPLICATION_WRITES_ENABLED="0"',
+    ]);
+    expect(envExample).toMatch(
+      /APPLICATION_IDENTITY_WRITES_ENABLED="0"\nAPPLICATION_WRITES_ENABLED="0"/u,
+    );
+  });
+
+  it("documents the closed application-write gate", () => {
+    const documents = [
+      readFileSync(join(root, "README.md"), "utf8"),
+      readFileSync(join(root, "docs/operations/production-runbook.md"), "utf8"),
+    ].map((document) => document.replace(/\s+/gu, " "));
+
+    for (const document of documents) {
+      expect(document).toContain("APPLICATION_WRITES_ENABLED");
+      expect(document).toMatch(/server-only/iu);
+      expect(document).toMatch(/accepts only [^\n]*0[^\n]*1/iu);
+      expect(document).toMatch(/missing[^\n]*defaults?[^\n]*closed/iu);
+      expect(document).toMatch(/invalid[^\n]*(?:blank|whitespace|true)/iu);
+      expect(document).toMatch(/Production[^\n]*set[^\n]*explicit/iu);
+    }
+    const readme = documents[0];
+    expect(readme).toMatch(/normal local\/CI[^\n]*["`]1["`]/iu);
+    expect(readme).toMatch(/maintenance[^\n]*["`]0["`]/iu);
+    expect(readme).toMatch(/identity[^\n]*distinct|distinction[^\n]*identity/iu);
+  });
+
+  it("requires the staged two-gate hosted rollout and rejects the paused-build path", () => {
+    const documents = [
+      readFileSync(join(root, "README.md"), "utf8"),
+      readFileSync(join(root, "docs/operations/production-runbook.md"), "utf8"),
+      readFileSync(
+        join(root, "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md"),
+        "utf8",
+      ),
+    ].map((document) => document.replace(/\s+/gu, " "));
+
+    for (const document of documents) {
+      for (const requiredText of [
+        "identity=0,writes=1",
+        "identity=1,writes=0",
+        "identity=1,writes=1",
+        "Ready",
+        "exact intended Git SHA",
+        "no canonical alias",
+        "2 × maxDuration",
+        "at least 60 seconds",
+        "authenticated negative probe",
+        "503 DEPLOYMENT_PAUSED",
+        "prepare",
+        "review",
+        "apply",
+        "recorded same",
+        "without redeploying",
+        "smoke",
+        "cleanup",
+        "rollback target",
+        "writes_stopped",
+      ]) {
+        expect(document).toContain(requiredText);
+      }
+      expect(document).toMatch(/external writers (?:are|were) resumed last|resume external writers last/iu);
+      expect(document).toMatch(/no build or promotion (?:while paused|occurred while paused)/iu);
+      expect(document).toMatch(
+        /promote(?: the)? (?:candidate|it) while unpaused|promote only while unpaused|promotion occurred only while unpaused/iu,
+      );
+      expect(document).not.toMatch(
+        /(?:build|deploy|deployment|promotion)[^.]{0,100}(?:while|remains) Vercel (?:was|remains) paused/iu,
+      );
+    }
+
+    const runbook = documents[1];
+    expect(runbook).toContain("vercel --prod --skip-domain");
+    expect(runbook).toContain(
+      '{ "error": "Application writes are temporarily disabled", "code": "writes_stopped", "retryable": true }',
+    );
+    for (const header of [
+      "Cache-Control: private, no-store",
+      "Pragma: no-cache",
+      "Retry-After: 60",
+    ]) {
+      expect(runbook).toContain(header);
+    }
+    for (const mutation of [
+      "Application POST/PATCH/DELETE",
+      "Settings PUT",
+      "pairing creation",
+      "valid pair exchange",
+      "installation deletion",
+      "self-revoke",
+      "Settings GET does not create a row",
+      "lastUsedAt/updatedAt",
+    ]) {
+      expect(runbook).toContain(mutation);
+    }
+    expect(runbook).toMatch(/mode-0700|mode `0700`/iu);
+    expect(runbook).toMatch(/sanitized counts\/hashes/iu);
+    expect(runbook).toMatch(/if (?:DB|the database) apply occurred[^.]{0,140}identity-unaware/iu);
+    const plan = readFileSync(
+      join(root, "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md"),
+      "utf8",
+    );
+    expect(plan).toMatch(/SUPERSEDED[^.]{0,100}(?:unsuccessful|unsuccessfully)/iu);
   });
 
   it("documents the maintenance-gated Application identity rollout", () => {
@@ -94,11 +198,10 @@ describe("production operations documentation contract", () => {
 
     for (const document of documents) {
       expect(document).toContain("Production identity maintenance");
-      expect(document).toContain(prepareDispatch);
       expect(document).toContain("writers_stopped=true");
       expect(document).toContain("prepare_run_id");
       expect(document).toMatch(
-        /writers remain stopped continuously|keep writers stopped continuously/iu,
+        /writers (?:remain|remained) stopped continuously|keep writers stopped continuously/iu,
       );
       expect(document).toMatch(
         /failure[^.]{0,160}writers remain stopped|failure[^.]{0,160}keep writers stopped/iu,
@@ -108,6 +211,7 @@ describe("production operations documentation contract", () => {
       );
     }
     const runbook = documents[1];
+    expect(runbook).toContain(prepareDispatch);
     expect(runbook).toContain(applyDispatch);
   });
 
@@ -118,13 +222,14 @@ describe("production operations documentation contract", () => {
     ).replace(/\s+/gu, " ");
     for (const requiredText of [
       "verified backup prerequisite",
-      "APPLICATION_IDENTITY_WRITES_ENABLED=0",
+      "APPLICATION_IDENTITY_WRITES_ENABLED",
+      "APPLICATION_WRITES_ENABLED",
       "pause Vercel",
       "production-identity-maintenance.yml",
       "rowCountBefore",
       "rowCountAfter",
       "uniqueIndexVerified",
-      "APPLICATION_IDENTITY_WRITES_ENABLED=1",
+      "APPLICATION_IDENTITY_WRITES_ENABLED",
       "resume Application writers",
     ]) {
       expect(runbook).toContain(requiredText);
@@ -152,9 +257,14 @@ describe("production operations documentation contract", () => {
       'gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"';
     const orderedRequirements = [
       "verified backup prerequisite",
-      "APPLICATION_IDENTITY_WRITES_ENABLED=0",
+      "identity=0,writes=1",
+      "identity=1,writes=0",
+      "promote the candidate while unpaused",
+      "2 × maxDuration",
+      "authenticated negative probe",
       "pause Vercel",
-      "503",
+      "503 DEPLOYMENT_PAUSED",
+      "no build or promotion while paused",
       prepareDispatch,
       "capture numeric PREPARE_RUN_ID",
       "headSha equals TARGET_SHA",
@@ -169,9 +279,12 @@ describe("production operations documentation contract", () => {
       'gh run download "$APPLY_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-apply-$APPLY_RUN_ID"',
       'node scripts/compare-application-identity-reports.mjs --expected "$PREPARE_REPORT" --actual "$APPLY_REPORT" --actual-mode apply',
       "compare the approved prepare report with the apply report",
-      "APPLICATION_IDENTITY_WRITES_ENABLED=1",
-      "deploy the same exact TARGET_SHA while Vercel remains paused and canonical 503",
       "resume Vercel Production",
+      "resume the recorded same",
+      "without redeploying",
+      "identity=1,writes=1",
+      "vercel --prod --skip-domain",
+      "no canonical alias",
       "production monitor",
       "authenticated UI create/read/delete cleanup",
       "extension pairing/exchange/create",
@@ -199,7 +312,7 @@ describe("production operations documentation contract", () => {
   it("keeps the README concise and free of an unbound apply run ID", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
 
-    expect(readme).toMatch(/capture and wait for numeric `?PREPARE_RUN_ID`?/iu);
+    expect(readme).toMatch(/capture\s+and\s+wait\s+for\s+numeric\s+`?PREPARE_RUN_ID`?/iu);
     expect(readme).not.toContain(
       'gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"',
     );
@@ -371,33 +484,40 @@ describe("production operations documentation contract", () => {
     expect(phaseEnd).toBeGreaterThan(phaseStart);
     const phase = design.slice(phaseStart, phaseEnd).replace(/\s+/gu, " ");
 
+    expect(design).toMatch(/SUPERSEDED/iu);
+    expect(design).toContain(
+      "2026-09-04-production-write-stop-rollout-design.md",
+    );
     expect(phase).toContain(
       "This is a design-level summary, not the executable operator procedure.",
     );
     expect(phase).toContain("production operations runbook");
     expect(phase).toContain("is authoritative for the exact hosted commands and order");
-    const initialOrder = [
-      "pause Vercel Production",
-      "canonical `503`",
-      "stop ordinary, automated, and background Application writers",
-    ];
-    let initialPrior = -1;
-    for (const requirement of initialOrder) {
-      const next = phase.toLowerCase().indexOf(requirement.toLowerCase(), initialPrior + 1);
-      expect(next).toBeGreaterThan(initialPrior);
-      initialPrior = next;
-    }
     const orderedRequirements = [
-      "keep Vercel Production paused",
-      "prepare",
-      "apply",
-      "APPLICATION_IDENTITY_WRITES_ENABLED=1",
+      "identity=0,writes=1",
+      "identity=1,writes=0",
+      "vercel --prod --skip-domain",
       "Ready",
-      "resume Vercel Production before any authenticated",
+      "exact intended Git SHA",
+      "no canonical alias",
+      "promote the candidate while unpaused",
+      "2 × maxDuration",
+      "authenticated negative probe",
+      "pause Vercel",
+      "503 DEPLOYMENT_PAUSED",
+      "prepare",
+      "review",
+      "apply",
+      "no build or promotion while paused",
+      "resume the recorded same",
+      "without redeploying",
+      "identity=1,writes=1",
+      "promote only while unpaused",
       "production monitor",
-      "authenticated UI",
+      "smoke",
       "one explicitly authorized bounded smoke actor/session at a time",
-      "resume Application writers LAST",
+      "Complete bounded cleanup",
+      "external writers are resumed last",
     ];
     let prior = -1;
     for (const requirement of orderedRequirements) {
@@ -411,6 +531,15 @@ describe("production operations documentation contract", () => {
     expect(phase).toMatch(/preserve the actual current gate and deployment state/iu);
     expect(phase).toMatch(
       /do not force[^.]{0,160}(?:gate|APPLICATION_IDENTITY_WRITES_ENABLED)[^.]{0,160}absent a reviewed hosted rollback/iu,
+    );
+    expect(phase).not.toMatch(
+      /pause Vercel Production[^.]{0,120}(?:first|before)[^.]{0,100}stop ordinary/iu,
+    );
+    expect(phase).not.toMatch(
+      /keep Vercel Production paused continuously through[^.]{0,220}(?:gate|deployment)[^.]{0,120}Ready/iu,
+    );
+    expect(phase).not.toMatch(
+      /(?:build|deploy|deployment|promotion)[^.]{0,120}(?:while|remains) Vercel (?:was|remains) paused/iu,
     );
     expect(phase).not.toMatch(/keep the write gate at `?0`?/iu);
     expect(phase).not.toMatch(/resume the Vercel project only after every check passes/iu);

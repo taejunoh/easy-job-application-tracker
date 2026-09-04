@@ -13,6 +13,7 @@ import {
   decorateCorsResponse,
   type CorsAllowed,
 } from "./cors";
+import { applicationWriteGuard } from "./application-writes";
 import { InvalidRequestError } from "./request-body";
 
 const INTERNAL_ERROR = Object.freeze({
@@ -55,6 +56,7 @@ type ProtectedPrincipalHandler<
 
 type ProtectedRouteOptions = Readonly<{
   installationMethods?: readonly string[];
+  writeMethods?: readonly string[];
 }>;
 
 export function createProtectedRoute(
@@ -64,6 +66,9 @@ export function createProtectedRoute(
   const methodPolicy = Object.freeze([...methods]);
   const installationMethods = new Set(
     (options.installationMethods ?? []).map((method) => method.toUpperCase()),
+  );
+  const writeMethods = new Set(
+    (options.writeMethods ?? []).map((method) => method.toUpperCase()),
   );
 
   const execute = async <TRequest extends Request, TArgs extends unknown[]>(
@@ -79,7 +84,10 @@ export function createProtectedRoute(
       if (!corsResult.allowed) return privateNoStore(corsResult.response);
       cors = corsResult;
 
-      const authentication = await authenticateApiRequestAsync(request);
+      const isWriteMethod = writeMethods.has(request.method.toUpperCase());
+      const authentication = await authenticateApiRequestAsync(request, {
+        touchInstallation: !isWriteMethod,
+      });
       if (!authentication.authenticated) {
         return protectedResponse(
           Response.json(authentication.error, {
@@ -96,6 +104,11 @@ export function createProtectedRoute(
           Response.json(FORBIDDEN, { status: 403 }),
           cors,
         );
+      }
+
+      if (isWriteMethod) {
+        const stopped = applicationWriteGuard();
+        if (stopped) return decorateCorsResponse(stopped, cors);
       }
 
       const principal = authenticationPrincipal(authentication);

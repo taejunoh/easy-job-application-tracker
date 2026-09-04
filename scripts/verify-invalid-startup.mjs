@@ -25,6 +25,7 @@ const MANAGED_ENV_NAMES = [
   "APP_ACCESS_TOKEN",
   "APP_BASE_URL",
   "CORS_ALLOWED_ORIGINS",
+  "APPLICATION_WRITES_ENABLED",
   "NODE_ENV",
 ];
 const VALID_ENV = Object.freeze({
@@ -34,6 +35,7 @@ const VALID_ENV = Object.freeze({
   APP_ACCESS_TOKEN: "startup-access-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   APP_BASE_URL: "https://jobtracker.test",
   CORS_ALLOWED_ORIGINS: "https://jobtracker.test",
+  APPLICATION_WRITES_ENABLED: "1",
 });
 const VALID_DEVELOPMENT_ENV = Object.freeze({
   ...VALID_ENV,

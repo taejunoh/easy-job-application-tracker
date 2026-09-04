@@ -1,7 +1,10 @@
 import { configuredExtensionInstallationService } from "@/lib/security/configured-extension-installations";
+import { applicationWriteGuard } from "@/lib/security/application-writes";
 import { createProtectedRoute } from "@/lib/security/protected-route";
 
-const route = createProtectedRoute(["DELETE"]);
+export const maxDuration = 30;
+
+const route = createProtectedRoute(["DELETE"], { writeMethods: ["DELETE"] });
 const FORBIDDEN = { error: "Forbidden", code: "forbidden" } as const;
 const NOT_FOUND = { error: "Installation not found", code: "not_found" } as const;
 const UUID_PATTERN =
@@ -18,6 +21,8 @@ export const DELETE = route.handlerWithPrincipal(
     if (!UUID_PATTERN.test(id)) {
       return Response.json(NOT_FOUND, { status: 404 });
     }
+    const stopped = applicationWriteGuard();
+    if (stopped) return stopped;
     const revoked = await configuredExtensionInstallationService().revoke(id);
     return revoked
       ? Response.json({ revoked: true })

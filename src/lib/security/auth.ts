@@ -17,6 +17,7 @@ export type AuthConfig = Readonly<{
   encryptionSecret: string;
   appOrigin: string;
   corsAllowedOrigins?: readonly string[];
+  applicationWritesEnabled: boolean;
 }>;
 
 export type InstallationAuthenticationRecord = Readonly<{
@@ -38,6 +39,7 @@ export type AuthOptions = Readonly<{
   config?: AuthConfig;
   now?: number;
   installationStore?: InstallationAuthenticationStore;
+  touchInstallation?: boolean;
 }>;
 
 export type SessionCookieOptions = Readonly<{
@@ -296,8 +298,12 @@ export async function authenticateApiRequestAsync(
         origin,
         config.encryptionSecret,
       );
+      if (!verifyCredentialDigest(record.tokenDigest, digest)) {
+        return UNAUTHORIZED;
+      }
       if (
-        !verifyCredentialDigest(record.tokenDigest, digest) ||
+        config.applicationWritesEnabled &&
+        options.touchInstallation !== false &&
         !(await store.touch(record.id, new Date(now * 1000)))
       ) {
         return UNAUTHORIZED;

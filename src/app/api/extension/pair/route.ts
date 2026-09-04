@@ -1,6 +1,11 @@
 import { getServerEnv } from "@/lib/server-env";
+import {
+  applicationWritesEnabled,
+  applicationWritesStoppedResponse,
+} from "@/lib/security/application-writes";
 import { privateNoStore } from "@/lib/security/auth-response";
 import { configuredExtensionInstallationService } from "@/lib/security/configured-extension-installations";
+import { PAIRING_PERSISTENCE_STOPPED } from "@/lib/security/extension-installations";
 import {
   corsHeaders,
   corsPreflight,
@@ -12,6 +17,8 @@ const UNAUTHORIZED = {
   error: "Authentication required",
   code: "unauthorized",
 } as const;
+
+export const maxDuration = 30;
 
 export async function POST(request: Request): Promise<Response> {
   const cors = corsHeaders(request, ["POST"]);
@@ -34,11 +41,21 @@ export async function POST(request: Request): Promise<Response> {
   } catch {
     code = undefined;
   }
-  const installed = await configuredExtensionInstallationService()
-    .exchangePairingCode(code, origin);
-  const response = installed
-    ? Response.json(installed, { status: 201 })
-    : Response.json(UNAUTHORIZED, { status: 401 });
+  const service = configuredExtensionInstallationService();
+  if (!applicationWritesEnabled()) {
+    const response = (await service.validatePairingCode(code, origin))
+      ? applicationWritesStoppedResponse()
+      : privateNoStore(Response.json(UNAUTHORIZED, { status: 401 }));
+    return decorateCorsResponse(response, cors);
+  }
+  const installed = await service.exchangePairingCode(code, origin, {
+    beforePersist: applicationWritesEnabled,
+  });
+  const response = installed === PAIRING_PERSISTENCE_STOPPED
+    ? applicationWritesStoppedResponse()
+    : installed
+      ? Response.json(installed, { status: 201 })
+      : Response.json(UNAUTHORIZED, { status: 401 });
   return privateNoStore(decorateCorsResponse(response, cors));
 }
 

@@ -4,6 +4,10 @@ JobTracker is a self-hosted job application tracker with a Chrome extension. The
 
 This guide starts with a local setup so you can verify the complete workflow before deploying it.
 
+> Production identity maintenance follows the [authoritative production
+> operations runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout),
+> which is the sole source of executable operator commands and ordering.
+
 ## What You Can Do
 
 - Save jobs from LinkedIn, Indeed, Glassdoor, Lever, Greenhouse, Workday, and other career pages.
@@ -70,7 +74,7 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
 ```
 
 Use the first output for encryption and the second output for application
-access. Edit `.env` so the five required variables and optional rollout gate
+access. Edit `.env` so the five required variables and optional rollout gates
 follow this local template:
 
 ```dotenv
@@ -80,6 +84,7 @@ APP_ACCESS_TOKEN="<second-generated-secret>"
 APP_BASE_URL="http://localhost:3000"
 CORS_ALLOWED_ORIGINS="http://localhost:3000,chrome-extension://<extension-id>"
 APPLICATION_IDENTITY_WRITES_ENABLED="0"
+APPLICATION_WRITES_ENABLED="1"
 ```
 
 Reserved URL characters in the database username, password, or database name must be percent-encoded before you place those components in `DATABASE_URL`. For example, encode `@` as `%40`.
@@ -97,16 +102,22 @@ The variables serve these purposes:
 | `APP_ACCESS_TOKEN` | Private root credential used only by the web `/connect` page to create an administrator session. Never paste it into the Chrome extension. It is not a provider API key. |
 | `APP_BASE_URL` | Exact public origin of the JobTracker server, with no path. Use `http://localhost:3000` locally. |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins allowed to call the server. Include the app origin and the exact `chrome-extension://<extension-id>` origin. |
-| `APPLICATION_IDENTITY_WRITES_ENABLED` | Optional closed rollout gate. It accepts only `"0"` or `"1"` and defaults to `"0"`; keep it disabled until the identity migration and any required legacy-data backfill are verified. |
+| `APPLICATION_IDENTITY_WRITES_ENABLED` | Server-only identity gate. It accepts only `"0"` or `"1"` and defaults to `"0"`; keep it disabled until the identity migration and any required legacy-data backfill are verified. |
+| `APPLICATION_WRITES_ENABLED` | Server-only application-write gate. It accepts exactly `"0"` or `"1"`; a missing value defaults closed (`"0"`). Any defined invalid value—including blank, whitespace, `true`, or another string—fails validation. Production must set it explicitly; normal local/CI uses `"1"`, while maintenance uses `"0"`. |
 
 Do not commit `.env`, reuse one generated value for both secrets, or paste either secret into screenshots or issue reports.
 
 For a new empty local database, leave the identity gate at `"0"` while you
-apply the checked-in migrations. You may enable it only after migration status
-is current and the `Application` table is confirmed empty. For an existing
-database, follow the maintenance rollout in the
+apply the checked-in migrations, and use `APPLICATION_WRITES_ENABLED="1"` for
+normal local/CI work. You may enable the identity gate only after migration
+status is current and the `Application` table is confirmed empty. For an
+existing database, follow the maintenance rollout in the
 [production operations runbook](docs/operations/production-runbook.md); do not
-enable the gate before its dry run, backfill, and verification are complete.
+enable either maintenance gate before its dry run, backfill, and verification
+are complete. `APPLICATION_WRITES_ENABLED` is server-only and is never a
+Chrome-extension setting. Keep the identity-gate distinction clear: the
+identity gate controls identity maintenance writes, while the application gate
+controls ordinary Application mutations.
 
 ### 3. Prepare the database
 
@@ -232,7 +243,7 @@ For production-only connection, deployment, backup, and recovery problems, use t
 
 ## Production Deployment
 
-The supported hosted topology is Vercel for the Next.js application and Neon, or another managed PostgreSQL provider, for the database. Start with an empty PostgreSQL database and configure the five required server variables plus the optional `APPLICATION_IDENTITY_WRITES_ENABLED` rollout gate in the Production environment. Use a canonical HTTPS origin for `APP_BASE_URL` and include that origin plus only approved Chrome extension origins in `CORS_ALLOWED_ORIGINS`.
+The supported hosted topology is Vercel for the Next.js application and Neon, or another managed PostgreSQL provider, for the database. Start with an empty PostgreSQL database and configure the five required server variables plus both server-only rollout gates, `APPLICATION_IDENTITY_WRITES_ENABLED` and `APPLICATION_WRITES_ENABLED`, in the Production environment. Production must set both gates explicitly; use a canonical HTTPS origin for `APP_BASE_URL` and include that origin plus only approved Chrome extension origins in `CORS_ALLOWED_ORIGINS`.
 
 The **Vercel Next.js preset** runs `npm run build`; Vercel does not run `npm start`. When the build loads `next.config.ts`, JobTracker validates the complete server environment at **build time**. At **request-serving runtime**, `src/instrumentation.ts` validates it again before a new Node.js server instance handles requests. `npm start` pre-listen validation applies to **self-hosted Node only**.
 
@@ -278,8 +289,9 @@ npx prisma migrate status
 
 Confirm the `Application`, `Settings`, `ExtensionInstallation`,
 `ExtensionPairingGrant`, and `_prisma_migrations` tables exist before serving
-traffic. No seed is required; the Settings row is created on the first
-authenticated Settings request.
+traffic. No seed is required; the Settings singleton is created only on the
+first successful PUT /api/settings. An authenticated GET /api/settings is
+read-only and does not create the row.
 
 If an existing database was previously created with `prisma db push`, first take a verified backup and compare it with the current Prisma schema:
 
@@ -299,25 +311,66 @@ Never use a destructive reset, `db push` data-loss acceptance, or an unreviewed 
 
 ### Production identity maintenance
 
-Production identity maintenance is a manual, ordered operation: verify a
-backup and scratch restore, set `APPLICATION_IDENTITY_WRITES_ENABLED=0`, pause
-Vercel until the canonical origin returns `503`, and stop every Application
-writer. Dispatch prepare from `main` with the required writer-stop attestation:
+The Settings singleton is created only on the first successful PUT /api/settings; an authenticated GET /api/settings is read-only and does not create the row. The complete staged candidate, rollback, fixture-ledger, and cleanup procedure is the [production operations runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
 
-```bash
-gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare -f writers_stopped=true
-```
+#### Rollout state and evidence summary
 
-Capture and wait for numeric `PREPARE_RUN_ID` with `gh run list`, `gh run view`,
-and `gh run watch --exit-status`, then follow the runbook to review the prepare
-artifact and dispatch apply with that approved ID. The workflow's `prepare_run_id`
-input must contain that approved numeric value. The runbook also defines the
-SHA checks, gate-1 deployment while paused, Vercel resume, production monitor,
-web/extension smoke checks, and final writer resume. Writers remain stopped
-continuously until every post-resume smoke pass succeeds. Any failure means
-writers remain stopped continuously; do not run `prisma db push`, `prisma db
-reset`, or destructive shortcuts. See the [Production identity maintenance
-rollout](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
+This is a design and operator-state summary; it does not assert that the
+production rollout has occurred. The [production operations runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout)
+owns the real procedure and evidence. Its planned state model requires the
+rollout to enter `PAUSED_AFTER_APPLY` after database apply; failed or ambiguous
+evidence must enter `HOLD_PAUSED`, where no build, deploy, alias assignment, or
+promotion is permitted. After approval, the plan requires resuming the exact
+recorded `identity=1,writes=0` Ready deployment with no redeploy; it is the
+recorded same deployment for `UNPAUSED_READONLY` read-only and authenticated
+negative probes. A
+regression requires an exact Ready candidate ID and reviewed SHA or must return
+to `HOLD_PAUSED`. The private ledger must retain exact owned IDs until bounded
+cleanup is verified, and cleanup may remove only those IDs.
+
+Production identity maintenance is a manual, ordered two-gate operation. The
+plan requires starting from an `identity=0,writes=1` Ready canonical support
+deployment and private fixtures: one disposable Application, one installed
+extension credential, and a second unconsumed pairing grant. Their URL, IDs,
+tokens, pairing codes, and request/response bodies must remain only in a
+private mode-0700 operator workspace and must be absent from logs, artifacts,
+Actions output, shell history, PR/comments, and docs.
+
+Stage 1 acceptance requires a Ready `identity=1,writes=0` Production candidate
+with the exact intended Git SHA and no canonical alias. Operators must promote
+only while unpaused. The post-promotion acceptance gate requires a bounded
+drain of at least `2 × maxDuration` (at least 60 seconds when modules have
+30-second maximum duration). After the drain, the post-drain authenticated
+negative probe must prove that all eight persistent mutations return
+`503 writes_stopped`: Application POST/PATCH/DELETE,
+Settings PUT, pairing creation, valid pair exchange, installation deletion, and
+self-revoke. The required behavior is that Settings GET does not create a row,
+and installation-authenticated reads must not change `lastUsedAt/updatedAt`.
+
+Stage 2 requires canonical `503 DEPLOYMENT_PAUSED` before prepare/apply. The
+identity backfill must be prepared, privately reviewed, and applied only while
+paused. Acceptance requires evidence that no build or promotion occurred while
+paused. After apply evidence is approved and the pause is cleared, the same
+read-only `identity=1,writes=0` deployment may resume without redeploying,
+building, or promoting. A final Ready `identity=1,writes=1` candidate then
+requires unpaused promotion, smoke, bounded cleanup, and evidence that external
+writers are resumed last. Cleanup must delete the disposable Application,
+consume the still-unconsumed grant once, revoke both disposable installations,
+and retain only sanitized statuses/counts/hashes.
+
+The plan requires prepare and apply to be dispatched from `main` only after
+writer-stop attestation and pause evidence. Evidence must capture and wait for
+numeric `PREPARE_RUN_ID`; numeric prepare/apply run identifiers, exact rollout
+SHA, private artifact review, and `writers_stopped=true` are required, with
+apply using the approved numeric `prepare_run_id`. The authoritative
+[Production identity maintenance runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout)
+defines all executable dispatch, observation, promotion, rollback, fixture, and
+cleanup procedures. The rollout invariant requires that writers remain stopped
+continuously until every post-resume smoke pass succeeds. Any failure must keep
+writers stopped; `prisma db push`, `prisma db reset`, and destructive shortcuts
+are forbidden. The rollback target must be a recorded Ready
+`identity=1,writes=0` deployment; promotion and rollback are allowed only while
+unpaused, and neither action may target identity-unaware code.
 
 ## Development and Verification
 

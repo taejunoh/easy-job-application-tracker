@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { encrypt } from "@/lib/crypto";
 import { createProtectedRoute } from "@/lib/security/protected-route";
+import { applicationWriteGuard } from "@/lib/security/application-writes";
 import {
   InvalidRequestError,
   MAX_SETTINGS_BODY_BYTES,
@@ -10,29 +11,29 @@ import {
 } from "@/lib/security/request-body";
 import { MAX_RESUME_CODE_POINTS } from "@/lib/resume/constants";
 
-const route = createProtectedRoute(["GET", "PUT"]);
+export const maxDuration = 30;
+
+const route = createProtectedRoute(["GET", "PUT"], {
+  writeMethods: ["PUT"],
+});
 
 export const OPTIONS = route.OPTIONS;
 
 export const GET = route.handler(async function GET(request: NextRequest) {
-  let settings = await prisma.settings.findFirst();
-
-  if (!settings) {
-    settings = await prisma.settings.create({ data: {} });
-  }
+  const settings = await prisma.settings.findFirst();
 
   const { searchParams } = new URL(request.url);
   const includeResume = searchParams.get("includeResume") === "true";
 
   const response: Record<string, unknown> = {
-    llmProvider: settings.llmProvider,
-    hasApiKey: settings.apiKey !== "",
-    linkedinUrl: settings.linkedinUrl,
-    githubUrl: settings.githubUrl,
+    llmProvider: settings?.llmProvider ?? "openai",
+    hasApiKey: Boolean(settings?.apiKey),
+    linkedinUrl: settings?.linkedinUrl ?? "",
+    githubUrl: settings?.githubUrl ?? "",
   };
 
   if (includeResume) {
-    response.resumeText = settings.resumeText;
+    response.resumeText = settings?.resumeText ?? "";
   }
 
   return NextResponse.json(response);
@@ -87,18 +88,13 @@ export const PUT = route.handler(async function PUT(request: NextRequest) {
     data.resumeText = body.resumeText;
   }
 
-  let settings = await prisma.settings.findFirst();
-
-  if (!settings) {
-    settings = await prisma.settings.create({
-      data: { ...data, id: "singleton" },
-    });
-  } else {
-    settings = await prisma.settings.update({
-      where: { id: settings.id },
-      data,
-    });
-  }
+  const stopped = applicationWriteGuard();
+  if (stopped) return stopped;
+  const settings = await prisma.settings.upsert({
+    where: { id: "singleton" },
+    create: { ...data, id: "singleton" },
+    update: data,
+  });
 
   return NextResponse.json({
     llmProvider: settings.llmProvider,

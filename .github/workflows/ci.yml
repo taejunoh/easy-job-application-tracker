@@ -41,6 +41,7 @@ jobs:
       RUN_DATABASE_INTEGRATION: "1"
       ALLOW_DESTRUCTIVE_DATABASE_TESTS: jobtracker-ci-delete-all
       APPLICATION_IDENTITY_WRITES_ENABLED: "1"
+      APPLICATION_WRITES_ENABLED: "1"
 
     steps:
       - name: Check out repository
@@ -133,6 +134,7 @@ jobs:
       RUN_EXTENSION_E2E: "1"
       ALLOW_DESTRUCTIVE_EXTENSION_E2E: jobtracker-extension-e2e-delete-all
       APPLICATION_IDENTITY_WRITES_ENABLED: "1"
+      APPLICATION_WRITES_ENABLED: "1"
 
     steps:
       - name: Check out repository

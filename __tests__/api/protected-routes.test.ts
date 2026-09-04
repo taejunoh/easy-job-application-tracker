@@ -31,6 +31,7 @@ jest.mock("@/lib/server-env", () => {
       CORS_ALLOWED_ORIGINS:
         "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
       APPLICATION_IDENTITY_WRITES_ENABLED: "1",
+      APPLICATION_WRITES_ENABLED: "1",
     },
     "production",
   );
@@ -53,6 +54,7 @@ jest.mock("@/lib/prisma", () => ({
       findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      upsert: jest.fn(),
     },
   },
 }));
@@ -132,6 +134,7 @@ describe("application route contract enforcement", () => {
           CORS_ALLOWED_ORIGINS:
             "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
           APPLICATION_IDENTITY_WRITES_ENABLED: "1",
+          APPLICATION_WRITES_ENABLED: "1",
         }, "production"),
     }));
   });
@@ -214,6 +217,12 @@ describe("application route contract enforcement", () => {
       code: "request_too_large",
     });
     expect(prisma.application.create).not.toHaveBeenCalled();
+  });
+
+  it("pins persistent application and settings routes to the bounded duration", () => {
+    expect(applicationsRoute.maxDuration).toBe(30);
+    expect(applicationDetailRoute.maxDuration).toBe(30);
+    expect(settingsRoute.maxDuration).toBe(30);
   });
 });
 
@@ -774,6 +783,40 @@ describe("protected product API actual requests", () => {
     consoleError.mockRestore();
   });
 
+  it.each(["57014", "55P03"] as const)(
+    "normalizes PostgreSQL timeout error %s without leaking database details",
+    async (code) => {
+      const route = actualRoutes.find(
+        ({ name }) => name === "stats GET",
+      ) as ActualRouteCase;
+      jest.mocked(prisma.application.count).mockRejectedValueOnce(
+        Object.assign(new Error("private database timeout detail"), { code }),
+      );
+      const consoleError = jest
+        .spyOn(console, "error")
+        .mockImplementation(() => undefined);
+
+      const response = await invokeActual(
+        route,
+        productRequest(route, {
+          origin: APP_ORIGIN,
+          cookie: SESSION_COOKIE,
+        }),
+      );
+
+      expect(response.status).toBe(500);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual({
+        error: "Internal server error",
+        code: "internal_error",
+      });
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(text).not.toContain(code);
+      expect(text).not.toContain("private database timeout detail");
+      consoleError.mockRestore();
+    },
+  );
+
   it.each([
     [
       "applications POST",
@@ -1089,7 +1132,7 @@ describe("protected product API actual requests", () => {
       error: "Invalid request",
       code: "invalid_request",
     });
-    expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+    expect(prisma.settings.upsert).not.toHaveBeenCalled();
   });
 
   it("settings accepts exactly 500,000 Unicode code points", async () => {
@@ -1100,7 +1143,7 @@ describe("protected product API actual requests", () => {
     const response = await settingsRoute.PUT(request);
 
     expect(response.status).toBe(200);
-    expect(prisma.settings.findFirst).toHaveBeenCalled();
+    expect(prisma.settings.upsert).toHaveBeenCalled();
   });
 
   it.each([
@@ -1120,7 +1163,7 @@ describe("protected product API actual requests", () => {
         code: "request_too_large",
       });
       expect(response.headers.get("Cache-Control")).toContain("no-store");
-      expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+      expect(prisma.settings.upsert).not.toHaveBeenCalled();
     },
   );
 
@@ -1130,7 +1173,7 @@ describe("protected product API actual requests", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(prisma.settings.findFirst).toHaveBeenCalled();
+    expect(prisma.settings.upsert).toHaveBeenCalled();
   });
 
   it("settings rejects an oversized stream without awaiting reader cancellation", async () => {
@@ -1150,7 +1193,7 @@ describe("protected product API actual requests", () => {
     expect(outcome.response.status).toBe(413);
     expect(outcome.response.headers.get("Cache-Control")).toContain("no-store");
     expect(cancel).toHaveBeenCalled();
-    expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+    expect(prisma.settings.upsert).not.toHaveBeenCalled();
   });
 
   it.each(["application detail PATCH", "application detail DELETE"])(
@@ -1260,6 +1303,172 @@ describe("protected product API preflights", () => {
       code: "origin_not_allowed",
     });
     expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+});
+
+describe("protected route application write stop", () => {
+  beforeEach(() => {
+    jest.mocked(getServerEnv).mockReturnValue({
+      ...getServerEnv(),
+      applicationWritesEnabled: false,
+    });
+  });
+
+  it("returns the stable 503 response for an authenticated declared write method", async () => {
+    const handler = jest.fn(() => new Response("handler-called"));
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const request = new NextRequest(`${APP_ORIGIN}/api/protected`, {
+      method: "POST",
+      headers: {
+        Origin: APP_ORIGIN,
+        Cookie: SESSION_COOKIE,
+      },
+      body: "private-body-must-not-be-read",
+    });
+
+    const response = await route.handler(handler)(request);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Application writes are temporarily disabled",
+      code: "writes_stopped",
+      retryable: true,
+    });
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(response.headers.get("Retry-After")).toBe("60");
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(APP_ORIGIN);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("authenticates a declared installation write without touching it before the stop gate", async () => {
+    const initiallyClosed = getServerEnv();
+    const open = { ...initiallyClosed, applicationWritesEnabled: true };
+    const closed = { ...open, applicationWritesEnabled: false };
+    let environmentCalls = 0;
+    jest.mocked(getServerEnv).mockImplementation(() => {
+      environmentCalls += 1;
+      return environmentCalls <= 2 ? open : closed;
+    });
+    jest
+      .mocked(extensionInstallationAuthenticationStore.findForAuthentication)
+      .mockResolvedValue({
+        id: INSTALLATION.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: INSTALLATION.digest,
+        expiresAt: new Date(Date.now() + 60_000),
+        revokedAt: null,
+      });
+    jest
+      .mocked(extensionInstallationAuthenticationStore.touch)
+      .mockResolvedValue(true);
+    const handler = jest.fn(() => new Response("handler-called"));
+    const route = createProtectedRoute(["POST"], {
+      installationMethods: ["POST"],
+      writeMethods: ["POST"],
+    });
+
+    const response = await route.handler(handler)(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "POST",
+        headers: {
+          Origin: EXTENSION_ORIGIN,
+          Authorization: `Bearer ${INSTALLATION.token}`,
+        },
+      }),
+    );
+
+    expect(response.status).toBe(503);
+    expect(environmentCalls).toBe(3);
+    expect(
+      extensionInstallationAuthenticationStore.findForAuthentication,
+    ).toHaveBeenCalledWith(INSTALLATION.selector);
+    expect(extensionInstallationAuthenticationStore.touch).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("keeps unauthenticated writes at 401", async () => {
+    const handler = jest.fn(() => new Response("handler-called"));
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const response = await route.handler(handler)(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "POST",
+        headers: { Origin: APP_ORIGIN },
+        body: "private-body-must-not-be-read",
+      }),
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: "Authentication required",
+      code: "unauthorized",
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("keeps bad Origins at 403 before the write stop", async () => {
+    const handler = jest.fn(() => new Response("handler-called"));
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const response = await route.handler(handler)(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "POST",
+        headers: {
+          Origin: UNKNOWN_ORIGIN,
+          Cookie: SESSION_COOKIE,
+        },
+        body: "private-body-must-not-be-read",
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: "Origin not allowed",
+      code: "origin_not_allowed",
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("keeps OPTIONS at 204 while writes are stopped", async () => {
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const response = route.OPTIONS(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "OPTIONS",
+        headers: {
+          Origin: APP_ORIGIN,
+          "Access-Control-Request-Method": "POST",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+  });
+
+  it("lets an authenticated read method reach its handler", async () => {
+    const handler = jest.fn(() => new Response("read-ok"));
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const response = await route.handler(handler)(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "GET",
+        headers: {
+          Origin: APP_ORIGIN,
+          Cookie: SESSION_COOKIE,
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe("read-ok");
+    expect(handler).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1460,6 +1669,7 @@ function arrangeSuccessfulBusinessLogic(): void {
   jest.mocked(prisma.settings.findFirst).mockResolvedValue(settings as never);
   jest.mocked(prisma.settings.create).mockResolvedValue(settings as never);
   jest.mocked(prisma.settings.update).mockResolvedValue(settings as never);
+  jest.mocked(prisma.settings.upsert).mockResolvedValue(settings as never);
 
   jest.mocked(parseMetaTags).mockReturnValue({
     jobTitle: "Engineer",
@@ -1554,8 +1764,9 @@ function expectedDownstream(route: ActualRouteCase): jest.Mock {
     case "parse resume POST":
       return jest.mocked(parsePdfInWorker);
     case "settings GET":
-    case "settings PUT":
       return jest.mocked(prisma.settings.findFirst);
+    case "settings PUT":
+      return jest.mocked(prisma.settings.upsert);
     case "stats GET":
       return jest.mocked(prisma.application.count);
     default:
@@ -1575,6 +1786,7 @@ function downstreamMocks(): jest.Mock[] {
     jest.mocked(prisma.settings.findFirst),
     jest.mocked(prisma.settings.create),
     jest.mocked(prisma.settings.update),
+    jest.mocked(prisma.settings.upsert),
     jest.mocked(parseMetaTags),
     jest.mocked(createProvider),
     jest.mocked(analyzeKeywordMatch),
