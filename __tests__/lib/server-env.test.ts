@@ -197,6 +197,45 @@ describe("parseServerEnv", () => {
     expect(config.databaseUrl).toBe(databaseUrl);
   });
 
+  it.each([
+    "statement_timeout=1",
+    "STATEMENT_TIMEOUT=1",
+    "lock_timeout=1",
+    "LOCK_TIMEOUT=1",
+    "options=-c%20statement_timeout%3D0",
+    "OPTIONS=-c%20lock_timeout%3D0",
+    "statement_timeout=1&statement_timeout=2",
+    "Statement_Timeout=1&statement_timeout=2",
+    "lock_timeout=1&lock_timeout=2",
+    "Lock_Timeout=1&lock_timeout=2",
+    "options=one&options=two",
+    "Options=one&options=two",
+  ])("rejects reserved PostgreSQL timeout URL query %s", (query) => {
+    const databaseUrl =
+      `postgresql://jobtracker:database-password@db.example.com:5432/jobtracker?${query}`;
+
+    expect(() =>
+      parseServerEnv(
+        { ...productionSource, DATABASE_URL: databaseUrl },
+        "production",
+      ),
+    ).toThrow(
+      "must not contain reserved PostgreSQL timeout parameters",
+    );
+  });
+
+  it("accepts supported non-timeout PostgreSQL URL query parameters unchanged", () => {
+    const databaseUrl =
+      "postgresql://jobtracker:database-password@db.example.com:5432/jobtracker?sslmode=require&sslcert=client-cert.pem&sslkey=client-key.pem&sslrootcert=ca.pem&schema=public&application_name=jobtracker";
+
+    const config = parseServerEnv(
+      { ...productionSource, DATABASE_URL: databaseUrl },
+      "production",
+    );
+
+    expect(config.databaseUrl).toBe(databaseUrl);
+  });
+
   it.each(["short", " ".repeat(32), "é".repeat(15) + "a"])(
     "rejects weak ENCRYPTION_SECRET values",
     (encryptionSecret) => {
