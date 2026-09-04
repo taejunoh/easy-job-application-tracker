@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -162,6 +163,23 @@ function baseScenario(): Record<string, string> {
   };
 }
 
+function writeStopEvidence(deploymentId: string): Record<string, string | number> {
+  const projection = {
+    cacheControl: "private, no-store",
+    code: "writes_stopped",
+    deploymentId,
+    expectedStatus: 503,
+    observedAt: "2026-09-04T00:00:00Z",
+    observedStatus: 503,
+    retryAfter: "60",
+    schemaVersion: 1,
+  };
+  return {
+    ...projection,
+    projectionSha256: createHash("sha256").update(JSON.stringify(projection)).digest("hex"),
+  };
+}
+
 function aliasJson(alias: string): string {
   if (alias === "missing") return JSON.stringify({ id: "dpl_valid", readyState: "READY" });
   return JSON.stringify({ id: "dpl_valid", readyState: "READY", aliases: JSON.parse(alias) });
@@ -194,6 +212,14 @@ function normalResumeBlock(): string {
 function stageOneLedgerBlock(): string {
   const block = bashBlocks(rolloutSection()).find((candidate) =>
     normalize(candidate).includes('STAGE_ONE_LEDGER_TMP="$(mktemp "$EVIDENCE_ROOT/.rollout-ledger.stage1.XXXXXX")"'),
+  );
+  expect(block).toBeDefined();
+  return block ?? "";
+}
+
+function stageOneWriteStopEvidenceBlock(): string {
+  const block = bashBlocks(rolloutSection()).find((candidate) =>
+    normalize(candidate).includes("STAGE_ONE_EVIDENCE_PROJECTION"),
   );
   expect(block).toBeDefined();
   return block ?? "";
@@ -402,7 +428,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     const block = regressionBlock();
     const normalizedBlock = normalize(block);
     expectOrdered(normalizedBlock, [
-      "validate_evidence_root || enter_hold_paused",
+      "validate_stage1_write_stop_selector || enter_hold_paused",
       'ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"',
       "sleep 60",
       'READONLY_STATUS="$(curl',
@@ -421,7 +447,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         fixtureOwnership: {
           applicationIds: ["app_owned"], ownedDeploymentIds: ["dpl_valid"], preProbeHash: "before", postProbeHash: "after",
           settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
-          pairing: { preStopUnconsumedGrantId: "grant", codeReference: "code-ref" },
+          pairingGrantIds: ["grant"], pairing: { preStopUnconsumedGrantId: "grant", codeReference: "code-ref" },
           installation: { credentialReference: "credential-ref", installationId: "installation" },
           cleanup: [{ action: "revoke_installation", targetId: "installation", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
         },
@@ -429,7 +455,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
           deploymentId: "dpl_valid", targetSha: "sha-reviewed", gates: { identity: "1", writes: "0" }, reviewedGateConfig: { identity: "1", writes: "0" },
           ready: true, readyState: "READY", readyEvidence: { deploymentId: "dpl_valid", state: "READY", observedAt: "2026-09-04T00:00:00Z" },
           canonicalPromotionVerified: true, canonicalPromotion: { origin: expectedOrigin, deploymentId: "dpl_valid", verified: true, verifiedAt: "2026-09-04T00:00:00Z" },
-          compatibilityVerified: true, timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
+          compatibilityVerified: true, timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" }, writeStopEvidence: writeStopEvidence("dpl_valid"),
         },
       }), { mode: 0o600 });
       const source = `${candidateFunction()}\n${normalResumeBlock().replace(/^[ \t]*read -r -p .*$/gmu, "     :")}\n[[ "$(cat \"$NPM_LOG\")" == "run check:production:writes-stopped" ]] || exit 90\n[[ ! -s "$DEPLOY_LOG" && ! -s "$PROMOTE_LOG" ]] || exit 91`;
@@ -442,9 +468,9 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
   it("requires observed provider pause evidence before HOLD_PAUSED on missing evidence or a failed probe", () => {
     const testableBlock = regressionBlock()
       .replace(/^[ \t]*read -r -p 'After the provider pause is complete, press Enter: ' _ <\/dev\/tty \|\| return 1$/mu, "     :")
-      .replace(/   # Normal PAUSED_AFTER_APPLY -> UNPAUSED_READONLY:[\s\S]*?   validate_evidence_root \|\| enter_hold_paused\n\n/u, "")
+      .replace(/   # Normal PAUSED_AFTER_APPLY -> UNPAUSED_READONLY:[\s\S]*?   validate_stage1_write_stop_selector \|\| enter_hold_paused\n\n/u, "")
       .replace("sleep 60 || enter_hold_paused", ":");
-    const helperBlock = normalResumeBlock().slice(0, normalResumeBlock().indexOf("validate_evidence_root || enter_hold_paused"))
+    const helperBlock = normalResumeBlock().slice(0, normalResumeBlock().indexOf("validate_stage1_write_stop_selector || enter_hold_paused"))
       .replace(/^[ \t]*read -r -p 'After the provider pause is complete, press Enter: ' _ <\/dev\/tty \|\| return 1$/mu, "     :");
     const source = `${candidateFunction()}\n${helperBlock}\n${testableBlock}`;
     const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-regression-"));
@@ -475,6 +501,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
           canonicalPromotion: { origin: expectedOrigin, deploymentId: "dpl_valid", verified: true, verifiedAt: "2026-09-04T00:00:00Z" },
           compatibilityVerified: true,
           timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
+          writeStopEvidence: writeStopEvidence("dpl_valid"),
         },
       }), { mode: 0o600 });
       const failedProbe = runMockedFailure(source, {
@@ -504,6 +531,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         fixtureOwnership: {
           applicationIds: ["app_fixture_1", "app_fixture_2"],
           ownedDeploymentIds: ["dpl_fixture_1"],
+          pairingGrantIds: ["grant_fixture"],
           preProbeHash: "sha256:before",
           postProbeHash: "sha256:after",
           settings: { existedBefore: true, contentHashBefore: "sha256:settings-before", contentHashAfter: "sha256:settings-after" },
@@ -683,6 +711,123 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     expect(execFileSync("bash", ["-n"], { input: block, encoding: "utf8" })).toBe("");
   });
 
+  it("requires authenticated stopped-write evidence that is bound to the exact Stage 1 deployment", () => {
+    const section = rolloutSection();
+    expectOrdered(section, [
+      'STAGE_ONE_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"',
+      "STAGE_ONE_CANDIDATE_ID",
+      "check:production:writes-stopped",
+      "stage1.writeStopEvidence",
+    ]);
+    expect(section).toContain("projectionSha256");
+    expect(section).toContain("observedStatus: 503");
+    expect(section).toContain('cacheControl: "private, no-store"');
+    expect(section).toContain('retryAfter: "60"');
+    expect(section).toContain('code: "writes_stopped"');
+  });
+
+  it("atomically records only a hash-bound stopped-write projection after the exact canonical Stage 1 check", () => {
+    const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-write-stop-evidence-"));
+    try {
+      const ledger = join(temporaryRoot, "rollout-ledger.json");
+      const initialLedger = {
+        schemaVersion: 1,
+        fixtureOwnership: {
+          applicationIds: ["app_fixture"],
+          ownedDeploymentIds: ["dpl_fixture"],
+          pairingGrantIds: ["grant_fixture"],
+          preProbeHash: "before", postProbeHash: "after",
+          settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
+          pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref" },
+          installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
+          cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
+        },
+      };
+      writeFileSync(ledger, JSON.stringify(initialLedger), { mode: 0o600 });
+      const source = `${stageOneLedgerBlock()}\n${stageOneWriteStopEvidenceBlock()}\n[[ "$(cat \"$NPM_LOG\")" == "run check:production:writes-stopped" ]] || exit 94`;
+      expect(runMocked(source, {
+        ...baseScenario(), EVIDENCE_ROOT: temporaryRoot, APP_ACCESS_TOKEN: "private-test-token", STAGE_ONE_CANDIDATE_ID: "dpl_valid",
+      }, "")).toBe("");
+      const record = JSON.parse(readFileSync(ledger, "utf8"));
+      expect(record.stage1.writeStopEvidence).toMatchObject({
+        deploymentId: "dpl_valid", expectedStatus: 503, observedStatus: 503, cacheControl: "private, no-store", retryAfter: "60", code: "writes_stopped",
+      });
+      const { projectionSha256, ...projection } = record.stage1.writeStopEvidence;
+      expect(projectionSha256).toBe(createHash("sha256").update(JSON.stringify(projection)).digest("hex"));
+      expect(JSON.stringify(record)).not.toContain("private-test-token");
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("holds without a provider mutation when stopped-write evidence is missing, mismatched, or hash-tampered", () => {
+    const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-write-stop-selector-"));
+    try {
+      const ledger = join(temporaryRoot, "rollout-ledger.json");
+      const source = `${candidateFunction()}\n${normalResumeBlock().replace(/^[ \t]*read -r -p .*$/gmu, "     :")}`;
+      const stage1 = {
+        deploymentId: "dpl_valid", targetSha: "sha-reviewed", gates: { identity: "1", writes: "0" }, reviewedGateConfig: { identity: "1", writes: "0" },
+        ready: true, readyState: "READY", readyEvidence: { deploymentId: "dpl_valid", state: "READY", observedAt: "2026-09-04T00:00:00Z" },
+        canonicalPromotionVerified: true, canonicalPromotion: { origin: expectedOrigin, deploymentId: "dpl_valid", verified: true, verifiedAt: "2026-09-04T00:00:00Z" },
+        compatibilityVerified: true, timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
+      };
+      for (const invalidStage1 of [
+        stage1,
+        { ...stage1, writeStopEvidence: { ...writeStopEvidence("dpl_other") } },
+        { ...stage1, writeStopEvidence: { ...writeStopEvidence("dpl_valid"), projectionSha256: "0".repeat(64) } },
+      ]) {
+        writeFileSync(ledger, JSON.stringify({ schemaVersion: 1, stage1: invalidStage1 }), { mode: 0o600 });
+        const failure = runMockedFailure(source, {
+          ...baseScenario(), EVIDENCE_ROOT: temporaryRoot, ROLLBACK_READ_TOKEN: "private-test-token", CURL_STATUS_SEQUENCE: "503", CURL_BODY_SEQUENCE: "DEPLOYMENT_PAUSED",
+        }, "");
+        expect(failure.stderr).toContain("HOLD_PAUSED");
+        expect(failure.deploys).toBe("");
+        expect(failure.promotes).toBe("");
+        expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({ schemaVersion: 1, stage1: invalidStage1 });
+      }
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts only typed cleanup targets from the owned pre- and post-resume unions", () => {
+    const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-typed-cleanup-"));
+    try {
+      const ledger = join(temporaryRoot, "rollout-ledger.json");
+      const owned = {
+        applicationIds: ["app_pre"], postResumeApplicationIds: ["app_post"], ownedDeploymentIds: ["dpl_fixture"],
+        pairingGrantIds: ["grant_pre"], postResumePairingGrantIds: ["grant_post"], installationIds: ["installation_pre"], postResumeInstallationIds: ["installation_post"],
+        preProbeHash: "before", postProbeHash: "after",
+        settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
+        pairing: { preStopUnconsumedGrantId: "grant_pre", codeReference: "private-code-ref" },
+        installation: { credentialReference: "private-credential-ref", installationId: "installation_singleton" },
+        cleanup: [
+          { action: "delete_application", targetId: "app_post", expectedTerminalState: "404", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" },
+          { action: "consume_pairing_grant", targetId: "grant_post", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" },
+          { action: "revoke_installation", targetId: "installation_post", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" },
+          { action: "reconcile", targetRef: "settings", expectedTerminalState: "matched", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" },
+        ],
+      };
+      writeFileSync(ledger, JSON.stringify({ schemaVersion: 1, fixtureOwnership: owned }), { mode: 0o600 });
+      execFileSync("bash", ["-c", stageOneLedgerBlock()], {
+        env: { ...process.env, EVIDENCE_ROOT: temporaryRoot, TARGET_SHA: "sha-reviewed", APP_BASE_URL: expectedOrigin, STAGE_ONE_CANDIDATE_ID: "dpl_stageone" },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      expect(JSON.parse(readFileSync(ledger, "utf8")).stage1.deploymentId).toBe("dpl_stageone");
+
+      const invalid = { ...owned, cleanup: [{ action: "delete_application", targetId: "app_unowned", expectedTerminalState: "404", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }] };
+      const original = JSON.stringify({ schemaVersion: 1, fixtureOwnership: invalid });
+      writeFileSync(ledger, original, { mode: 0o600 });
+      expect(() => execFileSync("bash", ["-c", stageOneLedgerBlock()], {
+        env: { ...process.env, EVIDENCE_ROOT: temporaryRoot, TARGET_SHA: "sha-reviewed", APP_BASE_URL: expectedOrigin, STAGE_ONE_CANDIDATE_ID: "dpl_stageone" },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+      expect(readFileSync(ledger, "utf8")).toBe(original);
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("defines a fail-closed private ledger setup with restrictive modes", () => {
     const block = ledgerSetupBlock();
     const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
@@ -788,7 +933,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     expect(normalizedSection).toContain("replay rejection");
     expect(normalizedSection).toContain("credential returns `401`");
     expect(normalizedSection).toContain("final counts and content hashes");
-    expect(normalizedSection).toContain("ledger retained");
+    expect(normalizedSection).toContain("ledger is retained");
     expect(normalizedSection).toContain("second unrecorded credential attempt");
     expect(normalizedSection).toContain("syntactically valid `PUT /api/settings`");
     expect(normalizedSection).toContain("private, non-production canary");
@@ -816,7 +961,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     const failure = normalize(section.slice(failureStart, section.indexOf("8. Resume Vercel Production")));
     expect(failure).toContain("HOLD_PAUSED");
     expect(failure.toLowerCase()).toContain("ordinary and external writers remain stopped");
-    expect(failure).toContain("ledger retained");
+    expect(failure).toContain("ledger is retained");
     expect(failure).toContain("unbounded delete");
     expect(failure).toContain("second unrecorded credential attempt");
     expectOrdered(failure, [

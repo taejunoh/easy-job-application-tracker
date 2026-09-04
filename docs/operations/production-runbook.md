@@ -264,7 +264,14 @@ promotion. It is paused only across prepare/apply, and the actual platform
    set -euo pipefail
    : "${EVIDENCE_ROOT:?set EVIDENCE_ROOT to a private path outside the repository}"
    file_mode() {
-     stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1"
+     local mode=""
+     case "$(uname -s)" in
+       Darwin) mode="$(stat -f '%Lp' -- "$1")" || return 1 ;;
+       Linux) mode="$(stat -c '%a' -- "$1")" || return 1 ;;
+       *) mode="$(stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1")" || return 1 ;;
+     esac
+     [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+     printf '%s\n' "$mode"
    }
    [[ "$EVIDENCE_ROOT" == /* ]] || exit 1
    EVIDENCE_PARENT="$(dirname -- "$EVIDENCE_ROOT")"
@@ -330,7 +337,14 @@ promotion. It is paused only across prepare/apply, and the actual platform
    set -euo pipefail
    : "${EVIDENCE_ROOT:?private ledger path is required}"
    file_mode() {
-     stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1"
+     local mode=""
+     case "$(uname -s)" in
+       Darwin) mode="$(stat -f '%Lp' -- "$1")" || return 1 ;;
+       Linux) mode="$(stat -c '%a' -- "$1")" || return 1 ;;
+       *) mode="$(stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1")" || return 1 ;;
+     esac
+     [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+     printf '%s\n' "$mode"
    }
    validate_evidence_root() {
      local REPO_ROOT="" EVIDENCE_PARENT="" EVIDENCE_BASENAME="" EVIDENCE_PARENT_REAL="" EVIDENCE_CANDIDATE=""
@@ -355,10 +369,15 @@ promotion. It is paused only across prepare/apply, and the actual platform
    [[ "$STAGE_ONE_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
    STAGE_ONE_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
    # mktemp performs exclusive noclobber creation in this verified physical directory.
+   validate_evidence_root || exit 1
    STAGE_ONE_LEDGER_TMP="$(mktemp "$EVIDENCE_ROOT/.rollout-ledger.stage1.XXXXXX")" || exit 1
    [[ -f "$STAGE_ONE_LEDGER_TMP" && ! -L "$STAGE_ONE_LEDGER_TMP" ]] || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    chmod 0600 "$STAGE_ONE_LEDGER_TMP" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   validate_evidence_root || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    jq -e '
+     def valid_utc:
+       type == "string" and
+       (try (. as $timestamp | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ") == $timestamp) catch false);
      type == "object" and (.schemaVersion == 1) and (.stage1? == null) and
      (.fixtureOwnership | type == "object") and
      (.fixtureOwnership.applicationIds | type == "array" and length > 0) and
@@ -367,7 +386,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
      (.fixtureOwnership.ownedDeploymentIds | type == "array" and length > 0) and
      all(.fixtureOwnership.ownedDeploymentIds[]; (type == "string") and length > 0) and
      ((.fixtureOwnership.ownedDeploymentIds | unique | length) == (.fixtureOwnership.ownedDeploymentIds | length)) and
-     (if (.fixtureOwnership | has("pairingGrantIds")) then (.fixtureOwnership.pairingGrantIds as $ids | ($ids | type == "array" and all(.[]; (type == "string") and length > 0)) and (($ids | unique | length) == ($ids | length))) else true end) and
+     (.fixtureOwnership.pairing.preStopUnconsumedGrantId as $preStop | .fixtureOwnership.pairingGrantIds as $pairingIds | ($pairingIds | type == "array" and length > 0 and all(.[]; (type == "string") and length > 0) and (($pairingIds | unique | length) == ($pairingIds | length))) and (($pairingIds | index($preStop)) != null)) and
      (if (.fixtureOwnership | has("installationIds")) then (.fixtureOwnership.installationIds as $ids | ($ids | type == "array" and all(.[]; (type == "string") and length > 0)) and (($ids | unique | length) == ($ids | length))) else true end) and
      (if (.fixtureOwnership | has("postResumeApplicationIds")) then (.fixtureOwnership.postResumeApplicationIds as $ids | ($ids | type == "array" and all(.[]; (type == "string") and length > 0)) and (($ids | unique | length) == ($ids | length))) else true end) and
      (if (.fixtureOwnership | has("postResumePairingGrantIds")) then (.fixtureOwnership.postResumePairingGrantIds as $ids | ($ids | type == "array" and all(.[]; (type == "string") and length > 0)) and (($ids | unique | length) == ($ids | length))) else true end) and
@@ -388,14 +407,15 @@ promotion. It is paused only across prepare/apply, and the actual platform
      .fixtureOwnership as $owned |
      all($owned.cleanup[]; (type == "object") and
        (.action | IN("delete_application", "consume_pairing_grant", "revoke_installation", "reconcile")) and
-       (.expectedTerminalState | type == "string" and length > 0) and
-       (.timestamp | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+       (.timestamp | valid_utc) and
        (.observedResult | IN("pending", "succeeded", "verified", "rejected")) and
-       (if .action == "delete_application" then (.targetId as $id | ($owned.applicationIds | index($id)) != null)
-        elif .action == "consume_pairing_grant" then (.targetId as $id | (($owned.pairingGrantIds // []) | index($id)) != null)
-        elif .action == "revoke_installation" then (.targetId == $owned.installation.installationId)
-        else .targetRef == "settings" end))
+       (if .action == "delete_application" then (.expectedTerminalState == "404") and (.targetId as $id | (($owned.applicationIds + ($owned.postResumeApplicationIds // [])) | index($id)) != null)
+        elif .action == "consume_pairing_grant" then (.expectedTerminalState == "401") and (.targetId as $id | (($owned.pairingGrantIds + ($owned.postResumePairingGrantIds // [])) | index($id)) != null)
+        elif .action == "revoke_installation" then (.expectedTerminalState == "401") and (.targetId as $id | (($id == $owned.installation.installationId) or ((($owned.installationIds // []) + ($owned.postResumeInstallationIds // [])) | index($id) != null)))
+        else (.expectedTerminalState == "matched") and (.targetRef == "settings") end)) and
+     (($owned.cleanup | map(.action + ":" + (.targetId // .targetRef)) | unique | length) == ($owned.cleanup | length))
    ' "$LEDGER" >/dev/null || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   validate_evidence_root || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    jq \
      --arg id "$STAGE_ONE_CANDIDATE_ID" \
      --arg sha "$TARGET_SHA" \
@@ -416,10 +436,9 @@ promotion. It is paused only across prepare/apply, and the actual platform
          timestamps: {recordedAt: $observedAt, readyObservedAt: $observedAt, canonicalPromotionVerifiedAt: $observedAt}
        }
      }' "$LEDGER" > "$STAGE_ONE_LEDGER_TMP" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
-   [[ -f "$LEDGER" && ! -L "$LEDGER" && "$(file_mode "$LEDGER")" == "600" ]] || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
+   validate_evidence_root || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    mv -f -- "$STAGE_ONE_LEDGER_TMP" "$LEDGER" || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
-   [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
-   [[ "$(file_mode "$LEDGER")" == "600" ]] || exit 1
+   validate_evidence_root || exit 1
    jq -e --arg id "$STAGE_ONE_CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg origin "$APP_BASE_URL" '
      type == "object" and .schemaVersion == 1 and
      (.fixtureOwnership | type == "object") and
@@ -433,6 +452,40 @@ promotion. It is paused only across prepare/apply, and the actual platform
      .stage1.canonicalPromotion.verified == true and .stage1.compatibilityVerified == true
    ' "$LEDGER" >/dev/null || exit 1
    unset STAGE_ONE_LEDGER_TMP STAGE_ONE_RECORDED_AT
+   ```
+
+   The pre-probe Stage 1 record is deliberately incomplete: it is not an
+   eligible resume or regression selector. Immediately after its canonical ID
+   is bound, run the authenticated stopped-write check and atomically add only
+   its sanitized, hash-bound evidence. The check never writes a token or HTTP
+   body to the ledger.
+
+   ```bash
+   set -euo pipefail
+   validate_evidence_root || exit 1
+   STAGE_ONE_LEDGER_ID="$(jq -er '.stage1.deploymentId' "$LEDGER")" || exit 1
+   [[ "$STAGE_ONE_LEDGER_ID" == "$STAGE_ONE_CANDIDATE_ID" ]] || exit 1
+   STAGE_ONE_CANONICAL="$(vercel inspect "$APP_BASE_URL" --format=json --no-color | jq -ce '{id}')" || exit 1
+   jq -e --arg id "$STAGE_ONE_LEDGER_ID" '.id == $id' <<<"$STAGE_ONE_CANONICAL" >/dev/null || exit 1
+   PRODUCTION_APP_URL="$APP_BASE_URL" PRODUCTION_APP_ACCESS_TOKEN="$APP_ACCESS_TOKEN" npm run check:production:writes-stopped >/dev/null || exit 1
+   STAGE_ONE_EVIDENCE_OBSERVED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+   STAGE_ONE_EVIDENCE_PROJECTION="$(jq -cnS --arg id "$STAGE_ONE_LEDGER_ID" --arg observedAt "$STAGE_ONE_EVIDENCE_OBSERVED_AT" '{schemaVersion: 1, deploymentId: $id, expectedStatus: 503, observedStatus: 503, cacheControl: "private, no-store", retryAfter: "60", code: "writes_stopped", observedAt: $observedAt}')" || exit 1
+   STAGE_ONE_EVIDENCE_HASH="$(printf '%s' "$STAGE_ONE_EVIDENCE_PROJECTION" | shasum -a 256 | awk '{print $1}')" || exit 1
+   [[ "$STAGE_ONE_EVIDENCE_HASH" =~ ^[0-9a-f]{64}$ ]] || exit 1
+   validate_evidence_root || exit 1
+   STAGE_ONE_EVIDENCE_TMP="$(mktemp "$EVIDENCE_ROOT/.rollout-ledger.write-stop.XXXXXX")" || exit 1
+   chmod 0600 "$STAGE_ONE_EVIDENCE_TMP" || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
+   validate_evidence_root || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
+   jq -e --arg id "$STAGE_ONE_LEDGER_ID" --argjson evidence "$(jq -cn --argjson projection "$STAGE_ONE_EVIDENCE_PROJECTION" --arg hash "$STAGE_ONE_EVIDENCE_HASH" '$projection + {projectionSha256: $hash}')" '
+     .stage1.deploymentId == $id and (.stage1.writeStopEvidence? == null)
+   ' "$LEDGER" >/dev/null || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
+   validate_evidence_root || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
+   jq --argjson evidence "$(jq -cn --argjson projection "$STAGE_ONE_EVIDENCE_PROJECTION" --arg hash "$STAGE_ONE_EVIDENCE_HASH" '$projection + {projectionSha256: $hash}')" '.stage1.writeStopEvidence = $evidence' "$LEDGER" > "$STAGE_ONE_EVIDENCE_TMP" || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
+   validate_evidence_root || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
+   mv -f -- "$STAGE_ONE_EVIDENCE_TMP" "$LEDGER" || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
+   validate_evidence_root || exit 1
+   jq -e --arg id "$STAGE_ONE_LEDGER_ID" --arg hash "$STAGE_ONE_EVIDENCE_HASH" '.stage1.deploymentId == $id and .stage1.writeStopEvidence.projectionSha256 == $hash' "$LEDGER" >/dev/null || exit 1
+   unset STAGE_ONE_CANONICAL STAGE_ONE_EVIDENCE_TMP STAGE_ONE_EVIDENCE_PROJECTION STAGE_ONE_EVIDENCE_HASH STAGE_ONE_EVIDENCE_OBSERVED_AT
    ```
 
    This stage sets `APPLICATION_IDENTITY_WRITES_ENABLED="1"` while keeping
@@ -565,7 +618,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
    jq '{schemaVersion, mode, rowCountBefore, rowCountAfter, stateTotals, uniqueIndexVerified}' "$APPLY_REPORT"
    ```
 
-   compare the approved prepare report with the apply report using the command
+   Compare the approved prepare report with the apply report using the command
    above. Do not proceed on any mismatch.
 7. After the apply report, migration status, empty schema diff, row counts, and
    unique identity index are approved, keep Vercel paused and confirm the
@@ -603,7 +656,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
    Cleanup or rejection failure first requires the provider Production pause
    control, followed by a bounded canonical-origin curl that proves HTTP `503`
    and `DEPLOYMENT_PAUSED`; only then is the state labeled `HOLD_PAUSED`.
-   ledger retained with all evidence and the safe paused/read-only state is
+   The ledger is retained with all evidence and the safe paused/read-only state is
    preserved. Ordinary and external writers remain stopped. Cleanup failure
    never permits an unbounded delete or a second unrecorded credential attempt.
    There is
@@ -630,7 +683,14 @@ promotion. It is paused only across prepare/apply, and the actual platform
    CANONICAL_ORIGIN="https://easy-job-application-tracker.vercel.app"
 
    file_mode() {
-     stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1"
+     local mode=""
+     case "$(uname -s)" in
+       Darwin) mode="$(stat -f '%Lp' -- "$1")" || return 1 ;;
+       Linux) mode="$(stat -c '%a' -- "$1")" || return 1 ;;
+       *) mode="$(stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1")" || return 1 ;;
+     esac
+     [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+     printf '%s\n' "$mode"
    }
 
    validate_evidence_root() {
@@ -676,28 +736,48 @@ promotion. It is paused only across prepare/apply, and the actual platform
      [[ "$HTTP_STATUS" =~ ^(2[0-9]{2}|3[0-9]{2}|401)$ ]] || return 1
    }
 
-   validate_evidence_root || enter_hold_paused
+   validate_stage1_write_stop_selector() {
+     local STAGE_ONE_EVIDENCE_PROJECTION="" STAGE_ONE_EVIDENCE_HASH=""
+     validate_evidence_root || return 1
+     jq -e --arg sha "$TARGET_SHA" --arg origin "$CANONICAL_ORIGIN" '
+       def valid_utc:
+         type == "string" and
+         (try (. as $timestamp | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ") == $timestamp) catch false);
+       .stage1 as $s | $s.writeStopEvidence as $e |
+       (.schemaVersion == 1) and
+       ($s.deploymentId | type == "string" and test("^dpl_[A-Za-z0-9]+$")) and
+       ($s.targetSha == $sha) and
+       ($s.gates.identity == "1") and ($s.gates.writes == "0") and
+       ($s.reviewedGateConfig.identity == "1") and ($s.reviewedGateConfig.writes == "0") and
+       ($s.ready == true) and ($s.readyState == "READY") and
+       ($s.readyEvidence.deploymentId == $s.deploymentId) and ($s.readyEvidence.state == "READY") and
+       ($s.readyEvidence.observedAt | valid_utc) and
+       ($s.canonicalPromotionVerified == true) and
+       ($s.canonicalPromotion.origin == $origin) and ($s.canonicalPromotion.deploymentId == $s.deploymentId) and
+       ($s.canonicalPromotion.verified == true) and ($s.canonicalPromotion.verifiedAt | valid_utc) and
+       ($s.compatibilityVerified == true) and
+       ($s.timestamps | type == "object") and
+       ($s.timestamps.readyObservedAt | valid_utc) and
+       ($s.timestamps.canonicalPromotionVerifiedAt | valid_utc) and
+       ($e.schemaVersion == 1) and ($e.deploymentId == $s.deploymentId) and
+       ($e.expectedStatus == 503) and ($e.observedStatus == 503) and
+       ($e.cacheControl == "private, no-store") and ($e.retryAfter == "60") and
+       ($e.code == "writes_stopped") and ($e.observedAt | valid_utc) and
+       ($e.projectionSha256 | type == "string" and test("^[0-9a-f]{64}$"))
+     ' "$LEDGER" >/dev/null || return 1
+     validate_evidence_root || return 1
+     STAGE_ONE_RECORD_ID="$(jq -er '.stage1.deploymentId' "$LEDGER")" || return 1
+     validate_evidence_root || return 1
+     STAGE_ONE_EVIDENCE_PROJECTION="$(jq -ceS '.stage1.writeStopEvidence | del(.projectionSha256)' "$LEDGER")" || return 1
+     STAGE_ONE_EVIDENCE_HASH="$(printf '%s' "$STAGE_ONE_EVIDENCE_PROJECTION" | shasum -a 256 | awk '{print $1}')" || return 1
+     validate_evidence_root || return 1
+     STAGE_ONE_RECORDED_EVIDENCE_HASH="$(jq -er '.stage1.writeStopEvidence.projectionSha256' "$LEDGER")" || return 1
+     [[ "$STAGE_ONE_EVIDENCE_HASH" == "$STAGE_ONE_RECORDED_EVIDENCE_HASH" ]] || return 1
+   }
+
+   validate_stage1_write_stop_selector || enter_hold_paused
    [[ -n "${TARGET_SHA:-}" ]] || enter_hold_paused
    [[ "${APP_BASE_URL:-}" == "$CANONICAL_ORIGIN" ]] || enter_hold_paused
-   jq -e --arg sha "$TARGET_SHA" --arg origin "$CANONICAL_ORIGIN" '
-     .stage1 as $s |
-     (.schemaVersion == 1) and
-     ($s.deploymentId | type == "string" and test("^dpl_[A-Za-z0-9]+$")) and
-     ($s.targetSha == $sha) and
-     ($s.gates.identity == "1") and ($s.gates.writes == "0") and
-     ($s.reviewedGateConfig.identity == "1") and ($s.reviewedGateConfig.writes == "0") and
-     ($s.ready == true) and ($s.readyState == "READY") and
-     ($s.readyEvidence.deploymentId == $s.deploymentId) and ($s.readyEvidence.state == "READY") and
-     ($s.readyEvidence.observedAt | type == "string" and length > 0) and
-     ($s.canonicalPromotionVerified == true) and
-     ($s.canonicalPromotion.origin == $origin) and ($s.canonicalPromotion.deploymentId == $s.deploymentId) and
-     ($s.canonicalPromotion.verified == true) and ($s.canonicalPromotion.verifiedAt | type == "string" and length > 0) and
-     ($s.compatibilityVerified == true) and
-     ($s.timestamps | type == "object") and
-     ($s.timestamps.readyObservedAt | type == "string" and length > 0) and
-     ($s.timestamps.canonicalPromotionVerifiedAt | type == "string" and length > 0)
-   ' "$LEDGER" >/dev/null || enter_hold_paused
-   STAGE_ONE_RECORD_ID="$(jq -er '.stage1.deploymentId' "$LEDGER")" || enter_hold_paused
    STAGE_ONE_INSPECT="$(vercel inspect "$STAGE_ONE_RECORD_ID" --wait --timeout 3m --format=json --no-color | jq -ce '{id,readyState,aliases}')" || enter_hold_paused
    jq -e --arg id "$STAGE_ONE_RECORD_ID" '(.id == $id) and (.readyState == "READY") and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$STAGE_ONE_INSPECT" >/dev/null || enter_hold_paused
    STAGE_ONE_METADATA="$(vercel api "/v13/deployments/$STAGE_ONE_RECORD_ID" --raw | jq -ce 'if (.alias | type) == "array" then {id,readyState,target,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])} else error("deployment alias shape is not an array") end')" || enter_hold_paused
@@ -728,7 +808,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
 
    ```bash
    [[ "${POST_RESUME_REGRESSION_CONFIRMED:-}" == "true" ]] || exit 1
-   validate_evidence_root || enter_hold_paused
+   validate_stage1_write_stop_selector || enter_hold_paused
 
    ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")" || enter_hold_paused
    [[ "$ROLLBACK_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || enter_hold_paused
