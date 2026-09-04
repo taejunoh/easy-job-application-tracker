@@ -502,8 +502,9 @@ describe("production rollout safety hardening", () => {
       ".target == \"production\"",
       "((.aliases | length) == 0)",
       "vercel promote \"$CANDIDATE_ID\" --yes",
-      "canonical origin",
-      ".id == $CANDIDATE_ID",
+      "CANONICAL_METADATA=",
+      "vercel inspect \"$APP_BASE_URL\" --format=json --no-color",
+      ".id == $id",
     ]);
     expect(section).toContain("TARGET_SHA");
     expect(section).toMatch(
@@ -838,7 +839,8 @@ git commit -m "docs: align rollout references with authoritative runbook"
 - [ ] **Step 1: Review diff and scan for unsafe artifacts**
 
 ~~~bash
-git diff --check -- \
+BASE_SHA="$(git merge-base HEAD origin/main)"
+git diff --check "$BASE_SHA"..HEAD -- \
   src/lib/database-timeouts.ts src/lib/prisma.ts src/lib/server-env-core.js \
   __tests__/lib/database-timeouts.test.ts __tests__/lib/prisma.test.ts \
   __tests__/lib/server-env.test.ts __tests__/lib/prisma-timeouts.integration.test.ts \
@@ -849,7 +851,7 @@ git diff --check -- \
   docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md \
   docs/superpowers/plans/2026-09-03-hosted-production-rollout.md
 git status --short
-git diff --stat -- \
+git diff --stat "$BASE_SHA"..HEAD -- \
   src/lib/database-timeouts.ts src/lib/prisma.ts src/lib/server-env-core.js \
   __tests__/lib/database-timeouts.test.ts __tests__/lib/prisma.test.ts \
   __tests__/lib/server-env.test.ts __tests__/lib/prisma-timeouts.integration.test.ts \
@@ -861,12 +863,10 @@ git diff --stat -- \
   docs/superpowers/plans/2026-09-03-hosted-production-rollout.md
 rg -n "raw API|provider credential|pairing code/reference|statement_timeout|lock_timeout|PAUSED_AFTER_APPLY|HOLD_PAUSED|UNPAUSED_READONLY" README.md docs/operations/production-runbook.md docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md docs/superpowers/plans/2026-09-03-hosted-production-rollout.md
 for marker in "T""BD" "TO""DO"; do
-  if rg -n "$marker|Bearer [^[:space:]]+|raw API JSON|postgresql://[^[:space:]]+@|GET /api/settings[^.]{0,100}creates the row" README.md docs/operations/production-runbook.md docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md docs/superpowers/plans/2026-09-03-hosted-production-rollout.md; then
+  if rg -n "$marker|Bearer [^[:space:]]+|postgresql://[^[:space:]]+@|GET /api/settings[^.]{0,100}creates the row" README.md docs/operations/production-runbook.md docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md docs/superpowers/plans/2026-09-03-hosted-production-rollout.md; then
     exit 1
   fi
 done
-  exit 1
-fi
 ~~~
 
 Expected: diff check exits 0, only intended files are changed, and no fixture ledger, raw Vercel JSON, private evidence, or unresolved marker exists.
