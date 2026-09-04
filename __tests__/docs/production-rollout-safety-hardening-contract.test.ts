@@ -1,7 +1,12 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const root = join(__dirname, "../..");
+const inspectAliases =
+  '((.aliases // []) | type == "array") and (((.aliases // []) | length) == 0)';
+const projectedAliases =
+  '(.aliases | type == "array") and ((.aliases | length) == 0)';
 
 function normalize(text: string): string {
   return text.replace(/\s+/gu, " ").trim();
@@ -63,6 +68,13 @@ describe("production rollout staged-candidate binding documentation contract", (
       .map((line) => line.trim())
       .filter(Boolean);
 
+    expect(procedure).toContain(
+      'local CANDIDATE_JSON="" CANDIDATE_INSPECT="" CANDIDATE_METADATA="" CANONICAL_METADATA="" CANDIDATE_ID="" CANDIDATE_URL=""',
+    );
+    expect(procedure).toContain(
+      "trap 'unset CANDIDATE_JSON CANDIDATE_INSPECT CANDIDATE_METADATA CANONICAL_METADATA CANDIDATE_ID CANDIDATE_URL; trap - RETURN' RETURN",
+    );
+
     const deployLine = oneLine(
       lines,
       /^CANDIDATE_JSON="\$\(vercel deploy \. --prod --skip-domain --yes --format=json --no-color\)"$/u,
@@ -123,7 +135,7 @@ describe("production rollout staged-candidate binding documentation contract", (
     expect(inspectLine).toContain('vercel inspect "$CANDIDATE_ID" --wait');
     expect(inspectCheck).toContain('--arg id "$CANDIDATE_ID"');
     expect(inspectCheck).toContain('.readyState == "READY"');
-    expect(inspectCheck).toContain('(.aliases // []) | length) == 0');
+    expect(inspectCheck).toContain(inspectAliases);
     expect(apiLine).toMatch(
       /^CANDIDATE_METADATA="\$\(vercel api "\/v13\/deployments\/\$CANDIDATE_ID" --raw \| jq -ce /u,
     );
@@ -137,7 +149,7 @@ describe("production rollout staged-candidate binding documentation contract", (
     expect(metadataCheck).toContain('.target == "production"');
     expect(metadataCheck).toContain(".githubCommitSha == $sha");
     expect(metadataCheck).toContain(".url == $url");
-    expect(metadataCheck).toContain("(.aliases | length) == 0");
+    expect(metadataCheck).toContain(projectedAliases);
     expect(promoteLine).toBe('vercel promote "$CANDIDATE_ID" --yes');
     expect(canonicalLine).toContain('vercel inspect "$APP_BASE_URL"');
     expect(canonicalCheck).toContain('--arg id "$CANDIDATE_ID"');
@@ -146,32 +158,37 @@ describe("production rollout staged-candidate binding documentation contract", (
     expectOrdered(procedure, [
       '[[ "${VERCEL_UNPAUSED_ATTESTED:-}" == "true" ]]',
       '[[ -n "$TARGET_SHA" ]]',
+      '[[ -n "${APP_BASE_URL:-}" ]]',
       '[[ -z "$(git status --porcelain)" ]]',
       '[[ "$(git rev-parse HEAD)" == "$TARGET_SHA" ]]',
       deployLine,
       idLine,
       urlLine,
-      "unset CANDIDATE_JSON",
       '[[ "$CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]]',
       '[[ -n "$CANDIDATE_URL" ]]',
       inspectLine,
       inspectCheck,
-      "unset CANDIDATE_INSPECT",
       apiLine,
       metadataCheck,
-      "unset CANDIDATE_METADATA",
       promoteLine,
       canonicalLine,
       canonicalCheck,
-      "unset CANONICAL_METADATA CANDIDATE_ID CANDIDATE_URL",
     ]);
 
     const deployPosition = procedure.indexOf(deployLine);
-    const rawDeployUnsetPosition = procedure.indexOf("unset CANDIDATE_JSON");
+    const rawDeployUnsetPosition = procedure.indexOf("\n  unset CANDIDATE_JSON\n");
     expect(rawDeployUnsetPosition).toBeGreaterThan(deployPosition);
     expect(
-      procedure.slice(rawDeployUnsetPosition + "unset CANDIDATE_JSON".length),
+      procedure.slice(rawDeployUnsetPosition + "\n  unset CANDIDATE_JSON\n".length),
     ).not.toContain("CANDIDATE_JSON");
+    const inspectUnsetPosition = procedure.indexOf("\n  unset CANDIDATE_INSPECT\n");
+    const metadataUnsetPosition = procedure.indexOf("\n  unset CANDIDATE_METADATA\n");
+    const canonicalUnsetPosition = procedure.indexOf(
+      "\n  unset CANONICAL_METADATA CANDIDATE_ID CANDIDATE_URL",
+    );
+    expect(rawDeployUnsetPosition).toBeLessThan(inspectUnsetPosition);
+    expect(inspectUnsetPosition).toBeLessThan(metadataUnsetPosition);
+    expect(metadataUnsetPosition).toBeLessThan(canonicalUnsetPosition);
     expect(procedure.match(/vercel api /gu)).toHaveLength(1);
     expect(apiLine).toContain("--raw | jq -ce");
     expect(candidate).not.toMatch(/^\s*export\s+CANDIDATE_/mu);
@@ -190,6 +207,16 @@ describe("production rollout staged-candidate binding documentation contract", (
       expect(block).not.toMatch(/\b(?:vercel\s+(?:deploy|promote|alias)|vercel\s+--prod)\b/iu);
     }
     expect(procedure).toMatch(/\[\[ "\$\{VERCEL_UNPAUSED_ATTESTED:-\}" == "true" \]\]/u);
+
+    for (const predicate of [inspectAliases, projectedAliases]) {
+      expect(() =>
+        execFileSync("jq", ["-e", predicate], {
+          input: '{"aliases":""}\n',
+          encoding: "utf8",
+          stdio: ["pipe", "pipe", "pipe"],
+        }),
+      ).toThrow();
+    }
   });
 
   it("uses the same guarded procedure for both staged rollout gates", () => {

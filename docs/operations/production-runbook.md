@@ -182,9 +182,12 @@ set -euo pipefail
 
 stage_candidate() {
   local stage_name="$1"
+  local CANDIDATE_JSON="" CANDIDATE_INSPECT="" CANDIDATE_METADATA="" CANONICAL_METADATA="" CANDIDATE_ID="" CANDIDATE_URL=""
+  trap 'unset CANDIDATE_JSON CANDIDATE_INSPECT CANDIDATE_METADATA CANONICAL_METADATA CANDIDATE_ID CANDIDATE_URL; trap - RETURN' RETURN
   : "$stage_name"
   [[ "${VERCEL_UNPAUSED_ATTESTED:-}" == "true" ]]
   [[ -n "$TARGET_SHA" ]]
+  [[ -n "${APP_BASE_URL:-}" ]]
   [[ -z "$(git status --porcelain)" ]]
   [[ "$(git rev-parse HEAD)" == "$TARGET_SHA" ]]
   CANDIDATE_JSON="$(vercel deploy . --prod --skip-domain --yes --format=json --no-color)"
@@ -195,11 +198,11 @@ stage_candidate() {
   [[ -n "$CANDIDATE_URL" ]]
 
   CANDIDATE_INSPECT="$(vercel inspect "$CANDIDATE_ID" --wait --timeout 3m --format=json --no-color)"
-  jq -e --arg id "$CANDIDATE_ID" '(.id == $id) and (.readyState == "READY") and (((.aliases // []) | length) == 0)' <<<"$CANDIDATE_INSPECT" >/dev/null
+  jq -e --arg id "$CANDIDATE_ID" '(.id == $id) and (.readyState == "READY") and (((.aliases // []) | type == "array") and (((.aliases // []) | length) == 0))' <<<"$CANDIDATE_INSPECT" >/dev/null
   unset CANDIDATE_INSPECT
 
   CANDIDATE_METADATA="$(vercel api "/v13/deployments/$CANDIDATE_ID" --raw | jq -ce '{id,readyState,target,url,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])}')"
-  jq -e --arg id "$CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg url "$CANDIDATE_URL" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.url == $url) and ((.aliases | length) == 0)' <<<"$CANDIDATE_METADATA" >/dev/null
+  jq -e --arg id "$CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg url "$CANDIDATE_URL" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.url == $url) and ((.aliases | type == "array") and ((.aliases | length) == 0))' <<<"$CANDIDATE_METADATA" >/dev/null
   unset CANDIDATE_METADATA
 
   # Promotion is reachable only in this unpaused procedure.
