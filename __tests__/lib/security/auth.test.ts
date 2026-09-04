@@ -27,6 +27,7 @@ const config: AuthConfig = {
   encryptionSecret: ENCRYPTION_SECRET,
   appOrigin: APP_ORIGIN,
   corsAllowedOrigins: [APP_ORIGIN, EXTENSION_ORIGIN],
+  applicationWritesEnabled: true,
 };
 
 const unauthorized = {
@@ -347,6 +348,7 @@ describe("authenticateApiRequest", () => {
       },
     });
     expect(touch).toHaveBeenCalledWith(credential.selector, new Date(NOW));
+    expect(touch).toHaveBeenCalledTimes(1);
 
     const wrongOrigin = apiRequest("POST", {
       authorization: `Bearer ${credential.token}`,
@@ -359,6 +361,47 @@ describe("authenticateApiRequest", () => {
         installationStore,
       }),
     ).resolves.toEqual(unauthorized);
+  });
+
+  it("authenticates a valid installation without touching it while writes are stopped", async () => {
+    const credential = createInstallationCredential({
+      encryptionSecret: ENCRYPTION_SECRET,
+      origin: EXTENSION_ORIGIN,
+    });
+    const touch = jest.fn().mockResolvedValue(true);
+    const installationStore = {
+      findForAuthentication: jest.fn().mockResolvedValue({
+        id: credential.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: credential.digest,
+        expiresAt: new Date(NOW + 60_000),
+        revokedAt: null,
+      }),
+      touch,
+    };
+
+    await expect(
+      authenticateApiRequestAsync(
+        apiRequest("POST", {
+          authorization: `Bearer ${credential.token}`,
+          origin: EXTENSION_ORIGIN,
+        }),
+        {
+          config: { ...config, applicationWritesEnabled: false },
+          now: NOW,
+          installationStore,
+        },
+      ),
+    ).resolves.toEqual({
+      authenticated: true,
+      via: "installation",
+      principal: {
+        kind: "installation",
+        installationId: credential.selector,
+        origin: EXTENSION_ORIGIN,
+      },
+    });
+    expect(touch).not.toHaveBeenCalled();
   });
 
   it.each([

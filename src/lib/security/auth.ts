@@ -17,6 +17,7 @@ export type AuthConfig = Readonly<{
   encryptionSecret: string;
   appOrigin: string;
   corsAllowedOrigins?: readonly string[];
+  applicationWritesEnabled: boolean;
 }>;
 
 export type InstallationAuthenticationRecord = Readonly<{
@@ -296,8 +297,11 @@ export async function authenticateApiRequestAsync(
         origin,
         config.encryptionSecret,
       );
+      if (!verifyCredentialDigest(record.tokenDigest, digest)) {
+        return UNAUTHORIZED;
+      }
       if (
-        !verifyCredentialDigest(record.tokenDigest, digest) ||
+        config.applicationWritesEnabled &&
         !(await store.touch(record.id, new Date(now * 1000)))
       ) {
         return UNAUTHORIZED;

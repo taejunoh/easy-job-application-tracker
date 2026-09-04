@@ -32,6 +32,7 @@ jest.mock("@/lib/server-env", () => {
       APP_BASE_URL: "https://jobs.example.com",
       CORS_ALLOWED_ORIGINS:
         "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+      APPLICATION_WRITES_ENABLED: "0",
     },
     "production",
   );
@@ -209,6 +210,7 @@ describe("DELETE /api/auth/session", () => {
 
 describe("POST /api/auth/verify", () => {
   beforeEach(() => {
+    jest.clearAllMocks();
     jest
       .mocked(extensionInstallationAuthenticationStore.findForAuthentication)
       .mockResolvedValue({
@@ -240,6 +242,7 @@ describe("POST /api/auth/verify", () => {
         EXTENSION_ORIGIN,
       );
       expect(response.headers.get("Access-Control-Allow-Credentials")).toBeNull();
+      expect(extensionInstallationAuthenticationStore.touch).not.toHaveBeenCalled();
   });
 
   it.each([APP_ORIGIN, EXTENSION_ORIGIN])(
