@@ -11,6 +11,11 @@ const CHECKOUT_SHA = "df4cb1c069e1874edd31b4311f1884172cec0e10";
 const SETUP_NODE_SHA = "249970729cb0ef3589644e2896645e5dc5ba9c38";
 const UPLOAD_ARTIFACT_SHA =
   "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+const PREPARE_REPORT_PATH = "$RUNNER_TEMP/application-identity-prepare.json";
+const APPROVED_REPORT_PATH = "$RUNNER_TEMP/approved/application-identity-prepare.json";
+const CURRENT_DRY_RUN_REPORT_PATH =
+  "$RUNNER_TEMP/application-identity-current-dry-run.json";
+const APPLY_REPORT_PATH = "$RUNNER_TEMP/application-identity-apply.json";
 
 type Step = Readonly<{
   name: string;
@@ -321,6 +326,7 @@ describe("production identity maintenance workflow contract", () => {
     expect(prepareBackfillCommand).toBeDefined();
     const prepareReport = argumentAfter(prepareBackfillCommand, "--report");
     expect(prepareReport).toBeDefined();
+    expect(prepareReport).toBe(PREPARE_REPORT_PATH);
     expect(prepareComparator).toBeDefined();
     expect(prepareComparatorCommand).toBeDefined();
     expect(argumentAfter(prepareComparatorCommand, "--expected")).toBe(prepareReport);
@@ -364,9 +370,8 @@ describe("production identity maintenance workflow contract", () => {
     expect(preparePaths[0]).toMatch(/(?:\$\{\{\s*runner\.temp\s*\}\}|\$RUNNER_TEMP)/u);
     expect(preparePaths[0]).toMatch(/\.json$/u);
     expect(canonicalPath(preparePaths[0])).toBe(canonicalPath(prepareReport));
-    const prepareReportBasename = canonicalPath(preparePaths[0])?.split("/").pop();
-    expect(prepareReportBasename).toBeDefined();
-    const approvedExtractedReport = `$RUNNER_TEMP/approved/${prepareReportBasename}`;
+    expect(canonicalPath(preparePaths[0])).toBe(PREPARE_REPORT_PATH);
+    const approvedExtractedReport = APPROVED_REPORT_PATH;
 
     expect(provenance?.env).toMatchObject({
       GH_TOKEN: "${{ github.token }}",
@@ -402,11 +407,13 @@ describe("production identity maintenance workflow contract", () => {
     expect(currentDryRunCommand).toBeDefined();
     const currentDryRunReport = argumentAfter(currentDryRunCommand, "--report");
     expect(currentDryRunReport).toBeDefined();
+    expect(currentDryRunReport).toBe(CURRENT_DRY_RUN_REPORT_PATH);
     expect(canonicalPath(currentDryRunReport)).toMatch(/^\$RUNNER_TEMP\/.+\.json$/u);
     expect(applyBackfill).toBeDefined();
     expect(applyBackfillCommand).toBeDefined();
     const applyReport = argumentAfter(applyBackfillCommand, "--report");
     expect(applyReport).toBeDefined();
+    expect(applyReport).toBe(APPLY_REPORT_PATH);
     const canonicalCurrentDryRunReport = canonicalPath(currentDryRunReport);
     const canonicalApplyReport = canonicalPath(applyReport);
     expect(canonicalCurrentDryRunReport).toMatch(/^\$RUNNER_TEMP\/.+\.json$/u);
@@ -473,11 +480,19 @@ describe("production identity maintenance workflow contract", () => {
       || comparatorPattern.test(command)
       || isSafeAssignment(command);
     expect(approvedReport).toBeDefined();
-    expect(canonicalPath(approvedReport)).toBe(approvedExtractedReport);
+    expect(approvedReport).toBe(approvedExtractedReport);
     expect(argumentAfter(preApplyCommand, "--actual")).toBe(currentDryRunReport);
-    expect(canonicalPath(argumentAfter(postApplyCommand, "--expected")))
-      .toBe(approvedExtractedReport);
+    expect(argumentAfter(postApplyCommand, "--expected")).toBe(approvedExtractedReport);
     expect(argumentAfter(postApplyCommand, "--actual")).toBe(applyReport);
+    for (const reportPath of [
+      prepareReport,
+      approvedReport,
+      currentDryRunReport,
+      applyReport,
+    ]) {
+      expect(reportPath).toMatch(/^\$RUNNER_TEMP(?:\/approved)?\/[a-z0-9-]+\.json$/u);
+      expect(reportPath).not.toMatch(/(?:\.\.?\/|[*?\[\]{}])/u);
+    }
     const provenanceIndex = steps.indexOf(provenance as Step);
     const downloadIndex = steps.indexOf(download as Step);
     const currentDryRunIndex = steps.indexOf(currentDryRun as Step);
@@ -505,7 +520,7 @@ describe("production identity maintenance workflow contract", () => {
     expect(applyPaths).toHaveLength(1);
     expect(applyPaths[0]).toMatch(/(?:\$\{\{\s*runner\.temp\s*\}\}|\$RUNNER_TEMP)/u);
     expect(applyPaths[0]).toMatch(/\.json$/u);
-    expect(canonicalPath(applyPaths[0])).toBe(canonicalPath(applyReport));
+    expect(canonicalPath(applyPaths[0])).toBe(APPLY_REPORT_PATH);
     expect(applyPaths.join("\n")).not.toMatch(
       /(?:raw|dump|backup|database|\.sql\b|\.csv\b|\.jsonl\b)/iu,
     );
@@ -637,6 +652,8 @@ describe("production identity maintenance workflow contract", () => {
     expect(approvedReport).toBeDefined();
     expect(cleanupRun).toContain(canonicalPath(currentDryRunReport));
     expect(cleanupRun).toContain(canonicalPath(applyReport));
+    expect(cleanupRun).toContain(CURRENT_DRY_RUN_REPORT_PATH);
+    expect(cleanupRun).toContain(APPLY_REPORT_PATH);
     expect(cleanupRun).toContain("$RUNNER_TEMP/approved");
     expect(uploadPaths).toHaveLength(2);
     expect(uploadPaths.join("\n")).not.toMatch(
