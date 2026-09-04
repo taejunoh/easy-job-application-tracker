@@ -31,6 +31,7 @@ jest.mock("@/lib/server-env", () => {
       CORS_ALLOWED_ORIGINS:
         "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
       APPLICATION_IDENTITY_WRITES_ENABLED: "1",
+      APPLICATION_WRITES_ENABLED: "1",
     },
     "production",
   );
@@ -132,6 +133,7 @@ describe("application route contract enforcement", () => {
           CORS_ALLOWED_ORIGINS:
             "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
           APPLICATION_IDENTITY_WRITES_ENABLED: "1",
+          APPLICATION_WRITES_ENABLED: "1",
         }, "production"),
     }));
   });
@@ -214,6 +216,12 @@ describe("application route contract enforcement", () => {
       code: "request_too_large",
     });
     expect(prisma.application.create).not.toHaveBeenCalled();
+  });
+
+  it("pins persistent application and settings routes to the bounded duration", () => {
+    expect(applicationsRoute.maxDuration).toBe(30);
+    expect(applicationDetailRoute.maxDuration).toBe(30);
+    expect(settingsRoute.maxDuration).toBe(30);
   });
 });
 
