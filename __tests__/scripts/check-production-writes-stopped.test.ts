@@ -115,6 +115,27 @@ async function readRequestBody(request: import("node:http").IncomingMessage): Pr
   return body;
 }
 
+async function observeResponseClose(
+  response: import("node:http").ServerResponse | undefined,
+): Promise<boolean> {
+  if (!response || response.destroyed) return true;
+  const socket = response.socket;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      response.off("close", onClose);
+      socket?.off("close", onClose);
+      resolve(false);
+    }, 100);
+    const onClose = () => {
+      clearTimeout(timer);
+      socket?.off("close", onClose);
+      resolve(true);
+    };
+    response.once("close", onClose);
+    socket?.once("close", onClose);
+  });
+}
+
 type PredicateCase = Readonly<{
   name: string;
   body: string;
@@ -155,12 +176,18 @@ describe("authenticated production write-stop probe", () => {
     const { server, url } = await listen(async (request, response) => {
       const body = request.method === "POST" ? await readRequestBody(request) : "";
       requests.push({ method: request.method ?? "", path: request.url ?? "", headers: request.headers, body });
-      if (requests.length === 1 || requests.length === 3) {
+      const isStatsRead = request.method === "GET" && request.url === "/api/stats";
+      const isApplicationPost = request.method === "POST" && request.url === "/api/applications";
+      if (isStatsRead && (requests.length === 1 || requests.length === 3)) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify(validStats));
         return;
       }
-      expect(request.method).toBe("POST");
+      if (!isApplicationPost || requests.length !== 2) {
+        response.writeHead(404);
+        response.end();
+        return;
+      }
       const posted = JSON.parse(body) as Record<string, unknown>;
       expect(Object.keys(posted).sort()).toEqual([
         "appliedDate", "company", "description", "jobTitle", "jobType", "location", "notes", "salary", "status", "url",
@@ -205,8 +232,22 @@ describe("authenticated production write-stop probe", () => {
 
   it("fails generically when the write-stop response body stalls", async () => {
     const sentinel = "stalled-body-sentinel-never-print";
+    const requests: string[] = [];
+    let postedBody = "";
     let stalledResponse: import("node:http").ServerResponse | undefined;
-    const { server, url } = await listen((_request, response) => {
+    const { server, url } = await listen(async (request, response) => {
+      requests.push(`${request.method ?? ""} ${request.url ?? ""}`);
+      if (request.method === "GET" && request.url === "/api/stats") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(validStats));
+        return;
+      }
+      if (request.method !== "POST" || request.url !== "/api/applications") {
+        response.writeHead(404);
+        response.end();
+        return;
+      }
+      postedBody = await readRequestBody(request);
       stalledResponse = response;
       response.writeHead(503, {
         "content-type": "application/json",
@@ -217,7 +258,17 @@ describe("authenticated production write-stop probe", () => {
     });
 
     try {
-      expectGenericFailure(await runMonitor(url, "50"), url, [sentinel]);
+      const result = await runMonitor(url, "50");
+      const posted = JSON.parse(postedBody) as Record<string, unknown>;
+      const syntheticValues = [posted.url, posted.jobTitle, posted.company].filter(
+        (value): value is string => typeof value === "string",
+      );
+      expectGenericFailure(result, url, [sentinel, ...syntheticValues]);
+      expect(requests).toEqual(["GET /api/stats", "POST /api/applications"]);
+      expect(posted.url).toEqual(expect.any(String));
+      expect(posted.jobTitle).toEqual(expect.any(String));
+      expect(posted.company).toEqual(expect.any(String));
+      expect(await observeResponseClose(stalledResponse)).toBe(true);
     } finally {
       stalledResponse?.destroy();
       await close(server);
@@ -226,11 +277,19 @@ describe("authenticated production write-stop probe", () => {
 
   it("fails generically and cancels an oversized write-stop response body", async () => {
     const sentinel = "oversized-body-sentinel-never-print";
+    const requests: string[] = [];
+    let postedBody = "";
     let oversizedResponse: import("node:http").ServerResponse | undefined;
     const oversizedBody = `${"x".repeat(256 * 1024)}${sentinel}`;
     const { server, url } = await listen(async (request, response) => {
-      if (request.method === "POST") {
-        await readRequestBody(request);
+      requests.push(`${request.method ?? ""} ${request.url ?? ""}`);
+      if (request.method === "GET" && request.url === "/api/stats") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(validStats));
+        return;
+      }
+      if (request.method === "POST" && request.url === "/api/applications") {
+        postedBody = await readRequestBody(request);
         oversizedResponse = response;
         response.writeHead(503, {
           "content-type": "application/json",
@@ -240,12 +299,23 @@ describe("authenticated production write-stop probe", () => {
         response.end(oversizedBody);
         return;
       }
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(validStats));
+      response.writeHead(404);
+      response.end();
     });
 
     try {
-      expectGenericFailure(await runMonitor(url, "500"), url, [sentinel]);
+      const result = await runMonitor(url, "500");
+      const posted = JSON.parse(postedBody) as Record<string, unknown>;
+      const syntheticValues = [posted.url, posted.jobTitle, posted.company].filter(
+        (value): value is string => typeof value === "string",
+      );
+      expectGenericFailure(result, url, [sentinel, ...syntheticValues]);
+      expect(requests).toEqual(["GET /api/stats", "POST /api/applications"]);
+      expect(requests).not.toContain("DELETE /api/applications");
+      expect(posted.url).toEqual(expect.any(String));
+      expect(posted.jobTitle).toEqual(expect.any(String));
+      expect(posted.company).toEqual(expect.any(String));
+      expect(await observeResponseClose(oversizedResponse)).toBe(true);
     } finally {
       oversizedResponse?.destroy();
       await close(server);
@@ -262,16 +332,23 @@ describe("authenticated production write-stop probe", () => {
     ["wrong retry header", 503, JSON.stringify({ code: "writes_stopped", error: "Application writes are temporarily disabled", retryable: true }), { "retry-after": "1" }],
     ["missing retry header", 503, JSON.stringify({ code: "writes_stopped", error: "Application writes are temporarily disabled", retryable: true }), {}],
   ])("fails generically on %s without cleanup or response leaks", async (_, status, body, headers = {}) => {
-    const methods: string[] = [];
+    const requests: string[] = [];
     const postedBodies: string[] = [];
     const { server, url } = await listen(async (request, response) => {
-      methods.push(request.method ?? "");
-      if (request.method === "POST") postedBodies.push(await readRequestBody(request));
-      if (methods.length === 1 || methods.length === 3) {
+      requests.push(`${request.method ?? ""} ${request.url ?? ""}`);
+      const isStatsRead = request.method === "GET" && request.url === "/api/stats";
+      const isApplicationPost = request.method === "POST" && request.url === "/api/applications";
+      if (isStatsRead && (requests.length === 1 || requests.length === 3)) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify(validStats));
         return;
       }
+      if (!isApplicationPost || requests.length !== 2) {
+        response.writeHead(404);
+        response.end();
+        return;
+      }
+      postedBodies.push(await readRequestBody(request));
       response.writeHead(status, { "content-type": "application/json", ...headers });
       response.end(body);
     });
@@ -282,16 +359,23 @@ describe("authenticated production write-stop probe", () => {
         (value): value is string => typeof value === "string",
       );
       expectGenericFailure(result, url, capturedValues);
-      expect(methods).not.toContain("DELETE");
+      expect(requests).not.toContain("DELETE /api/applications");
     } finally {
       await close(server);
     }
   });
 
   it.each(exactPredicateCases)("fails generically on exact response predicate case: $name", async ({ body, sentinels }) => {
+    const requests: string[] = [];
     const postedBodies: string[] = [];
     const { server, url } = await listen(async (request, response) => {
-      if (request.method === "POST") {
+      requests.push(`${request.method ?? ""} ${request.url ?? ""}`);
+      if (request.method === "GET" && request.url === "/api/stats") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(validStats));
+        return;
+      }
+      if (request.method === "POST" && request.url === "/api/applications") {
         postedBodies.push(await readRequestBody(request));
         response.writeHead(503, {
           "content-type": "application/json",
@@ -301,8 +385,8 @@ describe("authenticated production write-stop probe", () => {
         response.end(body);
         return;
       }
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(validStats));
+      response.writeHead(404);
+      response.end();
     });
     try {
       const result = await runMonitor(url);
@@ -311,6 +395,7 @@ describe("authenticated production write-stop probe", () => {
         (value): value is string => typeof value === "string",
       );
       expectGenericFailure(result, url, [...sentinels, ...syntheticValues]);
+      expect(requests).toEqual(["GET /api/stats", "POST /api/applications"]);
     } finally {
       await close(server);
     }
@@ -318,11 +403,19 @@ describe("authenticated production write-stop probe", () => {
 
   it("fails when before and after stats differ", async () => {
     let statsReads = 0;
+    const requests: string[] = [];
+    let postedBody = "";
     const { server, url } = await listen(async (request, response) => {
-      if (request.method === "POST") {
-        await readRequestBody(request);
+      requests.push(`${request.method ?? ""} ${request.url ?? ""}`);
+      if (request.method === "POST" && request.url === "/api/applications") {
+        postedBody = await readRequestBody(request);
         response.writeHead(503, { "content-type": "application/json", "cache-control": "private, no-store", "retry-after": "60" });
         response.end(JSON.stringify({ code: "writes_stopped", error: "Application writes are temporarily disabled", retryable: true }));
+        return;
+      }
+      if (request.method !== "GET" || request.url !== "/api/stats") {
+        response.writeHead(404);
+        response.end();
         return;
       }
       statsReads += 1;
@@ -330,14 +423,25 @@ describe("authenticated production write-stop probe", () => {
       response.end(JSON.stringify(statsReads === 1 ? validStats : { ...validStats, total: 8, recentApplications: [] }));
     });
     try {
-      expectGenericFailure(await runMonitor(url), url);
+      const result = await runMonitor(url);
+      const posted = JSON.parse(postedBody) as Record<string, unknown>;
+      const syntheticValues = [posted.url, posted.jobTitle, posted.company].filter(
+        (value): value is string => typeof value === "string",
+      );
+      expectGenericFailure(result, url, syntheticValues);
+      expect(requests).toEqual(["GET /api/stats", "POST /api/applications", "GET /api/stats"]);
     } finally {
       await close(server);
     }
   });
 
   it("fails generically on redirects, refusal, and timeout", async () => {
-    const redirect = await listen((_request, response) => {
+    const redirect = await listen((request, response) => {
+      if (request.method !== "GET" || request.url !== "/api/stats") {
+        response.writeHead(404);
+        response.end();
+        return;
+      }
       response.writeHead(302, { location: redirectLocation });
       response.end(secretBody);
     });
@@ -351,9 +455,13 @@ describe("authenticated production write-stop probe", () => {
     await close(refused.server);
     expectGenericFailure(await runMonitor(refused.url), refused.url);
 
-    const timeout = await listen(() => undefined);
+    const timeoutRequests: string[] = [];
+    const timeout = await listen((request) => {
+      timeoutRequests.push(`${request.method ?? ""} ${request.url ?? ""}`);
+    });
     try {
       expectGenericFailure(await runMonitor(timeout.url, "50"), timeout.url);
+      expect(timeoutRequests).toEqual(["GET /api/stats"]);
     } finally {
       await close(timeout.server);
     }
