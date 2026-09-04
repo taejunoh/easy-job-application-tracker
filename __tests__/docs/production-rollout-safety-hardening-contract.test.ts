@@ -62,7 +62,7 @@ exit 2
   writeFileSync(join(directory, "vercel"), `#!/usr/bin/env bash
 case "\${1:-}" in
   deploy) printf '%s\\n' deploy >> "\${DEPLOY_LOG:?}"; printf '%s\\n' "\${DEPLOY_JSON:-}" ;;
-  inspect) if [[ "\${2:-}" == "\${APP_BASE_URL:-}" ]]; then printf '%s\\n' "\${CANONICAL_JSON:-}"; else printf '%s\\n' "\${INSPECT_JSON:-}"; fi ;;
+  inspect) printf '%s\\n' inspect >> "\${VERCEL_INSPECT_LOG:?}"; if [[ "\${2:-}" == "\${APP_BASE_URL:-}" ]]; then printf '%s\\n' "\${CANONICAL_JSON:-}"; else printf '%s\\n' "\${INSPECT_JSON:-}"; fi ;;
   api) printf '%s\\n' "\${API_JSON:-}" ;;
   promote) printf '%s\\n' "\${2:-}" >> "\${PROMOTE_LOG:?}" ;;
   *) exit 2 ;;
@@ -110,6 +110,7 @@ function runMocked(source: string, variables: Record<string, string>, body: stri
         PROMOTE_LOG: join(directory, "promote.log"),
         CURL_LOG: join(directory, "curl.log"),
         NPM_LOG: join(directory, "npm.log"),
+        VERCEL_INSPECT_LOG: join(directory, "inspect.log"),
         MOCK_REPO_ROOT: root,
       },
     });
@@ -118,7 +119,7 @@ function runMocked(source: string, variables: Record<string, string>, body: stri
   }
 }
 
-function runMockedFailure(source: string, variables: Record<string, string>, body: string): { stderr: string; deploys: string; promotes: string; curlCalls: number } {
+function runMockedFailure(source: string, variables: Record<string, string>, body: string): { stderr: string; deploys: string; promotes: string; inspects: string; curlCalls: number } {
   const directory = mockBin();
   try {
     try {
@@ -133,6 +134,7 @@ function runMockedFailure(source: string, variables: Record<string, string>, bod
           PROMOTE_LOG: join(directory, "promote.log"),
           CURL_LOG: join(directory, "curl.log"),
           NPM_LOG: join(directory, "npm.log"),
+          VERCEL_INSPECT_LOG: join(directory, "inspect.log"),
           MOCK_REPO_ROOT: root,
         },
       });
@@ -144,6 +146,7 @@ function runMockedFailure(source: string, variables: Record<string, string>, bod
         stderr: String(failure.stderr ?? ""),
         deploys: existsSync(join(directory, "deploy.log")) ? readFileSync(join(directory, "deploy.log"), "utf8") : "",
         promotes: existsSync(join(directory, "promote.log")) ? readFileSync(join(directory, "promote.log"), "utf8") : "",
+        inspects: existsSync(join(directory, "inspect.log")) ? readFileSync(join(directory, "inspect.log"), "utf8") : "",
         curlCalls: existsSync(join(directory, "curl.log")) ? readFileSync(join(directory, "curl.log"), "utf8").trim().split("\n").filter(Boolean).length : 0,
       };
     }
@@ -452,10 +455,10 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
           cleanup: [{ action: "revoke_installation", targetId: "installation", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
         },
         stage1: {
-          deploymentId: "dpl_valid", targetSha: "sha-reviewed", gates: { identity: "1", writes: "0" }, reviewedGateConfig: { identity: "1", writes: "0" },
+          deploymentId: "dpl_valid", targetSha: "sha-reviewed", gates: { identity: "1", writes: "0" }, reviewedGateConfig: { identity: "1", writes: "0", reviewedAt: "2026-09-04T00:00:00Z" },
           ready: true, readyState: "READY", readyEvidence: { deploymentId: "dpl_valid", state: "READY", observedAt: "2026-09-04T00:00:00Z" },
           canonicalPromotionVerified: true, canonicalPromotion: { origin: expectedOrigin, deploymentId: "dpl_valid", verified: true, verifiedAt: "2026-09-04T00:00:00Z" },
-          compatibilityVerified: true, timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" }, writeStopEvidence: writeStopEvidence("dpl_valid"),
+          compatibilityVerified: true, timestamps: { recordedAt: "2026-09-04T00:00:00Z", readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" }, writeStopEvidence: writeStopEvidence("dpl_valid"),
         },
       }), { mode: 0o600 });
       const source = `${candidateFunction()}\n${normalResumeBlock().replace(/^[ \t]*read -r -p .*$/gmu, "     :")}\n[[ "$(cat \"$NPM_LOG\")" == "run check:production:writes-stopped" ]] || exit 90\n[[ ! -s "$DEPLOY_LOG" && ! -s "$PROMOTE_LOG" ]] || exit 91`;
@@ -500,7 +503,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
           canonicalPromotionVerified: true,
           canonicalPromotion: { origin: expectedOrigin, deploymentId: "dpl_valid", verified: true, verifiedAt: "2026-09-04T00:00:00Z" },
           compatibilityVerified: true,
-          timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
+          timestamps: { recordedAt: "2026-09-04T00:00:00Z", readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
           writeStopEvidence: writeStopEvidence("dpl_valid"),
         },
       }), { mode: 0o600 });
@@ -760,21 +763,26 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     }
   });
 
-  it("holds without a provider mutation when stopped-write evidence is missing, mismatched, or hash-tampered", () => {
+  it("holds without a provider mutation when selector evidence or UTC record fields are missing, mismatched, or tampered", () => {
     const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-write-stop-selector-"));
     try {
       const ledger = join(temporaryRoot, "rollout-ledger.json");
       const source = `${candidateFunction()}\n${normalResumeBlock().replace(/^[ \t]*read -r -p .*$/gmu, "     :")}`;
       const stage1 = {
-        deploymentId: "dpl_valid", targetSha: "sha-reviewed", gates: { identity: "1", writes: "0" }, reviewedGateConfig: { identity: "1", writes: "0" },
+        deploymentId: "dpl_valid", targetSha: "sha-reviewed", gates: { identity: "1", writes: "0" }, reviewedGateConfig: { identity: "1", writes: "0", reviewedAt: "2026-09-04T00:00:00Z" },
         ready: true, readyState: "READY", readyEvidence: { deploymentId: "dpl_valid", state: "READY", observedAt: "2026-09-04T00:00:00Z" },
         canonicalPromotionVerified: true, canonicalPromotion: { origin: expectedOrigin, deploymentId: "dpl_valid", verified: true, verifiedAt: "2026-09-04T00:00:00Z" },
-        compatibilityVerified: true, timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
+        compatibilityVerified: true, timestamps: { recordedAt: "2026-09-04T00:00:00Z", readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
+        writeStopEvidence: writeStopEvidence("dpl_valid"),
       };
       for (const invalidStage1 of [
-        stage1,
+        { ...stage1, writeStopEvidence: undefined },
         { ...stage1, writeStopEvidence: { ...writeStopEvidence("dpl_other") } },
         { ...stage1, writeStopEvidence: { ...writeStopEvidence("dpl_valid"), projectionSha256: "0".repeat(64) } },
+        { ...stage1, reviewedGateConfig: { identity: "1", writes: "0" } },
+        { ...stage1, reviewedGateConfig: { identity: "1", writes: "0", reviewedAt: "2026-09-04T00:00:00+00:00" } },
+        { ...stage1, timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" } },
+        { ...stage1, timestamps: { ...stage1.timestamps, recordedAt: "2026-09-04T00:00:00+00:00" } },
       ]) {
         writeFileSync(ledger, JSON.stringify({ schemaVersion: 1, stage1: invalidStage1 }), { mode: 0o600 });
         const failure = runMockedFailure(source, {
@@ -783,6 +791,8 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         expect(failure.stderr).toContain("HOLD_PAUSED");
         expect(failure.deploys).toBe("");
         expect(failure.promotes).toBe("");
+        expect(failure.inspects).toBe("");
+        expect(failure.curlCalls).toBe(1);
         expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({ schemaVersion: 1, stage1: invalidStage1 });
       }
     } finally {

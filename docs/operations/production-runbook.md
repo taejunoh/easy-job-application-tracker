@@ -748,7 +748,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
        ($s.deploymentId | type == "string" and test("^dpl_[A-Za-z0-9]+$")) and
        ($s.targetSha == $sha) and
        ($s.gates.identity == "1") and ($s.gates.writes == "0") and
-       ($s.reviewedGateConfig.identity == "1") and ($s.reviewedGateConfig.writes == "0") and
+       ($s.reviewedGateConfig.identity == "1") and ($s.reviewedGateConfig.writes == "0") and ($s.reviewedGateConfig.reviewedAt | valid_utc) and
        ($s.ready == true) and ($s.readyState == "READY") and
        ($s.readyEvidence.deploymentId == $s.deploymentId) and ($s.readyEvidence.state == "READY") and
        ($s.readyEvidence.observedAt | valid_utc) and
@@ -757,6 +757,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
        ($s.canonicalPromotion.verified == true) and ($s.canonicalPromotion.verifiedAt | valid_utc) and
        ($s.compatibilityVerified == true) and
        ($s.timestamps | type == "object") and
+       ($s.timestamps.recordedAt | valid_utc) and
        ($s.timestamps.readyObservedAt | valid_utc) and
        ($s.timestamps.canonicalPromotionVerifiedAt | valid_utc) and
        ($e.schemaVersion == 1) and ($e.deploymentId == $s.deploymentId) and
