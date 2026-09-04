@@ -9,6 +9,8 @@ const defaultExceptionsPath = resolve(
   "docs/operations/npm-audit-exceptions.json",
 );
 const severityNames = ["info", "low", "moderate", "high", "critical"];
+const auditAttempts = 2;
+const auditTimeoutMs = 120_000;
 
 let counts;
 let productionCounts;
@@ -75,19 +77,30 @@ function parseArguments(arguments_) {
 function loadAudit(auditFile, omitDev = false) {
   if (auditFile) return readJson(auditFile);
 
-  const result = spawnSync(
-    "npm",
-    ["audit", "--json", ...(omitDev ? ["--omit=dev"] : [])],
-    {
-    cwd: root,
-    encoding: "utf8",
-    maxBuffer: 20 * 1024 * 1024,
-    },
-  );
-  if (result.error || result.signal || ![0, 1].includes(result.status)) {
-    throw new Error("npm audit failed");
+  const arguments_ = ["audit", "--json", ...(omitDev ? ["--omit=dev"] : [])];
+  for (let attempt = 0; attempt < auditAttempts; attempt += 1) {
+    const result = spawnSync("npm", arguments_, {
+      cwd: root,
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: auditTimeoutMs,
+    });
+    if (result.error || result.signal || ![0, 1].includes(result.status)) {
+      continue;
+    }
+
+    let audit;
+    try {
+      audit = JSON.parse(result.stdout);
+    } catch {
+      continue;
+    }
+    if (isRecord(audit) && audit.error) {
+      continue;
+    }
+    return audit;
   }
-  return JSON.parse(result.stdout);
+  throw new Error("npm audit failed");
 }
 
 function readJson(path) {
