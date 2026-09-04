@@ -21,6 +21,9 @@ const DATABASE_INTEGRATION_REQUESTED =
 const DATABASE_TEST_IDENTITY = DATABASE_INTEGRATION_REQUESTED
   ? assertDatabaseTestSafety(process.env)
   : undefined;
+if (DATABASE_TEST_IDENTITY !== undefined) {
+  assertExactDatabaseName(DATABASE_TEST_IDENTITY);
+}
 const describeDatabase = DATABASE_INTEGRATION_REQUESTED
   ? describe
   : describe.skip;
@@ -52,7 +55,7 @@ type DurableSnapshot = Readonly<{
   settingsCount: number;
   pairingGrantCount: number;
   installationCount: number;
-  applications: readonly unknown[];
+  applicationDigest: string;
   settings: Readonly<{ id: string; contentHash: string }> | null;
   pairingGrants: readonly unknown[];
   installations: readonly unknown[];
@@ -402,7 +405,11 @@ async function snapshotDurableState(
     settingsCount,
     pairingGrantCount,
     installationCount,
-    applications: applicationRows.map((row) => ({
+    applicationDigest: createHash("sha256")
+      .update(
+        JSON.stringify(
+          applicationRows
+            .map((row) => ({
       id: row.id,
       url: row.url,
       jobTitle: row.jobTitle,
@@ -420,7 +427,12 @@ async function snapshotDurableState(
       canonicalUrl: row.canonicalUrl,
       duplicateOfId: row.duplicateOfId,
       identityState: row.identityState,
-    })),
+            }))
+            .sort((left, right) => left.id.localeCompare(right.id)),
+        ),
+        "utf8",
+      )
+      .digest("hex"),
     settings:
       settingsRow === null
         ? null
@@ -491,6 +503,14 @@ function requiredDatabaseIdentity(): DatabaseTestIdentity {
     throw new Error("Database integration identity was not validated");
   }
   return DATABASE_TEST_IDENTITY;
+}
+
+function assertExactDatabaseName(identity: DatabaseTestIdentity): void {
+  if (identity.database !== "jobtracker_ci") {
+    throw new Error(
+      "Refusing destructive database integration tests: exact database target required",
+    );
+  }
 }
 
 function requiredLiveDatabaseIdentity(): DatabaseTestIdentity {
