@@ -700,6 +700,42 @@ describe("production rollout staged-candidate binding documentation contract", (
     }
   });
 
+  it("keeps the historical hosted plan factual and requirement-scoped", () => {
+    const plan = readFileSync(
+      join(root, "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md"),
+      "utf8",
+    );
+    const factualText = plan.replace(/^>\s?/gmu, " ");
+    expect(factualText).toMatch(/does not assert that any\s+Production action occurred/iu);
+    expect(factualText).toMatch(/Each step states\s+what the plan required/iu);
+    const historicalSteps = plan.slice(plan.indexOf("### Historical task 1"));
+
+    const taskSections = [...plan.matchAll(/^### Historical task [1-6]:/gmu)];
+    expect(taskSections).toHaveLength(6);
+    for (const [index, match] of taskSections.entries()) {
+      const start = match.index ?? -1;
+      const end = taskSections[index + 1]?.index ?? plan.length;
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(plan.slice(start, end)).toMatch(/\b(?:plan|required|would have|acceptance|success criterion)\b/iu);
+    }
+
+    const forbiddenCompletionAssertions = [
+      /\bThe rollout (?:integrated|created|completed|verified)\b/iu,
+      /\bVercel was unpaused\b/iu,
+      /\bThe historical record confirmed\b/iu,
+      /\bThe historical plan (?:published|merged|dispatched)\b/iu,
+      /\bThe historical transition resumed\b/iu,
+      /(?:^|[.;]\s+)promotion occurred\b/iu,
+      /\bThis was the final staged\b/iu,
+      /\bThe final historical record contained\b/iu,
+      /\bThe evidence recorded that external writers are resumed\b/iu,
+      /\bThe historical (?:inspection|rehearsal|smoke) (?:used|decrypted|restored|covered)\b/iu,
+    ];
+    for (const assertion of forbiddenCompletionAssertions) {
+      expect(historicalSteps).not.toMatch(assertion);
+    }
+  });
+
   it("rejects every executable Vercel invocation in fenced shell blocks", () => {
     const fixture = [
       "```bash\n# vercel deploy is only a comment\necho 'vercel deploy is only text'\nprintf '%s' 'vercel inspect is only text'\nvercel env add SECRET production --value test\n```",
