@@ -174,6 +174,7 @@ describe("deployment verification contract", () => {
       RUN_DATABASE_INTEGRATION: "1",
       ALLOW_DESTRUCTIVE_DATABASE_TESTS: "jobtracker-ci-delete-all",
       APPLICATION_IDENTITY_WRITES_ENABLED: "1",
+      APPLICATION_WRITES_ENABLED: "1",
     });
     expect(job.steps).toEqual([
       {
@@ -275,6 +276,7 @@ describe("deployment verification contract", () => {
       ALLOW_DESTRUCTIVE_EXTENSION_E2E:
         "jobtracker-extension-e2e-delete-all",
       APPLICATION_IDENTITY_WRITES_ENABLED: "1",
+      APPLICATION_WRITES_ENABLED: "1",
     });
     expect(job.steps).toEqual([
       {

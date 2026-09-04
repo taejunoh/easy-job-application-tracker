@@ -11,6 +11,7 @@
  *   appOrigin: string,
  *   corsAllowedOrigins: readonly string[],
  *   applicationIdentityWritesEnabled: boolean,
+ *   applicationWritesEnabled: boolean,
  * }>} ServerEnv
  */
 
@@ -58,6 +59,10 @@ function parseServerEnv(source, nodeEnv) {
     source,
     "APPLICATION_IDENTITY_WRITES_ENABLED",
   );
+  const applicationWritesEnabled = parseOptionalBinaryFlag(
+    source,
+    "APPLICATION_WRITES_ENABLED",
+  );
 
   return Object.freeze({
     databaseUrl,
@@ -67,6 +72,7 @@ function parseServerEnv(source, nodeEnv) {
     appOrigin,
     corsAllowedOrigins,
     applicationIdentityWritesEnabled,
+    applicationWritesEnabled,
   });
 }
 
