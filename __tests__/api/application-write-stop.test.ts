@@ -48,6 +48,7 @@ jest.mock("@/lib/prisma", () => ({
       findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      upsert: jest.fn(),
     },
   },
 }));
@@ -184,6 +185,7 @@ describe("application write stop for web mutations", () => {
         prisma.settings.findFirst,
         prisma.settings.create,
         prisma.settings.update,
+        prisma.settings.upsert,
         parseCreateApplicationRequest,
         parseUpdateApplicationRequest,
         readBoundedJsonBody,
@@ -233,4 +235,150 @@ describe("application write stop for web mutations", () => {
     });
     expect(prisma.settings.create).not.toHaveBeenCalled();
   });
+
+  it("uses atomic upsert for simultaneous pristine Settings PUTs", async () => {
+    jest.mocked(getServerEnv).mockReturnValue({
+      ...BASE_ENV,
+      applicationWritesEnabled: true,
+    });
+    jest
+      .mocked(prisma.settings.upsert)
+      .mockResolvedValue(settingsFixture() as never);
+
+    const [first, second] = await Promise.all([
+      settingsRoute.PUT(settingsPutRequest()),
+      settingsRoute.PUT(settingsPutRequest()),
+    ]);
+
+    for (const response of [first, second]) {
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        llmProvider: "openai",
+        hasApiKey: true,
+      });
+    }
+    expect(prisma.settings.upsert).toHaveBeenCalledTimes(2);
+    expect(prisma.settings.upsert).toHaveBeenCalledWith({
+      where: { id: "singleton" },
+      create: { llmProvider: "openai", id: "singleton" },
+      update: { llmProvider: "openai" },
+    });
+    expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+    expect(prisma.settings.create).not.toHaveBeenCalled();
+    expect(prisma.settings.update).not.toHaveBeenCalled();
+  });
+
+  describe("persistence-time write rechecks", () => {
+    it.each([
+      ["legacy Application POST", false],
+      ["identity Application POST", true],
+    ])("stops %s before persistence", async (name, identityWritesEnabled) => {
+      const getEnvCalls = configurePersistenceRecheck(identityWritesEnabled);
+      jest.mocked(prisma.application.create).mockResolvedValue({} as never);
+
+      const response = await applicationsRoute.POST(applicationPostRequest());
+
+      await expectStopped(response);
+      expect(parseCreateApplicationRequest).toHaveBeenCalledTimes(1);
+      expect(getEnvCalls()).toBe(6);
+      expect(prisma.application.create).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    });
+
+    it("stops Application PATCH before update", async () => {
+      const getEnvCalls = configurePersistenceRecheck();
+
+      const response = await applicationDetailRoute.PATCH(
+        applicationPatchRequest(),
+        { params: Promise.resolve({ id: APPLICATION_ID }) },
+      );
+
+      await expectStopped(response);
+      expect(parseUpdateApplicationRequest).toHaveBeenCalledTimes(1);
+      expect(getEnvCalls()).toBe(5);
+      expect(prisma.application.update).not.toHaveBeenCalled();
+    });
+
+    it("stops Application DELETE before delete", async () => {
+      const getEnvCalls = configurePersistenceRecheck();
+
+      const response = await applicationDetailRoute.DELETE(
+        applicationDeleteRequest(),
+        { params: Promise.resolve({ id: APPLICATION_ID }) },
+      );
+
+      await expectStopped(response);
+      expect(getEnvCalls()).toBe(5);
+      expect(prisma.application.delete).not.toHaveBeenCalled();
+      expect(prisma.application.count).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["pristine/create", null],
+      ["existing/update", settingsFixture()],
+    ])(
+      "stops Settings PUT %s semantics before atomic upsert",
+      async (_name, existingSettings) => {
+        const getEnvCalls = configurePersistenceRecheck();
+        jest
+          .mocked(prisma.settings.findFirst)
+          .mockResolvedValue(existingSettings as never);
+
+        const response = await settingsRoute.PUT(settingsPutRequest());
+
+        await expectStopped(response);
+        expect(readBoundedJsonBody).toHaveBeenCalledTimes(1);
+        expect(getEnvCalls()).toBe(5);
+        expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+        expect(prisma.settings.upsert).not.toHaveBeenCalled();
+      },
+    );
+  });
 });
+
+function settingsFixture() {
+  return {
+    id: "singleton",
+    llmProvider: "openai",
+    apiKey: "encrypted-key",
+    linkedinUrl: "",
+    githubUrl: "",
+    resumeText: "",
+  };
+}
+
+function configurePersistenceRecheck(
+  applicationIdentityWritesEnabled?: boolean,
+): () => number {
+  const enabled = {
+    ...BASE_ENV,
+    applicationWritesEnabled: true,
+    ...(applicationIdentityWritesEnabled === undefined
+      ? {}
+      : { applicationIdentityWritesEnabled }),
+  };
+  const disabled = { ...enabled, applicationWritesEnabled: false };
+  let calls = 0;
+  jest.mocked(getServerEnv).mockImplementation(() => {
+    calls += 1;
+    if (calls <= 4) return enabled;
+    if (applicationIdentityWritesEnabled !== undefined && calls === 5) {
+      return enabled;
+    }
+    return disabled;
+  });
+  return () => calls;
+}
+
+async function expectStopped(response: Response): Promise<void> {
+  expect(response.status).toBe(503);
+  await expect(response.json()).resolves.toEqual({
+    error: "Application writes are temporarily disabled",
+    code: "writes_stopped",
+    retryable: true,
+  });
+  expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+  expect(response.headers.get("Pragma")).toBe("no-cache");
+  expect(response.headers.get("Retry-After")).toBe("60");
+  expect(response.headers.get("Access-Control-Allow-Origin")).toBe(APP_ORIGIN);
+}

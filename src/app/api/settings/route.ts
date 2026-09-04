@@ -88,22 +88,13 @@ export const PUT = route.handler(async function PUT(request: NextRequest) {
     data.resumeText = body.resumeText;
   }
 
-  let settings = await prisma.settings.findFirst();
-
-  if (!settings) {
-    const stopped = applicationWriteGuard();
-    if (stopped) return stopped;
-    settings = await prisma.settings.create({
-      data: { ...data, id: "singleton" },
-    });
-  } else {
-    const stopped = applicationWriteGuard();
-    if (stopped) return stopped;
-    settings = await prisma.settings.update({
-      where: { id: settings.id },
-      data,
-    });
-  }
+  const stopped = applicationWriteGuard();
+  if (stopped) return stopped;
+  const settings = await prisma.settings.upsert({
+    where: { id: "singleton" },
+    create: { ...data, id: "singleton" },
+    update: data,
+  });
 
   return NextResponse.json({
     llmProvider: settings.llmProvider,

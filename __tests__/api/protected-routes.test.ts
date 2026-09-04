@@ -54,6 +54,7 @@ jest.mock("@/lib/prisma", () => ({
       findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      upsert: jest.fn(),
     },
   },
 }));
@@ -1097,7 +1098,7 @@ describe("protected product API actual requests", () => {
       error: "Invalid request",
       code: "invalid_request",
     });
-    expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+    expect(prisma.settings.upsert).not.toHaveBeenCalled();
   });
 
   it("settings accepts exactly 500,000 Unicode code points", async () => {
@@ -1108,7 +1109,7 @@ describe("protected product API actual requests", () => {
     const response = await settingsRoute.PUT(request);
 
     expect(response.status).toBe(200);
-    expect(prisma.settings.findFirst).toHaveBeenCalled();
+    expect(prisma.settings.upsert).toHaveBeenCalled();
   });
 
   it.each([
@@ -1128,7 +1129,7 @@ describe("protected product API actual requests", () => {
         code: "request_too_large",
       });
       expect(response.headers.get("Cache-Control")).toContain("no-store");
-      expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+      expect(prisma.settings.upsert).not.toHaveBeenCalled();
     },
   );
 
@@ -1138,7 +1139,7 @@ describe("protected product API actual requests", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(prisma.settings.findFirst).toHaveBeenCalled();
+    expect(prisma.settings.upsert).toHaveBeenCalled();
   });
 
   it("settings rejects an oversized stream without awaiting reader cancellation", async () => {
@@ -1158,7 +1159,7 @@ describe("protected product API actual requests", () => {
     expect(outcome.response.status).toBe(413);
     expect(outcome.response.headers.get("Cache-Control")).toContain("no-store");
     expect(cancel).toHaveBeenCalled();
-    expect(prisma.settings.findFirst).not.toHaveBeenCalled();
+    expect(prisma.settings.upsert).not.toHaveBeenCalled();
   });
 
   it.each(["application detail PATCH", "application detail DELETE"])(
@@ -1588,6 +1589,7 @@ function arrangeSuccessfulBusinessLogic(): void {
   jest.mocked(prisma.settings.findFirst).mockResolvedValue(settings as never);
   jest.mocked(prisma.settings.create).mockResolvedValue(settings as never);
   jest.mocked(prisma.settings.update).mockResolvedValue(settings as never);
+  jest.mocked(prisma.settings.upsert).mockResolvedValue(settings as never);
 
   jest.mocked(parseMetaTags).mockReturnValue({
     jobTitle: "Engineer",
@@ -1682,8 +1684,9 @@ function expectedDownstream(route: ActualRouteCase): jest.Mock {
     case "parse resume POST":
       return jest.mocked(parsePdfInWorker);
     case "settings GET":
-    case "settings PUT":
       return jest.mocked(prisma.settings.findFirst);
+    case "settings PUT":
+      return jest.mocked(prisma.settings.upsert);
     case "stats GET":
       return jest.mocked(prisma.application.count);
     default:
@@ -1703,6 +1706,7 @@ function downstreamMocks(): jest.Mock[] {
     jest.mocked(prisma.settings.findFirst),
     jest.mocked(prisma.settings.create),
     jest.mocked(prisma.settings.update),
+    jest.mocked(prisma.settings.upsert),
     jest.mocked(parseMetaTags),
     jest.mocked(createProvider),
     jest.mocked(analyzeKeywordMatch),
