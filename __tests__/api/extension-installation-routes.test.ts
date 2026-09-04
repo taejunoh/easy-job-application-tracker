@@ -19,10 +19,11 @@ jest.mock("@/lib/server-env", () => {
       APP_BASE_URL: "https://jobs.example.com",
       CORS_ALLOWED_ORIGINS:
         "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+      APPLICATION_WRITES_ENABLED: "1",
     },
     "production",
   );
-  return { ...actual, getServerEnv: () => config };
+  return { ...actual, getServerEnv: jest.fn(() => config) };
 });
 
 jest.mock("@/lib/security/extension-installation-store", () => ({
@@ -53,6 +54,8 @@ import * as profileRoute from "@/app/api/extension/profile/route";
 import * as revokeRoute from "@/app/api/extension/revoke/route";
 import * as verifyRoute from "@/app/api/auth/verify/route";
 import { prisma } from "@/lib/prisma";
+import { getServerEnv } from "@/lib/server-env";
+import { configuredExtensionInstallationService } from "@/lib/security/configured-extension-installations";
 import {
   extensionCredentialStore,
   extensionInstallationAuthenticationStore,
@@ -63,6 +66,7 @@ const EXTENSION_ORIGIN =
   "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
 const SECRET = "encryption-secret-" + "e".repeat(32);
 const SESSION_COOKIE = `${SESSION_COOKIE_NAME}=${createSessionToken()}`;
+const BASE_ENV = getServerEnv();
 const INSTALLATION = createInstallationCredential({
   encryptionSecret: SECRET,
   origin: EXTENSION_ORIGIN,
@@ -73,6 +77,7 @@ const INSTALLATION = createInstallationCredential({
 describe("extension installation API", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.mocked(getServerEnv).mockReturnValue(BASE_ENV);
     jest.mocked(extensionCredentialStore.list).mockResolvedValue([]);
     jest.mocked(extensionCredentialStore.revoke).mockResolvedValue(true);
     jest.mocked(extensionCredentialStore.consumePairingGrant).mockResolvedValue(
@@ -239,7 +244,245 @@ describe("extension installation API", () => {
       expect.any(Date),
     );
   });
+
+  describe("when application writes are stopped", () => {
+    beforeEach(() => {
+      jest.mocked(getServerEnv).mockReturnValue({
+        ...BASE_ENV,
+        applicationWritesEnabled: false,
+      });
+    });
+
+    it("stops each valid extension credential mutation without persisting it", async () => {
+      const pairing = pairingFixture();
+      jest.mocked(extensionCredentialStore.findPairingGrant).mockResolvedValue(
+        pairing.grant,
+      );
+
+      const pairingResponse = await pairingRoute.POST(
+        jsonRequest(`${APP_ORIGIN}/api/extension/pairing`, APP_ORIGIN, {
+          origin: EXTENSION_ORIGIN,
+        }, { Cookie: SESSION_COOKIE }),
+      );
+      await expectStopped(pairingResponse, APP_ORIGIN);
+      expect(extensionCredentialStore.createPairingGrant).not.toHaveBeenCalled();
+
+      const pairResponse = await pairRoute.POST(
+        jsonRequest(`${APP_ORIGIN}/api/extension/pair`, EXTENSION_ORIGIN, {
+          code: pairing.credential.code,
+        }),
+      );
+      await expectStopped(pairResponse, EXTENSION_ORIGIN);
+      expect(extensionCredentialStore.consumePairingGrant).not.toHaveBeenCalled();
+      expect(await configuredExtensionInstallationService().validatePairingCode(
+        pairing.credential.code,
+        EXTENSION_ORIGIN,
+      )).toBe(true);
+
+      const revokeResponse = await revokeRoute.POST(
+        new Request(`${APP_ORIGIN}/api/extension/revoke`, {
+          method: "POST",
+          headers: {
+            Origin: EXTENSION_ORIGIN,
+            Authorization: `Bearer ${INSTALLATION.token}`,
+          },
+        }),
+      );
+      await expectStopped(revokeResponse, EXTENSION_ORIGIN);
+
+      const deleteResponse = await installationRoute.DELETE(
+        new Request(
+          `${APP_ORIGIN}/api/extension/installations/${INSTALLATION.selector}`,
+          {
+            method: "DELETE",
+            headers: { Origin: APP_ORIGIN, Cookie: SESSION_COOKIE },
+          },
+        ),
+        { params: Promise.resolve({ id: INSTALLATION.selector }) },
+      );
+      await expectStopped(deleteResponse, APP_ORIGIN);
+      expect(extensionCredentialStore.revoke).not.toHaveBeenCalled();
+      expect(extensionInstallationAuthenticationStore.touch).not.toHaveBeenCalled();
+    });
+
+    it("keeps unauthenticated, invalid-code, and rejected-origin requests at 401 or 403", async () => {
+      const unauthenticatedPairing = await pairingRoute.POST(
+        jsonRequest(`${APP_ORIGIN}/api/extension/pairing`, APP_ORIGIN, {
+          origin: EXTENSION_ORIGIN,
+        }),
+      );
+      expect(unauthenticatedPairing.status).toBe(401);
+
+      const invalidCode = await pairRoute.POST(
+        jsonRequest(`${APP_ORIGIN}/api/extension/pair`, EXTENSION_ORIGIN, {
+          code: "bad",
+        }),
+      );
+      expect(invalidCode.status).toBe(401);
+      expect(extensionCredentialStore.consumePairingGrant).not.toHaveBeenCalled();
+
+      for (const grant of [
+        { ...pairingFixture().grant, expiresAt: new Date(Date.now() - 1) },
+        {
+          ...pairingFixture().grant,
+          origin: "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba",
+        },
+        { ...pairingFixture().grant, consumedAt: new Date() },
+      ]) {
+        const pairing = pairingFixture();
+        jest.mocked(extensionCredentialStore.findPairingGrant).mockResolvedValue({
+          ...grant,
+          id: pairing.credential.selector,
+          codeDigest: pairing.credential.digest,
+        });
+        const response = await pairRoute.POST(
+          jsonRequest(`${APP_ORIGIN}/api/extension/pair`, EXTENSION_ORIGIN, {
+            code: pairing.credential.code,
+          }),
+        );
+        expect(response.status).toBe(401);
+      }
+
+      const rejectedOrigin = await installationRoute.DELETE(
+        new Request(
+          `${APP_ORIGIN}/api/extension/installations/${INSTALLATION.selector}`,
+          {
+            method: "DELETE",
+            headers: {
+              Origin: "https://untrusted.example.com",
+              Cookie: SESSION_COOKIE,
+            },
+          },
+        ),
+        { params: Promise.resolve({ id: INSTALLATION.selector }) },
+      );
+      expect(rejectedOrigin.status).toBe(403);
+      expect(extensionCredentialStore.revoke).not.toHaveBeenCalled();
+    });
+
+    it("rechecks immediately before persistence after pairing, revocation, and deletion started open", async () => {
+      const pairingCalls = configureWriteRecheck(4);
+      const pairingResponse = await pairingRoute.POST(
+        jsonRequest(`${APP_ORIGIN}/api/extension/pairing`, APP_ORIGIN, {
+          origin: EXTENSION_ORIGIN,
+        }, { Cookie: SESSION_COOKIE }),
+      );
+      await expectStopped(pairingResponse, APP_ORIGIN);
+      expect(pairingCalls()).toBe(5);
+      expect(extensionCredentialStore.createPairingGrant).not.toHaveBeenCalled();
+
+      const revokeCalls = configureWriteRecheck(3, 2);
+      const revokeResponse = await revokeRoute.POST(
+        new Request(`${APP_ORIGIN}/api/extension/revoke`, {
+          method: "POST",
+          headers: {
+            Origin: EXTENSION_ORIGIN,
+            Authorization: `Bearer ${INSTALLATION.token}`,
+          },
+        }),
+      );
+      await expectStopped(revokeResponse, EXTENSION_ORIGIN);
+      expect(revokeCalls()).toBe(4);
+      expect(extensionCredentialStore.revoke).not.toHaveBeenCalled();
+      expect(extensionInstallationAuthenticationStore.touch).not.toHaveBeenCalled();
+
+      const deleteCalls = configureWriteRecheck(3);
+      const deleteResponse = await installationRoute.DELETE(
+        new Request(
+          `${APP_ORIGIN}/api/extension/installations/${INSTALLATION.selector}`,
+          {
+            method: "DELETE",
+            headers: { Origin: APP_ORIGIN, Cookie: SESSION_COOKIE },
+          },
+        ),
+        { params: Promise.resolve({ id: INSTALLATION.selector }) },
+      );
+      await expectStopped(deleteResponse, APP_ORIGIN);
+      expect(deleteCalls()).toBe(4);
+      expect(extensionCredentialStore.revoke).not.toHaveBeenCalled();
+    });
+
+    it("validates a parsed pairing code before stopping without consuming it", async () => {
+      const pairing = pairingFixture();
+      jest.mocked(extensionCredentialStore.findPairingGrant).mockResolvedValue(
+        pairing.grant,
+      );
+      const calls = configureWriteRecheck(3);
+
+      const response = await pairRoute.POST(
+        jsonRequest(`${APP_ORIGIN}/api/extension/pair`, EXTENSION_ORIGIN, {
+          code: pairing.credential.code,
+        }),
+      );
+
+      await expectStopped(response, EXTENSION_ORIGIN);
+      expect(calls()).toBe(4);
+      expect(extensionCredentialStore.findPairingGrant).toHaveBeenCalledWith(
+        pairing.credential.selector,
+      );
+      expect(extensionCredentialStore.consumePairingGrant).not.toHaveBeenCalled();
+    });
+  });
+
+  it("sets the extension credential mutation runtime limit", () => {
+    expect(pairingRoute.maxDuration).toBe(30);
+    expect(pairRoute.maxDuration).toBe(30);
+    expect(revokeRoute.maxDuration).toBe(30);
+    expect(installationRoute.maxDuration).toBe(30);
+  });
 });
+
+function pairingFixture() {
+  const credential = createPairingCredential({
+    encryptionSecret: SECRET,
+    origin: EXTENSION_ORIGIN,
+    randomUUID: () => "018f9f72-f2e9-7c29-a6fc-001122334488",
+    randomBytes: () => Buffer.alloc(32, 8),
+  });
+  return {
+    credential,
+    grant: {
+      id: credential.selector,
+      origin: EXTENSION_ORIGIN,
+      codeDigest: credential.digest,
+      expiresAt: new Date(Date.now() + 60_000),
+      consumedAt: null,
+      installationId: null,
+      createdAt: new Date(),
+    },
+  };
+}
+
+function configureWriteRecheck(
+  enabledCalls: number,
+  disabledAuthenticationCall?: number,
+): () => number {
+  let calls = 0;
+  jest.mocked(getServerEnv).mockImplementation(() => {
+    calls += 1;
+    if (calls === disabledAuthenticationCall) {
+      return { ...BASE_ENV, applicationWritesEnabled: false };
+    }
+    return {
+      ...BASE_ENV,
+      applicationWritesEnabled: calls <= enabledCalls,
+    };
+  });
+  return () => calls;
+}
+
+async function expectStopped(response: Response, origin: string): Promise<void> {
+  expect(response.status).toBe(503);
+  await expect(response.json()).resolves.toEqual({
+    error: "Application writes are temporarily disabled",
+    code: "writes_stopped",
+    retryable: true,
+  });
+  expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+  expect(response.headers.get("Pragma")).toBe("no-cache");
+  expect(response.headers.get("Retry-After")).toBe("60");
+  expect(response.headers.get("Access-Control-Allow-Origin")).toBe(origin);
+}
 
 function jsonRequest(
   url: string,

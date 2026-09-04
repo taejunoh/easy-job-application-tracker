@@ -46,6 +46,35 @@ describe("extension installation lifecycle", () => {
     expect(store.grants.get(grant.id)?.consumedAt).toBeNull();
   });
 
+  it("validates a usable pairing code without consuming or installing it", async () => {
+    const store = memoryStore();
+    const service = serviceFor(store);
+    const grant = await service.createPairingGrant(ORIGIN);
+
+    await expect(service.validatePairingCode(grant.code, ORIGIN)).resolves.toBe(
+      true,
+    );
+    await expect(service.validatePairingCode("bad", ORIGIN)).resolves.toBe(false);
+    await expect(
+      service.validatePairingCode(grant.code, OTHER_ORIGIN),
+    ).resolves.toBe(false);
+    await expect(
+      serviceFor(store, NOW + 10 * 60 * 1000).validatePairingCode(
+        grant.code,
+        ORIGIN,
+      ),
+    ).resolves.toBe(false);
+
+    const consumed = await service.createPairingGrant(ORIGIN);
+    store.grants.get(consumed.id)!.consumedAt = new Date(NOW);
+    await expect(
+      service.validatePairingCode(consumed.code, ORIGIN),
+    ).resolves.toBe(false);
+
+    expect(store.grants.get(grant.id)?.consumedAt).toBeNull();
+    expect(store.installations.size).toBe(0);
+  });
+
   it("creates distinct installations and revokes only the selected one", async () => {
     const store = memoryStore();
     const service = serviceFor(store);

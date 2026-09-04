@@ -78,6 +78,31 @@ export function createExtensionInstallationService(options: ServiceOptions) {
     );
   }
 
+  async function validPairingGrant(code: unknown, origin: string) {
+    if (!allowedOrigin(origin)) return null;
+    const parsed = parsePairingCode(code);
+    if (parsed === null) return null;
+    const grant = await options.store.findPairingGrant(parsed.selector);
+    const observedAt = new Date(now());
+    if (
+      grant === null ||
+      grant.origin !== origin ||
+      grant.consumedAt !== null ||
+      grant.expiresAt.getTime() <= observedAt.getTime()
+    ) {
+      return null;
+    }
+    const digest = digestPairingSecret(
+      parsed.selector,
+      parsed.secret,
+      origin,
+      options.encryptionSecret,
+    );
+    return verifyCredentialDigest(grant.codeDigest, digest)
+      ? { grant, observedAt }
+      : null;
+  }
+
   return Object.freeze({
     async createPairingGrant(origin: string) {
       if (!allowedOrigin(origin)) throw new TypeError("Invalid extension origin");
@@ -103,33 +128,20 @@ export function createExtensionInstallationService(options: ServiceOptions) {
       });
     },
 
+    async validatePairingCode(code: unknown, origin: string) {
+      return (await validPairingGrant(code, origin)) !== null;
+    },
+
     async exchangePairingCode(code: unknown, origin: string) {
-      if (!allowedOrigin(origin)) return null;
-      const parsed = parsePairingCode(code);
-      if (parsed === null) return null;
-      const grant = await options.store.findPairingGrant(parsed.selector);
-      const consumedAt = new Date(now());
-      if (
-        grant === null ||
-        grant.origin !== origin ||
-        grant.consumedAt !== null ||
-        grant.expiresAt.getTime() <= consumedAt.getTime()
-      ) {
-        return null;
-      }
-      const digest = digestPairingSecret(
-        parsed.selector,
-        parsed.secret,
-        origin,
-        options.encryptionSecret,
-      );
-      if (!verifyCredentialDigest(grant.codeDigest, digest)) return null;
+      const validGrant = await validPairingGrant(code, origin);
+      if (validGrant === null) return null;
+      const { grant, observedAt } = validGrant;
 
       const credential = createInstallationCredential(
         credentialOptions(origin),
       );
       const expiresAt = new Date(
-        consumedAt.getTime() + INSTALLATION_LIFETIME_MS,
+        observedAt.getTime() + INSTALLATION_LIFETIME_MS,
       );
       const installation: PersistedInstallation = {
         id: credential.selector,
@@ -138,13 +150,13 @@ export function createExtensionInstallationService(options: ServiceOptions) {
         expiresAt,
         revokedAt: null,
         lastUsedAt: null,
-        createdAt: consumedAt,
-        updatedAt: consumedAt,
+        createdAt: observedAt,
+        updatedAt: observedAt,
       };
       const consumed = await options.store.consumePairingGrant({
         grantId: grant.id,
         expectedDigest: grant.codeDigest,
-        consumedAt,
+        consumedAt: observedAt,
         installation,
       });
       if (!consumed) return null;
