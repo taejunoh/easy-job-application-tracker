@@ -1,0 +1,141 @@
+name: Production identity maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Identity maintenance phase
+        required: true
+        type: choice
+        options: [prepare, apply]
+      writers_stopped:
+        description: Attest that every Application writer is stopped
+        required: true
+        type: boolean
+        default: false
+      prepare_run_id:
+        description: Approved prepare workflow run ID; required for apply
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: production-identity-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22.22.2
+      - name: Validate maintenance request
+        env:
+          PHASE: ${{ inputs.phase }}
+          WRITERS_STOPPED: ${{ inputs.writers_stopped }}
+          PREPARE_RUN_ID: ${{ inputs.prepare_run_id }}
+          CURRENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test "$CURRENT_REF" = "refs/heads/main"
+          test "$WRITERS_STOPPED" = "true"
+          case "$PHASE" in
+            prepare) test -z "$PREPARE_RUN_ID" ;;
+            apply) [[ "$PREPARE_RUN_ID" =~ ^[1-9][0-9]*$ ]] ;;
+            *) exit 1 ;;
+          esac
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          npm ci
+      - name: Deploy additive migrations
+        run: |
+          set -euo pipefail
+          npx prisma migrate deploy
+      - name: Check migration status
+        run: |
+          set -euo pipefail
+          npx prisma migrate status
+      - name: Check schema migration diff
+        run: |
+          set -euo pipefail
+          npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+      - name: Create prepare dry-run evidence
+        if: inputs.phase == 'prepare'
+        run: |
+          set -euo pipefail
+          umask 077
+          npm run backfill:application-identities -- --report "$RUNNER_TEMP/application-identity-prepare.json"
+      - name: Validate prepare dry-run evidence
+        if: inputs.phase == 'prepare'
+        run: |
+          set -euo pipefail
+          node scripts/compare-application-identity-reports.mjs --expected "$RUNNER_TEMP/application-identity-prepare.json" --actual "$RUNNER_TEMP/application-identity-prepare.json" --actual-mode dry-run
+      - name: Upload prepare evidence
+        if: inputs.phase == 'prepare'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: application-identity-prepare-${{ github.run_id }}
+          path: $RUNNER_TEMP/application-identity-prepare.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Validate approved prepare provenance
+        if: inputs.phase == 'apply'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          metadata="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARE_RUN_ID")"
+          test "$(jq -r .conclusion <<<"$metadata")" = "success"
+          test "$(jq -r .event <<<"$metadata")" = "workflow_dispatch"
+          test "$(jq -r .head_branch <<<"$metadata")" = "main"
+          test "$(jq -r .head_sha <<<"$metadata")" = "$GITHUB_SHA"
+          test "$(jq -r .path <<<"$metadata")" = ".github/workflows/production-identity-maintenance.yml"
+      - name: Download approved prepare evidence
+        if: inputs.phase == 'apply'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-prepare-$PREPARE_RUN_ID" --dir "$RUNNER_TEMP/approved"
+      - name: Create current dry-run evidence
+        if: inputs.phase == 'apply'
+        run: |
+          set -euo pipefail
+          npm run backfill:application-identities -- --report "$RUNNER_TEMP/application-identity-current-dry-run.json"
+      - name: Compare approved and current evidence
+        if: inputs.phase == 'apply'
+        run: |
+          set -euo pipefail
+          node scripts/compare-application-identity-reports.mjs --expected "$RUNNER_TEMP/approved/application-identity-prepare.json" --actual "$RUNNER_TEMP/application-identity-current-dry-run.json" --actual-mode dry-run
+      - name: Apply approved identity maintenance
+        if: inputs.phase == 'apply'
+        run: |
+          set -euo pipefail
+          npm run backfill:application-identities -- --apply --writers-stopped --report "$RUNNER_TEMP/application-identity-apply.json"
+      - name: Compare approved and applied evidence
+        if: inputs.phase == 'apply'
+        run: |
+          set -euo pipefail
+          node scripts/compare-application-identity-reports.mjs --expected "$RUNNER_TEMP/approved/application-identity-prepare.json" --actual "$RUNNER_TEMP/application-identity-apply.json" --actual-mode apply
+      - name: Upload apply evidence
+        if: inputs.phase == 'apply'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: application-identity-apply-${{ github.run_id }}
+          path: $RUNNER_TEMP/application-identity-apply.json
+          if-no-files-found: error
+      - name: Remove temporary identity evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/approved" "$RUNNER_TEMP/application-identity-current-dry-run.json" "$RUNNER_TEMP/application-identity-apply.json" "$RUNNER_TEMP/application-identity-prepare.json"
