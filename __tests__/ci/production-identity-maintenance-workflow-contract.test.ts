@@ -371,6 +371,7 @@ describe("production identity maintenance workflow contract", () => {
     }
     expect(download).toBeDefined();
     expect(normalizeCondition(download?.if)).toBe("inputs.phase == 'apply'");
+    expect(download?.env).toMatchObject({ GH_TOKEN: "${{ github.token }}" });
 
     expect(currentDryRun).toBeDefined();
     const currentDryRunRun = normalizeRun(currentDryRun?.run);
@@ -378,6 +379,7 @@ describe("production identity maintenance workflow contract", () => {
     expect(currentDryRunRun).not.toMatch(/(?:^|\s)--writers-stopped(?:\s|$)/u);
     const currentDryRunReport = argumentAfter(currentDryRun?.run, "--report");
     expect(currentDryRunReport).toBeDefined();
+    expect(canonicalPath(currentDryRunReport)).toMatch(/^\$RUNNER_TEMP\/.+\.json$/u);
     expect(applyBackfill).toBeDefined();
     const applyBackfillRun = normalizeRun(applyBackfill?.run);
     expect(applyBackfillRun).toMatch(/(?:^|\s)--apply(?:\s|$)/u);
