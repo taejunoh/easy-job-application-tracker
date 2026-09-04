@@ -5,6 +5,7 @@ import { access, chmod, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
+import { pathToFileURL } from "node:url";
 import pg from "pg";
 import {
   fingerprintClient,
@@ -46,8 +47,8 @@ const SIGNAL_EXIT_CODES = new Map([
 ]);
 const TERMINATION_GRACE_MS = 2_000;
 const CLEANUP_CONTROL_TIMEOUT_MS = 2_500;
-const DOCKER_DUMP_WRAPPER = [
-  "set -u",
+export const DOCKER_DUMP_WRAPPER = [
+  "set -eu",
   "pidfile=$1; startfile=$2; cancelfile=$3; shift 3",
   "umask 077",
   "terminate() {",
@@ -642,11 +643,13 @@ async function main() {
   return supervisor.interruption;
 }
 
-try {
-  const interruption = await main();
-  if (interruption) process.exitCode = interruption.exitCode;
-  else process.stdout.write("Production backup snapshot created.\n");
-} catch {
-  process.stderr.write("Production backup failed.\n");
-  process.exitCode = 1;
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    const interruption = await main();
+    if (interruption) process.exitCode = interruption.exitCode;
+    else process.stdout.write("Production backup snapshot created.\n");
+  } catch {
+    process.stderr.write("Production backup failed.\n");
+    process.exitCode = 1;
+  }
 }
