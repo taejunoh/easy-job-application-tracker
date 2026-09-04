@@ -146,9 +146,17 @@ Capture the reviewed application commit before starting:
 
 ```bash
 set -euo pipefail
-export TARGET_SHA="$(git rev-parse HEAD)"
+git fetch origin main --prune
+export TARGET_SHA="$(git rev-parse origin/main)"
+git rev-parse --verify refs/remotes/origin/main >/dev/null
 GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 ```
+
+`origin/main` is the authoritative source for `TARGET_SHA`: both manual
+workflow dispatches below use `--ref main`, so a local branch `HEAD` or an
+unreviewed worktree must never be used as the target. The run-list filters and
+metadata checks for both phases must match this same SHA before a run is
+watched or its artifact is reviewed.
 
 Follow this exact hosted sequence. The backup prerequisite, gate, Vercel pause
 and canonical `503` must be established before either workflow phase runs.
@@ -289,11 +297,13 @@ and canonical `503` must be established before either workflow phase runs.
    time may run. That actor runs the post-resume smoke sequence: authenticated UI
    create/read/delete cleanup, using unique smoke rows and immediate cleanup;
    then extension pairing/exchange/create and read using a one-time pairing
-   code, unique smoke rows, and immediate cleanup. Revoke the
-   ExtensionInstallation server-side, then verify replay rejection and 401 from
-   the revoked credential. No other session, automation, background job, or
-   writer may perform these operations, and these checks must not run while
-   Vercel is paused.
+   code, unique smoke rows, and immediate cleanup. For the extension portion,
+   follow the [exact revocation and consumed-code replay lifecycle](chrome-extension-smoke.md#revocation-and-consumed-code-replay-lifecycle): keep the paired
+   popup/session available, revoke the ExtensionInstallation—the exact smoke
+   installation—server-side, then verify replay rejection and 401 from the
+   revoked credential. No other
+   session, automation, background job, or writer may perform these operations,
+   and these checks must not run while Vercel is paused.
 10. The final action is `resume Application writers LAST`; general Application
     writer resume is last and occurs only after every post-resume smoke pass
     succeeds. Retain only privacy-safe prepare/apply reports and approved
@@ -306,7 +316,7 @@ ordinary, automated, background, and Application writers stopped. A
 post-resume smoke failure leaves Application writers stopped; pause Vercel
 again before any further hosted change, preserve sanitized evidence, and recover
 through an isolated restore target and reviewed rollback. Any failure means
-   writers remain stopped continuously; do not enable identity writes, resume
+writers remain stopped continuously. Do not enable identity writes, resume
 writers, or retry apply with a different commit or report. Do not run `prisma db
 push`, `prisma db reset`, or `prisma migrate reset`, or use other destructive
 shortcuts against Production.

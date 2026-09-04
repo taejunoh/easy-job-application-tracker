@@ -76,7 +76,7 @@ describe("production operations documentation contract", () => {
     }
     expect(runbook).toContain("scratch restore");
     expect(runbook).toContain("mode `0600`");
-    expect(runbook).toContain("do not enable identity writes");
+    expect(runbook).toMatch(/do not enable identity writes/iu);
   });
 
   it("publishes the guarded Production identity maintenance operator workflow", () => {
@@ -131,7 +131,7 @@ describe("production operations documentation contract", () => {
     }
     expect(runbook).toContain("scratch restore");
     expect(runbook).toContain("mode-`0700`");
-    expect(runbook).toContain("do not enable identity writes");
+    expect(runbook).toMatch(/do not enable identity writes/iu);
   });
 
   it("requires the hosted identity rollout to stay paused until every smoke check passes", () => {
@@ -242,6 +242,108 @@ describe("production operations documentation contract", () => {
       /do not change either[^.]{0,120}absent a reviewed hosted rollback/iu,
     );
     expect(abort).not.toMatch(/keep the gate at `?0`?/iu);
+  });
+
+  it("anchors both hosted workflow phases to the fetched main commit", () => {
+    const runbook = readFileSync(
+      join(root, "docs/operations/production-runbook.md"),
+      "utf8",
+    );
+    const sectionStart = runbook.indexOf(
+      "## Application identity maintenance rollout",
+    );
+    const sectionEnd = runbook.indexOf("## Backup and restore", sectionStart);
+    expect(sectionStart).not.toBe(-1);
+    expect(sectionEnd).toBeGreaterThan(sectionStart);
+    const section = runbook.slice(sectionStart, sectionEnd).replace(/\s+/gu, " ");
+
+    expect(section).toContain("git fetch origin main --prune");
+    expect(section).toMatch(/TARGET_SHA=.*git rev-parse origin\/main/iu);
+    expect(section).toContain(
+      "both manual workflow dispatches below use `--ref main`",
+    );
+    expect(section).not.toMatch(/TARGET_SHA=.*git rev-parse HEAD/iu);
+
+    for (const phase of ["PREPARE", "APPLY"]) {
+      const captureStart = section.indexOf(`${phase}_RUN_ID=""`);
+      const captureEnd = section.indexOf(`${phase}_METADATA`, captureStart);
+      expect(captureStart).not.toBe(-1);
+      expect(captureEnd).toBeGreaterThan(captureStart);
+      const capture = section.slice(captureStart, captureEnd);
+      expect(capture).toContain(
+        "gh run list --workflow production-identity-maintenance.yml --branch main",
+      );
+      expect(capture).toContain("headSha");
+      expect(capture).toContain("$TARGET_SHA");
+    }
+  });
+
+  it("links the hosted rollout to an executable revoke and replay smoke lifecycle", () => {
+    const runbook = readFileSync(
+      join(root, "docs/operations/production-runbook.md"),
+      "utf8",
+    );
+    const smokeRunbook = readFileSync(
+      join(root, "docs/operations/chrome-extension-smoke.md"),
+      "utf8",
+    );
+    const sectionStart = runbook.indexOf(
+      "## Application identity maintenance rollout",
+    );
+    const sectionEnd = runbook.indexOf("## Backup and restore", sectionStart);
+    const section = runbook.slice(sectionStart, sectionEnd).replace(/\s+/gu, " ");
+    const smokeStart = smokeRunbook.indexOf("## Production system Chrome smoke");
+    const smoke = smokeRunbook.slice(smokeStart).replace(/\s+/gu, " ");
+
+    expect(section).toContain(
+      "chrome-extension-smoke.md#revocation-and-consumed-code-replay-lifecycle",
+    );
+    for (const requirement of [
+      "keep the paired popup/session available",
+      "revoke the exact smoke installation",
+      "server-side",
+      "authenticated request",
+      "401",
+      "local credential cleanup",
+      "separate fresh installation/profile/context",
+      "already-consumed one-time code",
+      "Do not expose or log the code",
+      "unique smoke row",
+      "unique smoke installation",
+    ]) {
+      expect(smoke.toLowerCase()).toContain(requirement.toLowerCase());
+    }
+    expect(smoke).toMatch(/authenticated[^.]{0,120}Settings/iu);
+
+    const orderedRequirements = [
+      "keep the paired popup/session available",
+      "revoke the exact smoke installation",
+      "authenticated request",
+      "401",
+      "local credential cleanup",
+      "separate fresh installation/profile/context",
+      "already-consumed one-time code",
+      "unique smoke row",
+      "unique smoke installation",
+    ];
+    let prior = -1;
+    for (const requirement of orderedRequirements) {
+      const next = smoke.toLowerCase().indexOf(requirement.toLowerCase(), prior + 1);
+      expect(next).toBeGreaterThan(prior);
+      prior = next;
+    }
+    expect(smoke).toMatch(/do not expose or log the (?:exact )?code/iu);
+    expect(smoke).toMatch(/do not use \*{0,2}Disconnect\*{0,2} as proof/iu);
+  });
+
+  it("capitalizes the identity-write abort instruction", () => {
+    const runbook = readFileSync(
+      join(root, "docs/operations/production-runbook.md"),
+      "utf8",
+    );
+
+    expect(runbook).not.toContain("continuously; do not enable identity writes");
+    expect(runbook).toContain("continuously. Do not enable identity writes");
   });
 
   it("publishes the complete quarantine operator workflow", () => {
