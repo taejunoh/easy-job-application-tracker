@@ -145,13 +145,22 @@ the extension's 401 handling are both confirmed.
    the expired/disconnected state and that local credential cleanup (including
    the installation credential) completed. Do not expose or log the credential
    or response body.
-3. In a separate fresh installation/profile/context with no stored JobTracker
-   credential, attempt to reuse the exact already-consumed one-time code from
-   the successful pairing. Keep the code only in private operator memory while
-   entering it; do not expose or log the code. The `/api/extension/pair` request
-   must be rejected with `401`, no new installation may be created, and the
-   popup must report that the pairing code was not accepted.
-4. Confirm cleanup targets only the unique smoke row and unique smoke
+3. After the 401 handler leaves the original extension disconnected and
+   credential-free, keep using that original extension popup/profile for the
+   replay check. Before entering the code, verify that its extension origin
+   exactly equals the original approved origin (`chrome-extension://...`) and
+   that the installed extension ID is unchanged. Do not reinstall/load another
+   copy: this unpacked manifest has no stable key, so doing so changes the
+   extension ID. If a second context is used for troubleshooting, it must
+   preserve the exact same extension origin; an origin mismatch is invalid
+   evidence.
+4. In that same original extension popup/context, attempt to reuse the exact
+   already-consumed one-time code from the successful pairing. Keep the code
+   only in private operator memory while entering it; do not expose or log the
+   code. The `/api/extension/pair` request must be rejected with `401`, no new
+   installation may be created, and the popup must report that the pairing code
+   was not accepted.
+5. Confirm cleanup targets only the unique smoke row and unique smoke
    installation: delete the row, leave the exact installation revoked, and
    discard the transient code. Do not disconnect or revoke any unrelated
    installation or delete any unrelated application row.

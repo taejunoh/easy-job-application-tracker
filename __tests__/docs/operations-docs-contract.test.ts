@@ -305,7 +305,9 @@ describe("production operations documentation contract", () => {
       "authenticated request",
       "401",
       "local credential cleanup",
-      "separate fresh installation/profile/context",
+      "disconnected and credential-free",
+      "original extension popup",
+      "extension origin exactly equals the original approved origin",
       "already-consumed one-time code",
       "Do not expose or log the code",
       "unique smoke row",
@@ -321,7 +323,9 @@ describe("production operations documentation contract", () => {
       "authenticated request",
       "401",
       "local credential cleanup",
-      "separate fresh installation/profile/context",
+      "disconnected and credential-free",
+      "original extension popup",
+      "extension origin exactly equals the original approved origin",
       "already-consumed one-time code",
       "unique smoke row",
       "unique smoke installation",
@@ -332,6 +336,13 @@ describe("production operations documentation contract", () => {
       expect(next).toBeGreaterThan(prior);
       prior = next;
     }
+    expect(smoke).not.toMatch(/separate fresh installation\/profile\/context/iu);
+    expect(smoke).toMatch(
+      /do not reinstall\/load another copy[^.]{0,160}(?:changes|change) the extension ID/iu,
+    );
+    expect(smoke).toMatch(
+      /second context[^.]{0,220}exact same extension origin[^.]{0,220}origin mismatch is invalid evidence/iu,
+    );
     expect(smoke).toMatch(/do not expose or log the (?:exact )?code/iu);
     expect(smoke).toMatch(/do not use \*{0,2}Disconnect\*{0,2} as proof/iu);
   });
