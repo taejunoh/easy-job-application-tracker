@@ -153,6 +153,11 @@ This is a design-level summary, not the executable operator procedure. The
 is authoritative for the exact hosted commands and order; this design must
 remain aligned with it.
 
+The Settings singleton is created only on the first successful PUT /api/settings;
+an authenticated GET /api/settings is read-only and does not create the row. The
+runbook linked above owns the executable candidate, rollback, fixture-ledger,
+and cleanup procedure.
+
 The hosted operator sequence from this historical design is superseded. For
 reference, the approved sequence is:
 

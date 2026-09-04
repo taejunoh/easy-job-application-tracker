@@ -8,6 +8,17 @@
 
 **Tech Stack:** Git/GitHub CLI, GitHub Actions, Vercel CLI 50.40.0 and dashboard, PostgreSQL 17, age, Docker, Chrome extension.
 
+> **Historical/superseded implementation plan.** This document preserves the
+> earlier hosted rollout record and design-level evidence requirements. It is
+> not executable operator guidance; the [production operations
+> runbook](../../operations/production-runbook.md#application-identity-maintenance-rollout)
+> is the sole source of executable commands and ordering.
+
+The Settings singleton is created only on the first successful PUT /api/settings;
+an authenticated GET /api/settings is read-only and does not create the row. See
+the [production operations runbook](../../operations/production-runbook.md#application-identity-maintenance-rollout)
+for the authoritative candidate, rollback, fixture-ledger, and cleanup procedure.
+
 ---
 
 ### Task 1: Integrate through a reviewed pull request
@@ -107,22 +118,15 @@ invent deployment IDs.
 
 - [ ] **Step 1: Link the known project and verify identity**
 
-```bash
-vercel link --yes --team taejunohs-projects --project easy-job-application-tracker
-vercel project inspect easy-job-application-tracker --scope taejunohs-projects
-vercel env ls production
-```
+The authoritative runbook's Vercel project-link and identity checks must confirm
+that the project owns `easy-job-application-tracker.vercel.app`; stop if the
+team, project, or domain differs.
 
-Expected: the project owns `easy-job-application-tracker.vercel.app`. Stop if the team, project, or domain differs.
+For evidence terminology, the staged Production candidate is built through the
+runbook's `vercel --prod --skip-domain` procedure and must reach `Ready` with
+the exact intended Git SHA and no canonical alias before promotion.
 
 - [ ] **Step 2: Establish the `identity=0,writes=1` Ready canonical support deployment**
-
-```bash
-test "$(git rev-parse HEAD)" = "$ROLLOUT_SHA"
-vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "0" --yes --force
-vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force
-vercel --prod --yes
-```
 
 Require a Ready deployment serving the canonical alias with both gate values
 `identity=0,writes=1`. Do not proceed if either value is absent or enabled in
@@ -138,12 +142,6 @@ put them in logs, artifacts, Actions output, shell history, PR/comments, or
 docs.
 
 - [ ] **Step 4: Stage and promote the read-only candidate while unpaused**
-
-```bash
-vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "1" --yes --force
-vercel env add APPLICATION_WRITES_ENABLED production --value "0" --yes --force
-vercel --prod --skip-domain --yes
-```
 
 Inspect the candidate before promotion: require `Ready`, the exact intended
 Git SHA, and no canonical alias. Record its staged deployment ID, promote it
@@ -229,12 +227,6 @@ cleared; resume that same deployment without redeploying, building, or
 promoting.
 
 - [ ] **Step 3: Stage and promote the final write-enabled candidate while unpaused**
-
-```bash
-test "$(git rev-parse HEAD)" = "$ROLLOUT_SHA"
-vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force
-vercel --prod --skip-domain --yes
-```
 
 Inspect the candidate before promotion: require `Ready`, the exact intended
 Git SHA, and no canonical alias. Record the new/staged deployment ID and

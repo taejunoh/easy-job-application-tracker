@@ -239,6 +239,37 @@ function stageOneWriteStopEvidenceBlock(): string {
 }
 
 describe("production rollout staged-candidate binding documentation contract", () => {
+  it("keeps non-runbook documents design-level and fixes Settings wording", () => {
+    const files = [
+      ["README.md", "docs/operations/production-runbook.md"],
+      [
+        "docs/superpowers/specs/2026-09-04-production-write-stop-rollout-design.md",
+        "../../operations/production-runbook.md",
+      ],
+      [
+        "docs/superpowers/specs/2026-09-03-production-recovery-and-identity-rollout-design.md",
+        "../../operations/production-runbook.md",
+      ],
+      [
+        "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md",
+        "../../operations/production-runbook.md",
+      ],
+    ];
+    for (const [file, runbookLink] of files) {
+      const document = readFileSync(join(root, file), "utf8");
+      expect(document).toContain(runbookLink);
+      expect(document).toContain("first successful PUT /api/settings");
+      expect(document).not.toContain("authenticated GET /api/settings creates");
+      expect(document).not.toMatch(/vercel api \/v13\/deployments\//u);
+      expect(document).not.toMatch(/vercel promote "\$CANDIDATE_ID"/u);
+
+      const fencedVercelBlocks = [...document.matchAll(/```(?:bash|sh|shell)\r?\n([\s\S]*?)```/gu)]
+        .map(([, block]) => block)
+        .filter((block) => /\bvercel\s+(?:deploy|api|inspect|promote)\b/iu.test(block));
+      expect(fencedVercelBlocks).toEqual([]);
+    }
+  });
+
   it("binds candidate data flow with explicit guards and safe projections", () => {
     const section = rolloutSection();
     const procedureMatch = candidateFunction().match(/stage_candidate\(\) \(([\s\S]*?)\n\)/u);

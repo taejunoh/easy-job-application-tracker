@@ -1,5 +1,10 @@
 # Production Write-Stop Rollout Design
 
+> This is a design-level summary of the approved constraints and evidence
+> requirements, not a second operator procedure. The [production operations
+> runbook](../../operations/production-runbook.md#application-identity-maintenance-rollout)
+> is the sole source of executable commands and ordering.
+
 ## Status and decision
 
 This design is approved for implementation. It revises the hosted identity
@@ -41,9 +46,9 @@ The Vercel sequencing follows three documented platform properties:
 - [`vercel --prod --skip-domain`](https://vercel.com/docs/cli/deploying-from-cli)
   creates a staged Production deployment without assigning the Production
   domains.
-- [`vercel promote`](https://vercel.com/docs/cli/promote) assigns an existing
-  Production deployment, while promoting a Preview deployment can trigger a
-  new Production build.
+- The Vercel promotion operation ([platform documentation](https://vercel.com/docs/cli/promote))
+  assigns an existing Production deployment, while promoting a Preview
+  deployment can trigger a new Production build.
 - [Environment variable changes](https://vercel.com/docs/environment-variables)
   apply only to new deployments, so the current canonical deployment retains
   its previous gate values until an explicit promotion.
@@ -102,6 +107,11 @@ deployment is not rollout evidence.
 The final state is never reached by changing an environment variable in place;
 it is reached only by assigning a Ready deployment built from the exact
 reviewed commit with both values set to `"1"`.
+
+The Settings singleton is created only on the first successful PUT /api/settings;
+an authenticated GET /api/settings is read-only and does not create the row. The
+complete candidate, rollback, fixture-ledger, and cleanup procedure is defined
+in the [production operations runbook](../../operations/production-runbook.md#application-identity-maintenance-rollout).
 
 ## Fail-closed semantics
 
@@ -164,7 +174,7 @@ cannot silently escape the gate.
 | `PATCH /api/applications/:id` | Updates any mutable Application fields. | Guard before update. |
 | `DELETE /api/applications/:id` | Deletes an Application; the duplicate-preservation check is read-only but belongs to this guarded operation. | Guard before delete. A blocked request performs no count or delete query. |
 | `PUT /api/settings` | Creates the singleton `Settings` row when absent or updates provider, encrypted API key, profile URLs, and resume text. | Guard before body processing and before create/update. |
-| `GET /api/settings` when the singleton is absent | Current implementation creates a default singleton as a hidden read-path write. | Change read behavior so it returns empty/default values without creating a row while closed. If creation remains supported while open, guard it explicitly. |
+| `GET /api/settings` when the singleton is absent | Current implementation has a hidden read-path write. | Change read behavior so it returns empty/default values without creating a row while closed. If creation remains supported while open, guard it explicitly. |
 | `POST /api/extension/pairing` | Creates a one-time `ExtensionPairingGrant`. | Guard before grant creation. Session principal and origin validation remain required. |
 | `POST /api/extension/pair` | Consumes a pairing grant and inserts an `ExtensionInstallation` in one transaction. | Guard before exchange and again around the transaction. A rejected exchange must not consume the grant or create an installation. |
 | `DELETE /api/extension/installations/:id` | Revokes an installation by setting `revokedAt` and `updatedAt`. | Guard before revoke. |

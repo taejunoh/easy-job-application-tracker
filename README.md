@@ -285,8 +285,9 @@ npx prisma migrate status
 
 Confirm the `Application`, `Settings`, `ExtensionInstallation`,
 `ExtensionPairingGrant`, and `_prisma_migrations` tables exist before serving
-traffic. No seed is required; the Settings row is created on the first
-authenticated Settings request.
+traffic. No seed is required; the Settings singleton is created only on the
+first successful PUT /api/settings. An authenticated GET /api/settings is
+read-only and does not create the row.
 
 If an existing database was previously created with `prisma db push`, first take a verified backup and compare it with the current Prisma schema:
 
@@ -305,6 +306,8 @@ npx prisma migrate status
 Never use a destructive reset, `db push` data-loss acceptance, or an unreviewed down migration on a database containing records you need. A safe rollback restores a tested backup. Legacy data imports require a separately reviewed export/import process. See the [production operations runbook](docs/operations/production-runbook.md) and the [sanitized production cutover record](docs/operations/production-cutover-2026-07-14.md) before changing a production database.
 
 ### Production identity maintenance
+
+The Settings singleton is created only on the first successful PUT /api/settings; an authenticated GET /api/settings is read-only and does not create the row. The complete staged candidate, rollback, fixture-ledger, and cleanup procedure is the [production operations runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
 
 Production identity maintenance is a manual, ordered two-gate operation. Start
 with an `identity=0,writes=1` Ready canonical support deployment. Before Stage
