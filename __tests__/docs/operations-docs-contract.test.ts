@@ -57,28 +57,22 @@ describe("production operations documentation contract", () => {
     ]);
   });
 
-  it("documents the maintenance-gated Application identity rollout in exact order", () => {
+  it("documents the maintenance-gated Application identity rollout", () => {
     const runbook = readFileSync(
       join(root, "docs/operations/production-runbook.md"),
       "utf8",
     ).replace(/\s+/gu, " ");
-    const requiredSteps = [
+    for (const requiredText of [
       'APPLICATION_IDENTITY_WRITES_ENABLED="0"',
       "stop every Application writer",
       "Backup and restore",
-      "npm run backfill:application-identities -- --report",
-      "npm run backfill:application-identities -- --apply --writers-stopped --report",
       "rowCountBefore",
       "rowCountAfter",
       "uniqueIndexVerified",
       'APPLICATION_IDENTITY_WRITES_ENABLED="1"',
       "resume Application writers",
-    ];
-    let prior = -1;
-    for (const text of requiredSteps) {
-      const next = runbook.indexOf(text, prior + 1);
-      expect(next).toBeGreaterThan(prior);
-      prior = next;
+    ]) {
+      expect(runbook).toContain(requiredText);
     }
     expect(runbook).toContain("scratch restore");
     expect(runbook).toContain("mode `0600`");
@@ -101,7 +95,6 @@ describe("production operations documentation contract", () => {
     for (const document of documents) {
       expect(document).toContain("Production identity maintenance");
       expect(document).toContain(prepareDispatch);
-      expect(document).toContain(applyDispatch);
       expect(document).toContain("writers_stopped=true");
       expect(document).toContain("prepare_run_id");
       expect(document).toMatch(
@@ -114,36 +107,102 @@ describe("production operations documentation contract", () => {
         /do not (?:run|use)[^.]{0,160}(?:prisma db push|prisma db reset|destructive)/iu,
       );
     }
+    const runbook = documents[1];
+    expect(runbook).toContain(applyDispatch);
   });
 
   it("keeps identity maintenance in the exact safe operator sequence", () => {
-    const runbookDocument = readFileSync(
+    const runbook = readFileSync(
       join(root, "docs/operations/production-runbook.md"),
       "utf8",
-    );
-    const sectionStart = runbookDocument.indexOf(
-      "## Application identity maintenance rollout",
-    );
-    expect(sectionStart).not.toBe(-1);
-    const runbook = runbookDocument.slice(sectionStart).replace(/\s+/gu, " ");
-    const requiredSteps = [
+    ).replace(/\s+/gu, " ");
+    for (const requiredText of [
       "verified backup prerequisite",
       "APPLICATION_IDENTITY_WRITES_ENABLED=0",
       "pause Vercel",
-      "download and review the prepare report",
-      "numeric prepare run id",
-      "review the apply report",
+      "production-identity-maintenance.yml",
+      "rowCountBefore",
+      "rowCountAfter",
+      "uniqueIndexVerified",
       "APPLICATION_IDENTITY_WRITES_ENABLED=1",
-      "deploy the same exact commit while Vercel remains paused",
-      "authenticated checks",
       "resume Application writers",
+    ]) {
+      expect(runbook).toContain(requiredText);
+    }
+    expect(runbook).toContain("scratch restore");
+    expect(runbook).toContain("mode-`0700`");
+    expect(runbook).toContain("do not enable identity writes");
+  });
+
+  it("requires the hosted identity rollout to stay paused until every smoke check passes", () => {
+    const runbook = readFileSync(
+      join(root, "docs/operations/production-runbook.md"),
+      "utf8",
+    );
+    const sectionStart = runbook.indexOf(
+      "## Application identity maintenance rollout",
+    );
+    const sectionEnd = runbook.indexOf("## Backup and restore", sectionStart);
+    expect(sectionStart).not.toBe(-1);
+    expect(sectionEnd).toBeGreaterThan(sectionStart);
+    const section = runbook.slice(sectionStart, sectionEnd).replace(/\s+/gu, " ");
+    const prepareDispatch =
+      "gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare -f writers_stopped=true";
+    const applyDispatch =
+      'gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"';
+    const orderedRequirements = [
+      "verified backup prerequisite",
+      "APPLICATION_IDENTITY_WRITES_ENABLED=0",
+      "pause Vercel",
+      "503",
+      prepareDispatch,
+      "capture numeric PREPARE_RUN_ID",
+      "headSha equals TARGET_SHA",
+      'gh run watch "$PREPARE_RUN_ID" --exit-status',
+      'gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-prepare-$PREPARE_RUN_ID"',
+      'node scripts/compare-application-identity-reports.mjs --expected "$PREPARE_REPORT" --actual "$PREPARE_REPORT" --actual-mode dry-run',
+      "review the prepare report",
+      applyDispatch,
+      "capture numeric APPLY_RUN_ID",
+      "verify apply run headSha equals TARGET_SHA",
+      'gh run watch "$APPLY_RUN_ID" --exit-status',
+      'gh run download "$APPLY_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-apply-$APPLY_RUN_ID"',
+      'node scripts/compare-application-identity-reports.mjs --expected "$PREPARE_REPORT" --actual "$APPLY_REPORT" --actual-mode apply',
+      "compare the approved prepare report with the apply report",
+      "APPLICATION_IDENTITY_WRITES_ENABLED=1",
+      "deploy the same exact TARGET_SHA while Vercel remains paused and canonical 503",
+      "resume Vercel Production",
+      "production monitor",
+      "authenticated UI create/read/delete cleanup",
+      "extension pairing/exchange/create",
+      "revoke the ExtensionInstallation",
+      "replay rejection and 401",
+      "resume Application writers LAST",
     ];
     let prior = -1;
-    for (const text of requiredSteps) {
-      const next = runbook.toLowerCase().indexOf(text.toLowerCase(), prior + 1);
+    for (const requirement of orderedRequirements) {
+      const next = section.toLowerCase().indexOf(requirement.toLowerCase(), prior + 1);
       expect(next).toBeGreaterThan(prior);
       prior = next;
     }
+    expect(section).toMatch(
+      /writers remain stopped continuously until every post-resume smoke pass succeeds/iu,
+    );
+    expect(section).not.toMatch(
+      /npm run backfill:application-identities[^.]{0,160}(?:DRY_RUN_REPORT|APPLY_REPORT)/iu,
+    );
+    expect(section).not.toMatch(
+      /authenticated checks[^.]{0,100}(?:while|with) Vercel remains paused/iu,
+    );
+  });
+
+  it("keeps the README concise and free of an unbound apply run ID", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+
+    expect(readme).toMatch(/capture and wait for numeric `?PREPARE_RUN_ID`?/iu);
+    expect(readme).not.toContain(
+      'gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"',
+    );
   });
 
   it("publishes the complete quarantine operator workflow", () => {

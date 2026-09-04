@@ -301,23 +301,23 @@ Never use a destructive reset, `db push` data-loss acceptance, or an unreviewed 
 
 Production identity maintenance is a manual, ordered operation: verify a
 backup and scratch restore, set `APPLICATION_IDENTITY_WRITES_ENABLED=0`, pause
-Vercel, and stop every Application writer. Dispatch both phases with the
-required writer-stop attestation:
+Vercel until the canonical origin returns `503`, and stop every Application
+writer. Dispatch prepare from `main` with the required writer-stop attestation:
 
 ```bash
 gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare -f writers_stopped=true
-gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"
 ```
 
-Use only an approved numeric `prepare_run_id`; download and review the
-privacy-safe prepare and apply reports. Set
-`APPLICATION_IDENTITY_WRITES_ENABLED=1`, deploy the same exact commit while
-Vercel remains paused, run authenticated checks, then resume Vercel and
-Application writers. Writers remain stopped continuously until those checks
-pass. Any failure means writers remain stopped continuously; do not run `prisma
-db push`, `prisma db reset`, or destructive shortcuts. The exact commands,
-report requirements, and rollback rules are in the [Production identity
-maintenance rollout](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
+Capture and wait for numeric `PREPARE_RUN_ID` with `gh run list`, `gh run view`,
+and `gh run watch --exit-status`, then follow the runbook to review the prepare
+artifact and dispatch apply with that approved ID. The workflow's `prepare_run_id`
+input must contain that approved numeric value. The runbook also defines the
+SHA checks, gate-1 deployment while paused, Vercel resume, production monitor,
+web/extension smoke checks, and final writer resume. Writers remain stopped
+continuously until every post-resume smoke pass succeeds. Any failure means
+writers remain stopped continuously; do not run `prisma db push`, `prisma db
+reset`, or destructive shortcuts. See the [Production identity maintenance
+rollout](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
 
 ## Development and Verification
 

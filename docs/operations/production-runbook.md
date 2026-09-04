@@ -140,12 +140,18 @@ row editing, or a restore with destructive cleanup against Production.
 This is the one-time **Production identity maintenance** procedure for an
 existing database. Do not combine or reorder the stages. The workflow is
 manual-only and requires `writers_stopped=true` on both dispatches. Writers
-remain stopped continuously from the Vercel pause through the final
-authenticated checks and resume step.
+remain stopped continuously until every post-resume smoke pass succeeds.
 
-Follow this exact sequence. Capture the reviewed application commit as
-`TARGET_SHA` before starting; the prepare and apply runs must be on `main` and
-must use that same SHA.
+Capture the reviewed application commit before starting:
+
+```bash
+set -euo pipefail
+export TARGET_SHA="$(git rev-parse HEAD)"
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
+```
+
+Follow this exact hosted sequence. The backup prerequisite, gate, Vercel pause
+and canonical `503` must be established before either workflow phase runs.
 
 1. Verify the backup prerequisite before changing Production: complete
    [Backup and restore](#backup-and-restore), including a successful scratch
@@ -156,101 +162,146 @@ must use that same SHA.
    `APPLICATION_IDENTITY_WRITES_ENABLED="0"`). Do not proceed if the value is
    absent or enabled.
 3. Pause Vercel Production using the provider's Production project pause
-   control, confirm the pause is active, and record the pause confirmation.
-   Then stop every Application writer, including the web service, extension
-   installations, monitoring writes, background work, and operator sessions.
-   Keep writers stopped continuously; pausing traffic alone is not an
-   attestation.
-4. Create a private report directory outside the repository. The report paths
-   must not already exist; the backfill creates each report once with mode
-   `0600`.
+   control and require the canonical origin to return `503`. Record the pause
+   and `503` confirmation, then stop every Application writer, including the
+   web service, extension installations, monitoring writes, background work,
+   and operator sessions. Keep writers stopped continuously; pausing traffic
+   alone is not an attestation.
+4. Dispatch the prepare phase from `main` with the required writer-stop
+   attestation:
 
    ```bash
-   umask 077
-   BACKFILL_REPORT_ROOT="/absolute/private/application-identity-backfill"
-   install -d -m 0700 "$BACKFILL_REPORT_ROOT"
-   DRY_RUN_REPORT="$BACKFILL_REPORT_ROOT/dry-run.json"
-   APPLY_REPORT="$BACKFILL_REPORT_ROOT/apply.json"
-   ```
-
-   After the **Backup and restore** prerequisite is confirmed and writers are
-   stopped, the prepare job runs the following exact backfill command:
-
-   ```bash
-   npm run backfill:application-identities -- --report "$DRY_RUN_REPORT"
-   ```
-
-5. Dispatch the prepare phase from the reviewed commit with the required
-   writer-stop attestation:
-
-   ```bash
+   PREPARE_DISPATCHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
    gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare -f writers_stopped=true
    ```
 
-   Wait for the run to complete successfully. The workflow creates a
-   privacy-safe `application-identity-prepare-$RUN_ID` artifact. Download and
-   review the prepare report without printing row bodies or URLs:
+   Capture numeric PREPARE_RUN_ID only after the dispatch. Retrieve the
+   newest matching manual run for the exact workflow, `main`, and
+   `TARGET_SHA`; retry while GitHub indexes the dispatch, then reject any
+   non-numeric value:
 
    ```bash
-   gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-prepare-$PREPARE_RUN_ID" --dir "$BACKFILL_REPORT_ROOT/prepare"
-   jq '{schemaVersion, mode, rowCountBefore, rowCountAfter, stateTotals, uniqueIndexVerified}' "$BACKFILL_REPORT_ROOT/prepare/application-identity-prepare.json"
+   PREPARE_RUN_ID=""
+   for _ in {1..30}; do
+     PREPARE_RUN_ID="$(gh run list --workflow production-identity-maintenance.yml --branch main --event workflow_dispatch --limit 20 --json databaseId,headSha,createdAt --jq "[.[] | select(.headSha == \"$TARGET_SHA\" and .createdAt >= \"$PREPARE_DISPATCHED_AT\")] | sort_by(.createdAt) | last | .databaseId // empty")"
+     [[ "$PREPARE_RUN_ID" =~ ^[1-9][0-9]*$ ]] && break
+     sleep 2
+   done
+   [[ "$PREPARE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+   PREPARE_METADATA="$(gh run view "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,event,headBranch,headSha)"
+   jq -e --arg target "$TARGET_SHA" '(.workflowName == "Production identity maintenance") and (.event == "workflow_dispatch") and (.headBranch == "main") and (.headSha == $target)' <<<"$PREPARE_METADATA" >/dev/null
    ```
 
-   Require `rowCountBefore` and `rowCountAfter` to match, state totals to sum
-   to that count, and `uniqueIndexVerified` to be `true`. The prepare report
-   must contain no raw URLs, titles, companies, bodies, credentials, or
-   connection values. Use a numeric prepare run ID only; reject empty, signed,
-   decimal, or otherwise non-numeric input.
-6. After the prepare report is approved, dispatch apply with that exact numeric
-   prepare run ID and the same writer-stop attestation:
+   Verify `headSha equals TARGET_SHA` from that metadata, then wait for the
+   run to finish successfully:
 
    ```bash
-   PREPARE_RUN_ID=123456789 # replace with the approved run ID; digits only
+   gh run watch "$PREPARE_RUN_ID" --exit-status
+   ```
+
+   Create a private mode-`0700` directory outside the repository and download
+   the named artifact. Report paths and backfill execution are workflow-internal;
+   do not set local `DRY_RUN_REPORT`/`APPLY_REPORT` variables or run the
+   backfill directly.
+
+   ```bash
+   EVIDENCE_ROOT="/absolute/private/application-identity-maintenance"
+   install -d -m 0700 "$EVIDENCE_ROOT/prepare"
+   PREPARE_REPORT="$EVIDENCE_ROOT/prepare/application-identity-prepare.json"
+   gh run download "$PREPARE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-prepare-$PREPARE_RUN_ID" --dir "$EVIDENCE_ROOT/prepare"
+   chmod 0700 "$EVIDENCE_ROOT/prepare"
+   ```
+
+   Run the comparator self-check on the prepare report, then review only its
+   privacy-safe summary. Require matching row counts, state totals that sum to
+   the count, and `uniqueIndexVerified=true`; never print URLs, titles,
+   companies, bodies, credentials, or connection values.
+
+   ```bash
+   node scripts/compare-application-identity-reports.mjs --expected "$PREPARE_REPORT" --actual "$PREPARE_REPORT" --actual-mode dry-run
+   jq '{schemaVersion, mode, rowCountBefore, rowCountAfter, stateTotals, uniqueIndexVerified}' "$PREPARE_REPORT"
+   ```
+
+   Review the prepare report and approve it before continuing.
+5. Dispatch apply only after the prepare report is approved, using the same
+   `TARGET_SHA` and an explicitly captured numeric `PREPARE_RUN_ID`:
+
+   ```bash
+   [[ "$PREPARE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+   APPLY_DISPATCHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
    gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"
    ```
 
-   The workflow verifies that the prepare run succeeded, was manually
-   dispatched from `main`, and has the same commit SHA before it downloads the
-   approved artifact. It then runs this deterministic apply command with the
-   writer lock:
+   Capture numeric APPLY_RUN_ID from the newest matching workflow-dispatch
+   run after this dispatch, validate it, and verify the apply run's metadata:
 
    ```bash
-   npm run backfill:application-identities -- --apply --writers-stopped --report "$APPLY_REPORT"
+   APPLY_RUN_ID=""
+   for _ in {1..30}; do
+     APPLY_RUN_ID="$(gh run list --workflow production-identity-maintenance.yml --branch main --event workflow_dispatch --limit 20 --json databaseId,headSha,createdAt --jq "[.[] | select(.headSha == \"$TARGET_SHA\" and .createdAt >= \"$APPLY_DISPATCHED_AT\")] | sort_by(.createdAt) | last | .databaseId // empty")"
+     [[ "$APPLY_RUN_ID" =~ ^[1-9][0-9]*$ ]] && break
+     sleep 2
+   done
+   [[ "$APPLY_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+   APPLY_METADATA="$(gh run view "$APPLY_RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,event,headBranch,headSha)"
+   jq -e --arg target "$TARGET_SHA" '(.workflowName == "Production identity maintenance") and (.event == "workflow_dispatch") and (.headBranch == "main") and (.headSha == $target)' <<<"$APPLY_METADATA" >/dev/null
    ```
 
-   Download and review the apply report using the same privacy-safe `jq`
-   projection; require its counts, state totals, and `uniqueIndexVerified` to
-   match the approved prepare report.
+   Verify apply run headSha equals TARGET_SHA, then watch it with exit-status
+   handling. A failed watch is an abort, not a reason to resume writers:
 
    ```bash
-   gh run download "$APPLY_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-apply-$APPLY_RUN_ID" --dir "$BACKFILL_REPORT_ROOT/apply"
-   jq '{schemaVersion, mode, rowCountBefore, rowCountAfter, stateTotals, uniqueIndexVerified}' "$BACKFILL_REPORT_ROOT/apply/application-identity-apply.json"
+   gh run watch "$APPLY_RUN_ID" --exit-status
+   install -d -m 0700 "$EVIDENCE_ROOT/apply"
+   APPLY_REPORT="$EVIDENCE_ROOT/apply/application-identity-apply.json"
+   gh run download "$APPLY_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "application-identity-apply-$APPLY_RUN_ID" --dir "$EVIDENCE_ROOT/apply"
+   chmod 0700 "$EVIDENCE_ROOT/apply"
    ```
 
-7. If the apply report is approved, run `npx prisma migrate status`, verify an
-   empty schema diff, and independently verify row counts and the unique
-   identity index. Set the Production gate to
+   Run the comparator against the approved prepare report and actual apply
+   report, then review the apply report's privacy-safe summary. Require the
+   same counts, totals, and unique index result as prepare.
+
+   ```bash
+   node scripts/compare-application-identity-reports.mjs --expected "$PREPARE_REPORT" --actual "$APPLY_REPORT" --actual-mode apply
+   jq '{schemaVersion, mode, rowCountBefore, rowCountAfter, stateTotals, uniqueIndexVerified}' "$APPLY_REPORT"
+   ```
+
+   compare the approved prepare report with the apply report using the command
+   above. Do not proceed on any mismatch.
+6. After the apply report, migration status, empty schema diff, row counts, and
+   unique identity index are approved, set the Production gate to
    `APPLICATION_IDENTITY_WRITES_ENABLED=1` (environment-file spelling:
-   `APPLICATION_IDENTITY_WRITES_ENABLED="1"`) while Vercel remains paused.
-8. Deploy the same exact commit while Vercel remains paused (`TARGET_SHA`).
-   Promote only the Vercel deployment whose commit SHA equals `TARGET_SHA`; do
-   not create a new commit or deploy an unreviewed working tree. Then run the
-   authenticated checks for `/api/applications`, `/api/settings`, and one reversible
-   create/read operation, and inspect Vercel logs for related errors. These are
-   the authenticated checks that must pass before traffic resumes.
-9. Resume Vercel Production, confirm the pause is cleared, and only then
-   resume Application writers. Retain the privacy-safe prepare/apply reports
-   and backup evidence under the approved private evidence policy.
+   `APPLICATION_IDENTITY_WRITES_ENABLED="1"`) while Vercel remains paused and
+   the canonical `503` is still observed.
+7. Deploy the same exact TARGET_SHA while Vercel remains paused and canonical
+   503. Promote only the Vercel deployment whose assigned commit is exactly
+   `TARGET_SHA`; require `Ready` and retain the assignment evidence. Do not
+   create a new commit, deploy an unreviewed working tree, or run authenticated
+   smoke checks while paused.
+8. Resume Vercel Production, confirm the pause is cleared and the canonical
+   origin is no longer `503`, but keep every Application writer stopped. Only
+   after this resume run the `production monitor` and require its authenticated
+   `200` result.
+9. With Vercel online and writers still stopped, run the post-resume smoke
+   sequence: authenticated UI create/read/delete cleanup; then extension
+   pairing/exchange/create and read using a one-time pairing code; revoke the
+   ExtensionInstallation; verify replay rejection and 401 from the revoked
+   credential. These checks must not run while Vercel is paused.
+10. The final action is `resume Application writers LAST`, only after every
+    post-resume smoke pass succeeds. Retain only privacy-safe prepare/apply reports and approved
+    backup evidence.
 
-Abort behavior is part of the procedure. If any dispatch, provenance check,
-download, report review, migration check, schema check, authenticated check,
-or deployment check fails, leave Vercel paused and writers stopped
-continuously. Do not set the gate to `1`, resume writers, or retry apply with a
-different commit or report. Any failure means writers remain stopped
-continuously. do not enable identity writes. Preserve the sanitized evidence
-and recover only through an isolated restore target and a reviewed rollback.
-Do not run `prisma db push`, `prisma db reset`, or `prisma migrate reset`, or use
-other destructive shortcuts against Production.
+Abort behavior is part of the procedure. A pre-resume failure leaves Vercel
+paused with canonical `503`; keep the gate at `0` unless a reviewed hosted
+rollback explicitly changes it, and keep writers stopped. A post-resume smoke
+failure leaves Application writers stopped; pause Vercel again before any
+further hosted change, preserve sanitized evidence, and recover through an
+isolated restore target and reviewed rollback. Any failure means writers remain
+stopped continuously. do not enable identity writes, resume writers, or retry
+apply with a different commit or report. Do not run `prisma db push`, `prisma
+db reset`, or `prisma migrate reset`, or use other destructive shortcuts against
+Production.
 
 ## Backup and restore
 
