@@ -393,4 +393,45 @@ describe("task-first README user guide", () => {
       "CI enforces the dependency-audit policy",
     );
   });
+
+  test("summarizes the staged two-gate Production rollout", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8").replace(
+      /\s+/gu,
+      " ",
+    );
+
+    for (const requiredText of [
+      "APPLICATION_IDENTITY_WRITES_ENABLED",
+      "APPLICATION_WRITES_ENABLED",
+      "server-only",
+      "missing value defaults closed",
+      "invalid value",
+      "Production must set it explicitly",
+      "identity=0,writes=1",
+      "identity=1,writes=0",
+      "identity=1,writes=1",
+      "vercel --prod --skip-domain",
+      "Ready",
+      "exact intended Git SHA",
+      "no canonical alias",
+      "while unpaused",
+      "2 × maxDuration",
+      "at least 60 seconds",
+      "authenticated negative probe",
+      "503 DEPLOYMENT_PAUSED",
+      "without redeploying",
+      "all eight persistent mutations",
+      "Settings GET does not create a row",
+      "lastUsedAt/updatedAt",
+      "smoke",
+      "bounded cleanup",
+      "external writers are resumed last",
+      "rollback target",
+    ]) {
+      expect(readme).toContain(requiredText);
+    }
+    expect(readme).not.toMatch(
+      /(?:build|deploy|deployment|promotion)[^.]{0,100}(?:while|remains) Vercel (?:was|remains) paused/iu,
+    );
+  });
 });

@@ -70,7 +70,7 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
 ```
 
 Use the first output for encryption and the second output for application
-access. Edit `.env` so the five required variables and optional rollout gate
+access. Edit `.env` so the five required variables and optional rollout gates
 follow this local template:
 
 ```dotenv
@@ -80,6 +80,7 @@ APP_ACCESS_TOKEN="<second-generated-secret>"
 APP_BASE_URL="http://localhost:3000"
 CORS_ALLOWED_ORIGINS="http://localhost:3000,chrome-extension://<extension-id>"
 APPLICATION_IDENTITY_WRITES_ENABLED="0"
+APPLICATION_WRITES_ENABLED="1"
 ```
 
 Reserved URL characters in the database username, password, or database name must be percent-encoded before you place those components in `DATABASE_URL`. For example, encode `@` as `%40`.
@@ -97,16 +98,22 @@ The variables serve these purposes:
 | `APP_ACCESS_TOKEN` | Private root credential used only by the web `/connect` page to create an administrator session. Never paste it into the Chrome extension. It is not a provider API key. |
 | `APP_BASE_URL` | Exact public origin of the JobTracker server, with no path. Use `http://localhost:3000` locally. |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins allowed to call the server. Include the app origin and the exact `chrome-extension://<extension-id>` origin. |
-| `APPLICATION_IDENTITY_WRITES_ENABLED` | Optional closed rollout gate. It accepts only `"0"` or `"1"` and defaults to `"0"`; keep it disabled until the identity migration and any required legacy-data backfill are verified. |
+| `APPLICATION_IDENTITY_WRITES_ENABLED` | Server-only identity gate. It accepts only `"0"` or `"1"` and defaults to `"0"`; keep it disabled until the identity migration and any required legacy-data backfill are verified. |
+| `APPLICATION_WRITES_ENABLED` | Server-only application-write gate. It accepts exactly `"0"` or `"1"`; a missing value defaults closed (`"0"`). Any defined invalid value—including blank, whitespace, `true`, or another string—fails validation. Production must set it explicitly; normal local/CI uses `"1"`, while maintenance uses `"0"`. |
 
 Do not commit `.env`, reuse one generated value for both secrets, or paste either secret into screenshots or issue reports.
 
 For a new empty local database, leave the identity gate at `"0"` while you
-apply the checked-in migrations. You may enable it only after migration status
-is current and the `Application` table is confirmed empty. For an existing
-database, follow the maintenance rollout in the
+apply the checked-in migrations, and use `APPLICATION_WRITES_ENABLED="1"` for
+normal local/CI work. You may enable the identity gate only after migration
+status is current and the `Application` table is confirmed empty. For an
+existing database, follow the maintenance rollout in the
 [production operations runbook](docs/operations/production-runbook.md); do not
-enable the gate before its dry run, backfill, and verification are complete.
+enable either maintenance gate before its dry run, backfill, and verification
+are complete. `APPLICATION_WRITES_ENABLED` is server-only and is never a
+Chrome-extension setting. Keep the identity-gate distinction clear: the
+identity gate controls identity maintenance writes, while the application gate
+controls ordinary Application mutations.
 
 ### 3. Prepare the database
 
@@ -232,7 +239,7 @@ For production-only connection, deployment, backup, and recovery problems, use t
 
 ## Production Deployment
 
-The supported hosted topology is Vercel for the Next.js application and Neon, or another managed PostgreSQL provider, for the database. Start with an empty PostgreSQL database and configure the five required server variables plus the optional `APPLICATION_IDENTITY_WRITES_ENABLED` rollout gate in the Production environment. Use a canonical HTTPS origin for `APP_BASE_URL` and include that origin plus only approved Chrome extension origins in `CORS_ALLOWED_ORIGINS`.
+The supported hosted topology is Vercel for the Next.js application and Neon, or another managed PostgreSQL provider, for the database. Start with an empty PostgreSQL database and configure the five required server variables plus both server-only rollout gates, `APPLICATION_IDENTITY_WRITES_ENABLED` and `APPLICATION_WRITES_ENABLED`, in the Production environment. Production must set both gates explicitly; use a canonical HTTPS origin for `APP_BASE_URL` and include that origin plus only approved Chrome extension origins in `CORS_ALLOWED_ORIGINS`.
 
 The **Vercel Next.js preset** runs `npm run build`; Vercel does not run `npm start`. When the build loads `next.config.ts`, JobTracker validates the complete server environment at **build time**. At **request-serving runtime**, `src/instrumentation.ts` validates it again before a new Node.js server instance handles requests. `npm start` pre-listen validation applies to **self-hosted Node only**.
 
@@ -299,10 +306,41 @@ Never use a destructive reset, `db push` data-loss acceptance, or an unreviewed 
 
 ### Production identity maintenance
 
-Production identity maintenance is a manual, ordered operation: verify a
-backup and scratch restore, set `APPLICATION_IDENTITY_WRITES_ENABLED=0`, pause
-Vercel until the canonical origin returns `503`, and stop every Application
-writer. Dispatch prepare from `main` with the required writer-stop attestation:
+Production identity maintenance is a manual, ordered two-gate operation. Start
+with an `identity=0,writes=1` Ready canonical support deployment. Before Stage
+1 promotion, authenticated supported flows must create one disposable
+Application, one installed extension credential, and a second unconsumed
+pairing grant. Keep their URL, IDs, tokens, pairing codes, and request/response
+bodies only in a private mode-0700 operator workspace; never put them in logs,
+artifacts, Actions output, shell history, PR/comments, or docs.
+
+Stage a `identity=1,writes=0` Ready Production candidate with the exact
+`vercel --prod --skip-domain` command. Inspect that it is Ready, has the exact
+intended Git SHA, and has no canonical alias; promote the candidate while
+unpaused. Start a bounded drain, wait at least `2 × maxDuration` (at least 60
+seconds when modules have 30-second maximum duration), and pass the
+authenticated negative probe. Use the exact fixtures to prove all eight
+persistent mutations return `503 writes_stopped`: Application POST/PATCH/DELETE,
+Settings PUT, pairing creation, valid pair exchange, installation deletion, and
+self-revoke. Also prove Settings GET does not create a row and
+installation-authenticated reads do not change `lastUsedAt/updatedAt`.
+
+Only then pause Vercel and require the actual canonical `503 DEPLOYMENT_PAUSED`
+before prepare/apply. Prepare, privately review, and apply the identity
+backfill only while paused. Paused Vercel blocks build and promotion: never
+attempt either while paused. There is no build or promotion while paused.
+Resume the recorded same read-only
+`identity=1,writes=0` deployment without redeploying, then stage a final Ready
+`identity=1,writes=1` Production candidate with `vercel --prod --skip-domain`.
+Inspect its exact SHA and no canonical alias, promote while unpaused, run smoke
+and bounded cleanup, and resume external writers last. External writers are
+resumed last. After final promotion, external writers are resumed last; delete the disposable Application,
+consume the still-unconsumed grant exactly once, revoke both disposable
+installations, verify bounded cleanup, and record only sanitized
+statuses/counts/hashes. The full sequence and
+sanitized evidence fields are in the [production operations runbook](docs/operations/production-runbook.md).
+
+Dispatch prepare from `main` with the required writer-stop attestation:
 
 ```bash
 gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare -f writers_stopped=true
@@ -311,12 +349,16 @@ gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare 
 Capture and wait for numeric `PREPARE_RUN_ID` with `gh run list`, `gh run view`,
 and `gh run watch --exit-status`, then follow the runbook to review the prepare
 artifact and dispatch apply with that approved ID. The workflow's `prepare_run_id`
-input must contain that approved numeric value. The runbook also defines the
-SHA checks, gate-1 deployment while paused, Vercel resume, production monitor,
-web/extension smoke checks, and final writer resume. Writers remain stopped
+input must contain that approved numeric value. Writers remain stopped
 continuously until every post-resume smoke pass succeeds. Any failure means
 writers remain stopped continuously; do not run `prisma db push`, `prisma db
-reset`, or destructive shortcuts. See the [Production identity maintenance
+reset`, or destructive shortcuts. Record only the Git SHA, old/new/staged/
+canonical deployment IDs, promotion and drain times, monitor/negative-probe
+run IDs, backup/prepare/apply run IDs and safe artifact digests/names,
+pause/resume evidence, and sanitized cleanup status. The rollback target is
+the recorded Ready `identity=1,writes=0` deployment; rollback or promotion is
+allowed only while unpaused, and after DB apply never target identity-unaware
+code. See the [Production identity maintenance
 rollout](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
 
 ## Development and Verification

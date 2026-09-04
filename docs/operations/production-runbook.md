@@ -29,10 +29,37 @@ server variables:
 | `APP_BASE_URL` | Canonical root HTTPS origin, without a path. |
 | `CORS_ALLOWED_ORIGINS` | Exact canonical web origin plus each approved `chrome-extension://` origin; no wildcard. |
 
-`APPLICATION_IDENTITY_WRITES_ENABLED` is an optional closed rollout gate. It
-accepts only `"0"` or `"1"` and defaults to `"0"`. Keep it disabled until the
-maintenance backfill below is complete; fresh empty databases may enable it
-after migrations report current and the Application table is confirmed empty.
+`APPLICATION_IDENTITY_WRITES_ENABLED` is a server-only identity gate. It accepts
+only `"0"` or `"1"` and defaults to `"0"`. `APPLICATION_WRITES_ENABLED` is a
+server-only application-write gate; it accepts exactly `"0"` or `"1"`, and a
+missing value defaults closed (`"0"`). Any defined invalid value—including a
+blank, whitespace, `true`, or another string—fails validation. Production must
+set both gates explicitly. Normal local/CI uses `"1"` for application writes;
+maintenance uses `"0"`. The identity and application gates are distinct: the
+first controls identity maintenance writes, while the second stops ordinary
+Application mutations. Keep the identity gate disabled until the maintenance
+backfill below is complete; fresh empty databases may enable it after
+migrations report current and the Application table is confirmed empty.
+
+### Application stopped-write response contract
+
+When `APPLICATION_WRITES_ENABLED="0"`, every persistent Application mutation
+returns HTTP status `503` with exactly this JSON body:
+
+```json
+{ "error": "Application writes are temporarily disabled", "code": "writes_stopped", "retryable": true }
+```
+
+The response also includes exactly these headers:
+
+```text
+Cache-Control: private, no-store
+Pragma: no-cache
+Retry-After: 60
+```
+
+This application-level response is distinct from the platform response `503
+DEPLOYMENT_PAUSED`, which Vercel returns while the project is paused.
 
 Validate the checked-in build without printing any values:
 
@@ -158,24 +185,52 @@ unreviewed worktree must never be used as the target. The run-list filters and
 metadata checks for both phases must match this same SHA before a run is
 watched or its artifact is reviewed.
 
-Follow this exact hosted sequence. The backup prerequisite, gate, Vercel pause
-and canonical `503` must be established before either workflow phase runs.
+Follow this exact hosted sequence. Vercel is unpaused for every build and
+promotion. It is paused only across prepare/apply, and the actual platform
+`503 DEPLOYMENT_PAUSED` must be observed before either workflow phase runs.
 
 1. Verify the backup prerequisite before changing Production: complete
    [Backup and restore](#backup-and-restore), including a successful scratch
    restore, and record only the approved checksum, counts, schema, and
    migration identity. A verified backup prerequisite is mandatory.
-2. Confirm the deployed candidate has the closed gate
-   `APPLICATION_IDENTITY_WRITES_ENABLED=0` (the environment-file spelling is
-   `APPLICATION_IDENTITY_WRITES_ENABLED="0"`). Do not proceed if the value is
-   absent or enabled.
-3. Pause Vercel Production using the provider's Production project pause
-   control and require the canonical origin to return `503`. Record the pause
-   and `503` confirmation, then stop every Application writer, including the
-   web service, extension installations, monitoring writes, background work,
-   and operator sessions. Keep writers stopped continuously; pausing traffic
-   alone is not an attestation.
-4. Dispatch the prepare phase from `main` with the required writer-stop
+2. Confirm a Ready canonical support deployment with
+   `APPLICATION_IDENTITY_WRITES_ENABLED="0"` and
+   `APPLICATION_WRITES_ENABLED="1"` (`identity=0,writes=1`). Before Stage 1
+   promotion, use supported authenticated flows to create one disposable
+   Application, one installed extension credential, and a second unconsumed
+   pairing grant. Keep their URL, IDs, tokens, pairing codes, and request/
+   response bodies only in a private mode-0700 workspace; never put them in
+   logs, artifacts, Actions output, shell history, PR/comments, or docs.
+3. Stage the Stage 1 `identity=1,writes=0` Ready Production candidate with:
+
+   ```bash
+   vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "1" --yes --force
+   vercel env add APPLICATION_WRITES_ENABLED production --value "0" --yes --force
+   vercel --prod --skip-domain --yes
+   ```
+
+   This stage sets `APPLICATION_IDENTITY_WRITES_ENABLED="1"` while keeping
+   `APPLICATION_WRITES_ENABLED="0"`.
+
+   Inspect the candidate before promotion: require `Ready`, the exact
+   intended Git SHA, and no canonical alias. Record its staged deployment ID,
+   then promote the candidate while unpaused. Record promotion time, start a
+   bounded drain, wait at least `2 × maxDuration` (at least 60 seconds when
+   modules have a 30-second maximum duration), and pass an authenticated
+   negative probe. Use the exact fixtures to prove all eight persistent
+   mutations return HTTP `503` with code `writes_stopped`: Application
+   POST/PATCH/DELETE; Settings PUT; pairing creation; valid pair exchange;
+   installation deletion; and self-revoke. Also prove Settings GET does not
+   create a row and installation-authenticated reads do not touch
+   `lastUsedAt/updatedAt`. Compare only sanitized counts/hashes before and
+   after, and record sanitized results.
+4. Pause Vercel Production using the provider's Production project pause
+   control and REQUIRE the actual canonical `503 DEPLOYMENT_PAUSED` before any
+   prepare/apply. Record pause evidence and the observation. The operator must
+   stop every Application writer, including web, extension, monitoring, background, and
+   operator writers. Keep writers stopped continuously; pausing traffic alone
+   is not an attestation. There is no build or promotion while paused.
+5. Dispatch the prepare phase from `main` with the required writer-stop
    attestation:
 
    ```bash
@@ -231,7 +286,7 @@ and canonical `503` must be established before either workflow phase runs.
    ```
 
    Review the prepare report and approve it before continuing.
-5. Dispatch apply only after the prepare report is approved, using the same
+6. Dispatch apply only after the prepare report is approved, using the same
    `TARGET_SHA` and an explicitly captured numeric `PREPARE_RUN_ID`:
 
    ```bash
@@ -277,23 +332,29 @@ and canonical `503` must be established before either workflow phase runs.
 
    compare the approved prepare report with the apply report using the command
    above. Do not proceed on any mismatch.
-6. After the apply report, migration status, empty schema diff, row counts, and
-   unique identity index are approved, set the Production gate to
-   `APPLICATION_IDENTITY_WRITES_ENABLED=1` (environment-file spelling:
-   `APPLICATION_IDENTITY_WRITES_ENABLED="1"`) while Vercel remains paused and
-   the canonical `503` is still observed.
-7. Deploy the same exact TARGET_SHA while Vercel remains paused and canonical
-   503. Promote only the Vercel deployment whose assigned commit is exactly
-   `TARGET_SHA`; require `Ready` and retain the assignment evidence. Do not
-   create a new commit, deploy an unreviewed working tree, or run authenticated
-   smoke checks while paused.
-8. Resume Vercel Production, confirm the pause is cleared and the canonical
-   origin is no longer `503`, but keep ordinary, automated, and background
-   Application writers stopped. Ordinary, automated, and background Application
-   writers remain stopped for every smoke check. Only after this resume run the
-   `production monitor` and require its authenticated `200` result.
-9. With Vercel online and all ordinary, automated, and background writers still
-   stopped, only one explicitly authorized bounded smoke actor/session at a
+7. After the apply report, migration status, empty schema diff, row counts, and
+   unique identity index are approved, keep Vercel paused and confirm the
+   actual `503 DEPLOYMENT_PAUSED`. Do not build or promote while paused.
+8. Resume Vercel Production; resume the recorded same
+   `identity=1,writes=0` read-only deployment without redeploying. Confirm the
+   pause is cleared and the canonical origin is no longer the platform `503`;
+   do not build or promote as part of this resume.
+9. After resume, stage the final `identity=1,writes=1` Ready Production
+   candidate with the same exact TARGET_SHA:
+
+   ```bash
+   vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force
+   vercel --prod --skip-domain --yes
+   ```
+
+   Inspect the candidate before promotion: require `Ready`, the exact
+   intended Git SHA, and no canonical alias. Record the new/staged deployment
+   ID and promote it while unpaused. Do not create a new commit or deploy an
+   unreviewed working tree. Run the authenticated `production monitor` only
+   after Vercel is serving again and require its success.
+10. With Vercel online and ordinary, automated, and background Application
+   writers remain stopped, only one explicitly authorized bounded smoke
+   actor/session at a
    time may run. That actor runs the post-resume smoke sequence: authenticated UI
    create/read/delete cleanup, using unique smoke rows and immediate cleanup;
    then extension pairing/exchange/create and read using a one-time pairing
@@ -304,10 +365,30 @@ and canonical `503` must be established before either workflow phase runs.
    revoked credential. No other
    session, automation, background job, or writer may perform these operations,
    and these checks must not run while Vercel is paused.
-10. The final action is `resume Application writers LAST`; general Application
-    writer resume is last and occurs only after every post-resume smoke pass
-    succeeds. Retain only privacy-safe prepare/apply reports and approved
-    backup evidence.
+11. After the final write-enabled promotion and successful smoke, delete the
+    disposable Application, consume the still-unconsumed pairing grant exactly
+    once, revoke both disposable installations, and verify bounded cleanup.
+    Record only sanitized statuses/counts/hashes. Finally, resume external writers last;
+    external writers are resumed last, after every cleanup check;
+    `resume Application writers LAST` is the final action and occurs only after
+    every cleanup and smoke pass succeeds.
+12. The final action is `resume Application writers LAST`; general Application
+   writer resume is last and occurs only after every post-resume smoke pass
+   succeeds. Retain only privacy-safe prepare/apply reports and approved
+   backup evidence.
+
+Record only non-sensitive operational evidence in the private rollout record:
+the Git SHA; old, new, staged, and canonical deployment IDs; promotion time;
+drain start/end; Production monitor and authenticated negative-probe run IDs;
+backup, prepare, and apply workflow run IDs; safe artifact names and digests;
+pause/resume evidence; and sanitized cleanup status. Leave unknown future IDs
+blank until observed; never fabricate an ID or record a secret or private
+Application field.
+
+The rollback target is the recorded Ready `identity=1,writes=0` deployment.
+Rollback and promotion are permitted only while Vercel is unpaused. If the
+database apply occurred, never roll back to identity-unaware code; preserve
+the gate and deployment state until a reviewed compatible rollback is ready.
 
 Abort behavior is part of the procedure. A pre-resume failure leaves Vercel
 paused with canonical `503`; preserve the actual current gate and deployment

@@ -4,7 +4,7 @@
 
 **Goal:** Integrate the verified repository changes, create a fresh encrypted backup, execute the production identity maintenance phases under a continuous writer stop, and verify application and extension behavior before resuming service.
 
-**Architecture:** GitHub Actions retains database credentials and performs backup/migration/backfill. Vercel is explicitly paused across dry run, apply, gate update, and preparation of the replacement production deployment. The project resumes only when the gate-enabled deployment is ready and all offline evidence is approved.
+**Architecture:** GitHub Actions retains database credentials and performs backup/migration/backfill. Vercel is unpaused for builds and promotions. Vercel is paused only across prepare/apply, where the platform `503 DEPLOYMENT_PAUSED` protects the database mutation window. There is no build or promotion while paused.
 
 **Tech Stack:** Git/GitHub CLI, GitHub Actions, Vercel CLI 50.40.0 and dashboard, PostgreSQL 17, age, Docker, Chrome extension.
 
@@ -97,9 +97,13 @@ Require mode `0600` on:
 
 Decrypt to the private directory, verify the plaintext hash equals `dumpSha256`, restore into a disposable PostgreSQL 17 Docker database, run `TZ=UTC node scripts/fingerprint-database.mjs`, and compare the result with the manifest fingerprint. Remove the plaintext dump and disposable container in an unconditional cleanup. If the key is absent or has the wrong mode, stop the rollout and report the recovery-evidence gap.
 
-### Task 3: Link and pin the Vercel project closed
+### Task 3: Link Vercel and promote the read-only candidate
 
 **Files:** `.vercel/project.json` is local ignored state and must never be staged.
+
+Historical correction: the prior paused-build sequence is **SUPERSEDED and
+unsuccessful**. It is not rollout evidence. Do not recreate that sequence or
+invent deployment IDs.
 
 - [ ] **Step 1: Link the known project and verify identity**
 
@@ -111,25 +115,61 @@ vercel env ls production
 
 Expected: the project owns `easy-job-application-tracker.vercel.app`. Stop if the team, project, or domain differs.
 
-- [ ] **Step 2: Explicitly set the identity gate closed and deploy `ROLLOUT_SHA`**
+- [ ] **Step 2: Establish the `identity=0,writes=1` Ready canonical support deployment**
 
 ```bash
 test "$(git rev-parse HEAD)" = "$ROLLOUT_SHA"
 vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "0" --yes --force
+vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force
 vercel --prod --yes
 ```
 
-Inspect the returned deployment and require Ready state plus the canonical alias. Dispatch `production-monitor.yml` and require success before pausing.
+Require a Ready deployment serving the canonical alias with both gate values
+`identity=0,writes=1`. Do not proceed if either value is absent or enabled in
+the wrong direction.
 
-### Task 4: Maintain a continuous production writer stop
+- [ ] **Step 3: Create private pre-promotion fixtures**
+
+Before Stage 1 promotion, use supported authenticated flows to create one
+disposable Application, one installed extension credential, and a second
+unconsumed pairing grant. Keep their URL, IDs, tokens, pairing codes, and
+request/response bodies only in a private mode-0700 operator workspace. Do not
+put them in logs, artifacts, Actions output, shell history, PR/comments, or
+docs.
+
+- [ ] **Step 4: Stage and promote the read-only candidate while unpaused**
+
+```bash
+vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "1" --yes --force
+vercel env add APPLICATION_WRITES_ENABLED production --value "0" --yes --force
+vercel --prod --skip-domain --yes
+```
+
+Inspect the candidate before promotion: require `Ready`, the exact intended
+Git SHA, and no canonical alias. Record its staged deployment ID, promote it
+while unpaused, and record the promotion time. Start a bounded drain and wait
+at least `2 × maxDuration` (at least 60 seconds when modules have a 30-second
+maximum duration). Pass the authenticated negative probe, then use the exact
+fixtures to prove all eight persistent mutations return `503` with
+`writes_stopped`: Application POST/PATCH/DELETE, Settings PUT, pairing
+creation, valid pair exchange, installation deletion, and self-revoke. Also
+prove Settings GET does not create a row and installation-authenticated reads
+do not touch `lastUsedAt/updatedAt`. Compare only sanitized counts/hashes
+before and after and record sanitized results.
+
+### Task 4: Pause only for prepare/apply identity maintenance
 
 **Files:** GitHub artifacts and private operator evidence only; no repository changes.
 
-- [ ] **Step 1: Pause the Vercel project**
+- [ ] **Step 1: Pause Vercel after the read-only negative probe**
 
 Using the authenticated Vercel dashboard, select team `taejunohs-projects`, project `easy-job-application-tracker`, Settings → General → Pause Project, type the exact project name, and confirm. Verify the canonical production URL returns `503 DEPLOYMENT_PAUSED`.
 
-Do not continue if the project cannot be paused. Do not resume until Task 6.
+Require the actual platform `503 DEPLOYMENT_PAUSED` before any prepare/apply.
+Stop every Application writer and keep writers stopped continuously. There is no
+build or promotion while paused; prepare, private review, and apply are the only
+operations permitted during this pause. Do not continue if the project cannot
+be paused.
 
 - [ ] **Step 2: Run prepare under the writer-stop attestation**
 
@@ -141,11 +181,12 @@ gh workflow run production-identity-maintenance.yml \
 gh run list --workflow production-identity-maintenance.yml --event workflow_dispatch --limit 1
 ```
 
-Capture `PREPARE_RUN_ID`, require `headSha == ROLLOUT_SHA`, and wait with `gh run watch "$PREPARE_RUN_ID" --exit-status`.
+Capture numeric `PREPARE_RUN_ID`, require `headSha == ROLLOUT_SHA`, and wait
+with `gh run watch "$PREPARE_RUN_ID" --exit-status`.
 
 - [ ] **Step 3: Review the private dry-run evidence**
 
-Download artifact `application-identity-prepare-$PREPARE_RUN_ID` into a mode-0700 directory outside the repository. Require schema version 1, mode `dry-run`, equal before/after counts, state totals summing to that count, a true unique-index result, opaque 64-hex row identifiers only, and no URL/title/company/body/connection values.
+Download artifact `application-identity-prepare-$PREPARE_RUN_ID` into a mode-0700 directory outside the repository. Require schema version 1, mode `dry-run`, equal before/after counts, state totals summing to that count, a true unique-index result, opaque 64-hex row identifiers only, and no URL/title/company/body/connection values. Review it privately and approve it before apply.
 
 - [ ] **Step 4: Run apply without resuming writers**
 
@@ -158,51 +199,88 @@ gh workflow run production-identity-maintenance.yml \
 gh run list --workflow production-identity-maintenance.yml --event workflow_dispatch --limit 1
 ```
 
-Capture `APPLY_RUN_ID`, require the same head SHA, and wait for success. Download `application-identity-apply-$APPLY_RUN_ID`; require its invariant projection and opaque row plan to match the approved prepare report exactly.
+Capture numeric `APPLY_RUN_ID`, require the same head SHA, and wait for success.
+Download `application-identity-apply-$APPLY_RUN_ID`; require its invariant
+projection and opaque row plan to match the approved prepare report exactly.
+Never build, redeploy, or promote while paused.
 
-### Task 5: Prepare the gate-enabled deployment while paused
+### Task 5: Resume the recorded read-only deployment and stage final writes
 
 **Files:** No repository changes.
 
-- [ ] **Step 1: Set the production gate and build the same commit**
+- [ ] **Step 1: Approve the offline identity apply evidence while paused**
+
+```bash
+node scripts/compare-application-identity-reports.mjs \
+  --expected "$PREPARE_REPORT" \
+  --actual "$APPLY_REPORT" \
+  --actual-mode apply
+```
+
+Require migration status, an empty schema diff, matching row counts/totals,
+`uniqueIndexVerified=true`, and the exact `ROLLOUT_SHA`. Do not build or
+promote while paused.
+
+- [ ] **Step 2: Resume the recorded same read-only deployment**
+
+Resume Vercel only after the apply evidence is approved. Confirm the recorded
+same `identity=1,writes=0` deployment is serving and the platform pause is
+cleared; resume that same deployment without redeploying, building, or
+promoting.
+
+- [ ] **Step 3: Stage and promote the final write-enabled candidate while unpaused**
 
 ```bash
 test "$(git rev-parse HEAD)" = "$ROLLOUT_SHA"
-vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "1" --yes --force
-vercel --prod --yes
+vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force
+vercel --prod --skip-domain --yes
 ```
 
-Require the new deployment to reach Ready and become the production assignment while the project still returns `503 DEPLOYMENT_PAUSED`. If Vercel refuses deployment while paused, leave the project paused and stop; do not briefly resume the gate-0 deployment.
+Inspect the candidate before promotion: require `Ready`, the exact intended
+Git SHA, and no canonical alias. Record the new/staged deployment ID and
+promote only while unpaused. This is the final staged
+`identity=1,writes=1` Production candidate/promotion; no paused build or
+promotion is allowed.
 
-- [ ] **Step 2: Reconfirm offline evidence**
-
-Require: exact `ROLLOUT_SHA`; green GitHub CI; successful verified backup; successful prepare/apply runs; matching reports; Ready gate-1 deployment; and no writer-resume action yet.
-
-### Task 6: Resume and run production smoke checks
+### Task 6: Smoke, clean up, and resume external writers last
 
 **Files:** No repository changes; remove smoke-created records through the supported UI/API.
 
-- [ ] **Step 1: Resume the Vercel project**
-
-In the same dashboard Pause Project section, select Resume Project. Poll the canonical URL until it no longer returns `DEPLOYMENT_PAUSED` and the deployment inspected in Task 5 is serving.
-
-- [ ] **Step 2: Run automated authenticated health**
+- [ ] **Step 1: Run automated authenticated health**
 
 ```bash
 gh workflow run production-monitor.yml --ref main
 gh run list --workflow production-monitor.yml --event workflow_dispatch --limit 1
 ```
 
-Wait for the run and require success from `ROLLOUT_SHA`.
+Wait for the run and require success from `ROLLOUT_SHA`. Record the monitor
+run ID and sanitized result only.
 
-- [ ] **Step 3: Run authenticated Application create/read cleanup**
+- [ ] **Step 2: Run the required authenticated smoke and negative checks**
 
-Use the existing authenticated browser session at the canonical origin. Create one uniquely titled smoke Application with a valid `https://example.test/...` URL, confirm it appears and reads successfully, then delete only that exact smoke record through the supported UI. If creation returns an existing record, use a new unique URL and do not delete pre-existing data.
+With ordinary, automated, and background writers still stopped, allow only one
+explicitly authorized bounded smoke actor/session. Use the exact fixtures from
+Task 3 to confirm all eight persistent mutations remain rejected while the
+read-only deployment was active, then use the final write-enabled deployment
+for authenticated UI create/read/delete smoke with immediate cleanup. Run the
+extension pairing/exchange/create/read smoke, revoke the exact disposable
+installations, and require revoked credentials to return `401`. Record only
+sanitized counts/hashes, statuses, and the negative-probe run ID.
 
-- [ ] **Step 4: Run the production extension lifecycle**
+- [ ] **Step 3: Complete bounded cleanup**
 
-From Settings, create a one-time pairing code for the exact installed Chrome extension origin. Pair the extension once, verify authenticated read/create behavior using a uniquely identified smoke record, revoke that installation from Settings, and require the revoked extension credential to receive `401`. Delete only the extension-created smoke record through the authenticated web UI. Confirm the one-time code cannot be replayed and no root token was stored in extension storage.
+Delete the disposable Application, consume the still-unconsumed pairing grant
+exactly once, revoke both disposable installations, and verify bounded cleanup.
+Record only sanitized statuses/counts/hashes. Do not expose URLs, IDs, tokens,
+pairing codes, request/response bodies, or private Application data.
 
-- [ ] **Step 5: Record final hosted state**
+- [ ] **Step 4: Record final hosted state and resume external writers last**
 
-Capture the main SHA and URLs/IDs for CI, backup, prepare, apply, deployment, and final monitor. Record only counts, hashes, statuses, and sanitized artifact names. Do not copy tokens, database URLs, pairing codes, resume content, or Application fields into the repository.
+Capture the Git SHA; old/new/staged/canonical deployment IDs; promotion time;
+drain start/end; Production monitor and negative-probe run IDs; backup,
+prepare, and apply workflow run IDs; safe artifact names and digests;
+pause/resume evidence; and sanitized cleanup status. Future IDs remain blank
+until observed. Finally, resume external writers last, after every smoke and cleanup
+check succeeds; external writers are resumed last. If DB apply occurred, the rollback target is the recorded Ready
+`identity=1,writes=0` deployment; rollback/promotion is permitted only while
+unpaused and must never target identity-unaware code.
