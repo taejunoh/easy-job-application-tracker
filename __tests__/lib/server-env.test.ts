@@ -214,12 +214,11 @@ describe("parseServerEnv", () => {
     const databaseUrl =
       `postgresql://jobtracker:database-password@db.example.com:5432/jobtracker?${query}`;
 
-    expect(() =>
-      parseServerEnv(
-        { ...productionSource, DATABASE_URL: databaseUrl },
-        "production",
-      ),
-    ).toThrow(
+    expectInvalidWithoutValue(
+      "DATABASE_URL",
+      databaseUrl,
+      { DATABASE_URL: databaseUrl },
+      "production",
       "must not contain reserved PostgreSQL timeout parameters",
     );
   });
@@ -459,6 +458,7 @@ function expectInvalidWithoutValue(
   invalidValue: string,
   overrides: Partial<typeof productionSource>,
   nodeEnv: string | undefined = "production",
+  expectedMessage?: string,
 ): void {
   try {
     parseServerEnv({ ...productionSource, ...overrides }, nodeEnv);
@@ -467,5 +467,8 @@ function expectInvalidWithoutValue(
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain(variableName);
     expect((error as Error).message).not.toContain(invalidValue);
+    if (expectedMessage !== undefined) {
+      expect((error as Error).message).toContain(expectedMessage);
+    }
   }
 }
