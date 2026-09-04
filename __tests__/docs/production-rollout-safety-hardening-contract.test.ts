@@ -26,9 +26,9 @@ function bashBlocks(section: string): string[] {
 }
 
 function executableVercelLines(document: string): string[] {
-  const blocks = [...document.matchAll(/```(?:bash|sh|shell)\r?\n([\s\S]*?)```/gu)];
+  const blocks = fencedShellBlocks(document);
   return blocks
-    .flatMap(([, block]) => (block ?? "").split(/\r?\n/u))
+    .flatMap((block) => block.split(/\r?\n/u))
     .filter((line) => {
       const trimmed = line.trim();
       return (
@@ -37,6 +37,36 @@ function executableVercelLines(document: string): string[] {
         /\bvercel\b/iu.test(trimmed)
       );
     });
+}
+
+function fencedShellBlocks(document: string): string[] {
+  return [...document.matchAll(/```(?:bash|sh|shell)\r?\n([\s\S]*?)```/gu)].map(
+    ([, block]) => block ?? "",
+  );
+}
+
+function executableGhProductionLines(document: string): string[] {
+  return fencedShellBlocks(document)
+    .flatMap((block) => block.split(/\r?\n/u))
+    .filter((line) => {
+      const trimmed = line.trim();
+      return (
+        trimmed.length > 0 &&
+        !trimmed.startsWith("#") &&
+        /\bgh\s+(?:workflow\s+run|run\s+(?:list|view|watch|download|cancel|rerun)|pr\s+(?:create|checks|merge))\b/iu.test(
+          trimmed,
+        )
+      );
+    });
+}
+
+function readmeMaintenanceSection(): string {
+  const readme = readFileSync(join(root, "README.md"), "utf8");
+  const start = readme.indexOf("### Production identity maintenance");
+  const end = readme.indexOf("## Development and Verification", start);
+  expect(start).not.toBe(-1);
+  expect(end).toBeGreaterThan(start);
+  return readme.slice(start, end);
 }
 
 function expectOrderedMatches(source: string, requirements: RegExp[]): void {
@@ -316,6 +346,7 @@ describe("production rollout staged-candidate binding documentation contract", (
       }
 
       expect(executableVercelLines(document)).toEqual([]);
+      expect(executableGhProductionLines(document)).toEqual([]);
 
       const heading = document.search(/^#{3,4} Rollout state and evidence summary\s*$/mu);
       expect(heading).not.toBe(-1);
@@ -375,6 +406,35 @@ describe("production rollout staged-candidate binding documentation contract", (
       "result=`vercel alias ls`",
       "echo ready && vercel rm deployment-id",
     ]);
+  });
+
+  it("rejects indirect production workflow/run GitHub invocations", () => {
+    const fixture = [
+      "```bash\n# gh workflow run is only a comment\ngh workflow run production.yml --ref main\n```",
+      "```sh\n$ gh run watch 123\ncandidate=$(gh workflow run production.yml)\ncommand gh run list --workflow production.yml\n```",
+      "```shell\n  env GH_TOKEN=test gh run view 123\nGH_TOKEN=test gh run download 123\n```",
+    ].join("\n");
+
+    expect(executableGhProductionLines(fixture)).toEqual([
+      "gh workflow run production.yml --ref main",
+      "$ gh run watch 123",
+      "candidate=$(gh workflow run production.yml)",
+      "command gh run list --workflow production.yml",
+      "  env GH_TOKEN=test gh run view 123",
+      "GH_TOKEN=test gh run download 123",
+    ]);
+  });
+
+  it("keeps the README maintenance section and historical plan non-executable", () => {
+    expect(fencedShellBlocks(readmeMaintenanceSection())).toEqual([]);
+    expect(readmeMaintenanceSection()).not.toMatch(
+      /\bgh\s+(?:workflow\s+run|run\s+(?:list|view|watch|download|cancel|rerun))\b/iu,
+    );
+    const plan = readFileSync(
+      join(root, "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md"),
+      "utf8",
+    );
+    expect(fencedShellBlocks(plan)).toEqual([]);
   });
 
   it("binds candidate data flow with explicit guards and safe projections", () => {

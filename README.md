@@ -358,16 +358,15 @@ installations, verify bounded cleanup, and record only sanitized
 statuses/counts/hashes. The full sequence and
 sanitized evidence fields are in the [production operations runbook](docs/operations/production-runbook.md).
 
-Dispatch prepare from `main` with the required writer-stop attestation:
-
-```bash
-gh workflow run production-identity-maintenance.yml --ref main -f phase=prepare -f writers_stopped=true
-```
-
-Capture and wait for numeric `PREPARE_RUN_ID` with `gh run list`, `gh run view`,
-and `gh run watch --exit-status`, then follow the runbook to review the prepare
-artifact and dispatch apply with that approved ID. The workflow's `prepare_run_id`
-input must contain that approved numeric value. Writers remain stopped
+Prepare and apply are dispatched from `main` only after the required writer-stop
+attestation and pause evidence. The operator records numeric prepare/apply run
+identifiers. Capture and wait for numeric `PREPARE_RUN_ID`, verify its exact
+rollout SHA, and privately review the prepare
+artifact. The attestation is recorded as `writers_stopped=true`, and apply
+receives the approved numeric `prepare_run_id`. The
+authoritative [Production identity maintenance
+runbook](docs/operations/production-runbook.md#application-identity-maintenance-rollout)
+defines the dispatch and observation procedure. Writers remain stopped
 continuously until every post-resume smoke pass succeeds. Any failure means
 writers remain stopped continuously; do not run `prisma db push`, `prisma db
 reset`, or destructive shortcuts. Record only the Git SHA, old/new/staged/
@@ -376,8 +375,7 @@ run IDs, backup/prepare/apply run IDs and safe artifact digests/names,
 pause/resume evidence, and sanitized cleanup status. The rollback target is
 the recorded Ready `identity=1,writes=0` deployment; rollback or promotion is
 allowed only while unpaused, and after DB apply never target identity-unaware
-code. See the [Production identity maintenance
-rollout](docs/operations/production-runbook.md#application-identity-maintenance-rollout).
+code.
 
 ## Development and Verification
 

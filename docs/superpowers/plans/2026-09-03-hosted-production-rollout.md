@@ -38,46 +38,28 @@ is verified and cleanup may remove only those IDs.
 
 - [ ] **Step 1: Verify the branch before publishing**
 
-```bash
-git status --short --branch
-git diff main...HEAD --check
-git log --oneline --decorate main..HEAD
-```
-
-Expected: clean branch, no secret/generated files, and only the approved program commits.
+The historical verification required a clean branch, no secret/generated files,
+and only the approved program commits. The authoritative runbook owns the
+current executable checks.
 
 - [ ] **Step 2: Push the branch and open a PR**
 
-```bash
-git push -u origin codex/production-recovery-2026-09-03
-gh pr create \
-  --base main \
-  --head codex/production-recovery-2026-09-03 \
-  --title "Restore production backup and identity rollout" \
-  --body "Repairs the Docker pg_dump start race, clears dependency audit failures, adds guarded identity maintenance tooling, and aligns operator documentation."
-```
+The historical plan published the reviewed branch and opened a pull request
+with its recovery and identity-rollout scope. Follow the authoritative runbook
+for any current repository integration commands.
 
 - [ ] **Step 3: Require all PR checks**
 
-```bash
-gh pr checks --watch
-```
-
-Expected: `verify`, `backup-interruption`, and `extension-e2e` succeed. If any check fails, inspect its log, fix only the demonstrated defect on the branch, rerun local affected gates, push, and wait again.
+The historical gate required `verify`, `backup-interruption`, and
+`extension-e2e` to succeed. If a check failed, the recorded response was to
+inspect only the demonstrated defect, rerun affected local gates, and wait for
+the updated result.
 
 - [ ] **Step 4: Merge without bypassing checks**
 
-```bash
-gh pr merge --merge --delete-branch
-git switch main
-git pull --ff-only origin main
-```
-
-Record `git rev-parse HEAD` as `ROLLOUT_SHA`; do not deploy a different commit.
-Locate the new `main` push run with
-`gh run list --workflow ci.yml --branch main --limit 1`, verify its head SHA is
-`ROLLOUT_SHA`, and wait for that numeric run ID with `gh run watch --exit-status`
-before dispatching an operations workflow.
+The historical plan merged only after checks passed, recorded the integrated
+commit as `ROLLOUT_SHA`, and required the corresponding main-branch CI result
+to pass before any operations workflow. Do not deploy a different commit.
 
 ### Task 2: Prove the hosted backup path
 
@@ -85,17 +67,10 @@ before dispatching an operations workflow.
 
 - [ ] **Step 1: Dispatch from the exact main commit**
 
-```bash
-gh workflow run production-backup.yml --ref main
-gh run list --workflow production-backup.yml --event workflow_dispatch --limit 1
-```
-
-Capture the numeric run ID shown by the second command as `BACKUP_RUN_ID` and verify its head SHA equals `ROLLOUT_SHA` with:
-
-```bash
-gh run view "$BACKUP_RUN_ID" --json headSha,status,conclusion,url
-gh run watch "$BACKUP_RUN_ID" --exit-status
-```
+The historical plan dispatched the backup from `main`, captured a numeric
+`BACKUP_RUN_ID`, verified its head SHA equaled `ROLLOUT_SHA`, and waited for
+success. The authoritative runbook owns the current workflow-dispatch and
+observation commands.
 
 - [ ] **Step 2: Inspect the artifact without exposing secrets**
 
@@ -182,16 +157,10 @@ be paused.
 
 - [ ] **Step 2: Run prepare under the writer-stop attestation**
 
-```bash
-gh workflow run production-identity-maintenance.yml \
-  --ref main \
-  -f phase=prepare \
-  -f writers_stopped=true
-gh run list --workflow production-identity-maintenance.yml --event workflow_dispatch --limit 1
-```
-
-Capture numeric `PREPARE_RUN_ID`, require `headSha == ROLLOUT_SHA`, and wait
-with `gh run watch "$PREPARE_RUN_ID" --exit-status`.
+The historical prepare dispatch required the writer-stop attestation and a
+numeric `PREPARE_RUN_ID`; its head SHA had to equal `ROLLOUT_SHA` and the run
+had to complete successfully. The authoritative runbook owns the current
+workflow-dispatch and observation commands.
 
 - [ ] **Step 3: Review the private dry-run evidence**
 
@@ -199,17 +168,9 @@ Download artifact `application-identity-prepare-$PREPARE_RUN_ID` into a mode-070
 
 - [ ] **Step 4: Run apply without resuming writers**
 
-```bash
-gh workflow run production-identity-maintenance.yml \
-  --ref main \
-  -f phase=apply \
-  -f writers_stopped=true \
-  -f prepare_run_id="$PREPARE_RUN_ID"
-gh run list --workflow production-identity-maintenance.yml --event workflow_dispatch --limit 1
-```
-
-Capture numeric `APPLY_RUN_ID`, require the same head SHA, and wait for success.
-Download `application-identity-apply-$APPLY_RUN_ID`; require its invariant
+The historical apply dispatch used only the approved numeric prepare identifier
+and the same writer-stop attestation. Capture numeric `APPLY_RUN_ID`, require
+the same head SHA, and wait for success. Download the apply artifact and require its invariant
 projection and opaque row plan to match the approved prepare report exactly.
 Never build, redeploy, or promote while paused.
 
@@ -218,13 +179,6 @@ Never build, redeploy, or promote while paused.
 **Files:** No repository changes.
 
 - [ ] **Step 1: Approve the offline identity apply evidence while paused**
-
-```bash
-node scripts/compare-application-identity-reports.mjs \
-  --expected "$PREPARE_REPORT" \
-  --actual "$APPLY_REPORT" \
-  --actual-mode apply
-```
 
 Require migration status, an empty schema diff, matching row counts/totals,
 `uniqueIndexVerified=true`, and the exact `ROLLOUT_SHA`. Do not build or
@@ -250,11 +204,6 @@ promotion is allowed.
 **Files:** No repository changes; remove smoke-created records through the supported UI/API.
 
 - [ ] **Step 1: Run automated authenticated health**
-
-```bash
-gh workflow run production-monitor.yml --ref main
-gh run list --workflow production-monitor.yml --event workflow_dispatch --limit 1
-```
 
 Wait for the run and require success from `ROLLOUT_SHA`. Record the monitor
 run ID and sanitized result only.

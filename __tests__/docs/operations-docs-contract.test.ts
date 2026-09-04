@@ -196,7 +196,6 @@ describe("production operations documentation contract", () => {
 
     for (const document of documents) {
       expect(document).toContain("Production identity maintenance");
-      expect(document).toContain(prepareDispatch);
       expect(document).toContain("writers_stopped=true");
       expect(document).toContain("prepare_run_id");
       expect(document).toMatch(
@@ -210,6 +209,7 @@ describe("production operations documentation contract", () => {
       );
     }
     const runbook = documents[1];
+    expect(runbook).toContain(prepareDispatch);
     expect(runbook).toContain(applyDispatch);
   });
 
