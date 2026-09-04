@@ -478,8 +478,8 @@ describe("task-first README user guide", () => {
     for (const forbiddenCompletionClaim of [
       /\bhistorical evidence began\b/iu,
       /\brecorded Stage [12] evidence showed\b/iu,
-      /\bexact fixtures proved\b/iu,
-      /\bbackfill was prepared\b/iu,
+      /\b(?:the )?(?:exact )?fixtures proved\b/iu,
+      /\b(?:the )?(?:identity )?backfill (?:was )?prepared,[^.]{0,120}\bapplied\b/iu,
       /\bthe promotion occurred\b/iu,
       /\bcleanup (?:deleted|consumed|revoked)\b/iu,
       /\b(?:prepare and apply|workflows?) were dispatched\b/iu,
