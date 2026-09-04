@@ -19,6 +19,7 @@
     "check:extension": "node --check extension/background.js && node --check extension/content.js && node --check extension/popup.js && node -e \"const manifest=JSON.parse(require('node:fs').readFileSync('extension/manifest.json','utf8')); if (manifest.manifest_version !== 3) process.exit(1)\"",
     "check:audit": "node scripts/check-audit.mjs",
     "check:production": "node scripts/check-production-stats.mjs",
+    "check:production:writes-stopped": "node scripts/check-production-writes-stopped.mjs",
     "check:startup-env": "node scripts/verify-invalid-startup.mjs",
     "cleanup:quarantine": "node scripts/quarantine-numbered-copies.mjs",
     "backfill:application-identities": "node scripts/backfill-application-identities.mjs",

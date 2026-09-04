@@ -18,6 +18,7 @@ type MonitorWorkflow = Readonly<{
         name: string;
         uses?: string;
         run?: string;
+        if?: string;
         env?: Record<string, string>;
         with?: Record<string, unknown>;
       }>[];
@@ -37,9 +38,21 @@ describe("production monitor workflow contract", () => {
     expect(packageJson.scripts["check:production"]).toBe(
       "node scripts/check-production-stats.mjs",
     );
+    expect(packageJson.scripts["check:production:writes-stopped"]).toBe(
+      "node scripts/check-production-writes-stopped.mjs",
+    );
     expect(workflow.on).toEqual({
       schedule: [{ cron: "17 * * * *" }],
-      workflow_dispatch: null,
+      workflow_dispatch: {
+        inputs: {
+          expect_writes_stopped: {
+            description: "Require the authenticated write-stop probe",
+            required: true,
+            type: "boolean",
+            default: false,
+          },
+        },
+      },
     });
     expect(workflow.permissions).toEqual({ contents: "read" });
     expect(workflow.jobs.monitor).toMatchObject({
@@ -66,17 +79,29 @@ describe("production monitor workflow contract", () => {
         },
         run: "npm run check:production",
       },
+      {
+        name: "Check authenticated production write stop",
+        if: "${{ inputs.expect_writes_stopped == true }}",
+        env: {
+          PRODUCTION_APP_URL: "${{ vars.PRODUCTION_APP_URL }}",
+          PRODUCTION_APP_ACCESS_TOKEN:
+            "${{ secrets.PRODUCTION_APP_ACCESS_TOKEN }}",
+        },
+        run: "npm run check:production:writes-stopped",
+      },
     ]);
-    expect(workflow.jobs.monitor.steps.slice(0, -1)).toEqual(
-      expect.not.arrayContaining([
-        expect.objectContaining({
-          env: expect.objectContaining({
-            PRODUCTION_APP_ACCESS_TOKEN:
-              "${{ secrets.PRODUCTION_APP_ACCESS_TOKEN }}",
-          }),
-        }),
-      ]),
+    const steps = workflow.jobs.monitor.steps;
+    const secretEnvSteps = steps.filter((step) =>
+      Object.values(step.env ?? {}).some((value) =>
+        value.includes("${{ secrets.PRODUCTION_APP_ACCESS_TOKEN }}"),
+      ),
     );
+    expect(secretEnvSteps.map((step) => step.name)).toEqual([
+      "Check authenticated production stats",
+      "Check authenticated production write stop",
+    ]);
+    expect(steps[2].if).toBeUndefined();
+    expect(steps[3].if).toBe("${{ inputs.expect_writes_stopped == true }}");
     expect(source).not.toMatch(/curl|response|body|set -x/iu);
   });
 });
