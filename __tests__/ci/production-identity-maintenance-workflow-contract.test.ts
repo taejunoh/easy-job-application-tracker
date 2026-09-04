@@ -386,7 +386,7 @@ describe("production identity maintenance workflow contract", () => {
       'test "$(jq -r .event <<<"$metadata")" = "workflow_dispatch"',
       'test "$(jq -r .head_branch <<<"$metadata")" = "main"',
       'test "$(jq -r .head_sha <<<"$metadata")" = "$GITHUB_SHA"',
-      'test "$(jq -r .path <<<"$metadata")" = ".github/workflows/production-identity-maintenance.yml"',
+      'test "$(jq -r .path <<<"$metadata")" = ".github/workflows/production-identity-maintenance.yml@main"',
     ]) {
       expect(hasExactCommand(provenance?.run, check)).toBe(true);
     }
