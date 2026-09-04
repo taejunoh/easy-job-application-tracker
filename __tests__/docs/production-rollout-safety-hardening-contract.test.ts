@@ -651,6 +651,27 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         expect(readFileSync(ledger, "utf8")).toBe(original);
         expect(JSON.parse(readFileSync(ledger, "utf8")).stage1).toBeUndefined();
       }
+
+      const repositoryRoot = join(temporaryRoot, "repository");
+      const repositoryLedgerRoot = join(repositoryRoot, "private-ledger");
+      mkdirSync(repositoryLedgerRoot, { recursive: true, mode: 0o700 });
+      chmodSync(repositoryLedgerRoot, 0o700);
+      const repositoryLedger = join(repositoryLedgerRoot, "rollout-ledger.json");
+      const originalRepositoryLedger = JSON.stringify(preStageLedger);
+      writeFileSync(repositoryLedger, originalRepositoryLedger, { mode: 0o600 });
+      expect(() => execFileSync("bash", ["-c", `git() { if [[ "$1 $2" == "rev-parse --show-toplevel" ]]; then printf '%s\\n' "$FAKE_REPO_ROOT"; else command git "$@"; fi; }\n${block}`], {
+        env: {
+          ...process.env,
+          EVIDENCE_ROOT: repositoryLedgerRoot,
+          FAKE_REPO_ROOT: repositoryRoot,
+          TARGET_SHA: "sha-reviewed",
+          APP_BASE_URL: expectedOrigin,
+          STAGE_ONE_CANDIDATE_ID: "dpl_stageone",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+      expect(readFileSync(repositoryLedger, "utf8")).toBe(originalRepositoryLedger);
+      expect(JSON.parse(readFileSync(repositoryLedger, "utf8")).stage1).toBeUndefined();
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }

@@ -328,16 +328,28 @@ promotion. It is paused only across prepare/apply, and the actual platform
 
    ```bash
    set -euo pipefail
+   : "${EVIDENCE_ROOT:?private ledger path is required}"
    file_mode() {
      stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1"
    }
-   : "${EVIDENCE_ROOT:?private ledger path is required}"
-   [[ -d "$EVIDENCE_ROOT" && ! -L "$EVIDENCE_ROOT" ]] || exit 1
-   EVIDENCE_ROOT="$(cd -- "$EVIDENCE_ROOT" && pwd -P)" || exit 1
-   LEDGER="$EVIDENCE_ROOT/rollout-ledger.json"
-   [[ -f "$LEDGER" && ! -L "$LEDGER" ]] || exit 1
-   [[ "$(file_mode "$EVIDENCE_ROOT")" == "700" ]] || exit 1
-   [[ "$(file_mode "$LEDGER")" == "600" ]] || exit 1
+   validate_evidence_root() {
+     local REPO_ROOT="" EVIDENCE_PARENT="" EVIDENCE_BASENAME="" EVIDENCE_PARENT_REAL="" EVIDENCE_CANDIDATE=""
+     [[ -n "${EVIDENCE_ROOT:-}" && "$EVIDENCE_ROOT" == /* ]] || return 1
+     EVIDENCE_PARENT="$(dirname -- "$EVIDENCE_ROOT")" || return 1
+     EVIDENCE_BASENAME="$(basename -- "$EVIDENCE_ROOT")" || return 1
+     [[ -d "$EVIDENCE_PARENT" && -n "$EVIDENCE_BASENAME" && "$EVIDENCE_BASENAME" != "." && "$EVIDENCE_BASENAME" != ".." ]] || return 1
+     EVIDENCE_PARENT_REAL="$(cd -- "$EVIDENCE_PARENT" && pwd -P)" || return 1
+     EVIDENCE_CANDIDATE="$EVIDENCE_PARENT_REAL/$EVIDENCE_BASENAME"
+     REPO_ROOT="$(cd -- "$(git rev-parse --show-toplevel)" && pwd -P)" || return 1
+     case "$EVIDENCE_CANDIDATE" in "$REPO_ROOT"|"$REPO_ROOT"/*) return 1 ;; esac
+     [[ -d "$EVIDENCE_CANDIDATE" && ! -L "$EVIDENCE_CANDIDATE" ]] || return 1
+     [[ "$(cd -- "$EVIDENCE_CANDIDATE" && pwd -P)" == "$EVIDENCE_CANDIDATE" ]] || return 1
+     [[ "$(file_mode "$EVIDENCE_CANDIDATE")" == "700" ]] || return 1
+     EVIDENCE_ROOT="$EVIDENCE_CANDIDATE"
+     LEDGER="$EVIDENCE_ROOT/rollout-ledger.json"
+     [[ -f "$LEDGER" && ! -L "$LEDGER" && "$(file_mode "$LEDGER")" == "600" ]] || return 1
+   }
+   validate_evidence_root || exit 1
    [[ "${TARGET_SHA:-}" != "" ]] || exit 1
    [[ "${APP_BASE_URL:-}" == "https://easy-job-application-tracker.vercel.app" ]] || exit 1
    [[ "$STAGE_ONE_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
