@@ -32,6 +32,7 @@ const SEEDED_APPLICATION_ID = "018f9f72-f2e9-4c29-a6fc-001122334455";
 const SEEDED_APPLICATION_URL = "https://jobs.example.test/seeded-role";
 const SEEDED_AT = new Date("2026-01-01T00:00:00.000Z");
 const EXPIRES_AT = new Date("2099-01-01T00:00:00.000Z");
+const CONTAINER_POSTGRES_PORT = 5432;
 
 type ApplicationsRoute = typeof import("@/app/api/applications/route");
 type ApplicationDetailRoute =
@@ -116,7 +117,7 @@ describeDatabase("application write-stop PostgreSQL invariants", () => {
       expect.arrayContaining([APP_ORIGIN, EXTENSION_ORIGIN]),
     );
 
-    const expectedIdentity = requiredDatabaseIdentity();
+    const expectedIdentity = requiredLiveDatabaseIdentity();
     liveDatabaseIdentity = await verifyLiveDatabaseIdentity(
       prisma,
       expectedIdentity,
@@ -240,7 +241,7 @@ describeDatabase("application write-stop PostgreSQL invariants", () => {
       try {
         await resetVerifiedIntegrationDatabase(
           prisma,
-          requiredDatabaseIdentity(),
+          requiredLiveDatabaseIdentity(),
         );
         await prisma.extensionPairingGrant.deleteMany();
         await prisma.extensionInstallation.deleteMany();
@@ -260,7 +261,7 @@ describeDatabase("application write-stop PostgreSQL invariants", () => {
     expect(liveDatabaseIdentity).toEqual({
       database: requiredDatabaseIdentity().database,
       address: requiredDatabaseIdentity().serverAddress,
-      port: requiredDatabaseIdentity().port,
+      port: CONTAINER_POSTGRES_PORT,
       schema: "public",
     });
   });
@@ -490,6 +491,13 @@ function requiredDatabaseIdentity(): DatabaseTestIdentity {
     throw new Error("Database integration identity was not validated");
   }
   return DATABASE_TEST_IDENTITY;
+}
+
+function requiredLiveDatabaseIdentity(): DatabaseTestIdentity {
+  return {
+    ...requiredDatabaseIdentity(),
+    port: CONTAINER_POSTGRES_PORT,
+  };
 }
 
 function requiredEncryptionSecret(): string {
