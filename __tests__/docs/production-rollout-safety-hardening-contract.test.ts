@@ -258,6 +258,7 @@ ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
     const resumeState = section.slice(readonly, regression);
     expect(normalize(resumeState)).toMatch(/resume[^.]*recorded[^.]*same-identity[^.]*exact[^.]*deployment[^.]*without redeploy/iu);
     expect(resumeState).toContain("read-only");
+    expect(resumeState).toContain("deployment ID");
     expect(resumeState).toContain("negative probes");
     expect(resumeState).not.toMatch(/vercel\s+(?:build|deploy|alias|promote)/iu);
 
@@ -275,6 +276,12 @@ ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
     expect(normalize(section)).toMatch(/never enable writers merely to recover/iu);
     expect(normalize(section)).toMatch(/no state[^.]*permits promotion while paused/iu);
     expect(section.match(/vercel\s+promote\b/giu)).toHaveLength(1);
+
+    expectOrdered(section, [
+      "PAUSED_AFTER_APPLY -> UNPAUSED_READONLY",
+      "PAUSED_AFTER_APPLY -> HOLD_PAUSED",
+      "UNPAUSED_READONLY -> HOLD_PAUSED",
+    ]);
   });
 
   it("defines a fail-closed private ledger setup with restrictive modes", () => {
@@ -307,6 +314,17 @@ ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
       })).toThrow();
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
+    }
+
+    expect(execFileSync("bash", ["-n"], { input: block, encoding: "utf8" })).toBe("");
+    expect(block).not.toMatch(/\b(?:vercel|gh|curl|fetch|http)\b/iu);
+    for (const secretName of [
+      "DATABASE_URL",
+      "ENCRYPTION_SECRET",
+      "APP_ACCESS_TOKEN",
+      "PRODUCTION_DATABASE_URL",
+    ]) {
+      expect(block).not.toMatch(new RegExp(`\\b${secretName}\\s*=`, "u"));
     }
   });
 
@@ -345,5 +363,28 @@ ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
     expect(normalizedSection).toContain("unchanged Settings existence and content hash");
     expect(normalizedSection).toContain("Settings singleton is created only on the first successful `PUT /api/settings`");
     expect(normalizedSection).toContain("authenticated `GET /api/settings` never creates the row");
+
+    const cleanupStart = section.indexOf("11. After the final write-enabled promotion");
+    const cleanup = normalize(section.slice(cleanupStart));
+    expectOrdered(cleanup, [
+      "Delete only exact ledger-owned Application IDs",
+      "Consume the recorded pre-stop unconsumed pairing grant exactly once",
+      "prove replay rejection",
+      "Revoke every ledger-owned installation",
+      "stored credential returns `401`",
+      "Reconcile final counts and content hashes",
+      "Delete `rollout-ledger.json` only after every",
+      "resume external writers last",
+    ]);
+    expect(cleanup).toContain("supported application paths");
+    expect(cleanup).toContain("no real provider credential");
+
+    const failureStart = section.indexOf("Cleanup or rejection failure");
+    const failure = normalize(section.slice(failureStart, section.indexOf("8. Resume Vercel Production")));
+    expect(failure).toContain("HOLD_PAUSED");
+    expect(failure.toLowerCase()).toContain("ordinary and external writers remain stopped");
+    expect(failure).toContain("ledger retained");
+    expect(failure).toContain("unbounded delete");
+    expect(failure).toContain("second unrecorded credential attempt");
   });
 });

@@ -267,6 +267,13 @@ promotion. It is paused only across prepare/apply, and the actual platform
    chmod 0600 "$EVIDENCE_ROOT/rollout-ledger.json"
    ```
 
+   Run this setup block locally before any fixture request; it contains no
+   provider/API command and no real secret or credential. The ledger's required
+   ownership and state fields are the rollout SHA, staged and promoted
+   deployment IDs, canonical origin, exact owned Application IDs,
+   pre/post-probe hashes, Settings existence and hashes, pairing grant and
+   installation IDs, expected terminal state, and observed result.
+
    Retain `rollout-ledger.json` until cleanup verification succeeds. It is
    private operator material: never committed or uploaded; never echo or copy it to logs,
    Actions artifacts, pull requests, specifications, README files, shell
@@ -427,22 +434,32 @@ promotion. It is paused only across prepare/apply, and the actual platform
    permits promotion, and never enable writers merely to recover. No state
    permits promotion while paused.
 
+   The allowed transitions are ordered and explicit: `PAUSED_AFTER_APPLY ->
+   UNPAUSED_READONLY` only after the approved evidence gate and the exact
+   recorded deployment identity are confirmed; `PAUSED_AFTER_APPLY ->
+   HOLD_PAUSED` on any failure or missing/ambiguous compatible target;
+   `UNPAUSED_READONLY -> HOLD_PAUSED` on a missing or rejected rollback
+   candidate; and a successful compatible rollback remains
+   `UNPAUSED_READONLY`. Every failure transition keeps ordinary and external
+   writers stopped and retains the ledger.
+
    Evidence approval resumes the recorded same-identity exact Stage 1 deployment
-   without redeploying and enters `UNPAUSED_READONLY`. Run only
+   deployment ID without redeploying and enters `UNPAUSED_READONLY`. Run only
    read-only and authenticated negative probes after the resume. Never resume
    an identity-unaware, pre-apply, remembered URL, or environment-claim-only
    target. If a regression occurs after resume, remain unpaused only long
    enough to reuse the existing `stage_candidate` procedure with stage name
    `identity=1,writes=0`; its Ready, inspected Production candidate must prove
-   the reviewed compatible exact SHA and exact ID before its exact ID is
-   promoted. Execute the same guarded procedure only while unpaused; do not
+   the recorded identity `identity=1,writes=0`, reviewed compatible exact SHA,
+   and exact deployment ID before that exact ID is promoted. Execute the same
+   guarded procedure only while unpaused; do not
    add a second deploy or promotion procedure. Drain at least 60 seconds and
    probe again. If absent, pause and enter `HOLD_PAUSED` with writers stopped.
 
    Cleanup or rejection failure also returns to `HOLD_PAUSED`; ledger retained
-   with all evidence and the safe paused/read-only state is preserved. Cleanup
-   failure never permits an unbounded delete or a second unrecorded credential
-   attempt.
+   with all evidence and the safe paused/read-only state is preserved. Ordinary
+   and external writers remain stopped. Cleanup failure never permits an
+   unbounded delete or a second unrecorded credential attempt.
    There is
    no build, deploy, alias, or promote command reachable from a paused state.
 
@@ -489,7 +506,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
    session, automation, background job, or writer may perform these operations,
    and these checks must not run while Vercel is paused.
 11. After the final write-enabled promotion and successful smoke, perform
-    ownership-limited cleanup from the private ledger. Delete only exact ledger-owned Application IDs through supported application paths; never
+    ownership-limited cleanup from the private ledger. Delete only exact ledger-owned Application IDs through supported application paths—the supported Application deletion path; never
     search or delete by broad name, timestamp, origin, or user. Consume the
     recorded pre-stop unconsumed pairing grant exactly once, then prove replay
     rejection. Revoke every ledger-owned installation, then prove the exact
@@ -508,11 +525,14 @@ promotion. It is paused only across prepare/apply, and the actual platform
     unrecorded credential attempt.
 
     The stopped-write Settings check is a syntactically valid
-    `PUT /api/settings` containing only a private, non-production canary. It
-    must return the exact HTTP `503` stopped-write response while preserving unchanged
-    Settings existence and content hash. Any unexpected response or hash/
-    existence change stops the operation immediately; do not overwrite the
-    row for cleanup. Record only sanitized statuses/counts/hashes. Finally,
+    `PUT /api/settings` containing only a private, non-production canary and no
+    real provider credential. It must return the exact HTTP `503` stopped-write
+    response while preserving unchanged Settings existence and content hash.
+    Any unexpected response or hash/existence change stops the operation
+    immediately; do not overwrite the row for cleanup. Record only sanitized
+    statuses/counts/hashes. Delete `rollout-ledger.json` only after every
+    ownership, replay, revocation, stopped-write, final-count, hash, and
+    expected-terminal-state check succeeds; otherwise retain it. Finally,
     resume external writers last; `resume Application writers LAST` is the
     final action and occurs only after every cleanup check succeeds.
 12. The final action is `resume Application writers LAST`; general Application
