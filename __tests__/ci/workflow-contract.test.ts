@@ -147,7 +147,7 @@ describe("deployment verification contract", () => {
       "cancel-in-progress": true,
     });
     expect(job["runs-on"]).toBe("ubuntu-latest");
-    expect(job["timeout-minutes"]).toBe(25);
+    expect(job["timeout-minutes"]).toBe(40);
     expect(job.services).toEqual({
       postgres: {
         image:
