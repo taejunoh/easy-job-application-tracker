@@ -1263,6 +1263,126 @@ describe("protected product API preflights", () => {
   });
 });
 
+describe("protected route application write stop", () => {
+  beforeEach(() => {
+    jest.mocked(getServerEnv).mockReturnValue({
+      ...getServerEnv(),
+      applicationWritesEnabled: false,
+    });
+  });
+
+  it("returns the stable 503 response for an authenticated declared write method", async () => {
+    const handler = jest.fn(() => new Response("handler-called"));
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const request = new NextRequest(`${APP_ORIGIN}/api/protected`, {
+      method: "POST",
+      headers: {
+        Origin: APP_ORIGIN,
+        Cookie: SESSION_COOKIE,
+      },
+      body: "private-body-must-not-be-read",
+    });
+
+    const response = await route.handler(handler)(request);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Application writes are temporarily disabled",
+      code: "writes_stopped",
+      retryable: true,
+    });
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(response.headers.get("Retry-After")).toBe("60");
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(APP_ORIGIN);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("keeps unauthenticated writes at 401", async () => {
+    const handler = jest.fn(() => new Response("handler-called"));
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const response = await route.handler(handler)(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "POST",
+        headers: { Origin: APP_ORIGIN },
+        body: "private-body-must-not-be-read",
+      }),
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: "Authentication required",
+      code: "unauthorized",
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("keeps bad Origins at 403 before the write stop", async () => {
+    const handler = jest.fn(() => new Response("handler-called"));
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const response = await route.handler(handler)(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "POST",
+        headers: {
+          Origin: UNKNOWN_ORIGIN,
+          Cookie: SESSION_COOKIE,
+        },
+        body: "private-body-must-not-be-read",
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: "Origin not allowed",
+      code: "origin_not_allowed",
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("keeps OPTIONS at 204 while writes are stopped", async () => {
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const response = route.OPTIONS(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "OPTIONS",
+        headers: {
+          Origin: APP_ORIGIN,
+          "Access-Control-Request-Method": "POST",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+  });
+
+  it("lets an authenticated read method reach its handler", async () => {
+    const handler = jest.fn(() => new Response("read-ok"));
+    const route = createProtectedRoute(["GET", "POST"], {
+      writeMethods: ["POST"],
+    });
+    const response = await route.handler(handler)(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "GET",
+        headers: {
+          Origin: APP_ORIGIN,
+          Cookie: SESSION_COOKIE,
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe("read-ok");
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+});
+
 function detailContext(): RouteContext {
   return { params: Promise.resolve({ id: APPLICATION_ID }) };
 }
