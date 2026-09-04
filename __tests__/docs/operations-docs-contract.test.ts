@@ -482,33 +482,40 @@ describe("production operations documentation contract", () => {
     expect(phaseEnd).toBeGreaterThan(phaseStart);
     const phase = design.slice(phaseStart, phaseEnd).replace(/\s+/gu, " ");
 
+    expect(design).toMatch(/SUPERSEDED/iu);
+    expect(design).toContain(
+      "2026-09-04-production-write-stop-rollout-design.md",
+    );
     expect(phase).toContain(
       "This is a design-level summary, not the executable operator procedure.",
     );
     expect(phase).toContain("production operations runbook");
     expect(phase).toContain("is authoritative for the exact hosted commands and order");
-    const initialOrder = [
-      "pause Vercel Production",
-      "canonical `503`",
-      "stop ordinary, automated, and background Application writers",
-    ];
-    let initialPrior = -1;
-    for (const requirement of initialOrder) {
-      const next = phase.toLowerCase().indexOf(requirement.toLowerCase(), initialPrior + 1);
-      expect(next).toBeGreaterThan(initialPrior);
-      initialPrior = next;
-    }
     const orderedRequirements = [
-      "keep Vercel Production paused",
-      "prepare",
-      "apply",
-      "APPLICATION_IDENTITY_WRITES_ENABLED=1",
+      "identity=0,writes=1",
+      "identity=1,writes=0",
+      "vercel --prod --skip-domain",
       "Ready",
-      "resume Vercel Production before any authenticated",
+      "exact intended Git SHA",
+      "no canonical alias",
+      "promote the candidate while unpaused",
+      "2 × maxDuration",
+      "authenticated negative probe",
+      "pause Vercel",
+      "503 DEPLOYMENT_PAUSED",
+      "prepare",
+      "review",
+      "apply",
+      "no build or promotion while paused",
+      "resume the recorded same",
+      "without redeploying",
+      "identity=1,writes=1",
+      "promote only while unpaused",
       "production monitor",
-      "authenticated UI",
+      "smoke",
       "one explicitly authorized bounded smoke actor/session at a time",
-      "resume Application writers LAST",
+      "Complete bounded cleanup",
+      "external writers are resumed last",
     ];
     let prior = -1;
     for (const requirement of orderedRequirements) {
@@ -522,6 +529,15 @@ describe("production operations documentation contract", () => {
     expect(phase).toMatch(/preserve the actual current gate and deployment state/iu);
     expect(phase).toMatch(
       /do not force[^.]{0,160}(?:gate|APPLICATION_IDENTITY_WRITES_ENABLED)[^.]{0,160}absent a reviewed hosted rollback/iu,
+    );
+    expect(phase).not.toMatch(
+      /pause Vercel Production[^.]{0,120}(?:first|before)[^.]{0,100}stop ordinary/iu,
+    );
+    expect(phase).not.toMatch(
+      /keep Vercel Production paused continuously through[^.]{0,220}(?:gate|deployment)[^.]{0,120}Ready/iu,
+    );
+    expect(phase).not.toMatch(
+      /(?:build|deploy|deployment|promotion)[^.]{0,120}(?:while|remains) Vercel (?:was|remains) paused/iu,
     );
     expect(phase).not.toMatch(/keep the write gate at `?0`?/iu);
     expect(phase).not.toMatch(/resume the Vercel project only after every check passes/iu);

@@ -1,5 +1,12 @@
 # Production Recovery and Identity Rollout Design
 
+> **SUPERSEDED for the hosted identity operator sequence.** The paused-build
+> sequence in this historical design is not executable guidance. Use the
+> [2026-09-04 production write-stop rollout design](2026-09-04-production-write-stop-rollout-design.md)
+> and the [authoritative production operations runbook](../../operations/production-runbook.md#application-identity-maintenance-rollout)
+> for the approved staged two-gate procedure. Historical backup, audit, and
+> source-control evidence below is retained as recorded and is not rewritten.
+
 ## Goal
 
 Restore trustworthy production backups and a green CI gate, then complete the
@@ -146,29 +153,31 @@ This is a design-level summary, not the executable operator procedure. The
 is authoritative for the exact hosted commands and order; this design must
 remain aligned with it.
 
-The operator sequence is:
+The hosted operator sequence from this historical design is superseded. For
+reference, the approved sequence is:
 
-1. Confirm the current identity write gate remains `0`, pause Vercel Production
-   and require the canonical `503` first. Then stop ordinary, automated, and
-   background Application writers and attest that they remain stopped. Keep
-   Vercel Production paused continuously through `prepare`, `apply`, gate
-   `APPLICATION_IDENTITY_WRITES_ENABLED=1`, and the exact reviewed deployment
-   reaching `Ready`.
-2. Run `prepare` with the writer-stop attestation and keep writers stopped.
-3. Review the dry-run report and the fresh backup evidence without resuming
-   writers.
-4. Run `apply` with the writer-stop attestation and approved `prepare` run ID.
-5. Require the apply report to match the approved dry-run invariants.
-6. Set `APPLICATION_IDENTITY_WRITES_ENABLED=1` in Production and deploy the
-   exact reviewed `main` commit while Vercel remains paused and the canonical
-   `503` is still observed. Require the assigned deployment to reach `Ready`.
-7. Resume Vercel Production before any authenticated monitor, UI, or extension
-   smoke. Confirm the canonical origin is no longer `503`, then run the
-   `production monitor`, authenticated UI create/read/delete, and extension
-   pairing/exchange/create/revoke/replay checks. Ordinary, automated, and
-   background Application writers remain stopped; only one explicitly
-   authorized bounded smoke actor/session at a time may run.
-8. Resume Application writers LAST, only after every post-resume check passes.
+1. Start with an `identity=0,writes=1` Ready canonical support deployment.
+2. Stage an `identity=1,writes=0` Ready Production candidate with
+   `vercel --prod --skip-domain` while unpaused. Inspect `Ready`, the exact
+   intended Git SHA, and no canonical alias; promote the candidate while
+   unpaused. Drain for at least `2 × maxDuration` (at least 60 seconds for
+   30-second modules) and pass an authenticated negative probe.
+3. Pause Vercel and require the actual `503 DEPLOYMENT_PAUSED`. Prepare,
+   privately review, and apply only while paused. There is no build or
+   promotion while paused.
+4. Resume the recorded same `identity=1,writes=0` deployment without
+   redeploying, building, or promoting. Stage the final
+   `identity=1,writes=1` Production candidate with `--skip-domain`, then
+   promote only while unpaused.
+5. After final promotion, run the production monitor and smoke; ordinary,
+   automated, and background Application writers remain stopped, and only one
+   explicitly authorized bounded smoke actor/session at a time may run.
+   Complete bounded cleanup; external writers are resumed last. The old paused-build attempt is
+   **SUPERSEDED and unsuccessful**, not evidence.
+
+On any failure, preserve the actual current gate and deployment state and keep
+writers stopped; do not treat the historical paused-build sequence as a
+fallback.
 
 If Vercel cannot be paused reliably, the apply phase stops. If any migration,
 backfill, index, row-count, or smoke assertion fails, leave writers stopped and
@@ -231,9 +240,10 @@ verified, report that as an evidence gap and make no mutation.
   integrated commit.
 - A fresh encrypted production backup is uploaded only after successful scratch
   restore and fingerprint equality.
-- Identity migrations and backfill reports satisfy the runbook invariants, the
-  production gate is `1`, authenticated application checks pass, and writers are
-  resumed.
+- Identity migrations and backfill reports satisfy the runbook invariants; the
+  final staged Production candidate and promotion have
+  `identity=1,writes=1`, authenticated application checks pass, and external
+  writers are resumed last.
 - Production extension pairing, one-time exchange, authenticated access,
   revocation, and rejection after revocation are observed.
 - `.env.example`, README, and the runbook describe the same closed-by-default
