@@ -530,12 +530,36 @@ describe("production identity maintenance workflow contract", () => {
     expect(allCommands.filter((command) => command === "npx prisma migrate status")).toHaveLength(1);
     expect(allCommands.filter((command) => command === "npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code")).toHaveLength(1);
     expect(phaseCommandCount("prepare", backfillPattern)).toBe(1);
+    expect(phaseCommandCount("prepare", applyBackfillPattern)).toBe(0);
     expect(phaseCommandCount("apply", backfillPattern)).toBe(1);
     expect(phaseCommandCount("apply", applyBackfillPattern)).toBe(1);
     expect(phaseCommandCount("prepare", comparatorPattern)).toBe(1);
     expect(phaseCommandCount("apply", comparatorPattern)).toBe(2);
     expect(allCommands.filter((command) => command === 'metadata="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARE_RUN_ID")"')).toHaveLength(1);
     expect(allCommands.filter((command) => /^gh run download "\$PREPARE_RUN_ID" --repo "\$GITHUB_REPOSITORY" --name "application-identity-prepare-\$PREPARE_RUN_ID" --dir "\$RUNNER_TEMP\/approved"$/u.test(command))).toHaveLength(1);
+
+    const preparePhaseCommands = steps
+      .filter((step) => normalizeCondition(step.if) === "inputs.phase == 'prepare'")
+      .flatMap((step) => effectiveCommandLines(step.run));
+    const applyPhaseCommands = steps
+      .filter((step) => normalizeCondition(step.if) === "inputs.phase == 'apply'")
+      .flatMap((step) => effectiveCommandLines(step.run));
+    const comparatorCommands = (commands: readonly string[]): string[] =>
+      commands.filter((command) => comparatorPattern.test(command));
+    const isApplyProvenance = (command: string): boolean =>
+      command === 'metadata="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARE_RUN_ID")"'
+      || /^test "\$\(jq -r \.(?:conclusion|event|head_branch|head_sha|path) <<<"\$metadata"\)" = ".+"$/u.test(command)
+      || /^gh run download "\$PREPARE_RUN_ID" --repo "\$GITHUB_REPOSITORY" --name "application-identity-prepare-\$PREPARE_RUN_ID" --dir "\$RUNNER_TEMP\/approved"$/u.test(command);
+    expect(preparePhaseCommands.some((command) => applyBackfillPattern.test(command))).toBe(false);
+    expect(preparePhaseCommands.some((command) => isApplyProvenance(command))).toBe(false);
+    expect(comparatorCommands(preparePhaseCommands).every((command) =>
+      argumentAfter(command, "--actual-mode") !== "apply"
+        && argumentAfter(command, "--expected") === argumentAfter(command, "--actual"),
+    )).toBe(true);
+    expect(comparatorCommands(applyPhaseCommands).every((command) =>
+      argumentAfter(command, "--actual-mode") !== "dry-run"
+        || argumentAfter(command, "--expected") !== argumentAfter(command, "--actual"),
+    )).toBe(true);
   });
 
   it("cleans every temporary report unconditionally and forbids production data leaks or destructive commands", () => {
