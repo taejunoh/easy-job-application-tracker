@@ -84,7 +84,10 @@ export function createProtectedRoute(
       if (!corsResult.allowed) return privateNoStore(corsResult.response);
       cors = corsResult;
 
-      const authentication = await authenticateApiRequestAsync(request);
+      const isWriteMethod = writeMethods.has(request.method.toUpperCase());
+      const authentication = await authenticateApiRequestAsync(request, {
+        touchInstallation: !isWriteMethod,
+      });
       if (!authentication.authenticated) {
         return protectedResponse(
           Response.json(authentication.error, {
@@ -103,7 +106,7 @@ export function createProtectedRoute(
         );
       }
 
-      if (writeMethods.has(request.method.toUpperCase())) {
+      if (isWriteMethod) {
         const stopped = applicationWriteGuard();
         if (stopped) return decorateCorsResponse(stopped, cors);
       }

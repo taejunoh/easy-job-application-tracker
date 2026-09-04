@@ -39,6 +39,7 @@ export type AuthOptions = Readonly<{
   config?: AuthConfig;
   now?: number;
   installationStore?: InstallationAuthenticationStore;
+  touchInstallation?: boolean;
 }>;
 
 export type SessionCookieOptions = Readonly<{
@@ -302,6 +303,7 @@ export async function authenticateApiRequestAsync(
       }
       if (
         config.applicationWritesEnabled &&
+        options.touchInstallation !== false &&
         !(await store.touch(record.id, new Date(now * 1000)))
       ) {
         return UNAUTHORIZED;

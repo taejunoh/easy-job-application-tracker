@@ -422,6 +422,57 @@ describe("extension installation API", () => {
       );
       expect(extensionCredentialStore.consumePairingGrant).not.toHaveBeenCalled();
     });
+
+    it("keeps a valid stopped pairing code reusable across the final persistence gate", async () => {
+      const pairing = pairingFixture();
+      jest.mocked(extensionCredentialStore.findPairingGrant).mockResolvedValue(
+        pairing.grant,
+      );
+      const calls = configureWriteRecheck(4);
+
+      const stopped = await pairRoute.POST(
+        jsonRequest(`${APP_ORIGIN}/api/extension/pair`, EXTENSION_ORIGIN, {
+          code: pairing.credential.code,
+        }),
+      );
+
+      await expectStopped(stopped, EXTENSION_ORIGIN);
+      expect(calls()).toBe(5);
+      expect(extensionCredentialStore.consumePairingGrant).not.toHaveBeenCalled();
+
+      jest.mocked(getServerEnv).mockReturnValue(BASE_ENV);
+      const exchanged = await pairRoute.POST(
+        jsonRequest(`${APP_ORIGIN}/api/extension/pair`, EXTENSION_ORIGIN, {
+          code: pairing.credential.code,
+        }),
+      );
+
+      expect(exchanged.status).toBe(201);
+      expect(extensionCredentialStore.consumePairingGrant).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects a valid-format pairing code with the wrong secret without consuming it", async () => {
+      const pairing = pairingFixture();
+      jest.mocked(extensionCredentialStore.findPairingGrant).mockResolvedValue(
+        pairing.grant,
+      );
+      const [, selector, secret] = pairing.credential.code.split(".");
+      const wrongSecret = Buffer.from(
+        Buffer.from(secret!, "base64url").map((byte) => byte ^ 1),
+      ).toString("base64url");
+
+      const response = await pairRoute.POST(
+        jsonRequest(`${APP_ORIGIN}/api/extension/pair`, EXTENSION_ORIGIN, {
+          code: `jt_pair_v1.${selector}.${wrongSecret}`,
+        }),
+      );
+
+      expect(response.status).toBe(401);
+      expect(extensionCredentialStore.findPairingGrant).toHaveBeenCalledWith(
+        pairing.credential.selector,
+      );
+      expect(extensionCredentialStore.consumePairingGrant).not.toHaveBeenCalled();
+    });
   });
 
   it("sets the extension credential mutation runtime limit", () => {

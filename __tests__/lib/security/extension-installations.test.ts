@@ -1,4 +1,5 @@
 import {
+  PAIRING_PERSISTENCE_STOPPED,
   createExtensionInstallationService,
   type ExtensionCredentialStore,
   type PairingGrantRecord,
@@ -73,6 +74,26 @@ describe("extension installation lifecycle", () => {
 
     expect(store.grants.get(grant.id)?.consumedAt).toBeNull();
     expect(store.installations.size).toBe(0);
+  });
+
+  it("stops after validation before consuming and preserves the pairing code", async () => {
+    const store = memoryStore();
+    const service = serviceFor(store);
+    const grant = await service.createPairingGrant(ORIGIN);
+
+    await expect(
+      service.exchangePairingCode(grant.code, ORIGIN, {
+        beforePersist: () => false,
+      }),
+    ).resolves.toBe(PAIRING_PERSISTENCE_STOPPED);
+    expect(store.grants.get(grant.id)?.consumedAt).toBeNull();
+    expect(store.installations.size).toBe(0);
+
+    await expect(service.exchangePairingCode(grant.code, ORIGIN)).resolves.toEqual(
+      expect.objectContaining({ installationId: expect.any(String) }),
+    );
+    expect(store.grants.get(grant.id)?.consumedAt).toEqual(new Date(NOW));
+    expect(store.installations.size).toBe(1);
   });
 
   it("creates distinct installations and revokes only the selected one", async () => {

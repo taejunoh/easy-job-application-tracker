@@ -5,6 +5,7 @@ import {
 } from "@/lib/security/application-writes";
 import { privateNoStore } from "@/lib/security/auth-response";
 import { configuredExtensionInstallationService } from "@/lib/security/configured-extension-installations";
+import { PAIRING_PERSISTENCE_STOPPED } from "@/lib/security/extension-installations";
 import {
   corsHeaders,
   corsPreflight,
@@ -47,10 +48,14 @@ export async function POST(request: Request): Promise<Response> {
       : privateNoStore(Response.json(UNAUTHORIZED, { status: 401 }));
     return decorateCorsResponse(response, cors);
   }
-  const installed = await service.exchangePairingCode(code, origin);
-  const response = installed
-    ? Response.json(installed, { status: 201 })
-    : Response.json(UNAUTHORIZED, { status: 401 });
+  const installed = await service.exchangePairingCode(code, origin, {
+    beforePersist: applicationWritesEnabled,
+  });
+  const response = installed === PAIRING_PERSISTENCE_STOPPED
+    ? applicationWritesStoppedResponse()
+    : installed
+      ? Response.json(installed, { status: 201 })
+      : Response.json(UNAUTHORIZED, { status: 401 });
   return privateNoStore(decorateCorsResponse(response, cors));
 }
 

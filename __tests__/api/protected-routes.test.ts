@@ -1308,6 +1308,52 @@ describe("protected route application write stop", () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  it("authenticates a declared installation write without touching it before the stop gate", async () => {
+    const initiallyClosed = getServerEnv();
+    const open = { ...initiallyClosed, applicationWritesEnabled: true };
+    const closed = { ...open, applicationWritesEnabled: false };
+    let environmentCalls = 0;
+    jest.mocked(getServerEnv).mockImplementation(() => {
+      environmentCalls += 1;
+      return environmentCalls <= 2 ? open : closed;
+    });
+    jest
+      .mocked(extensionInstallationAuthenticationStore.findForAuthentication)
+      .mockResolvedValue({
+        id: INSTALLATION.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: INSTALLATION.digest,
+        expiresAt: new Date(Date.now() + 60_000),
+        revokedAt: null,
+      });
+    jest
+      .mocked(extensionInstallationAuthenticationStore.touch)
+      .mockResolvedValue(true);
+    const handler = jest.fn(() => new Response("handler-called"));
+    const route = createProtectedRoute(["POST"], {
+      installationMethods: ["POST"],
+      writeMethods: ["POST"],
+    });
+
+    const response = await route.handler(handler)(
+      new NextRequest(`${APP_ORIGIN}/api/protected`, {
+        method: "POST",
+        headers: {
+          Origin: EXTENSION_ORIGIN,
+          Authorization: `Bearer ${INSTALLATION.token}`,
+        },
+      }),
+    );
+
+    expect(response.status).toBe(503);
+    expect(environmentCalls).toBe(3);
+    expect(
+      extensionInstallationAuthenticationStore.findForAuthentication,
+    ).toHaveBeenCalledWith(INSTALLATION.selector);
+    expect(extensionInstallationAuthenticationStore.touch).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it("keeps unauthenticated writes at 401", async () => {
     const handler = jest.fn(() => new Response("handler-called"));
     const route = createProtectedRoute(["GET", "POST"], {

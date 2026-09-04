@@ -404,6 +404,52 @@ describe("authenticateApiRequest", () => {
     expect(touch).not.toHaveBeenCalled();
   });
 
+  it("authenticates a valid installation without touching it when requested", async () => {
+    const credential = createInstallationCredential({
+      encryptionSecret: ENCRYPTION_SECRET,
+      origin: EXTENSION_ORIGIN,
+    });
+    const touch = jest.fn().mockResolvedValue(false);
+    const installationStore = {
+      findForAuthentication: jest.fn().mockResolvedValue({
+        id: credential.selector,
+        origin: EXTENSION_ORIGIN,
+        tokenDigest: credential.digest,
+        expiresAt: new Date(NOW + 60_000),
+        revokedAt: null,
+      }),
+      touch,
+    };
+
+    await expect(
+      authenticateApiRequestAsync(
+        apiRequest("POST", {
+          authorization: `Bearer ${credential.token}`,
+          origin: EXTENSION_ORIGIN,
+        }),
+        { config, now: NOW, installationStore, touchInstallation: false },
+      ),
+    ).resolves.toMatchObject({
+      authenticated: true,
+      via: "installation",
+    });
+    expect(touch).not.toHaveBeenCalled();
+
+    await expect(
+      authenticateApiRequestAsync(
+        apiRequest("POST", {
+          authorization: `Bearer ${tokenWithWrongSecret(credential.token)}`,
+          origin: EXTENSION_ORIGIN,
+        }),
+        { config, now: NOW, installationStore, touchInstallation: false },
+      ),
+    ).resolves.toEqual(unauthorized);
+    expect(installationStore.findForAuthentication).toHaveBeenCalledWith(
+      credential.selector,
+    );
+    expect(touch).not.toHaveBeenCalled();
+  });
+
   it("rejects an installation with an invalid secret while writes are stopped", async () => {
     const credential = createInstallationCredential({
       encryptionSecret: ENCRYPTION_SECRET,
