@@ -488,4 +488,23 @@ describe("task-first README user guide", () => {
       expect(section).not.toMatch(forbiddenCompletionClaim);
     }
   });
+
+  test("keeps the Stage 1 promotion, drain, and probe order explicit", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const start = readme.indexOf("### Production identity maintenance");
+    const end = readme.indexOf("\n## Development and Verification", start);
+    const section = readme
+      .slice(start, end === -1 ? readme.length : end)
+      .replace(/\s+/gu, " ");
+    const promotion = section.indexOf("promote only while unpaused");
+    const drain = section.indexOf("post-promotion acceptance gate");
+    const probe = section.indexOf("post-drain authenticated negative probe");
+
+    expect(promotion).toBeGreaterThanOrEqual(0);
+    expect(drain).toBeGreaterThan(promotion);
+    expect(probe).toBeGreaterThan(drain);
+    expect(section.slice(drain, probe)).toContain("bounded drain");
+    expect(section.slice(probe)).toContain("all eight persistent mutations");
+    expect(section.slice(probe)).toContain("503 writes_stopped");
+  });
 });

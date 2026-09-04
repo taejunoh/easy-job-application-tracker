@@ -338,10 +338,11 @@ Actions output, shell history, PR/comments, and docs.
 
 Stage 1 acceptance requires a Ready `identity=1,writes=0` Production candidate
 with the exact intended Git SHA and no canonical alias. Operators must promote
-only while unpaused, after a bounded drain of at least `2 × maxDuration` (at
-least 60 seconds when modules have 30-second maximum duration) and an
-authenticated negative probe. The exact fixtures must prove that all eight
-persistent mutations return `503 writes_stopped`: Application POST/PATCH/DELETE,
+only while unpaused. The post-promotion acceptance gate requires a bounded
+drain of at least `2 × maxDuration` (at least 60 seconds when modules have
+30-second maximum duration). After the drain, the post-drain authenticated
+negative probe must prove that all eight persistent mutations return
+`503 writes_stopped`: Application POST/PATCH/DELETE,
 Settings PUT, pairing creation, valid pair exchange, installation deletion, and
 self-revoke. The required behavior is that Settings GET does not create a row,
 and installation-authenticated reads must not change `lastUsedAt/updatedAt`.
