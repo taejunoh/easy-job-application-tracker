@@ -89,6 +89,9 @@ if (( call_number < \${#bodies[@]} )); then body="\${bodies[$call_number]}"; els
 [[ "$output" == /dev/null ]] || printf '%s' "$body" > "$output"
 printf '%s' "$status"
 `, { mode: 0o700 });
+  writeFileSync(join(directory, "npm"), `#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "\${NPM_LOG:?}"
+`, { mode: 0o700 });
   return directory;
 }
 
@@ -105,6 +108,7 @@ function runMocked(source: string, variables: Record<string, string>, body: stri
         DEPLOY_LOG: join(directory, "deploy.log"),
         PROMOTE_LOG: join(directory, "promote.log"),
         CURL_LOG: join(directory, "curl.log"),
+        NPM_LOG: join(directory, "npm.log"),
         MOCK_REPO_ROOT: root,
       },
     });
@@ -127,6 +131,7 @@ function runMockedFailure(source: string, variables: Record<string, string>, bod
           DEPLOY_LOG: join(directory, "deploy.log"),
           PROMOTE_LOG: join(directory, "promote.log"),
           CURL_LOG: join(directory, "curl.log"),
+          NPM_LOG: join(directory, "npm.log"),
           MOCK_REPO_ROOT: root,
         },
       });
@@ -176,6 +181,13 @@ function regressionBlock(): string {
   );
   expect(block).toBeDefined();
   return block ?? "";
+}
+
+function normalResumeBlock(): string {
+  const block = regressionBlock();
+  const end = block.indexOf('ROLLBACK_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"');
+  expect(end).toBeGreaterThan(-1);
+  return block.slice(0, end);
 }
 
 function stageOneLedgerBlock(): string {
@@ -417,6 +429,32 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     expect(normalizedBlock).toMatch(/writers remain stopped|ledger retained/iu);
   });
 
+  it("executes PAUSED_AFTER_APPLY to UNPAUSED_READONLY through the exact recorded selector", () => {
+    const temporaryRoot = mkdtempSync(join(tmpdir(), "production-rollout-normal-resume-"));
+    try {
+      writeFileSync(join(temporaryRoot, "rollout-ledger.json"), JSON.stringify({
+        schemaVersion: 1,
+        fixtureOwnership: {
+          applicationIds: ["app_owned"], ownedDeploymentIds: ["dpl_valid"], preProbeHash: "before", postProbeHash: "after",
+          settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
+          pairing: { preStopUnconsumedGrantId: "grant", codeReference: "code-ref" },
+          installation: { credentialReference: "credential-ref", installationId: "installation" },
+          cleanup: [{ action: "revoke_installation", targetId: "installation", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
+        },
+        stage1: {
+          deploymentId: "dpl_valid", targetSha: "sha-reviewed", gates: { identity: "1", writes: "0" }, reviewedGateConfig: { identity: "1", writes: "0" },
+          ready: true, readyState: "READY", readyEvidence: { deploymentId: "dpl_valid", state: "READY", observedAt: "2026-09-04T00:00:00Z" },
+          canonicalPromotionVerified: true, canonicalPromotion: { origin: expectedOrigin, deploymentId: "dpl_valid", verified: true, verifiedAt: "2026-09-04T00:00:00Z" },
+          compatibilityVerified: true, timestamps: { readyObservedAt: "2026-09-04T00:00:00Z", canonicalPromotionVerifiedAt: "2026-09-04T00:00:00Z" },
+        },
+      }), { mode: 0o600 });
+      const source = `${candidateFunction()}\n${normalResumeBlock().replace(/^[ \t]*read -r -p .*$/gmu, "     :")}\n[[ "$(cat \"$NPM_LOG\")" == "run check:production:writes-stopped" ]] || exit 90`;
+      expect(runMocked(source, { ...baseScenario(), EVIDENCE_ROOT: temporaryRoot, ROLLBACK_READ_TOKEN: "private-test-token", CURL_STATUS_SEQUENCE: "401,200" }, "")).toBe("");
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("requires observed provider pause evidence before HOLD_PAUSED on missing evidence or a failed probe", () => {
     const testableBlock = regressionBlock()
       .replace(/^[ \t]*read -r -p 'After the provider pause is complete, press Enter: ' _ <\/dev\/tty \|\| return 1$/mu, "     :")
@@ -477,12 +515,13 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         schemaVersion: 1,
         fixtureOwnership: {
           applicationIds: ["app_fixture_1", "app_fixture_2"],
+          ownedDeploymentIds: ["dpl_fixture_1"],
           preProbeHash: "sha256:before",
           postProbeHash: "sha256:after",
           settings: { existedBefore: true, contentHashBefore: "sha256:settings-before", contentHashAfter: "sha256:settings-after" },
           pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref" },
           installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
-          cleanup: [{ action: "revoke", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
+          cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
         },
         extraPrivateRecord: { nested: ["preserve", { every: "value" }] },
       };
@@ -598,7 +637,12 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [null] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [""] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, pairingGrantIds: [17] } },
-        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, cleanup: [{ action: "revoke", expectedTerminalState: "401", observedResult: "pending" }] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, ownedDeploymentIds: ["dpl_fixture_1", "dpl_fixture_1"] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, cleanup: [{ action: "delete_application", targetId: "app_unowned", expectedTerminalState: "deleted", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, cleanup: [{ action: "unknown_action", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "not-utc", observedResult: "pending" }] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "unknown" }] } },
+        { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", observedResult: "pending" }] } },
       ]) {
         const original = JSON.stringify(malformedLedger);
         writeFileSync(ledger, original, { mode: 0o600 });

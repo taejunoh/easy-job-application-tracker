@@ -351,6 +351,9 @@ promotion. It is paused only across prepare/apply, and the actual platform
      (.fixtureOwnership | type == "object") and
      (.fixtureOwnership.applicationIds | type == "array" and length > 0) and
      all(.fixtureOwnership.applicationIds[]; (type == "string") and length > 0) and
+     (.fixtureOwnership.ownedDeploymentIds | type == "array" and length > 0) and
+     all(.fixtureOwnership.ownedDeploymentIds[]; (type == "string") and length > 0) and
+     ((.fixtureOwnership.ownedDeploymentIds | unique | length) == (.fixtureOwnership.ownedDeploymentIds | length)) and
      (if (.fixtureOwnership | has("pairingGrantIds")) then (.fixtureOwnership.pairingGrantIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
      (if (.fixtureOwnership | has("installationIds")) then (.fixtureOwnership.installationIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
      (if (.fixtureOwnership | has("postResumeApplicationIds")) then (.fixtureOwnership.postResumeApplicationIds | type == "array" and all(.[]; (type == "string") and length > 0)) else true end) and
@@ -369,7 +372,16 @@ promotion. It is paused only across prepare/apply, and the actual platform
      (.fixtureOwnership.installation.credentialReference | type == "string" and length > 0) and
      (.fixtureOwnership.installation.installationId | type == "string" and length > 0) and
      (.fixtureOwnership.cleanup | type == "array" and length > 0) and
-     all(.fixtureOwnership.cleanup[]; (type == "object") and (.action | type == "string" and length > 0) and (.expectedTerminalState | type == "string" and length > 0) and (.timestamp | type == "string" and length > 0) and (.observedResult | type == "string" and length > 0))
+     .fixtureOwnership as $owned |
+     all($owned.cleanup[]; (type == "object") and
+       (.action | IN("delete_application", "consume_pairing_grant", "revoke_installation", "reconcile")) and
+       (.expectedTerminalState | type == "string" and length > 0) and
+       (.timestamp | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+       (.observedResult | IN("pending", "succeeded", "verified", "rejected")) and
+       (if .action == "delete_application" then (.targetId as $id | ($owned.applicationIds | index($id)) != null)
+        elif .action == "consume_pairing_grant" then (.targetId as $id | (($owned.pairingGrantIds // []) | index($id)) != null)
+        elif .action == "revoke_installation" then (.targetId == $owned.installation.installationId)
+        else .targetRef == "settings" end))
    ' "$LEDGER" >/dev/null || { rm -f -- "$STAGE_ONE_LEDGER_TMP"; exit 1; }
    jq \
      --arg id "$STAGE_ONE_CANDIDATE_ID" \
