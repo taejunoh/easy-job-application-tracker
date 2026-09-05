@@ -1231,7 +1231,30 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
         },
       }), { mode: 0o600 });
       const source = `${candidateFunction()}\n${normalResumeBlock().replace(/^[ \t]*read -r -p .*$/gmu, "     :")}\n[[ "$(cat \"$NPM_LOG\")" == "run check:production:writes-stopped" ]] || exit 90\n[[ ! -s "$DEPLOY_LOG" && ! -s "$PROMOTE_LOG" ]] || exit 91`;
-      expect(runMocked(source, { ...baseScenario(), EVIDENCE_ROOT: temporaryRoot, ROLLBACK_READ_TOKEN: "private-test-token", CURL_STATUS_SEQUENCE: "401,200" }, "")).toBe("");
+      const promotedAliases = ["easy-job-application-tracker.vercel.app", "project.vercel.app", "branch.vercel.app"];
+      const promotedScenario = {
+        ...baseScenario(),
+        INSPECT_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", aliases: promotedAliases }),
+        API_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", target: "production", url: "https://candidate.example", meta: { githubCommitSha: "sha-reviewed" }, alias: promotedAliases }),
+        EVIDENCE_ROOT: temporaryRoot,
+        ROLLBACK_READ_TOKEN: "private-test-token",
+        CURL_STATUS_SEQUENCE: "401,200",
+      };
+      expect(runMocked(source, promotedScenario, "")).toBe("");
+
+      const invalidSelectors: Array<Record<string, string>> = [
+        { INSPECT_JSON: JSON.stringify({ id: "dpl_other", readyState: "READY", aliases: promotedAliases }) },
+        { INSPECT_JSON: JSON.stringify({ id: "dpl_valid", readyState: "BUILDING", aliases: promotedAliases }) },
+        { API_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", target: "preview", url: "https://candidate.example", meta: { githubCommitSha: "sha-reviewed" }, alias: promotedAliases }) },
+        { API_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", target: "production", url: "https://candidate.example", meta: { githubCommitSha: "sha-other" }, alias: promotedAliases }) },
+        { CANONICAL_JSON: JSON.stringify({ id: "dpl_other" }) },
+      ];
+      for (const overrides of invalidSelectors) {
+        const failure = runMockedFailure(source, { ...promotedScenario, ...overrides, CURL_STATUS_SEQUENCE: "401" }, "");
+        expect(failure.stderr).toContain("PAUSE_REQUIRED");
+        expect(failure.deploys).toBe("");
+        expect(failure.promotes).toBe("");
+      }
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
