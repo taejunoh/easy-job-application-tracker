@@ -373,6 +373,12 @@ promotion. It is paused only across prepare/apply, and the actual platform
    Stage 1; successful authenticated owned-fixture creation is the proof that
    ordinary application writes are enabled for this prerequisite.
 
+   Before creating any fixture, record the authenticated Application-list
+   baseline as `fixtureOwnership.applicationSnapshotBefore` with its count and
+   canonical SHA-256. This is the only final cleanup baseline: it is captured
+   before, not after, any owned Application is created, so cleanup must restore
+   that exact count/hash rather than a fixture-inflated snapshot.
+
    Retain `rollout-ledger.json` until cleanup verification succeeds. It is
    private operator material: never committed or uploaded; never echo or copy it to logs,
    Actions artifacts, pull requests, specifications, README files, shell
@@ -454,6 +460,9 @@ promotion. It is paused only across prepare/apply, and the actual platform
      (.fixtureOwnership.applicationIds | type == "array" and length > 0) and
      all(.fixtureOwnership.applicationIds[]; (type == "string") and length > 0) and
      ((.fixtureOwnership.applicationIds | unique | length) == (.fixtureOwnership.applicationIds | length)) and
+     (.fixtureOwnership.applicationSnapshotBefore | type == "object") and
+     (.fixtureOwnership.applicationSnapshotBefore.count | type == "number" and floor == . and . >= 0) and
+     (.fixtureOwnership.applicationSnapshotBefore.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
      (.fixtureOwnership.ownedDeploymentIds | type == "array" and length > 0) and
      all(.fixtureOwnership.ownedDeploymentIds[]; (type == "string") and length > 0) and
      ((.fixtureOwnership.ownedDeploymentIds | unique | length) == (.fixtureOwnership.ownedDeploymentIds | length)) and
@@ -571,12 +580,26 @@ promotion. It is paused only across prepare/apply, and the actual platform
    is the exact convention enforced by the final validator. It is not an
    assertion that the code remains valid after `expiresAt`.
 
+   The probe sends the actual canonical `POST /api/extension/pair` with the
+   private pre-stop code and its bound Chrome origin; it parses the credential
+   format and refuses a selector that is not the exact ledger grant ID. It
+   writes the raw response into the private `0700` directory before checking
+   status. If it observes an unexpected `201`, stop: retain that raw response,
+   record its exact installation ID and token as owned cleanup material before
+   any retry, and revoke/verify it. Never discard a created installation or
+   token merely because the stopped-write assertion failed.
+
    ```bash
    set -euo pipefail
    validate_evidence_root || exit 1
    STAGE_ONE_LEDGER_ID="$(jq -er '.stage1.deploymentId' "$LEDGER")" || exit 1
    PRESTOP_GRANT_ID="$(jq -er '.fixtureOwnership.pairing.preStopUnconsumedGrantId' "$LEDGER")" || exit 1
    PRESTOP_EXPIRES_AT="$(jq -er '.fixtureOwnership.pairing.expiresAt' "$LEDGER")" || exit 1
+   : "${PRESTOP_PAIRING_CODE:?private pre-stop pairing code is required}"
+   : "${PRESTOP_PAIRING_ORIGIN:?bound Chrome extension origin is required}"
+   PAIRING_RAW_RESPONSE="$(mktemp "$EVIDENCE_ROOT/.pairing-503-response.XXXXXX")" || exit 1
+   rm -f -- "$PAIRING_RAW_RESPONSE" || exit 1
+   PRODUCTION_APP_URL="$APP_BASE_URL" PRESTOP_PAIRING_CODE="$PRESTOP_PAIRING_CODE" PRESTOP_PAIRING_GRANT_ID="$PRESTOP_GRANT_ID" PRESTOP_PAIRING_ORIGIN="$PRESTOP_PAIRING_ORIGIN" PAIRING_PROBE_RESPONSE_FILE="$PAIRING_RAW_RESPONSE" node scripts/check-production-pairing-writes-stopped.mjs >/dev/null || exit 1
    PAIRING_EVIDENCE_OBSERVED_AT="$(node -e 'process.stdout.write(new Date().toISOString())')" || exit 1
    PRESTOP_EXPIRES_AT="$PRESTOP_EXPIRES_AT" PAIRING_EVIDENCE_OBSERVED_AT="$PAIRING_EVIDENCE_OBSERVED_AT" node -e '
      const expiry = Date.parse(process.env.PRESTOP_EXPIRES_AT);
@@ -594,7 +617,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
      .stage1.deploymentId == $id and
      .fixtureOwnership.pairing.preStopUnconsumedGrantId == $grant and
      .fixtureOwnership.pairing.expiresAt == $expiresAt and
-     (.stage1.pairingEvidence? == null) and
+     ((.stage1 | has("pairingEvidence")) | not) and
      ($observedAt < $expiresAt)
    ' "$LEDGER" >/dev/null || { rm -f -- "$PAIRING_EVIDENCE_TMP"; exit 1; }
    jq --argjson projection "$PAIRING_EVIDENCE_PROJECTION" --arg hash "$PAIRING_EVIDENCE_HASH" '
@@ -607,7 +630,8 @@ promotion. It is paused only across prepare/apply, and the actual platform
      .stage1.deploymentId == $id and .stage1.pairingEvidence.deploymentId == $id and
      .stage1.pairingEvidence.grantId == $grant and .stage1.pairingEvidence.projectionSha256 == $hash
    ' "$LEDGER" >/dev/null || exit 1
-   unset PAIRING_EVIDENCE_TMP PAIRING_EVIDENCE_PROJECTION PAIRING_EVIDENCE_HASH PAIRING_EVIDENCE_OBSERVED_AT PRESTOP_EXPIRES_AT PRESTOP_GRANT_ID
+   rm -f -- "$PAIRING_RAW_RESPONSE" || exit 1
+   unset PAIRING_EVIDENCE_TMP PAIRING_EVIDENCE_PROJECTION PAIRING_EVIDENCE_HASH PAIRING_EVIDENCE_OBSERVED_AT PRESTOP_EXPIRES_AT PRESTOP_GRANT_ID PAIRING_RAW_RESPONSE
    ```
 
    This stage sets `APPLICATION_IDENTITY_WRITES_ENABLED="1"` while keeping

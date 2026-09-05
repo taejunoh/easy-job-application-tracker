@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,18 +66,19 @@ function validStageEvidence(value, required, stage1Id, grantId, expiresAt) {
   );
 }
 
-function validConsume(record, ownedInstallations) {
+function validConsume(record, postResumeInstallations) {
   return hasKeys(record, ["action", "targetId", "expectedTerminalState", "observedResult", "observedAt", "firstExchangeStatus", "createdInstallationId", "replayStatus", "revoke"]) &&
     record.action === "consume_pairing_grant" && record.expectedTerminalState === "replay_401" &&
     record.observedResult === "verified" && utc(record.observedAt) && record.firstExchangeStatus === 201 &&
-    nonEmptyString(record.createdInstallationId) && ownedInstallations.has(record.createdInstallationId) &&
+    nonEmptyString(record.createdInstallationId) && postResumeInstallations.has(record.createdInstallationId) &&
     record.replayStatus === 401 && validRevocation(record.revoke);
 }
 
-function validFinalLedger(ledger) {
+function validFinalLedger(ledger, expectedContext) {
   if (!hasKeys(ledger, ["schemaVersion", "stage1", "fixtureOwnership"]) || ledger.schemaVersion !== 1) return false;
   const { stage1, fixtureOwnership: owned } = ledger;
-  if (!isObject(stage1) || !nonEmptyString(stage1.deploymentId) || !isObject(owned)) return false;
+  if (!isObject(expectedContext) || !nonEmptyString(expectedContext.targetSha) || !nonEmptyString(expectedContext.canonicalOrigin) ||
+      !isObject(stage1) || !nonEmptyString(stage1.deploymentId) || !isObject(owned)) return false;
 
   const applicationIds = owned.applicationIds;
   const postResumeApplicationIds = owned.postResumeApplicationIds ?? [];
@@ -87,6 +89,8 @@ function validFinalLedger(ledger) {
   if (!validIds(applicationIds, true) || !validIds(postResumeApplicationIds) ||
       !validIds(pairingGrantIds, true) || !validIds(postResumePairingGrantIds, true) ||
       !validIds(installationIds) || !validIds(postResumeInstallationIds, true) ||
+      !validIds(owned.ownedDeploymentIds, true) || !owned.ownedDeploymentIds.includes(stage1.deploymentId) ||
+      !validSnapshot(owned.applicationSnapshotBefore) ||
       !sha256(owned.preProbeHash) || owned.postProbeHash !== owned.preProbeHash || !isObject(owned.settings) ||
       !hasKeys(owned.settings, ["existedBefore", "contentHashBefore", "contentHashAfter"]) ||
       typeof owned.settings.existedBefore !== "boolean" || !sha256(owned.settings.contentHashBefore) ||
@@ -106,7 +110,21 @@ function validFinalLedger(ledger) {
 
   const applicationSet = new Set([...applicationIds, ...postResumeApplicationIds]);
   const installationSet = new Set([owned.installation.installationId, ...installationIds, ...postResumeInstallationIds]);
-  if (applicationSet.size !== applicationIds.length + postResumeApplicationIds.length) return false;
+  const postResumeInstallationSet = new Set(postResumeInstallationIds);
+  if (applicationSet.size !== applicationIds.length + postResumeApplicationIds.length ||
+      pairingGrantIds.some((id) => postResumePairingGrantIds.includes(id)) ||
+      installationIds.some((id) => postResumeInstallationIds.includes(id)) ||
+      postResumeInstallationIds.includes(owned.installation.installationId)) return false;
+
+  if (!hasKeys(stage1.gates, ["identity", "writes"]) || stage1.targetSha !== expectedContext.targetSha ||
+      stage1.gates.identity !== "1" || stage1.gates.writes !== "0" || stage1.ready !== true || stage1.readyState !== "READY" ||
+      !hasKeys(stage1.reviewedGateConfig, ["identity", "writes", "reviewedAt"]) ||
+      stage1.reviewedGateConfig.identity !== "1" || stage1.reviewedGateConfig.writes !== "0" || !utc(stage1.reviewedGateConfig.reviewedAt) ||
+      !hasKeys(stage1.readyEvidence, ["deploymentId", "state", "observedAt"]) || stage1.readyEvidence.deploymentId !== stage1.deploymentId || stage1.readyEvidence.state !== "READY" || !utc(stage1.readyEvidence.observedAt) ||
+      stage1.canonicalPromotionVerified !== true || !hasKeys(stage1.canonicalPromotion, ["origin", "deploymentId", "verified", "verifiedAt"]) ||
+      stage1.canonicalPromotion.origin !== expectedContext.canonicalOrigin || stage1.canonicalPromotion.deploymentId !== stage1.deploymentId || stage1.canonicalPromotion.verified !== true || !utc(stage1.canonicalPromotion.verifiedAt) ||
+      stage1.compatibilityVerified !== true || !hasKeys(stage1.timestamps, ["recordedAt", "readyObservedAt", "canonicalPromotionVerifiedAt"]) ||
+      !utc(stage1.timestamps.recordedAt) || !utc(stage1.timestamps.readyObservedAt) || !utc(stage1.timestamps.canonicalPromotionVerifiedAt)) return false;
 
   const preStop = owned.pairing.preStopUnconsumedGrantId;
   const cleanup = owned.cleanup;
@@ -138,7 +156,7 @@ function validFinalLedger(ledger) {
   if (preStopOutcomes.length !== 1) return false;
   const preStopOutcome = preStopOutcomes[0];
   if (preStopOutcome.action === "consume_pairing_grant") {
-    if (!validConsume(preStopOutcome, installationSet)) return false;
+    if (!validConsume(preStopOutcome, postResumeInstallationSet)) return false;
   } else if (!hasKeys(preStopOutcome, ["action", "targetId", "expectedTerminalState", "observedResult", "observedAt", "exchangeStatus", "pairingEvidenceSha256", "beforeInstallations", "afterInstallations"]) ||
       preStopOutcome.expectedTerminalState !== "expired_401" || preStopOutcome.exchangeStatus !== 401 ||
       preStopOutcome.pairingEvidenceSha256 !== stage1.pairingEvidence.projectionSha256 ||
@@ -151,7 +169,8 @@ function validFinalLedger(ledger) {
     postResumePairingGrantIds.includes(record.targetId));
   if (postResumeConsumes.length !== postResumePairingGrantIds.length ||
       new Set(postResumeConsumes.map((record) => record.targetId)).size !== postResumePairingGrantIds.length ||
-      !postResumeConsumes.every((record) => record.targetId !== preStop && validConsume(record, installationSet))) return false;
+      !postResumeConsumes.every((record) => record.targetId !== preStop && validConsume(record, postResumeInstallationSet)) ||
+      new Set(postResumeConsumes.map((record) => record.createdInstallationId)).size !== postResumeConsumes.length) return false;
 
   const deleteRecords = cleanup.filter((record) => record.action === "delete_application");
   if (deleteRecords.length !== applicationSet.size || !deleteRecords.every((record) =>
@@ -162,7 +181,7 @@ function validFinalLedger(ledger) {
   const directRevokes = cleanup.filter((record) => record.action === "revoke_installation");
   if (!directRevokes.every((record) => installationSet.has(record.targetId) &&
     record.expectedTerminalState === "credential_401" && record.mutationStatus === 200 && record.credentialStatus === 401)) return false;
-  const revokedByConsume = cleanup.filter((record) => record.action === "consume_pairing_grant" && validConsume(record, installationSet))
+  const revokedByConsume = cleanup.filter((record) => record.action === "consume_pairing_grant" && validConsume(record, postResumeInstallationSet))
     .map((record) => record.createdInstallationId);
   const revoked = new Set([...directRevokes.map((record) => record.targetId), ...revokedByConsume]);
   if (revoked.size !== installationSet.size || [...installationSet].some((id) => !revoked.has(id))) return false;
@@ -172,16 +191,17 @@ function validFinalLedger(ledger) {
   const reconcile = reconciliations[0];
   return hasKeys(reconcile, ["action", "targetRef", "expectedTerminalState", "observedResult", "observedAt", "applicationSnapshot", "settingsSnapshot"]) &&
     reconcile.targetRef === "settings" && reconcile.expectedTerminalState === "matched" &&
-    validSnapshot(reconcile.applicationSnapshot) && reconcile.applicationSnapshot.sha256 === owned.preProbeHash &&
+    validSnapshot(reconcile.applicationSnapshot) && reconcile.applicationSnapshot.count === owned.applicationSnapshotBefore.count &&
+    reconcile.applicationSnapshot.sha256 === owned.applicationSnapshotBefore.sha256 &&
     hasKeys(reconcile.settingsSnapshot, ["existed", "contentHash"]) &&
     reconcile.settingsSnapshot.existed === owned.settings.existedBefore &&
     reconcile.settingsSnapshot.contentHash === owned.settings.contentHashBefore;
 }
 
 /** Returns true only for a complete, internally-bound cleanup ledger. */
-export function validateFinalCleanupLedger(ledger) {
+export function validateFinalCleanupLedger(ledger, expectedContext) {
   try {
-    return validFinalLedger(ledger);
+    return validFinalLedger(ledger, expectedContext);
   } catch {
     return false;
   }
@@ -209,9 +229,17 @@ function readPrivateLedger(path) {
   return parsed;
 }
 
+function checkedContext() {
+  const repository = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), ".."));
+  return Object.freeze({
+    targetSha: execFileSync("git", ["-C", repository, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    canonicalOrigin: "https://easy-job-application-tracker.vercel.app",
+  });
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
-    if (process.argv.length !== 3 || !validateFinalCleanupLedger(readPrivateLedger(process.argv[2]))) throw new Error();
+    if (process.argv.length !== 3 || !validateFinalCleanupLedger(readPrivateLedger(process.argv[2]), checkedContext())) throw new Error();
     process.exitCode = 0;
   } catch {
     process.stderr.write("Invalid rollout cleanup ledger\n");

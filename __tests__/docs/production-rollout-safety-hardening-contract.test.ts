@@ -1217,7 +1217,7 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       writeFileSync(join(temporaryRoot, "rollout-ledger.json"), JSON.stringify({
         schemaVersion: 1,
         fixtureOwnership: {
-          applicationIds: ["app_owned"], ownedDeploymentIds: ["dpl_valid"], preProbeHash: "before", postProbeHash: "after",
+          applicationIds: ["app_owned"], applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, ownedDeploymentIds: ["dpl_valid"], preProbeHash: "before", postProbeHash: "after",
           settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
           pairingGrantIds: ["grant"], pairing: { preStopUnconsumedGrantId: "grant", codeReference: "code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
           installation: { credentialReference: "credential-ref", installationId: "installation" },
@@ -1314,7 +1314,7 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
           applicationIds: ["app_fixture_1", "app_fixture_2"],
           ownedDeploymentIds: ["dpl_fixture_1"],
           pairingGrantIds: ["grant_fixture"],
-          preProbeHash: "sha256:before",
+          applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, preProbeHash: "sha256:before",
           postProbeHash: "sha256:after",
           settings: { existedBefore: true, contentHashBefore: "sha256:settings-before", contentHashAfter: "sha256:settings-after" },
           pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
@@ -1518,7 +1518,7 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
           applicationIds: ["app_fixture"],
           ownedDeploymentIds: ["dpl_fixture"],
           pairingGrantIds: ["grant_fixture"],
-          preProbeHash: "before", postProbeHash: "after",
+          applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, preProbeHash: "before", postProbeHash: "after",
           settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
           pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
           installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
@@ -1556,7 +1556,7 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       const initialLedger = {
         schemaVersion: 1,
         fixtureOwnership: {
-          applicationIds: ["app_fixture"], ownedDeploymentIds: ["dpl_fixture"], pairingGrantIds: ["grant_fixture"], preProbeHash: "before", postProbeHash: "after",
+          applicationIds: ["app_fixture"], applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, ownedDeploymentIds: ["dpl_fixture"], pairingGrantIds: ["grant_fixture"], preProbeHash: "before", postProbeHash: "after",
           settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" }, pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
           installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
           cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
@@ -1635,7 +1635,7 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       const owned = {
         applicationIds: ["app_pre"], postResumeApplicationIds: ["app_post"], ownedDeploymentIds: ["dpl_fixture"],
         pairingGrantIds: ["grant_pre"], postResumePairingGrantIds: ["grant_post"], installationIds: ["installation_pre"], postResumeInstallationIds: ["installation_post"],
-        preProbeHash: "before", postProbeHash: "after",
+        applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, preProbeHash: "before", postProbeHash: "after",
         settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
         pairing: { preStopUnconsumedGrantId: "grant_pre", codeReference: "private-code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
         installation: { credentialReference: "private-credential-ref", installationId: "installation_singleton" },

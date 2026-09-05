@@ -50,12 +50,19 @@ function validLedger(outcome: "consume" | "expire" = "consume") {
     };
   return {
     schemaVersion: 1,
-    stage1: { deploymentId: stage1Id, writeStopEvidence, pairingEvidence },
+    stage1: {
+      deploymentId: stage1Id, targetSha: "a".repeat(40), gates: { identity: "1", writes: "0" },
+      reviewedGateConfig: { identity: "1", writes: "0", reviewedAt: "2026-09-05T12:00:00Z" },
+      ready: true, readyState: "READY", readyEvidence: { deploymentId: stage1Id, state: "READY", observedAt: "2026-09-05T12:00:00Z" },
+      canonicalPromotionVerified: true, canonicalPromotion: { origin: "https://easy-job-application-tracker.vercel.app", deploymentId: stage1Id, verified: true, verifiedAt: "2026-09-05T12:00:00Z" },
+      compatibilityVerified: true, timestamps: { recordedAt: "2026-09-05T12:00:00Z", readyObservedAt: "2026-09-05T12:00:00Z", canonicalPromotionVerifiedAt: "2026-09-05T12:00:00Z" },
+      writeStopEvidence, pairingEvidence,
+    },
     fixtureOwnership: {
-      applicationIds: ["app_pre"], postResumeApplicationIds: ["app_post"],
+      applicationIds: ["app_pre"], postResumeApplicationIds: ["app_post"], ownedDeploymentIds: [stage1Id],
       pairingGrantIds: ["grant_pre"], postResumePairingGrantIds: ["grant_post"],
       installationIds: ["installation_pre"], postResumeInstallationIds: outcome === "consume" ? ["installation_pre_exchange", "installation_post_exchange"] : ["installation_post_exchange"],
-      preProbeHash: "b".repeat(64), postProbeHash: "b".repeat(64),
+      applicationSnapshotBefore: { count: 0, sha256: "b".repeat(64) }, preProbeHash: "b".repeat(64), postProbeHash: "b".repeat(64),
       settings: { existedBefore: true, contentHashBefore: "c".repeat(64), contentHashAfter: "c".repeat(64) },
       pairing: { preStopUnconsumedGrantId: "grant_pre", codeReference: "private-code-ref", expiresAt },
       installation: { credentialReference: "private-credential-ref", installationId: "installation_pre" },
@@ -72,7 +79,7 @@ function validLedger(outcome: "consume" | "expire" = "consume") {
 }
 
 function validate(ledger: unknown): boolean {
-  const source = `import { validateFinalCleanupLedger } from ${JSON.stringify(validatorUrl)}; process.stdout.write(String(validateFinalCleanupLedger(${JSON.stringify(ledger)})));`;
+  const source = `import { validateFinalCleanupLedger } from ${JSON.stringify(validatorUrl)}; process.stdout.write(String(validateFinalCleanupLedger(${JSON.stringify(ledger)}, { targetSha: ${JSON.stringify("a".repeat(40))}, canonicalOrigin: "https://easy-job-application-tracker.vercel.app" })));`;
   return execFileSync(process.execPath, ["--input-type=module", "--eval", source], { encoding: "utf8" }) === "true";
 }
 
@@ -105,7 +112,9 @@ describe("final production rollout cleanup ledger validator", () => {
 
   it("rejects expiry evidence outside the exact Stage 1 binding or with changed snapshots", () => {
     const wrongId = validLedger("expire");
-    wrongId.stage1.pairingEvidence.deploymentId = "dpl_other";
+    const projection = { ...wrongId.stage1.pairingEvidence };
+    delete projection.projectionSha256;
+    wrongId.stage1.pairingEvidence = withHash({ ...projection, deploymentId: "dpl_other" });
     expect(validate(wrongId)).toBe(false);
 
     const afterExpiry = validLedger("expire");
@@ -126,6 +135,18 @@ describe("final production rollout cleanup ledger validator", () => {
     const missingRevoke = validLedger();
     missingRevoke.fixtureOwnership.installationIds.push("installation_extra");
     expect(validate(missingRevoke)).toBe(false);
+
+    const overlapping = validLedger();
+    overlapping.fixtureOwnership.postResumePairingGrantIds = ["grant_pre"];
+    expect(validate(overlapping)).toBe(false);
+
+    const tamperedStage1 = validLedger();
+    tamperedStage1.stage1.readyEvidence.deploymentId = "dpl_other";
+    expect(validate(tamperedStage1)).toBe(false);
+
+    const preexistingCreated = validLedger();
+    (preexistingCreated.fixtureOwnership.cleanup[0] as Record<string, unknown>).createdInstallationId = "installation_pre";
+    expect(validate(preexistingCreated)).toBe(false);
   });
 
   it("CLI accepts only a bounded private regular ledger and emits generic errors", () => {
@@ -135,7 +156,9 @@ describe("final production rollout cleanup ledger validator", () => {
       mkdirSync(privateRoot, { mode: 0o700 });
       chmodSync(privateRoot, 0o700);
       const ledger = join(privateRoot, "rollout-ledger.json");
-      writeFileSync(ledger, JSON.stringify(validLedger()), { mode: 0o600 });
+      const forCli = validLedger();
+      forCli.stage1.targetSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      writeFileSync(ledger, JSON.stringify(forCli), { mode: 0o600 });
       expect(spawnSync(process.execPath, [script, ledger], { encoding: "utf8" }).status).toBe(0);
 
       chmodSync(ledger, 0o644);
