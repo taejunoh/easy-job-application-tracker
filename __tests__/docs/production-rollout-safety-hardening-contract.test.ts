@@ -1432,6 +1432,7 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({ ...preStageLedger, stage1: { deploymentId: "dpl_existing" } });
 
       for (const malformedLedger of [
+        { ...preStageLedger, stage1: null },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [null] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [""] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, pairingGrantIds: [17] } },
@@ -1463,7 +1464,7 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
           stdio: ["pipe", "pipe", "pipe"],
         })).toThrow();
         expect(readFileSync(ledger, "utf8")).toBe(original);
-        expect(JSON.parse(readFileSync(ledger, "utf8")).stage1).toBeUndefined();
+        expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual(malformedLedger);
       }
 
       const repositoryRoot = join(temporaryRoot, "repository");
@@ -1537,6 +1538,14 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       const { projectionSha256, ...projection } = record.stage1.writeStopEvidence;
       expect(projectionSha256).toBe(createHash("sha256").update(JSON.stringify(projection)).digest("hex"));
       expect(JSON.stringify(record)).not.toContain("private-test-token");
+
+      const explicitNull = JSON.stringify({ ...record, stage1: { ...record.stage1, writeStopEvidence: null } });
+      writeFileSync(ledger, explicitNull, { mode: 0o600 });
+      expect(() => execFileSync("bash", ["-c", stageOneWriteStopEvidenceBlock()], {
+        env: { ...process.env, EVIDENCE_ROOT: temporaryRoot, APP_ACCESS_TOKEN: "private-test-token", STAGE_ONE_CANDIDATE_ID: "dpl_valid" },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+      expect(readFileSync(ledger, "utf8")).toBe(explicitNull);
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }

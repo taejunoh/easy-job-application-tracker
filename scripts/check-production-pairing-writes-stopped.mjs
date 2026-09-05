@@ -4,6 +4,11 @@ import { dirname } from "node:path";
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const PAIRING_CODE = /^jt_pair_v1\.([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/u;
 const EXTENSION_ORIGIN = /^chrome-extension:\/\/[a-p]{32}$/u;
+const CANONICAL_ORIGIN = "https://easy-job-application-tracker.vercel.app";
+
+function isLoopback(hostname) {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
 
 function privateEvidencePath(value) {
   if (typeof value !== "string" || !value.startsWith("/")) throw new Error();
@@ -40,7 +45,9 @@ function writePrivate(path, value) {
 
 export async function probePairingWritesStopped(config = process.env) {
   const origin = new URL(config.PRODUCTION_APP_URL);
-  if ((origin.protocol !== "https:" && origin.protocol !== "http:") || origin.username || origin.password || origin.pathname !== "/") throw new Error();
+  const loopback = origin.protocol === "http:" && isLoopback(origin.hostname) && config.PAIRING_PROBE_ALLOW_LOOPBACK === "1";
+  if (origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/" ||
+      (!loopback && origin.origin !== CANONICAL_ORIGIN)) throw new Error();
   const code = config.PRESTOP_PAIRING_CODE;
   const grantId = config.PRESTOP_PAIRING_GRANT_ID;
   const extensionOrigin = config.PRESTOP_PAIRING_ORIGIN;

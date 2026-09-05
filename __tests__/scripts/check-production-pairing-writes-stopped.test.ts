@@ -1,4 +1,4 @@
-import { createServer } from "node:http";
+import { createServer, type RequestListener } from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -11,7 +11,7 @@ const grantId = "018f9f72-f2e9-7c29-a6fc-001122334488";
 const code = `jt_pair_v1.${grantId}.${"a".repeat(43)}`;
 const extensionOrigin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
 
-async function listen(handler: Parameters<typeof createServer>[0]) {
+async function listen(handler: RequestListener) {
   const server = createServer(handler);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -20,10 +20,10 @@ async function listen(handler: Parameters<typeof createServer>[0]) {
   return { server, url: `http://127.0.0.1:${address.port}` };
 }
 
-async function run(url: string, evidencePath: string, suppliedCode = code) {
+async function run(url: string, evidencePath: string, suppliedCode = code, allowLoopback = true) {
   const child = spawn(process.execPath, [script], {
     cwd: root,
-    env: { ...process.env, PRODUCTION_APP_URL: url, PRESTOP_PAIRING_CODE: suppliedCode, PRESTOP_PAIRING_GRANT_ID: grantId, PRESTOP_PAIRING_ORIGIN: extensionOrigin, PAIRING_PROBE_RESPONSE_FILE: evidencePath },
+    env: { ...process.env, PRODUCTION_APP_URL: url, PRESTOP_PAIRING_CODE: suppliedCode, PRESTOP_PAIRING_GRANT_ID: grantId, PRESTOP_PAIRING_ORIGIN: extensionOrigin, PAIRING_PROBE_RESPONSE_FILE: evidencePath, ...(allowLoopback ? { PAIRING_PROBE_ALLOW_LOOPBACK: "1" } : {}) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = ""; let stderr = "";
@@ -60,6 +60,16 @@ describe("grant-bound pairing write-stop probe", () => {
       const result = await run(url, evidence);
       expect(result).toEqual({ code: 1, stdout: "", stderr: "Pairing write-stop probe failed.\n" });
       expect(readFileSync(evidence, "utf8")).toContain(token);
+    } finally { server.close(); await once(server, "close"); rmSync(privateRoot, { recursive: true, force: true }); }
+  });
+
+  it("rejects a non-canonical HTTP origin before transferring the pairing code", async () => {
+    const privateRoot = mkdtempSync(join(tmpdir(), "pairing-probe-")); chmodSync(privateRoot, 0o700);
+    const evidence = join(privateRoot, "pairing-response.json"); let requests = 0;
+    const { server, url } = await listen((_request, response) => { requests += 1; response.end(); });
+    try {
+      expect(await run(url, evidence, code, false)).toEqual({ code: 1, stdout: "", stderr: "Pairing write-stop probe failed.\n" });
+      expect(requests).toBe(0);
     } finally { server.close(); await once(server, "close"); rmSync(privateRoot, { recursive: true, force: true }); }
   });
 });

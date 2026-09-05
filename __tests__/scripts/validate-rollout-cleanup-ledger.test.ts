@@ -112,8 +112,8 @@ describe("final production rollout cleanup ledger validator", () => {
 
   it("rejects expiry evidence outside the exact Stage 1 binding or with changed snapshots", () => {
     const wrongId = validLedger("expire");
-    const projection = { ...wrongId.stage1.pairingEvidence };
-    delete projection.projectionSha256;
+    const { projectionSha256, ...projection } = wrongId.stage1.pairingEvidence;
+    expect(projectionSha256).toMatch(/^[0-9a-f]{64}$/u);
     wrongId.stage1.pairingEvidence = withHash({ ...projection, deploymentId: "dpl_other" });
     expect(validate(wrongId)).toBe(false);
 

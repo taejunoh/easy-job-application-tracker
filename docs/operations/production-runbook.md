@@ -455,7 +455,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
      def valid_expiry_utc:
        type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$") and
        (try (sub("\\.[0-9]{3}Z$"; "Z") as $seconds | ($seconds | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ") == $seconds)) catch false);
-     type == "object" and (.schemaVersion == 1) and (.stage1? == null) and
+     type == "object" and (.schemaVersion == 1) and ((has("stage1")) | not) and
      (.fixtureOwnership | type == "object") and
      (.fixtureOwnership.applicationIds | type == "array" and length > 0) and
      all(.fixtureOwnership.applicationIds[]; (type == "string") and length > 0) and
@@ -545,6 +545,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
    set -euo pipefail
    validate_evidence_root || exit 1
    STAGE_ONE_LEDGER_ID="$(jq -er '.stage1.deploymentId' "$LEDGER")" || exit 1
+   [[ "${APP_BASE_URL:-}" == "https://easy-job-application-tracker.vercel.app" ]] || exit 1
    [[ "$STAGE_ONE_LEDGER_ID" == "$STAGE_ONE_CANDIDATE_ID" ]] || exit 1
    STAGE_ONE_CANONICAL="$(vercel inspect "$APP_BASE_URL" --format=json --no-color | jq -ce '{id}')" || exit 1
    jq -e --arg id "$STAGE_ONE_LEDGER_ID" '.id == $id' <<<"$STAGE_ONE_CANONICAL" >/dev/null || exit 1
@@ -560,7 +561,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
    chmod 0600 "$STAGE_ONE_EVIDENCE_TMP" || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
    validate_evidence_root || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
    jq -e --arg id "$STAGE_ONE_LEDGER_ID" --argjson evidence "$(jq -cn --argjson projection "$STAGE_ONE_EVIDENCE_PROJECTION" --arg hash "$STAGE_ONE_EVIDENCE_HASH" '$projection + {projectionSha256: $hash}')" '
-     .stage1.deploymentId == $id and (.stage1.writeStopEvidence? == null)
+     .stage1.deploymentId == $id and ((.stage1 | has("writeStopEvidence")) | not)
    ' "$LEDGER" >/dev/null || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
    validate_evidence_root || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
    jq --argjson evidence "$(jq -cn --argjson projection "$STAGE_ONE_EVIDENCE_PROJECTION" --arg hash "$STAGE_ONE_EVIDENCE_HASH" '$projection + {projectionSha256: $hash}')" '.stage1.writeStopEvidence = $evidence' "$LEDGER" > "$STAGE_ONE_EVIDENCE_TMP" || { rm -f -- "$STAGE_ONE_EVIDENCE_TMP"; exit 1; }
