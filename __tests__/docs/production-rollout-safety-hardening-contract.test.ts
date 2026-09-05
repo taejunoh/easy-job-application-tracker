@@ -411,6 +411,14 @@ function supportFunction(): string {
   return match?.[0] ?? "";
 }
 
+function supportGateBlock(): string {
+  const block = bashBlocks(rolloutSection()).find((candidate) =>
+    candidate.includes('SUPPORT_CANDIDATE_ID="$(support_candidate "identity=0,writes=1")"'),
+  );
+  expect(block).toBeDefined();
+  return block ?? "";
+}
+
 function oneLine(lines: string[], matcher: RegExp): string {
   const matches = lines.filter((line) => matcher.test(line));
   expect(matches).toHaveLength(1);
@@ -441,6 +449,16 @@ case "\${1:-}" in
   inspect) printf '%s\\n' inspect >> "\${VERCEL_INSPECT_LOG:?}"; if [[ "\${2:-}" == "\${APP_BASE_URL:-}" ]]; then printf '%s\\n' "\${CANONICAL_JSON:-}"; else printf '%s\\n' "\${INSPECT_JSON:-}"; fi ;;
   api) printf '%s\\n' "\${API_JSON:-}" ;;
   promote) printf '%s\\n' "\${2:-}" >> "\${PROMOTE_LOG:?}" ;;
+  env)
+    [[ "\${2:-}" == "add" ]] || exit 2
+    key="\${3:-}"
+    value=""
+    while (($#)); do
+      if [[ "\${1:-}" == "--value" ]]; then value="\${2:-}"; shift 2; else shift; fi
+    done
+    printf '%s=%s\\n' "\$key" "\$value" >> "\${ENV_LOG:?}"
+    [[ "\${VERCEL_ENV_FAIL:-}" != "\$key" ]]
+    ;;
   *) exit 2 ;;
 esac
 `, { mode: 0o700 });
@@ -498,6 +516,7 @@ function runMocked(source: string, variables: Record<string, string>, body: stri
         NPM_LOG: join(directory, "npm.log"),
         SLEEP_LOG: join(directory, "sleep.log"),
         ORDER_LOG: join(directory, "order.log"),
+        ENV_LOG: join(directory, "env.log"),
         VERCEL_INSPECT_LOG: join(directory, "inspect.log"),
         MOCK_REPO_ROOT: root,
       },
@@ -507,7 +526,7 @@ function runMocked(source: string, variables: Record<string, string>, body: stri
   }
 }
 
-function runMockedFailure(source: string, variables: Record<string, string>, body: string): { stderr: string; deploys: string; promotes: string; inspects: string; curlCalls: number } {
+function runMockedFailure(source: string, variables: Record<string, string>, body: string): { stderr: string; deploys: string; promotes: string; inspects: string; envs: string; curlCalls: number } {
   const directory = mockBin();
   try {
     try {
@@ -524,6 +543,7 @@ function runMockedFailure(source: string, variables: Record<string, string>, bod
           NPM_LOG: join(directory, "npm.log"),
           SLEEP_LOG: join(directory, "sleep.log"),
           ORDER_LOG: join(directory, "order.log"),
+          ENV_LOG: join(directory, "env.log"),
           VERCEL_INSPECT_LOG: join(directory, "inspect.log"),
           MOCK_REPO_ROOT: root,
         },
@@ -537,6 +557,7 @@ function runMockedFailure(source: string, variables: Record<string, string>, bod
         deploys: existsSync(join(directory, "deploy.log")) ? readFileSync(join(directory, "deploy.log"), "utf8") : "",
         promotes: existsSync(join(directory, "promote.log")) ? readFileSync(join(directory, "promote.log"), "utf8") : "",
         inspects: existsSync(join(directory, "inspect.log")) ? readFileSync(join(directory, "inspect.log"), "utf8") : "",
+        envs: existsSync(join(directory, "env.log")) ? readFileSync(join(directory, "env.log"), "utf8") : "",
         curlCalls: existsSync(join(directory, "curl.log")) ? readFileSync(join(directory, "curl.log"), "utf8").trim().split("\n").filter(Boolean).length : 0,
       };
     }
@@ -1003,9 +1024,9 @@ describe("production rollout staged-candidate binding documentation contract", (
     expect(fixtureProof).toBeGreaterThan(support);
     expect(stageOne).toBeGreaterThan(support);
     expect(fixtureProof).toBeLessThan(stageOne);
+    expect(section.match(/support_candidate "identity=0,writes=1"/gu)).toHaveLength(1);
 
-    const supportBlock = bashBlocks(section).find((block) => block.includes("SUPPORT_CANDIDATE_ID"));
-    expect(supportBlock).toBeDefined();
+    const supportBlock = supportGateBlock();
     expect(supportBlock).toContain('vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "0" --yes --force || exit 1');
     expect(supportBlock).toContain('vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force || exit 1');
     expect(supportBlock).toContain('support_candidate "identity=0,writes=1"');
@@ -1047,6 +1068,24 @@ describe("production rollout staged-candidate binding documentation contract", (
 [[ "\$(sed -n '1p' "\${PROMOTE_LOG:?}")" == "dpl_valid" ]] || exit 87`)).toBe("");
   });
 
+  it("executes both support gates before staging and stops on either gate failure", () => {
+    const source = `${supportFunction()}\n${supportGateBlock()}`;
+    const expectedEnv = "APPLICATION_IDENTITY_WRITES_ENABLED=0\nAPPLICATION_WRITES_ENABLED=1\n";
+    const expectedEnvShell = "APPLICATION_IDENTITY_WRITES_ENABLED=0\\nAPPLICATION_WRITES_ENABLED=1";
+    expect(runMocked(source, baseScenario(), `[[ "\$(cat "\${ENV_LOG:?}")" == $'${expectedEnvShell}' ]] || exit 88
+[[ "\$(cat "\${PROMOTE_LOG:?}")" == "dpl_valid" ]] || exit 89`)).toBe("");
+
+    for (const [key, expectedEnvLog] of [
+      ["APPLICATION_IDENTITY_WRITES_ENABLED", "APPLICATION_IDENTITY_WRITES_ENABLED=0\n"],
+      ["APPLICATION_WRITES_ENABLED", expectedEnv],
+    ] as const) {
+      const failure = runMockedFailure(source, { ...baseScenario(), VERCEL_ENV_FAIL: key }, "");
+      expect(failure.envs).toBe(expectedEnvLog);
+      expect(failure.deploys).toBe("");
+      expect(failure.promotes).toBe("");
+    }
+  });
+
   it("fails closed under mocked responses and isolates projections", () => {
     const source = candidateFunction();
     const noLeak = `for name in CANDIDATE_DEPLOYMENT CANDIDATE_INSPECT CANDIDATE_METADATA CANONICAL_METADATA CANDIDATE_ID CANDIDATE_URL; do [[ -z "\${!name+x}" ]] || exit 60; done
@@ -1074,25 +1113,31 @@ ${noLeak.replace("[[ ! -s", "[[ -s")}`)).toBe("");
   });
 
   it("requires fresh live canonical status before deploy and promotion", () => {
-    const source = candidateFunction();
-    const staleAttestation = { ...baseScenario(), VERCEL_UNPAUSED_ATTESTED: "true", CURL_STATUS_SEQUENCE: "503,401" };
-    expect(runMocked(source, staleAttestation, `
-if stage_candidate "identity=1,writes=0"; then exit 69; fi
-[[ ! -s "\${DEPLOY_LOG:?}" ]] || exit 70
-[[ ! -s "\${PROMOTE_LOG:?}" ]] || exit 71
-[[ "$(wc -l < "\${CURL_LOG:?}")" -eq 1 ]] || exit 72`)).toBe("");
+    const helpers = [
+      { source: candidateFunction(), invocation: 'stage_candidate "identity=1,writes=0"' },
+      { source: supportFunction(), invocation: 'support_candidate "identity=0,writes=1"' },
+    ];
+    for (const [index, helper] of helpers.entries()) {
+      const offset = index * 10;
+      const staleAttestation = { ...baseScenario(), VERCEL_UNPAUSED_ATTESTED: "true", CURL_STATUS_SEQUENCE: "503,401" };
+      expect(runMocked(helper.source, staleAttestation, `
+if ${helper.invocation}; then exit ${69 + offset}; fi
+[[ ! -s "\${DEPLOY_LOG:?}" ]] || exit ${70 + offset}
+[[ ! -s "\${PROMOTE_LOG:?}" ]] || exit ${71 + offset}
+[[ "\$(wc -l < "\${CURL_LOG:?}")" -eq 1 ]] || exit ${72 + offset}`)).toBe("");
 
-    const pausesAfterInspect = { ...baseScenario(), VERCEL_UNPAUSED_ATTESTED: "true", CURL_STATUS_SEQUENCE: "401,503" };
-    expect(runMocked(source, pausesAfterInspect, `
-if stage_candidate "identity=1,writes=0"; then exit 73; fi
-[[ -s "\${DEPLOY_LOG:?}" ]] || exit 74
-[[ ! -s "\${PROMOTE_LOG:?}" ]] || exit 75
-[[ "$(wc -l < "\${CURL_LOG:?}")" -eq 2 ]] || exit 76`)).toBe("");
+      const pausesAfterInspect = { ...baseScenario(), VERCEL_UNPAUSED_ATTESTED: "true", CURL_STATUS_SEQUENCE: "401,503" };
+      expect(runMocked(helper.source, pausesAfterInspect, `
+if ${helper.invocation}; then exit ${73 + offset}; fi
+[[ -s "\${DEPLOY_LOG:?}" ]] || exit ${74 + offset}
+[[ ! -s "\${PROMOTE_LOG:?}" ]] || exit ${75 + offset}
+[[ "\$(wc -l < "\${CURL_LOG:?}")" -eq 2 ]] || exit ${76 + offset}`)).toBe("");
 
-    expect(runMocked(source, { ...baseScenario(), CURL_STATUS_SEQUENCE: "401,401" }, `
-captured="$(stage_candidate "identity=1,writes=0")" || exit 77
-[[ "$captured" == "dpl_valid" ]] || exit 78
-[[ "$(wc -l < "\${CURL_LOG:?}")" -eq 2 ]] || exit 79`)).toBe("");
+      expect(runMocked(helper.source, { ...baseScenario(), CURL_STATUS_SEQUENCE: "401,401" }, `
+captured="\$(${helper.invocation})" || exit ${77 + offset}
+[[ "\$captured" == "dpl_valid" ]] || exit ${78 + offset}
+[[ "\$(wc -l < "\${CURL_LOG:?}")" -eq 2 ]] || exit ${79 + offset}`)).toBe("");
+    }
   });
 
   it("binds paused-after-apply rollback to the recorded identity-aware deployment", () => {
