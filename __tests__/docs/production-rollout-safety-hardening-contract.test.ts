@@ -401,6 +401,16 @@ function candidateFunction(): string {
   return match?.[0] ?? "";
 }
 
+function supportFunction(): string {
+  const block = bashBlocks(rolloutSection()).find((candidate) =>
+    normalize(candidate).includes("support_candidate()"),
+  );
+  expect(block).toBeDefined();
+  const match = (block ?? "").match(/support_candidate\(\) \([\s\S]*?\n\)/u);
+  expect(match).not.toBeNull();
+  return match?.[0] ?? "";
+}
+
 function oneLine(lines: string[], matcher: RegExp): string {
   const matches = lines.filter((line) => matcher.test(line));
   expect(matches).toHaveLength(1);
@@ -420,8 +430,8 @@ function expectOrdered(source: string, requirements: string[]): void {
 function mockBin(): string {
   const directory = mkdtempSync(join(tmpdir(), "production-rollout-contract-"));
   writeFileSync(join(directory, "git"), `#!/usr/bin/env bash
-if [[ "\${1:-} \${2:-}" == "status --porcelain" ]]; then exit 0; fi
-if [[ "\${1:-} \${2:-}" == "rev-parse HEAD" ]]; then printf '%s\\n' "\${TARGET_SHA:-}"; exit 0; fi
+if [[ "\${1:-} \${2:-}" == "status --porcelain" ]]; then printf '%s\\n' "\${DIRTY_STATUS:-}"; exit 0; fi
+if [[ "\${1:-} \${2:-}" == "rev-parse HEAD" ]]; then printf '%s\\n' "\${MOCK_CURRENT_SHA:-\${TARGET_SHA:-}}"; exit 0; fi
 if [[ "\${1:-} \${2:-}" == "rev-parse --show-toplevel" ]]; then printf '%s\\n' "\${MOCK_REPO_ROOT:?}"; exit 0; fi
 exit 2
 `, { mode: 0o700 });
@@ -451,8 +461,11 @@ if (( call_number < \${#statuses[@]} )); then
 else
   status="\${statuses[\${#statuses[@]}-1]}"
 fi
-IFS=',' read -r -a bodies <<< "\${CURL_BODY_SEQUENCE:-}"
-if (( call_number < \${#bodies[@]} )); then body="\${bodies[$call_number]}"; else body="\${bodies[\${#bodies[@]}-1]}"; fi
+body=""
+if [[ -n "\${CURL_BODY_SEQUENCE:-}" ]]; then
+  IFS=',' read -r -a bodies <<< "\${CURL_BODY_SEQUENCE}"
+  if (( call_number < \${#bodies[@]} )); then body="\${bodies[$call_number]}"; else body="\${bodies[\${#bodies[@]}-1]}"; fi
+fi
 [[ "$output" == /dev/null ]] || printf '%s' "$body" > "$output"
 printf '%s' "$status"
 `, { mode: 0o700 });
@@ -976,7 +989,62 @@ describe("production rollout staged-candidate binding documentation contract", (
     const rollback = section.indexOf('stage_candidate "identity=1,writes=0"', resumeStart);
     expect(rollback).toBeGreaterThan(resumeStart);
     expect(rollback).toBeLessThan(final);
-    expect(section.match(/vercel deploy \. --prod --skip-domain --yes --format=json --no-color/gu)).toHaveLength(1);
+    expect(section.match(/vercel deploy \. --prod --skip-domain --yes --format=json --no-color/gu)).toHaveLength(2);
+  });
+
+  it("promotes the strict support candidate after ledger setup and before Stage 1", () => {
+    const section = rolloutSection();
+    const ledger = section.indexOf('(set -o noclobber; : > "$LEDGER")');
+    const support = section.indexOf('SUPPORT_CANDIDATE_ID="$(support_candidate "identity=0,writes=1")"');
+    const fixtureProof = section.indexOf("successful authenticated owned-fixture creation");
+    const stageOne = section.indexOf('STAGE_ONE_CANDIDATE_ID="$(stage_candidate "identity=1,writes=0")"');
+    expect(ledger).toBeGreaterThan(-1);
+    expect(support).toBeGreaterThan(ledger);
+    expect(fixtureProof).toBeGreaterThan(support);
+    expect(stageOne).toBeGreaterThan(support);
+    expect(fixtureProof).toBeLessThan(stageOne);
+
+    const supportBlock = bashBlocks(section).find((block) => block.includes("SUPPORT_CANDIDATE_ID"));
+    expect(supportBlock).toBeDefined();
+    expect(supportBlock).toContain('vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "0" --yes --force || exit 1');
+    expect(supportBlock).toContain('vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force || exit 1');
+    expect(supportBlock).toContain('support_candidate "identity=0,writes=1"');
+    expect(normalize(section)).toMatch(/private ledger exists[^.]*before creating or using any fixture[^.]*stage and promote the canonical support deployment/iu);
+    expect(normalize(section)).toMatch(/exact promoted ID owns the canonical alias/iu);
+  });
+
+  it("keeps support_candidate strict and fails closed before promotion", () => {
+    const source = supportFunction();
+    expect(source).toContain('[[ "$stage_name" == "identity=0,writes=1" ]] || return 1');
+    expect(source).not.toContain('identity=1,writes=0" || "$stage_name" == "identity=1,writes=1');
+
+    const invalid: Array<Record<string, string>> = [
+      { DIRTY_STATUS: " M docs/operations/production-runbook.md" },
+      { MOCK_CURRENT_SHA: "sha-other" },
+      { INSPECT_JSON: JSON.stringify({ id: "dpl_valid", readyState: "BUILDING", aliases: [] }) },
+      { INSPECT_JSON: JSON.stringify({ id: "dpl_other", readyState: "READY", aliases: [] }) },
+      { API_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", target: "preview", url: "https://candidate.example", meta: { githubCommitSha: "sha-reviewed" }, alias: [] }) },
+      { API_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", target: "production", url: "https://candidate.example", meta: { githubCommitSha: "sha-other" }, alias: [] }) },
+      { API_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", target: "production", url: "https://other.example", meta: { githubCommitSha: "sha-reviewed" }, alias: [] }) },
+      { DEPLOY_JSON: JSON.stringify({ id: "dpl_other", url: "https://candidate.example" }) },
+      { API_JSON: JSON.stringify({ id: "dpl_valid", readyState: "READY", target: "production", url: "https://candidate.example", meta: { githubCommitSha: "sha-reviewed" }, alias: ["canonical.example"] }) },
+    ];
+    for (const stage of ["", "identity=0,writes=0", "identity=1,writes=0", "identity=1,writes=1"]) {
+      invalid.push({ SUPPORT_STAGE: stage });
+    }
+
+    for (const overrides of invalid) {
+      const stage = overrides.SUPPORT_STAGE ?? "identity=0,writes=1";
+      const variables = { ...baseScenario(), ...overrides };
+      delete variables.SUPPORT_STAGE;
+      expect(runMocked(source, variables, `if support_candidate "${stage}"; then exit 81; fi
+[[ ! -s "\${PROMOTE_LOG:?}" ]] || exit 82`)).toBe("");
+    }
+
+    expect(runMocked(source, baseScenario(), `captured="\$(support_candidate "identity=0,writes=1")" || exit 84
+[[ "\$captured" == "dpl_valid" ]] || exit 85
+[[ "\$(wc -l < "\${PROMOTE_LOG:?}")" -eq 1 ]] || exit 86
+[[ "\$(sed -n '1p' "\${PROMOTE_LOG:?}")" == "dpl_valid" ]] || exit 87`)).toBe("");
   });
 
   it("fails closed under mocked responses and isolates projections", () => {
@@ -1073,7 +1141,7 @@ captured="$(stage_candidate "identity=1,writes=0")" || exit 77
     expect(normalize(section)).toMatch(/never resume[^.]*identity-unaware[^.]*pre-apply[^.]*remembered URL[^.]*environment[^.]*claim/iu);
     expect(normalize(section)).toMatch(/never enable writers merely to recover/iu);
     expect(normalize(section)).toMatch(/no state[^.]*permits promotion while paused/iu);
-    expect(section.match(/vercel\s+promote\b/giu)).toHaveLength(1);
+    expect(section.match(/vercel\s+promote\b/giu)).toHaveLength(2);
 
     expectOrdered(section, [
       "PAUSED_AFTER_APPLY -> UNPAUSED_READONLY",

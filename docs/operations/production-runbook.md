@@ -169,13 +169,15 @@ existing database. Do not combine or reorder the stages. The workflow is
 manual-only and requires `writers_stopped=true` on both dispatches. Writers
 remain stopped continuously until every post-resume smoke pass succeeds.
 
-The stages below call one parameterized candidate procedure. It is the
+The stages below use two parameterized candidate procedures. They are the
 explicit form of the existing `vercel --prod --skip-domain` Production
-operation: it never assigns the canonical domain during staging. Call it
-only from an unpaused flow. The candidate procedure is unpaused-only. The raw
-API response is never stored, echoed, uploaded, added to the ledger, or used
-as evidence; only its allow-listed projection is retained, and temporary JSON
-variables are unset after validation.
+operation: neither assigns the canonical domain during staging. Call them
+only from an unpaused flow. Both procedures are unpaused-only. The
+`support_candidate` procedure accepts only `identity=0,writes=1` and is
+allowed only before Stage 1 begins; never use it after identity maintenance
+starts. The raw API response is never stored, echoed, uploaded, added to the
+ledger, or used as evidence; only its allow-listed projection is retained, and
+temporary JSON variables are unset after validation.
 
 ```bash
 set -euo pipefail
@@ -195,6 +197,48 @@ stage_candidate() (
     [[ "$HTTP_STATUS" =~ ^(2[0-9]{2}|3[0-9]{2}|401)$ ]] || return 1
   }
   [[ "$stage_name" == "identity=1,writes=0" || "$stage_name" == "identity=1,writes=1" ]] || return 1
+  [[ -n "${TARGET_SHA:-}" ]] || return 1
+  [[ -n "${APP_BASE_URL:-}" ]] || return 1
+  [[ "$APP_BASE_URL" == "$EXPECTED_PRODUCTION_ORIGIN" ]] || return 1
+  WORKTREE_STATUS="$(git status --porcelain)" || return 1
+  [[ -z "$WORKTREE_STATUS" ]] || return 1
+  CURRENT_SHA="$(git rev-parse HEAD)" || return 1
+  [[ "$CURRENT_SHA" == "$TARGET_SHA" ]] || return 1
+
+  assert_canonical_unpaused "$APP_BASE_URL" || return 1
+  CANDIDATE_DEPLOYMENT="$(vercel deploy . --prod --skip-domain --yes --format=json --no-color | jq -ce '{id,url}')" || return 1
+  jq -e '(.id | type == "string") and (.id | test("^dpl_[A-Za-z0-9]+$")) and (.url | type == "string") and (.url | length > 0)' <<<"$CANDIDATE_DEPLOYMENT" >/dev/null || return 1
+  CANDIDATE_ID="$(jq -er '.id' <<<"$CANDIDATE_DEPLOYMENT")" || return 1
+  CANDIDATE_URL="$(jq -er '.url' <<<"$CANDIDATE_DEPLOYMENT")" || return 1
+
+  CANDIDATE_INSPECT="$(vercel inspect "$CANDIDATE_ID" --wait --timeout 3m --format=json --no-color | jq -ce '{id,readyState,aliases}')" || return 1
+  jq -e --arg id "$CANDIDATE_ID" '(.id == $id) and (.readyState == "READY") and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$CANDIDATE_INSPECT" >/dev/null || return 1
+
+  CANDIDATE_METADATA="$(vercel api "/v13/deployments/$CANDIDATE_ID" --raw | jq -ce 'if (.alias | type) == "array" then {id,readyState,target,url,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])} else error("deployment alias shape is not an array") end')" || return 1
+  jq -e --arg id "$CANDIDATE_ID" --arg sha "$TARGET_SHA" --arg url "$CANDIDATE_URL" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.url == $url) and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$CANDIDATE_METADATA" >/dev/null || return 1
+
+  assert_canonical_unpaused "$APP_BASE_URL" || return 1
+  vercel promote "$CANDIDATE_ID" --yes >/dev/null || return 1
+  CANONICAL_METADATA="$(vercel inspect "$APP_BASE_URL" --format=json --no-color | jq -ce '{id}')" || return 1
+  jq -e --arg id "$CANDIDATE_ID" '.id == $id' <<<"$CANONICAL_METADATA" >/dev/null || return 1
+  printf '%s\n' "$CANDIDATE_ID" || return 1
+)
+
+support_candidate() (
+  local stage_name="${1:-}"
+  local EXPECTED_PRODUCTION_ORIGIN="https://easy-job-application-tracker.vercel.app"
+  local WORKTREE_STATUS="" CURRENT_SHA=""
+  local CANDIDATE_DEPLOYMENT="" CANDIDATE_INSPECT="" CANDIDATE_METADATA="" CANONICAL_METADATA=""
+  local CANDIDATE_ID="" CANDIDATE_URL=""
+  set -o pipefail || return 1
+  assert_canonical_unpaused() {
+    local origin="${1:-}" HTTP_STATUS=""
+    [[ "$origin" == "$EXPECTED_PRODUCTION_ORIGIN" ]] || return 1
+    HTTP_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 -- "$origin")" || return 1
+    [[ "$HTTP_STATUS" != "000" && "$HTTP_STATUS" != "503" ]] || return 1
+    [[ "$HTTP_STATUS" =~ ^(2[0-9]{2}|3[0-9]{2}|401)$ ]] || return 1
+  }
+  [[ "$stage_name" == "identity=0,writes=1" ]] || return 1
   [[ -n "${TARGET_SHA:-}" ]] || return 1
   [[ -n "${APP_BASE_URL:-}" ]] || return 1
   [[ "$APP_BASE_URL" == "$EXPECTED_PRODUCTION_ORIGIN" ]] || return 1
@@ -305,6 +349,29 @@ promotion. It is paused only across prepare/apply, and the actual platform
    deployment IDs, canonical origin, exact owned Application IDs,
    pre/post-probe hashes, Settings existence and hashes, pairing grant and
    installation IDs, expected terminal state, and observed result.
+
+   After the private ledger exists and before creating or using any fixture,
+   stage and promote the canonical support deployment. Set both Production
+   gates explicitly before staging; the helper then requires the exact
+   reviewed SHA, candidate ID, `Ready` state, Production target, candidate URL,
+   no aliases, and a fresh unpaused canonical-origin check before promotion.
+   It verifies after promotion that the exact promoted ID owns the canonical
+   alias. Do not continue if either gate command or any helper check fails:
+
+   ```bash
+   set -euo pipefail
+   vercel env add APPLICATION_IDENTITY_WRITES_ENABLED production --value "0" --yes --force || exit 1
+   vercel env add APPLICATION_WRITES_ENABLED production --value "1" --yes --force || exit 1
+   SUPPORT_CANDIDATE_ID="$(support_candidate "identity=0,writes=1")" || exit 1
+   [[ "$SUPPORT_CANDIDATE_ID" =~ ^dpl_[A-Za-z0-9]+$ ]] || exit 1
+   ```
+
+   Against that canonical support deployment, use the authenticated supported
+   flows to verify the required reads and create the disposable Application,
+   extension credential, and unconsumed pairing grant. Verify that each exact
+   owned ID is recorded in the private ledger with sanitized evidence before
+   Stage 1; successful authenticated owned-fixture creation is the proof that
+   ordinary application writes are enabled for this prerequisite.
 
    Retain `rollout-ledger.json` until cleanup verification succeeds. It is
    private operator material: never committed or uploaded; never echo or copy it to logs,
