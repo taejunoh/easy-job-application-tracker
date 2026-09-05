@@ -392,7 +392,8 @@ promotion. It is paused only across prepare/apply, and the actual platform
    replaces fixture or cleanup ownership. Before this block, the private ledger
    must be a JSON object with `schemaVersion: 1` and `fixtureOwnership` records
    for exact Application IDs, pre/post hashes, Settings state/hashes, the
-   pre-stop pairing grant/code reference, installed credential/installation,
+   pre-stop pairing grant/code reference and the API-issued canonical UTC
+   `expiresAt` (retain its documented millisecond precision), installed credential/installation,
    and at least one cleanup action. Do not continue if the ledger is missing,
    a symlink, has a conflicting `stage1`, or does not validate after the atomic
    rename. Every owned-ID list contains only non-empty strings; optional
@@ -445,6 +446,9 @@ promotion. It is paused only across prepare/apply, and the actual platform
      def valid_utc:
        type == "string" and
        (try (. as $timestamp | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ") == $timestamp) catch false);
+     def valid_expiry_utc:
+       type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$") and
+       (try (sub("\\.[0-9]{3}Z$"; "Z") as $seconds | ($seconds | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ") == $seconds)) catch false);
      type == "object" and (.schemaVersion == 1) and (.stage1? == null) and
      (.fixtureOwnership | type == "object") and
      (.fixtureOwnership.applicationIds | type == "array" and length > 0) and
@@ -467,6 +471,7 @@ promotion. It is paused only across prepare/apply, and the actual platform
      (.fixtureOwnership.pairing | type == "object") and
      (.fixtureOwnership.pairing.preStopUnconsumedGrantId | type == "string" and length > 0) and
      (.fixtureOwnership.pairing.codeReference | type == "string" and length > 0) and
+     (.fixtureOwnership.pairing.expiresAt | valid_expiry_utc) and
      (.fixtureOwnership.installation | type == "object") and
      (.fixtureOwnership.installation.credentialReference | type == "string" and length > 0) and
      (.fixtureOwnership.installation.installationId | type == "string" and length > 0) and
@@ -557,6 +562,54 @@ promotion. It is paused only across prepare/apply, and the actual platform
    unset STAGE_ONE_CANONICAL STAGE_ONE_EVIDENCE_TMP STAGE_ONE_EVIDENCE_PROJECTION STAGE_ONE_EVIDENCE_HASH STAGE_ONE_EVIDENCE_OBSERVED_AT
    ```
 
+   The same drained valid-code `503` probe must now be bound to the exact
+   pre-stop grant before its expiry. At issuance, copy the API `expiresAt` as
+   its canonical UTC ISO-8601 millisecond value exactly (including `.000Z`);
+   do not round, strip milliseconds, or manufacture a timestamp. This second
+   atomic merge records only a sanitized projection. Its SHA-256 is computed
+   over `jq -cS` canonical key order with `projectionSha256` excluded, which
+   is the exact convention enforced by the final validator. It is not an
+   assertion that the code remains valid after `expiresAt`.
+
+   ```bash
+   set -euo pipefail
+   validate_evidence_root || exit 1
+   STAGE_ONE_LEDGER_ID="$(jq -er '.stage1.deploymentId' "$LEDGER")" || exit 1
+   PRESTOP_GRANT_ID="$(jq -er '.fixtureOwnership.pairing.preStopUnconsumedGrantId' "$LEDGER")" || exit 1
+   PRESTOP_EXPIRES_AT="$(jq -er '.fixtureOwnership.pairing.expiresAt' "$LEDGER")" || exit 1
+   PAIRING_EVIDENCE_OBSERVED_AT="$(node -e 'process.stdout.write(new Date().toISOString())')" || exit 1
+   PRESTOP_EXPIRES_AT="$PRESTOP_EXPIRES_AT" PAIRING_EVIDENCE_OBSERVED_AT="$PAIRING_EVIDENCE_OBSERVED_AT" node -e '
+     const expiry = Date.parse(process.env.PRESTOP_EXPIRES_AT);
+     const observed = Date.parse(process.env.PAIRING_EVIDENCE_OBSERVED_AT);
+     if (!Number.isFinite(expiry) || !Number.isFinite(observed) || observed >= expiry) process.exit(1);
+   ' || exit 1
+   PAIRING_EVIDENCE_PROJECTION="$(jq -cnS --arg id "$STAGE_ONE_LEDGER_ID" --arg grant "$PRESTOP_GRANT_ID" --arg expiresAt "$PRESTOP_EXPIRES_AT" --arg observedAt "$PAIRING_EVIDENCE_OBSERVED_AT" '{schemaVersion: 1, deploymentId: $id, grantId: $grant, expiresAt: $expiresAt, expectedStatus: 503, observedStatus: 503, cacheControl: "private, no-store", retryAfter: "60", code: "writes_stopped", observedAt: $observedAt}')" || exit 1
+   PAIRING_EVIDENCE_HASH="$(printf '%s' "$PAIRING_EVIDENCE_PROJECTION" | shasum -a 256 | awk '{print $1}')" || exit 1
+   [[ "$PAIRING_EVIDENCE_HASH" =~ ^[0-9a-f]{64}$ ]] || exit 1
+   validate_evidence_root || exit 1
+   PAIRING_EVIDENCE_TMP="$(mktemp "$EVIDENCE_ROOT/.rollout-ledger.pairing-503.XXXXXX")" || exit 1
+   chmod 0600 "$PAIRING_EVIDENCE_TMP" || { rm -f -- "$PAIRING_EVIDENCE_TMP"; exit 1; }
+   validate_evidence_root || { rm -f -- "$PAIRING_EVIDENCE_TMP"; exit 1; }
+   jq -e --arg id "$STAGE_ONE_LEDGER_ID" --arg grant "$PRESTOP_GRANT_ID" --arg expiresAt "$PRESTOP_EXPIRES_AT" --arg observedAt "$PAIRING_EVIDENCE_OBSERVED_AT" '
+     .stage1.deploymentId == $id and
+     .fixtureOwnership.pairing.preStopUnconsumedGrantId == $grant and
+     .fixtureOwnership.pairing.expiresAt == $expiresAt and
+     (.stage1.pairingEvidence? == null) and
+     ($observedAt < $expiresAt)
+   ' "$LEDGER" >/dev/null || { rm -f -- "$PAIRING_EVIDENCE_TMP"; exit 1; }
+   jq --argjson projection "$PAIRING_EVIDENCE_PROJECTION" --arg hash "$PAIRING_EVIDENCE_HASH" '
+     .stage1.pairingEvidence = ($projection + {projectionSha256: $hash})
+   ' "$LEDGER" > "$PAIRING_EVIDENCE_TMP" || { rm -f -- "$PAIRING_EVIDENCE_TMP"; exit 1; }
+   validate_evidence_root || { rm -f -- "$PAIRING_EVIDENCE_TMP"; exit 1; }
+   mv -f -- "$PAIRING_EVIDENCE_TMP" "$LEDGER" || { rm -f -- "$PAIRING_EVIDENCE_TMP"; exit 1; }
+   validate_evidence_root || exit 1
+   jq -e --arg id "$STAGE_ONE_LEDGER_ID" --arg grant "$PRESTOP_GRANT_ID" --arg hash "$PAIRING_EVIDENCE_HASH" '
+     .stage1.deploymentId == $id and .stage1.pairingEvidence.deploymentId == $id and
+     .stage1.pairingEvidence.grantId == $grant and .stage1.pairingEvidence.projectionSha256 == $hash
+   ' "$LEDGER" >/dev/null || exit 1
+   unset PAIRING_EVIDENCE_TMP PAIRING_EVIDENCE_PROJECTION PAIRING_EVIDENCE_HASH PAIRING_EVIDENCE_OBSERVED_AT PRESTOP_EXPIRES_AT PRESTOP_GRANT_ID
+   ```
+
    This stage sets `APPLICATION_IDENTITY_WRITES_ENABLED="1"` while keeping
    `APPLICATION_WRITES_ENABLED="0"`. The procedure inspects the candidate
    before promotion, proves the exact intended Git SHA, no aliases, and no
@@ -574,9 +627,12 @@ promotion. It is paused only across prepare/apply, and the actual platform
    only on the first successful `PUT /api/settings`; Settings GET does not
    create a row, and an authenticated `GET /api/settings` never creates the
    row. Also prove
-   installation-authenticated reads do not touch `lastUsedAt/updatedAt`.
-   Compare only sanitized counts/hashes before and after, and record sanitized
-   results in the private ledger.
+   installation-authenticated reads do not touch `lastUsedAt`. Prove that at
+   runtime from the authenticated API response. The API does not expose
+   `updatedAt`; treat stopped-write preservation of that field only as exact
+   reviewed authentication-code and test evidence, never as an observed
+   Production API value. Compare only sanitized counts/hashes before and
+   after, and record sanitized results in the private ledger.
 4. Pause Vercel Production using the provider's Production project pause
    control and REQUIRE the actual canonical `503 DEPLOYMENT_PAUSED` before any
    prepare/apply. Record pause evidence and the observation. The operator must
@@ -926,18 +982,42 @@ promotion. It is paused only across prepare/apply, and the actual platform
    and these checks must not run while Vercel is paused.
 11. After the final write-enabled promotion and successful smoke, perform
     ownership-limited cleanup from the private ledger. Delete only exact ledger-owned Application IDs through supported application paths—the supported Application deletion path; never
-    search or delete by broad name, timestamp, origin, or user. Consume the
-    recorded pre-stop unconsumed pairing grant exactly once, then prove replay
-    rejection. Revoke every ledger-owned installation, then prove the exact
-    stored credential returns `401`. Reconcile final counts and content hashes
-    with the ledger and record each action, expected terminal state, timestamp,
-    and observed result without recording private values.
+    search or delete by broad name, timestamp, origin, or user. Initial cleanup
+    records may be `pending` and contain only the intended action/target, its
+    expected terminal state, and the present record-created-at timestamp; do
+    not prefill a future successful status, created ID, evidence hash, or
+    result. Replace a pending record only with observed evidence when its
+    action actually occurs. When resolving the initial pending pairing record,
+    replace its initial generic expected `401` with the action-specific
+    `replay_401` or `expired_401`; that label alone is not evidence of either
+    future outcome.
+
+    The recorded pre-stop grant has exactly one terminal outcome. For
+    `consume_pairing_grant`, record `expectedTerminalState: replay_401`, a
+    first exchange `201`, the owned `createdInstallationId` in the
+    post-resume installation list, replay `401`, and a verified revoke with
+    mutation `200` and credential `401`. For `expire_pairing_grant`, record
+    `expectedTerminalState: expired_401`, exchange `401` observed strictly
+    after the canonical `expiresAt`, the exact Stage 1 pairing-evidence hash,
+    and equal before/after authenticated installation-list count plus SHA-256.
+    A `401` alone, both outcomes, neither outcome, a changed snapshot, or any
+    post-expiry claim that the pre-stop grant was valid is a hold condition.
+    The separate fresh post-resume grant must still complete first exchange
+    `201`, replay `401`, revoke `200`, and credential `401`; it must be a
+    different grant from the pre-stop grant.
+
+    Revoke every ledger-owned installation and prove the stored credential
+    returns `401`. Reconcile final Application count/SHA-256 and
+    Settings existence/content SHA-256 with the recorded baseline. Record
+    each action, expected terminal state, timestamp, and observed result
+    without recording private values.
 
     The ledger records the exact rollout SHA, staged candidate ID(s), promoted deployment ID values, canonical origin, exact owned Application IDs with
     pre- and post-probe hashes, whether the Settings singleton existed before the probe and its
     pre/post content hashes, the pre-stop unconsumed pairing grant and its
     pairing code/reference only inside the private ledger, the installed credential needed for the later
-    `401` proof and its installation ID, and every Application, pairing grant,
+    `401` proof and its installation ID, pairing `expiresAt`, the Stage 1
+    pairing-evidence projection hash, and every Application, pairing grant,
     or installation created after resume before it is used. Keep credential,
     pairing code, URL, title, company, note, resume text, and raw row/body
     values only inside the private directory and ledger. Never make a second
@@ -955,11 +1035,24 @@ promotion. It is paused only across prepare/apply, and the actual platform
     response while preserving unchanged Settings existence and content hash.
     Any unexpected response or hash/existence change stops the operation
     immediately; do not overwrite the row for cleanup. Record only sanitized
-    statuses/counts/hashes. Delete `rollout-ledger.json` only after every
-    ownership, replay, revocation, stopped-write, final-count, hash, and
-    expected-terminal-state check succeeds; otherwise retain it. Finally,
-    resume external writers last; `resume Application writers LAST` is the
-    final action and occurs only after every cleanup check succeeds.
+    statuses/counts/hashes. Before deletion or any external-writer resume,
+    run the read-only local final validator from the reviewed repository; it
+    performs no provider action and emits only a generic error on failure:
+
+    ```bash
+    node scripts/validate-rollout-cleanup-ledger.mjs "$LEDGER" || exit 1
+    rm -f -- "$LEDGER" || exit 1
+    ```
+
+    It accepts only the private, absolute, outside-repository `0700`
+    directory and a bounded `0600` non-symlink regular ledger, including a
+    realpath check of a symlinked parent. Delete `rollout-ledger.json` only
+    after every required check, including this validator and every ownership,
+    replay, revocation, stopped-write, final-count, hash, and
+    expected-terminal-state check succeeds; otherwise
+    retain it. Finally, resume external writers last; `resume Application
+    writers LAST` is the final action and occurs only after every cleanup check
+    succeeds.
 12. The final action is `resume Application writers LAST`; general Application
    writer resume is last and occurs only after every post-resume smoke pass
    succeeds. Retain only privacy-safe prepare/apply reports and approved
