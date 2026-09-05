@@ -1217,9 +1217,9 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       writeFileSync(join(temporaryRoot, "rollout-ledger.json"), JSON.stringify({
         schemaVersion: 1,
         fixtureOwnership: {
-          applicationIds: ["app_owned"], ownedDeploymentIds: ["dpl_valid"], preProbeHash: "before", postProbeHash: "after",
+          applicationIds: ["app_owned"], applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, ownedDeploymentIds: ["dpl_valid"], preProbeHash: "before", postProbeHash: "after",
           settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
-          pairingGrantIds: ["grant"], pairing: { preStopUnconsumedGrantId: "grant", codeReference: "code-ref" },
+          pairingGrantIds: ["grant"], pairing: { preStopUnconsumedGrantId: "grant", codeReference: "code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
           installation: { credentialReference: "credential-ref", installationId: "installation" },
           cleanup: [{ action: "revoke_installation", targetId: "installation", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
         },
@@ -1314,10 +1314,10 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
           applicationIds: ["app_fixture_1", "app_fixture_2"],
           ownedDeploymentIds: ["dpl_fixture_1"],
           pairingGrantIds: ["grant_fixture"],
-          preProbeHash: "sha256:before",
+          applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, preProbeHash: "sha256:before",
           postProbeHash: "sha256:after",
           settings: { existedBefore: true, contentHashBefore: "sha256:settings-before", contentHashAfter: "sha256:settings-after" },
-          pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref" },
+          pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
           installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
           cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
         },
@@ -1432,6 +1432,7 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({ ...preStageLedger, stage1: { deploymentId: "dpl_existing" } });
 
       for (const malformedLedger of [
+        { ...preStageLedger, stage1: null },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [null] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, applicationIds: [""] } },
         { ...preStageLedger, fixtureOwnership: { ...preStageLedger.fixtureOwnership, pairingGrantIds: [17] } },
@@ -1463,7 +1464,7 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
           stdio: ["pipe", "pipe", "pipe"],
         })).toThrow();
         expect(readFileSync(ledger, "utf8")).toBe(original);
-        expect(JSON.parse(readFileSync(ledger, "utf8")).stage1).toBeUndefined();
+        expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual(malformedLedger);
       }
 
       const repositoryRoot = join(temporaryRoot, "repository");
@@ -1518,9 +1519,9 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
           applicationIds: ["app_fixture"],
           ownedDeploymentIds: ["dpl_fixture"],
           pairingGrantIds: ["grant_fixture"],
-          preProbeHash: "before", postProbeHash: "after",
+          applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, preProbeHash: "before", postProbeHash: "after",
           settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
-          pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref" },
+          pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
           installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
           cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
         },
@@ -1537,6 +1538,14 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       const { projectionSha256, ...projection } = record.stage1.writeStopEvidence;
       expect(projectionSha256).toBe(createHash("sha256").update(JSON.stringify(projection)).digest("hex"));
       expect(JSON.stringify(record)).not.toContain("private-test-token");
+
+      const explicitNull = JSON.stringify({ ...record, stage1: { ...record.stage1, writeStopEvidence: null } });
+      writeFileSync(ledger, explicitNull, { mode: 0o600 });
+      expect(() => execFileSync("bash", ["-c", stageOneWriteStopEvidenceBlock()], {
+        env: { ...process.env, EVIDENCE_ROOT: temporaryRoot, APP_ACCESS_TOKEN: "private-test-token", STAGE_ONE_CANDIDATE_ID: "dpl_valid" },
+        stdio: ["pipe", "pipe", "pipe"],
+      })).toThrow();
+      expect(readFileSync(ledger, "utf8")).toBe(explicitNull);
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
@@ -1556,8 +1565,8 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       const initialLedger = {
         schemaVersion: 1,
         fixtureOwnership: {
-          applicationIds: ["app_fixture"], ownedDeploymentIds: ["dpl_fixture"], pairingGrantIds: ["grant_fixture"], preProbeHash: "before", postProbeHash: "after",
-          settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" }, pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref" },
+          applicationIds: ["app_fixture"], applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, ownedDeploymentIds: ["dpl_fixture"], pairingGrantIds: ["grant_fixture"], preProbeHash: "before", postProbeHash: "after",
+          settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" }, pairing: { preStopUnconsumedGrantId: "grant_fixture", codeReference: "private-code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
           installation: { credentialReference: "private-credential-ref", installationId: "installation_fixture" },
           cleanup: [{ action: "revoke_installation", targetId: "installation_fixture", expectedTerminalState: "401", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" }],
         },
@@ -1635,9 +1644,9 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
       const owned = {
         applicationIds: ["app_pre"], postResumeApplicationIds: ["app_post"], ownedDeploymentIds: ["dpl_fixture"],
         pairingGrantIds: ["grant_pre"], postResumePairingGrantIds: ["grant_post"], installationIds: ["installation_pre"], postResumeInstallationIds: ["installation_post"],
-        preProbeHash: "before", postProbeHash: "after",
+        applicationSnapshotBefore: { count: 0, sha256: "a".repeat(64) }, preProbeHash: "before", postProbeHash: "after",
         settings: { existedBefore: true, contentHashBefore: "before", contentHashAfter: "after" },
-        pairing: { preStopUnconsumedGrantId: "grant_pre", codeReference: "private-code-ref" },
+        pairing: { preStopUnconsumedGrantId: "grant_pre", codeReference: "private-code-ref", expiresAt: "2026-09-04T00:10:00.000Z" },
         installation: { credentialReference: "private-credential-ref", installationId: "installation_singleton" },
         cleanup: [
           { action: "delete_application", targetId: "app_post", expectedTerminalState: "404", timestamp: "2026-09-04T00:00:00Z", observedResult: "pending" },
@@ -1767,10 +1776,12 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
     expect(normalizedSection).toContain("never committed or uploaded");
     expect(normalizedSection).toMatch(/only exact ledger-owned Application IDs/iu);
     expect(normalizedSection).toMatch(/never search or delete by broad (?:name|timestamp|origin|user)/iu);
-    expect(normalizedSection).toContain("exactly once");
-    expect(normalizedSection).toContain("replay rejection");
+    expect(normalizedSection).toContain("exactly one terminal outcome");
+    expect(normalizedSection).toContain("expectedTerminalState: replay_401");
+    expect(normalizedSection).toContain("expectedTerminalState: expired_401");
+    expect(normalizedSection).toContain("pairing-evidence hash");
     expect(normalizedSection).toContain("credential returns `401`");
-    expect(normalizedSection).toContain("final counts and content hashes");
+    expect(normalizedSection).toContain("final Application count/SHA-256");
     expect(normalizedSection).toContain("ledger is retained");
     expect(normalizedSection).toContain("second unrecorded credential attempt");
     expect(normalizedSection).toContain("syntactically valid `PUT /api/settings`");
@@ -1784,11 +1795,12 @@ captured="\$(${helper.invocation})" || exit ${77 + offset}
     const cleanup = normalize(section.slice(cleanupStart));
     expectOrdered(cleanup, [
       "Delete only exact ledger-owned Application IDs",
-      "Consume the recorded pre-stop unconsumed pairing grant exactly once",
-      "prove replay rejection",
+      "recorded pre-stop grant has exactly one terminal outcome",
+      "separate fresh post-resume grant must still complete",
       "Revoke every ledger-owned installation",
       "stored credential returns `401`",
-      "Reconcile final counts and content hashes",
+      "Reconcile final Application count/SHA-256",
+      "node scripts/validate-rollout-cleanup-ledger.mjs \"$LEDGER\" || exit 1",
       "Delete `rollout-ledger.json` only after every",
       "resume external writers last",
     ]);

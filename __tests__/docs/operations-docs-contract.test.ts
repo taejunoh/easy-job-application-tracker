@@ -147,7 +147,9 @@ describe("production operations documentation contract", () => {
       "installation deletion",
       "self-revoke",
       "Settings GET does not create a row",
-      "lastUsedAt/updatedAt",
+      "runtime from the authenticated API response",
+      "reviewed authentication-code and test evidence",
+      "never as an observed Production API value",
     ]) {
       expect(runbook).toContain(mutation);
     }
