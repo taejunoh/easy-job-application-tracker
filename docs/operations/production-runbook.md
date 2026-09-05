@@ -931,9 +931,9 @@ promotion. It is paused only across prepare/apply, and the actual platform
    validate_stage1_write_stop_selector || enter_hold_paused
    [[ "${APP_BASE_URL:-}" == "$CANONICAL_ORIGIN" ]] || enter_hold_paused
    STAGE_ONE_INSPECT="$(vercel inspect "$STAGE_ONE_RECORD_ID" --wait --timeout 3m --format=json --no-color | jq -ce '{id,readyState,aliases}')" || enter_hold_paused
-   jq -e --arg id "$STAGE_ONE_RECORD_ID" '(.id == $id) and (.readyState == "READY") and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$STAGE_ONE_INSPECT" >/dev/null || enter_hold_paused
+   jq -e --arg id "$STAGE_ONE_RECORD_ID" '(.id == $id) and (.readyState == "READY") and (.aliases | type == "array")' <<<"$STAGE_ONE_INSPECT" >/dev/null || enter_hold_paused
    STAGE_ONE_METADATA="$(vercel api "/v13/deployments/$STAGE_ONE_RECORD_ID" --raw | jq -ce 'if (.alias | type) == "array" then {id,readyState,target,githubCommitSha:.meta.githubCommitSha,aliases:(.alias//[])} else error("deployment alias shape is not an array") end')" || enter_hold_paused
-   jq -e --arg id "$STAGE_ONE_RECORD_ID" --arg sha "$TARGET_SHA" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.aliases | type == "array") and ((.aliases | length) == 0)' <<<"$STAGE_ONE_METADATA" >/dev/null || enter_hold_paused
+   jq -e --arg id "$STAGE_ONE_RECORD_ID" --arg sha "$TARGET_SHA" '(.id == $id) and (.readyState == "READY") and (.target == "production") and (.githubCommitSha == $sha) and (.aliases | type == "array")' <<<"$STAGE_ONE_METADATA" >/dev/null || enter_hold_paused
    STAGE_ONE_CANONICAL="$(vercel inspect "$CANONICAL_ORIGIN" --format=json --no-color | jq -ce '{id}')" || enter_hold_paused
    jq -e --arg id "$STAGE_ONE_RECORD_ID" '.id == $id' <<<"$STAGE_ONE_CANONICAL" >/dev/null || enter_hold_paused
    # Normal PAUSED_AFTER_APPLY -> UNPAUSED_READONLY: prove the selector while
