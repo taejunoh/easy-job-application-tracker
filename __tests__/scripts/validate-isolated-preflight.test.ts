@@ -69,6 +69,38 @@ async function runCli(scriptPath: string, repository: string, inputs: Awaited<Re
   return execFile("node", [scriptPath, "--manifest", inputs.manifestPath, "--deny-list", inputs.denyListPath, "--report", inputs.reportPath, "--source-sha", inputs.sourceSha], { cwd: repository }).catch((error) => error);
 }
 
+async function probeInputs(directory: string, candidate = manifest, sourceSha = sha) {
+  return {
+    manifestPath: await privateJson(directory, "probe-manifest.json", candidate),
+    denyListPath: await privateJson(directory, "probe-deny-list.json", denyList),
+    reportPath: join(directory, "probe-report.json"),
+    sourceSha,
+  };
+}
+
+async function runPreflightProbe(directory: string, inputs: Awaited<ReturnType<typeof probeInputs>>) {
+  const harnessPath = join(directory, "preflight-probe.mjs");
+  const eventsPath = join(directory, "git-events.json");
+  await writeFile(harnessPath, `import { writeFile } from "node:fs/promises";
+const [scriptUrl, manifestPath, denyListPath, reportPath, sourceSha, eventsPath] = process.argv.slice(2);
+const { preflight } = await import(scriptUrl);
+const events = [];
+const git = async (args) => { events.push(args.join(" ")); return { code: 0, stdout: "git-private-sentinel", stderr: "git-private-sentinel" }; };
+try { await preflight({ manifestPath, denyListPath, reportPath, sourceSha, git }); process.stdout.write("passed\\n"); }
+catch { process.stderr.write("Isolated validation preflight refused.\\n"); process.exitCode = 1; }
+finally { await writeFile(eventsPath, JSON.stringify(events)); }\n`);
+  return execFile("node", [harnessPath, pathToFileURL(join(REPOSITORY_ROOT, "scripts/validate-isolated-preflight.mjs")).href, inputs.manifestPath, inputs.denyListPath, inputs.reportPath, inputs.sourceSha, eventsPath], { cwd: REPOSITORY_ROOT }).catch((error) => error);
+}
+
+async function expectNoGitProbe(directory: string, inputs: Awaited<ReturnType<typeof probeInputs>>) {
+  const result = await runPreflightProbe(directory, inputs);
+  expect(result.code).toBe(1);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toBe("Isolated validation preflight refused.\n");
+  expect(JSON.parse(await readFile(join(directory, "git-events.json"), "utf8"))).toEqual([]);
+  await expect(readFile(inputs.reportPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+}
+
 describe("isolated validation preflight", () => {
   it("runs the CLI against a real temporary Git checkout and reports malformed arguments without a stack", async () => {
     await temporary(async (directory) => {
@@ -103,6 +135,32 @@ describe("isolated validation preflight", () => {
       expect(result.stdout).toBe("");
       expect(result.stderr).toBe("Isolated validation preflight refused.\n");
       await expect(readFile(inputs.reportPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
+  it.each([
+    ["Production Vercel project", { ...manifest, vercelProjectId: "prj_production" }],
+    ["Production Neon organization", { ...manifest, neonOrganizationId: "org_production" }],
+    ["Production Neon project", { ...manifest, database: { ...manifest.database, projectId: "neon_production" } }],
+    ["Production database host", { ...manifest, database: { ...manifest.database, host: "ep-production.example.neon.tech" } }],
+    ["a manifest SHA mismatch", manifest, "f".repeat(40)],
+  ])("refuses %s before any Git access", async (_, candidate, sourceSha = sha) => {
+    await temporary(async (directory) => {
+      await expectNoGitProbe(directory, await probeInputs(directory, candidate, sourceSha));
+    });
+  });
+
+  it.each(["symlinked", "group-readable"] as const)("refuses %s private input before any Git access", async (kind) => {
+    await temporary(async (directory) => {
+      const inputs = await probeInputs(directory);
+      if (kind === "symlinked") {
+        const link = join(directory, "probe-manifest-link.json");
+        await symlink(inputs.manifestPath, link);
+        inputs.manifestPath = link;
+      } else {
+        await chmod(inputs.manifestPath, 0o644);
+      }
+      await expectNoGitProbe(directory, inputs);
     });
   });
 
