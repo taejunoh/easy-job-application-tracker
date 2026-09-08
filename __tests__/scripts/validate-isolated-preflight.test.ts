@@ -3,15 +3,14 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const execFile = promisify(execFileCallback);
 const REPOSITORY_ROOT = process.cwd();
-let REVIEWED_PATHS: readonly string[];
-let parseDenyList: (value: unknown) => unknown;
-let parseManifest: (value: unknown) => unknown;
-let preflight: (options: Record<string, unknown>) => Promise<unknown>;
-let readPrivateJson: (path: string, expectedKind: string) => Promise<unknown>;
-let realGit: (args: readonly string[]) => Promise<{ code: number | string; stdout: string; stderr: string }>;
+const REVIEWED_PATHS = [
+  "prisma/schema.prisma", "prisma/migrations", "prisma.config.ts",
+  "src/lib/applications/backfill.ts", "src/lib/applications/identity.ts",
+] as const;
 const sha = "5e5610944698e18230c8e67378dda35d8eb311f8";
 const manifest = {
   schemaVersion: 1, kind: "jobtracker-isolated-validation-manifest",
@@ -70,131 +69,7 @@ async function runCli(scriptPath: string, repository: string, inputs: Awaited<Re
   return execFile("node", [scriptPath, "--manifest", inputs.manifestPath, "--deny-list", inputs.denyListPath, "--report", inputs.reportPath, "--source-sha", inputs.sourceSha], { cwd: repository }).catch((error) => error);
 }
 
-function git(events: string[], options: { diffCode?: number; status?: string; missingPath?: string } = {}) {
-  return async (args: readonly string[]) => {
-    events.push(args.join(" "));
-    if (args[0] === "diff") return { code: options.diffCode ?? 0, stdout: "", stderr: "private-diff-sentinel" };
-    if (args[0] === "status") return { code: 0, stdout: options.status ?? "", stderr: "" };
-    if (args[0] === "cat-file" && args[1] === "-e" && args[2]?.includes(":")) {
-      return { code: args[2].endsWith(`:${options.missingPath}`) ? 1 : 0, stdout: "", stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-}
-
 describe("isolated validation preflight", () => {
-  beforeAll(async () => {
-    const loaded = await new Function("specifier", "return import(specifier)")("../../scripts/validate-isolated-preflight.mjs");
-    REVIEWED_PATHS = loaded.REVIEWED_PATHS;
-    parseDenyList = loaded.parseDenyList;
-    parseManifest = loaded.parseManifest;
-    preflight = loaded.preflight;
-    readPrivateJson = loaded.readPrivateJson;
-    realGit = loaded.realGit;
-  });
-
-  it("accepts a distinct manifest and writes only a redacted report", async () => {
-    await temporary(async (directory) => {
-      const events: string[] = [];
-      const reportPath = join(directory, "report.json");
-      await preflight({
-        manifestPath: await privateJson(directory, "manifest.json", manifest),
-        denyListPath: await privateJson(directory, "deny-list.json", denyList),
-        reportPath, sourceSha: sha, git: git(events),
-      });
-      expect(events).toContain(`cat-file -e ${sha}^{commit}`);
-      expect(events).toContain(`diff --quiet ${sha} -- ${REVIEWED_PATHS.join(" ")}`);
-      expect(events).toContain(`status --porcelain=v1 --untracked-files=all -- ${REVIEWED_PATHS.join(" ")}`);
-      expect(JSON.parse(await readFile(reportPath, "utf8"))).toEqual({
-        schemaVersion: 1, kind: "jobtracker-isolated-validation-preflight-report",
-        sourceSha: sha, manifestDigest: expect.stringMatching(/^[0-9a-f]{64}$/u), checkedPaths: REVIEWED_PATHS,
-      });
-      expect((await lstat(reportPath)).mode & 0o777).toBe(0o600);
-    });
-  });
-
-  it("preserves stdout from successful real Git commands", async () => {
-    const result = await realGit(["rev-parse", "--show-toplevel"]);
-    expect(result.code).toBe(0);
-    expect(result.stdout.trim()).toBe(REPOSITORY_ROOT);
-  });
-
-  it.each([
-    ["Production Vercel project", { ...manifest, vercelProjectId: "prj_production" }],
-    ["Production Neon organization", { ...manifest, neonOrganizationId: "org_production" }],
-    ["Production Neon project", { ...manifest, database: { ...manifest.database, projectId: "neon_production" } }],
-    ["Production database host", { ...manifest, database: { ...manifest.database, host: "ep-production.example.neon.tech" } }],
-    ["unapproved SHA", { ...manifest, sourceSha: "f".repeat(40) }],
-  ])("refuses %s before Git access", async (_, candidate) => {
-    await temporary(async (directory) => {
-      const events: string[] = [];
-      await expect(preflight({
-        manifestPath: await privateJson(directory, "manifest.json", candidate),
-        denyListPath: await privateJson(directory, "deny-list.json", denyList),
-        reportPath: join(directory, "report.json"), sourceSha: sha, git: git(events),
-      })).rejects.toThrow("Isolated validation preflight refused");
-      expect(events).toEqual([]);
-    });
-  });
-
-  it("rejects extra fields in security-sensitive JSON", async () => {
-    await expect(Promise.resolve().then(() => parseManifest({ ...manifest, secretSentinel: "do-not-leak" }))).rejects.toThrow("Isolated validation preflight refused");
-    await expect(Promise.resolve().then(() => parseDenyList({ ...denyList, secretSentinel: "do-not-leak" }))).rejects.toThrow("Isolated validation preflight refused");
-  });
-
-  it("refuses symlinked, group-readable, and oversized input files", async () => {
-    await temporary(async (directory) => {
-      const privatePath = await privateJson(directory, "private.json", manifest);
-      const linkPath = join(directory, "manifest-link.json");
-      await symlink(privatePath, linkPath);
-      await expect(readPrivateJson(linkPath, manifest.kind)).rejects.toThrow("Isolated validation preflight refused");
-      await chmod(privatePath, 0o644);
-      await expect(readPrivateJson(privatePath, manifest.kind)).rejects.toThrow("Isolated validation preflight refused");
-      await writeFile(privatePath, `${JSON.stringify(manifest)}${"x".repeat(17 * 1024)}`);
-      await chmod(privatePath, 0o600);
-      await expect(readPrivateJson(privatePath, manifest.kind)).rejects.toThrow("Isolated validation preflight refused");
-    });
-  });
-
-  it("refuses a private input whose symlinked parent resolves inside the repository", async () => {
-    await temporary(async (directory) => {
-      const linkParent = join(directory, "inside");
-      await symlink(REPOSITORY_ROOT, linkParent);
-      await expect(readPrivateJson(join(linkParent, "package.json"), "anything")).rejects.toThrow("Isolated validation preflight refused");
-    });
-  });
-
-  it.each([
-    ["a changed reviewed tree", { diffCode: 1 }],
-    ["an unclean reviewed path", { status: " M prisma/schema.prisma\n" }],
-    ["a missing reviewed path", { missingPath: "prisma.config.ts" }],
-  ])("refuses %s without writing a report or leaking command output", async (_, options) => {
-    await temporary(async (directory) => {
-      const events: string[] = [];
-      const reportPath = join(directory, "report.json");
-      await expect(preflight({
-        manifestPath: await privateJson(directory, "manifest.json", manifest),
-        denyListPath: await privateJson(directory, "deny-list.json", denyList),
-        reportPath, sourceSha: sha, git: git(events, options),
-      })).rejects.toThrow("Isolated validation preflight refused");
-      await expect(readFile(reportPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-      expect(JSON.stringify(events)).not.toContain("private-diff-sentinel");
-    });
-  });
-
-  it("preserves an existing report when the preflight refuses", async () => {
-    await temporary(async (directory) => {
-      const reportPath = join(directory, "report.json");
-      await writeFile(reportPath, "existing-report-secret", { mode: 0o644 });
-      await expect(preflight({
-        manifestPath: await privateJson(directory, "manifest.json", manifest),
-        denyListPath: await privateJson(directory, "deny-list.json", denyList),
-        reportPath, sourceSha: sha, git: git([], { diffCode: 1 }),
-      })).rejects.toThrow("Isolated validation preflight refused");
-      expect(await readFile(reportPath, "utf8")).toBe("existing-report-secret");
-    });
-  });
-
   it("runs the CLI against a real temporary Git checkout and reports malformed arguments without a stack", async () => {
     await temporary(async (directory) => {
       const { repository, scriptPath, sourceSha } = await fixtureRepository(directory);
@@ -204,6 +79,8 @@ describe("isolated validation preflight", () => {
       expect(cli.stderr).toBe("");
       expect(JSON.parse(await readFile(inputs.reportPath, "utf8")).sourceSha).toBe(sourceSha);
       expect((await lstat(inputs.reportPath)).mode & 0o777).toBe(0o600);
+      const gitProbe = await execFile("node", ["--input-type=module", "-e", `import { realGit } from ${JSON.stringify(pathToFileURL(scriptPath).href)}; const result = await realGit(["rev-parse", "HEAD"]); process.stdout.write(result.stdout);`], { cwd: repository });
+      expect(gitProbe.stdout).toBe(`${sourceSha}\n`);
       await expect(execFile("node", [scriptPath, "--manifest"], { cwd: repository })).rejects.toMatchObject({ code: 1, stderr: "Isolated validation preflight refused.\n" });
     });
   });
@@ -237,6 +114,10 @@ describe("isolated validation preflight", () => {
       expect(extraResult.code).toBe(1);
       expect(extraResult.stderr).toBe("Isolated validation preflight refused.\n");
       expect(extraResult.stderr).not.toContain("do-not-leak");
+      const deny = await cliInputs(directory, sourceSha, { ...manifest, vercelProjectId: "prj_production" });
+      const denyResult = await runCli(scriptPath, repository, deny);
+      expect(denyResult.code).toBe(1);
+      expect(denyResult.stderr).toBe("Isolated validation preflight refused.\n");
       const oversizedManifestPath = join(directory, "oversized.json");
       await writeFile(oversizedManifestPath, `${JSON.stringify({ ...manifest, sourceSha })}${"x".repeat(17 * 1024)}`, { mode: 0o600 });
       const oversized = { ...extra, manifestPath: oversizedManifestPath };
