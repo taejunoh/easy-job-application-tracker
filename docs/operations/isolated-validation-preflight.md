@@ -75,9 +75,11 @@ npm run validate:isolated:preflight -- \
 ```
 
 The command succeeds only when the supplied manifest source SHA matches the
-argument, none of its Vercel/Neon IDs or database host appears in the supplied
-Production deny list, the approved commit exists, and these reviewed paths
-match the current checkout with no local changes:
+argument, its Vercel project ID, Neon organization ID, Neon project ID, and
+database host do not appear in the supplied Production deny list, the approved
+commit exists, and these reviewed paths match the current checkout with no
+local changes. The manifest's branch ID and endpoint ID are validated for
+shape, but are not independently deny-list-checked by this local preflight:
 
 - `prisma/schema.prisma`
 - `prisma/migrations`
