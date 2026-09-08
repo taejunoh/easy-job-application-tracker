@@ -37,6 +37,9 @@ yarn-error.log*
 
 # vercel
 .vercel
+
+# Isolated validation local identifiers and reports.
+/.artifacts/isolated-validation/
 .artifacts/extension-e2e/
 
 # typescript
