@@ -52,7 +52,7 @@ async function probe(input: Record<string, unknown>) {
         async query(sql, values = []) {
           events.push(sql.replace(/\\s+/g, " ").trim());
           if (input.failQuery && sql.includes(input.failQuery)) throw new Error("fake query failure");
-          if (sql.includes("current_database")) return { rows: [input.identity ?? { database: "neondb", port: 5432, schema: "public", migrationTable: null, marker: null, publicRelations: [] }] };
+          if (sql.includes("current_database")) return { rows: [input.identity ?? { database: "neondb", port: 5432, schema: "public", migrationTable: null, marker: null, publicRelations: input.pgNameArray ? (sql.includes("c.relname::text") ? [] : "{}") : [] }] };
           if (sql.includes("pg_try_advisory_lock")) return { rows: [{ acquired: input.lock !== false }] };
           if (sql.includes("environment_marker") && /^SELECT/.test(sql.trim())) return input.markerRows === "unknown" ? { rows: [] } : marker();
           if (sql === "BEGIN") { inTransaction = true; return { rows: [] }; }
@@ -190,6 +190,12 @@ describe("isolated DB rehearsal", () => {
     const result = await probe({ databaseUrl, manifest, deny, identity });
     expect(result.ok).toBe(false);
     expect(result.events.some((event: string) => event.includes("CREATE ") || event.includes("INSERT ") || event.startsWith("exec:") || event.startsWith("DELETE"))).toBe(false);
+  });
+
+  it("casts pg_class name[] output to text[] before the strict fresh-array check", async () => {
+    const result = await probe({ databaseUrl, manifest, deny, pgNameArray: true });
+    expect(result.ok).toBe(true);
+    expect(result.events).toContain("summary:complete");
   });
 
   it.each([

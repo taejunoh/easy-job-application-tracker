@@ -243,7 +243,7 @@ export async function run(input) {
     await client.connect();
     connected = true;
     const identity = await queryOne(client,
-      "SELECT current_database() AS database, inet_server_port() AS port, current_schema() AS schema, to_regclass('public._prisma_migrations') AS \"migrationTable\", to_regclass('validation_control.environment_marker') AS marker, COALESCE(array_agg(c.relname ORDER BY c.relname) FILTER (WHERE c.oid IS NOT NULL), ARRAY[]::text[]) AS \"publicRelations\" FROM pg_class c LEFT JOIN pg_namespace n ON n.oid=c.relnamespace AND n.nspname='public' WHERE c.oid IS NULL OR n.oid IS NOT NULL");
+      "SELECT current_database() AS database, inet_server_port() AS port, current_schema() AS schema, to_regclass('public._prisma_migrations') AS \"migrationTable\", to_regclass('validation_control.environment_marker') AS marker, COALESCE(array_agg(c.relname::text ORDER BY c.relname) FILTER (WHERE c.oid IS NOT NULL), ARRAY[]::text[]) AS \"publicRelations\" FROM pg_class c LEFT JOIN pg_namespace n ON n.oid=c.relnamespace AND n.nspname='public' WHERE c.oid IS NULL OR n.oid IS NOT NULL");
     if (!isFresh(identity, manifest)) refuse();
     if (!(await queryOne(client, "SELECT pg_try_advisory_lock(hashtextextended('jobtracker-isolated-db-rehearsal-v1:' || $1, 0)) AS acquired", [manifest.environmentId])).acquired) refuse();
     locked = true;
