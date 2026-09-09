@@ -6,6 +6,9 @@ import { pathToFileURL } from "node:url";
 const supportUrl = pathToFileURL(
   join(__dirname, "../../scripts/extension-e2e-support.mjs"),
 ).href;
+const localWrapperUrl = pathToFileURL(
+  join(__dirname, "../../scripts/extension-e2e-local.mjs"),
+).href;
 const supportRunner = `
 import * as support from ${JSON.stringify(supportUrl)};
 const chunks = [];
@@ -17,6 +20,18 @@ try {
 } catch (error) {
   process.stdout.write(JSON.stringify({ ok: false, error: error.message }));
 }
+`;
+const childEnvironmentRunner = `
+import { buildChildEnvironment } from ${JSON.stringify(localWrapperUrl)};
+const chunks = [];
+for await (const chunk of process.stdin) chunks.push(chunk);
+const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+const value = buildChildEnvironment(
+  request.environment,
+  new URL(request.databaseUrl),
+  request.identity,
+);
+process.stdout.write(JSON.stringify(value));
 `;
 const redactionRunner = `
 import {
@@ -86,6 +101,25 @@ function callSupport<T>(operation: string, ...args: unknown[]): T {
     | { ok: false; error: string };
   if (!response.ok) throw new Error(response.error);
   return response.value;
+}
+
+function callChildEnvironment<T>(
+  environment: Record<string, string>,
+  databaseUrl: string,
+  identity: { address: string },
+): T {
+  const result = spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", childEnvironmentRunner],
+    {
+      input: JSON.stringify({ environment, databaseUrl, identity }),
+      encoding: "utf8",
+    },
+  );
+  if (result.status !== 0) {
+    throw new Error(result.stderr || `child environment exited ${result.status}`);
+  }
+  return JSON.parse(result.stdout) as T;
 }
 
 const validEnvironment = Object.freeze({
@@ -477,6 +511,37 @@ describe("extension E2E safety support", () => {
     }
     expect(wrapper).not.toContain("process.exit(");
   });
+
+  it.each([
+    ["ambient gate absent", {}],
+    ["ambient gate disabled", { APPLICATION_WRITES_ENABLED: "0" }],
+  ])(
+    "pins child writes on for the disposable loopback E2E database when %s",
+    (_name, ambientEnvironment) => {
+      const childEnvironment = callChildEnvironment<Record<string, string>>(
+        {
+          ...ambientEnvironment,
+          EXTENSION_E2E_POSTGRES_ADMIN_URL:
+            "postgresql://postgres@127.0.0.1:5432/postgres",
+        },
+        "postgresql://postgres@127.0.0.1:5432/jobtracker_extension_e2e_test",
+        { address: "127.0.0.1" },
+      );
+
+      expect(childEnvironment).toMatchObject({
+        APPLICATION_WRITES_ENABLED: "1",
+        DATABASE_URL:
+          "postgresql://postgres@127.0.0.1:5432/jobtracker_extension_e2e_test",
+        EXPECTED_DATABASE_SERVER_ADDRESS: "127.0.0.1",
+        RUN_EXTENSION_E2E: "1",
+        ALLOW_DESTRUCTIVE_EXTENSION_E2E:
+          "jobtracker-extension-e2e-delete-all",
+      });
+      expect(childEnvironment).not.toHaveProperty(
+        "EXTENSION_E2E_POSTGRES_ADMIN_URL",
+      );
+    },
+  );
 
   it("parses only a loopback Docker host-port binding", () => {
     expect(callSupport("parseDockerPort", "127.0.0.1:49152")).toBe(49152);
