@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import pg from "pg";
 
@@ -22,6 +23,9 @@ const adminUrl =
   "postgresql://postgres@127.0.0.1:5432/postgres";
 const childTerminationTimeout =
   process.env.EXTENSION_E2E_LOCAL_SIGNAL_FIXTURE === "1" ? 250 : 5_000;
+const isMainModule =
+  typeof process.argv[1] === "string" &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 const state = {
   admin: null,
   child: null,
@@ -33,48 +37,16 @@ const state = {
   treeTerminationPromise: null,
 };
 
-for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
-  process.on(signal, () => {
-    traceSignal(signal, state.requestedSignal === null);
-    if (state.requestedSignal) return;
-    state.requestedSignal = signal;
-    state.treeTerminationPromise = terminateActiveChildTree(signal);
-  });
-}
-
-let failure = null;
-try {
-  const target = assertSafeExtensionE2EAdminUrl(adminUrl);
-  state.target = target;
-  const admin = new Client({ connectionString: adminUrl });
-  state.admin = admin;
-  await admin.connect();
-  state.identity = await verifyPostgres17(admin, target);
-  throwIfShutdownRequested();
-
-  const existing = await admin.query(
-    "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS exists",
-    [databaseName],
-  );
-  if (existing.rows[0]?.exists === true) {
-    throw new Error("Refusing extension E2E: disposable database already exists");
-  }
-  throwIfShutdownRequested();
-
-  await admin.query(`CREATE DATABASE ${quotedDatabaseName()}`);
-  state.ownsDatabase = true;
-  throwIfShutdownRequested();
-
-  const databaseUrl = new URL(adminUrl);
-  databaseUrl.pathname = `/${databaseName}`;
+export function buildChildEnvironment(environment, databaseUrl, identity) {
   const childEnvironment = {
-    ...process.env,
+    ...environment,
     NODE_ENV: "production",
     RUN_EXTENSION_E2E: "1",
     ALLOW_DESTRUCTIVE_EXTENSION_E2E:
       "jobtracker-extension-e2e-delete-all",
     DATABASE_URL: databaseUrl.toString(),
-    EXPECTED_DATABASE_SERVER_ADDRESS: state.identity.address,
+    EXPECTED_DATABASE_SERVER_ADDRESS: identity.address,
+    APPLICATION_WRITES_ENABLED: "1",
     ENCRYPTION_SECRET: E2E_ENCRYPTION_SECRET,
     APP_ACCESS_TOKEN: E2E_ACCESS_TOKEN,
     APP_BASE_URL: E2E_CONFIGURED_APP_ORIGIN,
@@ -83,48 +55,92 @@ try {
       "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
   };
   delete childEnvironment.EXTENSION_E2E_POSTGRES_ADMIN_URL;
-
-  if (process.env.EXTENSION_E2E_LOCAL_SIGNAL_FIXTURE === "1") {
-    if (process.env.RUN_EXTENSION_E2E_SIGNAL_INTEGRATION !== "1") {
-      throw new Error("Refusing extension E2E: signal fixture sentinel missing");
-    }
-    await runChild(
-      process.execPath,
-      [
-        resolve(
-          root,
-          "__tests__/fixtures/extension-e2e/hanging-build-parent.mjs",
-        ),
-      ],
-      childEnvironment,
-    );
-  } else {
-    await runChild("npm", ["run", "build"], childEnvironment);
-    throwIfShutdownRequested();
-    await runChild(
-      process.execPath,
-      [resolve(root, "scripts/extension-e2e.mjs")],
-      childEnvironment,
-    );
-  }
-} catch (error) {
-  if (!state.requestedSignal) failure = error;
-} finally {
-  try {
-    if (state.treeTerminationPromise) await state.treeTerminationPromise;
-    await cleanup();
-  } catch (error) {
-    failure ??= error;
-  }
+  return childEnvironment;
 }
 
-if (failure) {
-  process.stderr.write(
-    `${failure instanceof Error ? failure.message : "Local extension E2E failed"}\n`,
-  );
-  process.exitCode = 1;
-} else if (state.requestedSignal) {
-  process.exitCode = signalExitCode(state.requestedSignal);
+if (isMainModule) {
+  for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+      traceSignal(signal, state.requestedSignal === null);
+      if (state.requestedSignal) return;
+      state.requestedSignal = signal;
+      state.treeTerminationPromise = terminateActiveChildTree(signal);
+    });
+  }
+
+  let failure = null;
+  try {
+    const target = assertSafeExtensionE2EAdminUrl(adminUrl);
+    state.target = target;
+    const admin = new Client({ connectionString: adminUrl });
+    state.admin = admin;
+    await admin.connect();
+    state.identity = await verifyPostgres17(admin, target);
+    throwIfShutdownRequested();
+
+    const existing = await admin.query(
+      "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS exists",
+      [databaseName],
+    );
+    if (existing.rows[0]?.exists === true) {
+      throw new Error("Refusing extension E2E: disposable database already exists");
+    }
+    throwIfShutdownRequested();
+
+    await admin.query(`CREATE DATABASE ${quotedDatabaseName()}`);
+    state.ownsDatabase = true;
+    throwIfShutdownRequested();
+
+    const databaseUrl = new URL(adminUrl);
+    databaseUrl.pathname = `/${databaseName}`;
+    const childEnvironment = buildChildEnvironment(
+      process.env,
+      databaseUrl,
+      state.identity,
+    );
+
+    if (process.env.EXTENSION_E2E_LOCAL_SIGNAL_FIXTURE === "1") {
+      if (process.env.RUN_EXTENSION_E2E_SIGNAL_INTEGRATION !== "1") {
+        throw new Error("Refusing extension E2E: signal fixture sentinel missing");
+      }
+      await runChild(
+        process.execPath,
+        [
+          resolve(
+            root,
+            "__tests__/fixtures/extension-e2e/hanging-build-parent.mjs",
+          ),
+        ],
+        childEnvironment,
+      );
+    } else {
+      await runChild("npm", ["run", "build"], childEnvironment);
+      throwIfShutdownRequested();
+      await runChild(
+        process.execPath,
+        [resolve(root, "scripts/extension-e2e.mjs")],
+        childEnvironment,
+      );
+    }
+  } catch (error) {
+    if (!state.requestedSignal) failure = error;
+  } finally {
+    try {
+      if (state.treeTerminationPromise) await state.treeTerminationPromise;
+      await cleanup();
+    } catch (error) {
+      failure ??= error;
+    }
+  }
+
+  if (failure) {
+    process.stderr.write(
+      `${failure instanceof Error ? failure.message : "Local extension E2E failed"}\n`,
+    );
+    process.exitCode = 1;
+  } else if (state.requestedSignal) {
+    process.exitCode = signalExitCode(state.requestedSignal);
+  }
 }
 
 async function verifyPostgres17(admin, target) {
