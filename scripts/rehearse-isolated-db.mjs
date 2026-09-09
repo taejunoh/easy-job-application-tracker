@@ -145,11 +145,11 @@ function isFresh(row, manifest) {
     row.migrationTable === null && row.marker === null && same(row.publicRelations, []);
 }
 
-async function assertMarker(client, manifest, runnerSha, fixtureIds) {
+async function assertMarker(client, manifest, runnerSha, digest, fixtureIds) {
   const row = await queryOne(client,
-    'SELECT "environmentId", "appSourceSha", "runnerSha", "fixtureIds" FROM "validation_control"."environment_marker" WHERE "environmentId"=$1',
+    'SELECT "environmentId", "appSourceSha", "runnerSha", "manifestDigest", "fixtureIds" FROM "validation_control"."environment_marker" WHERE "environmentId"=$1',
     [manifest.environmentId]);
-  if (row.environmentId !== manifest.environmentId || row.appSourceSha !== APPROVED_SHA || row.runnerSha !== runnerSha || !same(row.fixtureIds, fixtureIds)) refuse();
+  if (row.environmentId !== manifest.environmentId || row.appSourceSha !== APPROVED_SHA || row.runnerSha !== runnerSha || row.manifestDigest !== digest || !same(row.fixtureIds, fixtureIds)) refuse();
 }
 
 async function runBackfill(exec, sourceRoot, databaseUrl, args) {
@@ -176,8 +176,8 @@ async function verifyIdentityRows(client) {
   if (!sameJson(result?.rows, EXPECTED_IDENTITY_ROWS)) refuse();
 }
 
-async function assertCleanupScope(client, manifest, runnerSha, expectedIds) {
-  await assertMarker(client, manifest, runnerSha, FIXTURE_IDS);
+async function assertCleanupScope(client, manifest, runnerSha, digest, expectedIds) {
+  await assertMarker(client, manifest, runnerSha, digest, FIXTURE_IDS);
   const applications = await client.query('SELECT "id" FROM "Application" ORDER BY "id"');
   if (!same(applications?.rows?.map((row) => row.id), expectedIds)) refuse();
   const row = await queryOne(client,
@@ -185,29 +185,36 @@ async function assertCleanupScope(client, manifest, runnerSha, expectedIds) {
   if (row.settings !== 0 || row.installations !== 0 || row.grants !== 0) refuse();
 }
 
-async function cleanupOwnedFixtures(client, manifest, runnerSha) {
-  await assertCleanupScope(client, manifest, runnerSha, FIXTURE_IDS);
+async function cleanupOwnedFixtures(client, manifest, runnerSha, digest) {
+  await assertCleanupScope(client, manifest, runnerSha, digest, FIXTURE_IDS);
   const remaining = [...FIXTURE_IDS];
   for (const id of [...FIXTURE_IDS].reverse()) {
     const result = await client.query('DELETE FROM "Application" WHERE "id"=$1::text', [id]);
     if (result?.rowCount !== 1) refuse();
     remaining.splice(remaining.indexOf(id), 1);
-    await assertCleanupScope(client, manifest, runnerSha, remaining);
+    await assertCleanupScope(client, manifest, runnerSha, digest, remaining);
   }
   const applicationCount = await queryOne(client, 'SELECT count(*)::int AS count FROM "Application"');
   if (applicationCount.count !== 0) refuse();
   const migrations = await client.query('SELECT migration_name AS name FROM "_prisma_migrations" ORDER BY migration_name');
   if (!same(migrations?.rows?.map((row) => row.name), EXPECTED_MIGRATIONS)) refuse();
-  await assertMarker(client, manifest, runnerSha, FIXTURE_IDS);
+  await assertMarker(client, manifest, runnerSha, digest, FIXTURE_IDS);
 }
 
-function manifestDigest(manifest) {
-  return createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+function digestManifest(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 export async function run(input) {
-  const manifest = input.manifest ?? parseManifest((await readPrivateJson(input.manifestPath, "jobtracker-isolated-validation-manifest")).value);
-  const deny = input.deny ?? parseDenyList((await readPrivateJson(input.denyPath, "jobtracker-production-deny-list")).value);
+  const manifestInput = input.manifest === undefined
+    ? await readPrivateJson(input.manifestPath, "jobtracker-isolated-validation-manifest")
+    : { value: input.manifest, bytes: JSON.stringify(input.manifest) };
+  const denyInput = input.deny === undefined
+    ? await readPrivateJson(input.denyPath, "jobtracker-production-deny-list")
+    : { value: input.deny, bytes: JSON.stringify(input.deny) };
+  const manifest = parseManifest(manifestInput.value);
+  const deny = parseDenyList(denyInput.value);
+  const manifestDigest = digestManifest(manifestInput.bytes);
   const { sourceRoot, artifacts, runnerSha, databaseUrl, exec = execFile, git = execFile } = input;
   assertTarget(manifest, deny);
   validateUrl(databaseUrl, manifest, deny);
@@ -236,16 +243,16 @@ export async function run(input) {
     await client.query("BEGIN"); inTransaction = true;
     await client.query('CREATE SCHEMA "validation_control"');
     await client.query('CREATE TABLE "validation_control"."environment_marker" ("environmentId" TEXT PRIMARY KEY, "appSourceSha" TEXT NOT NULL, "runnerSha" TEXT NOT NULL, "manifestDigest" TEXT NOT NULL, "fixtureIds" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[], "createdAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)');
-    await client.query('INSERT INTO "validation_control"."environment_marker" ("environmentId","appSourceSha","runnerSha","manifestDigest") VALUES ($1,$2,$3,$4)', [manifest.environmentId, APPROVED_SHA, runnerSha, manifestDigest(manifest)]);
+    await client.query('INSERT INTO "validation_control"."environment_marker" ("environmentId","appSourceSha","runnerSha","manifestDigest") VALUES ($1,$2,$3,$4)', [manifest.environmentId, APPROVED_SHA, runnerSha, manifestDigest]);
     await client.query("COMMIT"); inTransaction = false;
 
-    await assertMarker(client, manifest, runnerSha, []);
+    await assertMarker(client, manifest, runnerSha, manifestDigest, []);
     await exec(join(NODE_BIN, "node"), [join(sourceRoot, "node_modules/prisma/build/index.js"), "migrate", "deploy"], { cwd: sourceRoot, env: safeEnv(databaseUrl), stdio: "pipe" });
-    await assertMarker(client, manifest, runnerSha, []);
+    await assertMarker(client, manifest, runnerSha, manifestDigest, []);
     await exec(join(NODE_BIN, "node"), [join(sourceRoot, "node_modules/prisma/build/index.js"), "migrate", "status"], { cwd: sourceRoot, env: safeEnv(databaseUrl), stdio: "pipe" });
     if ((await queryOne(client, 'SELECT count(*)::int AS count FROM "Application"')).count !== 0) refuse();
 
-    await assertMarker(client, manifest, runnerSha, []);
+    await assertMarker(client, manifest, runnerSha, manifestDigest, []);
     await client.query("BEGIN"); inTransaction = true;
     await client.query('UPDATE "validation_control"."environment_marker" SET "fixtureIds"=$1 WHERE "environmentId"=$2', [FIXTURE_IDS, manifest.environmentId]);
     for (const [id, url] of FIXTURES) await client.query('INSERT INTO "Application" ("id","url","jobTitle","company","status","appliedDate","createdAt","updatedAt") VALUES ($1,$2,$3,$4,$5,$6,$6,$6)', [id, url, `Synthetic ${id}`, "Validation", "Applied", new Date("2026-08-01T00:00:00.000Z")]);
@@ -254,7 +261,7 @@ export async function run(input) {
 
     const backfills = [["--report", join(artifacts, "01-dry.json")], ["--apply", "--writers-stopped", "--report", join(artifacts, "02-apply.json")], ["--report", join(artifacts, "03-dry.json")], ["--apply", "--writers-stopped", "--report", join(artifacts, "04-apply.json")]];
     for (const args of backfills) {
-      await assertMarker(client, manifest, runnerSha, FIXTURE_IDS);
+      await assertMarker(client, manifest, runnerSha, manifestDigest, FIXTURE_IDS);
       await runBackfill(exec, sourceRoot, databaseUrl, args);
       if (args.includes("--apply")) await verifyIdentityRows(client);
     }
@@ -268,7 +275,7 @@ export async function run(input) {
   } finally {
     if (owned) {
       try {
-        await cleanupOwnedFixtures(client, manifest, runnerSha);
+        await cleanupOwnedFixtures(client, manifest, runnerSha, manifestDigest);
         cleanup = "complete";
       } catch {
         cleanup = "pending";

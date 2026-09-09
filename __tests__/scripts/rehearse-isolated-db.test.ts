@@ -36,6 +36,7 @@ async function probe(input: Record<string, unknown>) {
     const probePath = join(directory, "probe.mjs");
     await writeFile(inputPath, JSON.stringify(input));
     await writeFile(probePath, `
+      import { createHash } from "node:crypto";
       import { readFile, writeFile } from "node:fs/promises";
       const input = JSON.parse(await readFile(process.argv[2], "utf8"));
       const { run, validateUrl } = await import(process.argv[3]);
@@ -44,7 +45,7 @@ async function probe(input: Record<string, unknown>) {
       let cleanupIds = input.cleanupRows ?? fixtures;
       let fixtureIds = [];
       let inTransaction = false;
-      const marker = () => ({ rows: [{ environmentId: input.manifest.environmentId, appSourceSha: input.manifest.sourceSha, runnerSha: "a".repeat(40), fixtureIds }] });
+      const marker = () => ({ rows: [{ environmentId: input.manifest.environmentId, appSourceSha: input.manifest.sourceSha, runnerSha: "a".repeat(40), manifestDigest: input.markerDigest ?? createHash("sha256").update(JSON.stringify(input.manifest)).digest("hex"), fixtureIds }] });
       const client = {
         async connect() { events.push("connect"); },
         async end() { events.push("end"); },
@@ -96,7 +97,7 @@ async function probe(input: Record<string, unknown>) {
   });
 }
 
-async function sourceProbe(kind: "missing" | "symlink" | "env") {
+async function sourceProbe(kind: "missing" | "symlink" | "env" | "wrong-sha" | "dirty") {
   return temporary(async (directory) => {
     const source = join(directory, "source");
     const output = join(directory, "output.json");
@@ -118,11 +119,11 @@ async function sourceProbe(kind: "missing" | "symlink" | "env") {
       import { writeFile } from "node:fs/promises";
       const { assertSource } = await import(process.argv[2]);
       const events = [];
-      const git = async (_command, args) => ({ stdout: args.includes("rev-parse") ? "5e5610944698e18230c8e67378dda35d8eb311f8\\n" : "" });
+      const git = async (_command, args) => ({ stdout: args.includes("rev-parse") ? (process.argv[5] === "wrong-sha" ? "f".repeat(40) + "\\n" : "5e5610944698e18230c8e67378dda35d8eb311f8\\n") : (args.includes("status") && process.argv[5] === "dirty" ? " M package.json\\n" : "") });
       try { await assertSource(process.argv[3], git, async () => events.push("exec")); await writeFile(process.argv[4], JSON.stringify({ ok: true, events })); }
       catch (error) { await writeFile(process.argv[4], JSON.stringify({ ok: false, message: error.message, events })); }
     `);
-    await execFile("/Users/taejunoh/.nvm/versions/node/v22.22.2/bin/node", [harness, runnerUrl, source, output]);
+    await execFile("/Users/taejunoh/.nvm/versions/node/v22.22.2/bin/node", [harness, runnerUrl, source, output, kind]);
     return JSON.parse(await (await import("node:fs/promises")).readFile(output, "utf8"));
   });
 }
@@ -171,6 +172,16 @@ describe("isolated DB rehearsal", () => {
   });
 
   it.each([
+    { ...deny, vercelProjectIds: [...deny.vercelProjectIds, manifest.vercelProjectId] },
+    { ...deny, neonOrganizationIds: [...deny.neonOrganizationIds, manifest.neonOrganizationId] },
+    { ...deny, neonProjectIds: [...deny.neonProjectIds, manifest.database.projectId] },
+    { ...deny, databaseHosts: [...deny.databaseHosts, manifest.database.host] },
+  ])("refuses each production deny-list category before source checks", async (candidateDeny) => {
+    const result = await probe({ databaseUrl, manifest, deny: candidateDeny });
+    expect(result).toMatchObject({ ok: false, message: "Isolated DB rehearsal refused", events: [] });
+  });
+
+  it.each([
     ["a pre-existing migration table", { database: "neondb", port: 5432, schema: "public", migrationTable: "_prisma_migrations", marker: null, publicRelations: [] }],
     ["a pre-existing marker", { database: "neondb", port: 5432, schema: "public", migrationTable: null, marker: "environment_marker", publicRelations: [] }],
     ["a pre-existing public relation", { database: "neondb", port: 5432, schema: "public", migrationTable: null, marker: null, publicRelations: ["Application"] }],
@@ -215,6 +226,35 @@ describe("isolated DB rehearsal", () => {
     expect(result.events.some((event: string) => event.includes("pg_advisory_unlock"))).toBe(true);
   });
 
+  it("refuses a marker with a different manifest digest before migration, fixtures, or child processes", async () => {
+    const result = await probe({ databaseUrl, manifest, deny, markerDigest: "0".repeat(64) });
+    expect(result.ok).toBe(false);
+    expect(result.events.some((event: string) => event.startsWith("exec:") || event.includes('INSERT INTO "Application"') || event.startsWith("DELETE"))).toBe(false);
+    expect(result.events).toContain("end");
+  });
+
+  it("refuses a missing durable marker before migration, fixtures, or child processes", async () => {
+    const result = await probe({ databaseUrl, manifest, deny, markerRows: "unknown" });
+    expect(result.ok).toBe(false);
+    expect(result.events.some((event: string) => event.startsWith("exec:") || event.includes('INSERT INTO "Application"') || event.startsWith("DELETE"))).toBe(false);
+    expect(result.events).toContain("end");
+  });
+
+  it("stops after an incorrect identity result and only performs owned cleanup", async () => {
+    const applicationRows = [{ id: "isr-0001-canonical", identityKey: null, canonicalUrl: null, duplicateOfId: null, identityState: "legacy_unresolved" }];
+    const result = await probe({ databaseUrl, manifest, deny, applicationRows });
+    expect(result.ok).toBe(false);
+    expect(result.events.filter((event: string) => event.startsWith("exec:")).length).toBe(4);
+    expect(result.events.filter((event: string) => event.startsWith("DELETE"))).toHaveLength(3);
+  });
+
+  it("stops after malformed backfill evidence and only performs owned cleanup", async () => {
+    const result = await probe({ databaseUrl, manifest, deny, badReport: true });
+    expect(result.ok).toBe(false);
+    expect(result.events.filter((event: string) => event.startsWith("exec:")).length).toBe(6);
+    expect(result.events.filter((event: string) => event.startsWith("DELETE"))).toHaveLength(3);
+  });
+
   it("checks identity results, report equality, post-cleanup state, and completes the owned fixture lifecycle", async () => {
     const result = await probe({ databaseUrl, manifest, deny });
     expect(result.ok).toBe(true);
@@ -235,7 +275,7 @@ describe("isolated DB rehearsal", () => {
     });
   });
 
-  it.each(["missing", "symlink", "env"] as const)("refuses a %s source path before dependency installation", async (kind) => {
+  it.each(["missing", "symlink", "env", "wrong-sha", "dirty"] as const)("refuses a %s source path before dependency installation", async (kind) => {
     const result = await sourceProbe(kind);
     expect(result).toMatchObject({ ok: false, message: "Isolated DB rehearsal refused", events: [] });
   });
