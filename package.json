@@ -22,6 +22,7 @@
     "check:production:writes-stopped": "node scripts/check-production-writes-stopped.mjs",
     "check:startup-env": "node scripts/verify-invalid-startup.mjs",
     "validate:isolated:preflight": "node scripts/validate-isolated-preflight.mjs",
+    "rehearse:isolated:db": "node scripts/rehearse-isolated-db.mjs",
     "cleanup:quarantine": "node scripts/quarantine-numbered-copies.mjs",
     "backfill:application-identities": "node scripts/backfill-application-identities.mjs",
     "screenshots": "node scripts/screenshots.mjs",
