@@ -97,7 +97,7 @@ async function probe(input: Record<string, unknown>) {
   });
 }
 
-async function sourceProbe(kind: "missing" | "symlink" | "env" | "wrong-sha" | "dirty") {
+async function sourceProbe(kind: "missing" | "symlink" | "env" | "example" | "wrong-sha" | "dirty") {
   return temporary(async (directory) => {
     const source = join(directory, "source");
     const output = join(directory, "output.json");
@@ -115,6 +115,7 @@ async function sourceProbe(kind: "missing" | "symlink" | "env" | "wrong-sha" | "
       await symlink(target, join(source, "src/lib/applications/identity.ts"));
     }
     if (kind === "env") await writeFile(join(source, ".env.local"), "not-a-secret\n");
+    if (kind === "example") await writeFile(join(source, ".env.example"), "non-secret-template\n");
     await writeFile(harness, `
       import { writeFile } from "node:fs/promises";
       const { assertSource } = await import(process.argv[2]);
@@ -278,5 +279,10 @@ describe("isolated DB rehearsal", () => {
   it.each(["missing", "symlink", "env", "wrong-sha", "dirty"] as const)("refuses a %s source path before dependency installation", async (kind) => {
     const result = await sourceProbe(kind);
     expect(result).toMatchObject({ ok: false, message: "Isolated DB rehearsal refused", events: [] });
+  });
+
+  it("permits only the approved tracked dotenv example before dependency installation", async () => {
+    const result = await sourceProbe("example");
+    expect(result).toMatchObject({ ok: true, events: ["exec", "exec", "exec"] });
   });
 });

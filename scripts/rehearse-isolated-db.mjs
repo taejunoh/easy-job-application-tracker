@@ -38,6 +38,7 @@ const REQUIRED_PATHS = Object.freeze([
 const EXPECTED_MIGRATIONS = Object.freeze([
   "20260713000000_init", "20260813010000_application_identity", "20260813020000_extension_installations",
 ]);
+const APPROVED_DOTENV_EXAMPLE = ".env.example";
 const EXPECTED_IDENTITY_ROWS = Object.freeze([
   { id: "isr-0001-canonical", identityKey: "url-v1:1541d4212c992b23bd3f8169c924f603700a2859b187e6771b999021bff87aeb", canonicalUrl: "https://jobs.validation.example/roles/alpha", duplicateOfId: null, identityState: "canonical" },
   { id: "isr-0002-duplicate", identityKey: null, canonicalUrl: "https://jobs.validation.example/roles/alpha", duplicateOfId: "isr-0001-canonical", identityState: "legacy_duplicate" },
@@ -122,7 +123,14 @@ export async function assertSource(sourceRoot, git = execFile, exec = execFile) 
     if (info.isSymbolicLink() || (kind === "file" ? !info.isFile() : !info.isDirectory()) || !contained(canonicalRoot, canonical)) refuse();
   }
   const names = await readdir(canonicalRoot).catch(() => refuse());
-  if (names.some((name) => name.startsWith(".env"))) refuse();
+  for (const name of names.filter((entry) => entry.startsWith(".env"))) {
+    if (name !== APPROVED_DOTENV_EXAMPLE) refuse();
+    await git("git", ["-C", canonicalRoot, "cat-file", "-e", `${APPROVED_SHA}:${name}`]);
+    const actual = join(canonicalRoot, name);
+    const info = await lstat(actual).catch(() => refuse());
+    const canonical = await realpath(actual).catch(() => refuse());
+    if (info.isSymbolicLink() || !info.isFile() || !contained(canonicalRoot, canonical)) refuse();
+  }
   await exec(join(NODE_BIN, "npm"), ["ci", "--ignore-scripts"], { cwd: canonicalRoot, env: safeEnv(), stdio: "pipe" });
   await exec(join(NODE_BIN, "npm"), ["rebuild", "@prisma/engines", "--ignore-scripts=false"], { cwd: canonicalRoot, env: safeEnv(), stdio: "pipe" });
   await exec(join(NODE_BIN, "node"), [join(canonicalRoot, "node_modules/prisma/build/index.js"), "--version"], { cwd: canonicalRoot, env: safeEnv(), stdio: "pipe" });
