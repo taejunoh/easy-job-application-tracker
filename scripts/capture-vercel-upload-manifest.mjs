@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { lstat, readFile, realpath, writeFile } from "node:fs/promises";
+import { createServer } from "node:https";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -142,6 +143,28 @@ export async function captureUploadManifest({ sourceRoot: rootPath, expectedSha,
   const manifest = await manifestFromCapture({ capturePath: received, root, expectedSha });
   await writeFile(report, `${JSON.stringify(manifest)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" }).catch(() => { throw refused(); });
   return manifest;
+}
+
+/** Starts the intentionally narrow, local-only fake used by an operator capture. */
+export async function startLoopbackCaptureApi({ capturePath, keyPath, certPath, projectId, teamId, projectName }) {
+  if (![capturePath, keyPath, certPath].every(isAbsolute) || ![projectId, teamId, projectName].every((value) => typeof value === "string" && value.length > 0)) throw refused();
+  const [key, cert] = await Promise.all([readFile(keyPath), readFile(certPath)]).catch(() => { throw refused(); });
+  const server = createServer({ key, cert }, async (request, response) => {
+    let body = ""; for await (const chunk of request) body += chunk;
+    const pathname = new URL(request.url ?? "/", "https://127.0.0.1").pathname;
+    if (request.method === "POST" && pathname === "/v13/deployments") {
+      await writeFile(capturePath, body, { encoding: "utf8", mode: 0o600, flag: "wx" }).catch(() => undefined);
+      response.writeHead(500, { "content-type": "application/json" }); response.end(JSON.stringify({ error: { code: "capture_sentinel", message: "capture sentinel" } })); return;
+    }
+    const payload = pathname === "/v2/user" ? { user: { id: "local-capture", username: "local-capture" } }
+      : pathname === `/teams/${teamId}` ? { id: teamId, slug: teamId }
+      : pathname === `/v9/projects/${projectId}` || pathname === `/v9/projects/${projectName}` ? { id: projectId, name: projectName, accountId: teamId, latestDeployments: [] }
+      : undefined;
+    response.writeHead(payload ? 200 : 500, { "content-type": "application/json" }); response.end(JSON.stringify(payload ?? { error: { code: "unexpected", message: "unexpected local capture request" } }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  return Object.freeze({ url: `https://127.0.0.1:${address.port}`, close: () => new Promise((resolve) => server.close(resolve)) });
 }
 
 function parseArgs(args) {

@@ -36,7 +36,7 @@ function responses({ tree = validTree(), deployment = validDeployment(), content
 }
 
 function validDeployment() {
-  return { id: "dpl_fixture", projectId: "prj_fixture", ownerId: "team_fixture", meta: { githubCommitSha: sha }, gitMetadata: {} };
+  return { id: "dpl_fixture", target: null, readyState: "READY", url: "fixture.vercel.app", projectId: "prj_fixture", ownerId: "team_fixture", project: { id: "prj_fixture" }, team: { id: "team_fixture" }, meta: { githubCommitSha: sha }, gitMetadata: {} };
 }
 
 function validTree() {
@@ -48,7 +48,7 @@ function validTree() {
 
 async function verify(directory, options = {}) {
   const paths = await input(directory);
-  return verifyDeploymentBytes({ sourceRoot: directory, expectedSha: sha, privateDir: paths.privateDir, manifestPath: paths.manifestPath, reportPath: paths.reportPath, deploymentId: "dpl_fixture", projectId: "prj_fixture", teamId: "team_fixture", base64Pointer: "/payload/body", request: responses(options) });
+  return verifyDeploymentBytes({ sourceRoot: directory, expectedSha: sha, privateDir: paths.privateDir, manifestPath: paths.manifestPath, reportPath: paths.reportPath, deploymentId: "dpl_fixture", projectId: "prj_fixture", teamId: "team_fixture", deploymentUrl: "https://fixture.vercel.app", base64Pointer: "/payload/body", request: responses(options) });
 }
 
 test("accepts a complete nested provider tree only when every decoded byte matches the captured upload manifest", async () => {
@@ -60,6 +60,17 @@ test("accepts a complete nested provider tree only when every decoded byte match
     assert.equal(report.sourceSha, sha);
     assert.equal(JSON.stringify(report).includes("aGVsbG8="), false);
     assert.equal((await (await import("node:fs/promises")).lstat(join(directory, "private", "report.json"))).mode & 0o777, 0o600);
+  });
+});
+
+test("refuses deployment responses outside the exact Ready Preview project/team URL contract", async () => {
+  const cases = [
+    ["wrong id", { id: "dpl_other" }], ["production target", { target: "production" }], ["staging target", { target: "staging" }], ["unknown state", { readyState: "BUILDING" }],
+    ["wrong nested project", { project: { id: "prj_other" } }], ["wrong nested team", { team: { id: "team_other" } }], ["wrong URL", { url: "other.vercel.app" }],
+    ["inconsistent top-level project", { projectId: "prj_other" }], ["inconsistent top-level owner", { ownerId: "team_other" }],
+  ];
+  for (const [name, change] of cases) await temporary(async (directory) => {
+    await assert.rejects(verify(directory, { deployment: { ...validDeployment(), ...change } }), /refused/u, name);
   });
 });
 

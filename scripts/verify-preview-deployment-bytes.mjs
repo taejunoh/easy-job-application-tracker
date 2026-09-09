@@ -60,14 +60,14 @@ function flatten(node, prefix = "", paths = new Set(), uids = new Set()) {
   if (node.type !== "file" || typeof node.uid !== "string" || node.uid.length === 0 || !Number.isInteger(node.mode) || !prefix || paths.has(prefix) || uids.has(node.uid)) throw refused();
   paths.add(prefix); uids.add(node.uid); return [{ path: prefix, uid: node.uid, apiMode: node.mode }];
 }
-function metadata(deployment, expectedSha, projectId, teamId) {
-  if (!object(deployment) || deployment.id === undefined || deployment.projectId !== projectId || deployment.ownerId !== teamId) throw refused();
+function metadata(deployment, expectedSha, deploymentId, projectId, teamId, deploymentUrl) {
+  if (!object(deployment) || deployment.id !== deploymentId || deployment.target !== null || deployment.readyState !== "READY" || typeof deployment.url !== "string" || `https://${deployment.url}` !== deploymentUrl || !object(deployment.project) || deployment.project.id !== projectId || !object(deployment.team) || deployment.team.id !== teamId || (deployment.projectId !== undefined && deployment.projectId !== projectId) || (deployment.ownerId !== undefined && deployment.ownerId !== teamId)) throw refused();
   const candidates = [deployment.meta?.githubCommitSha, deployment.gitMetadata?.commitSha]; let present = 0;
   for (const value of candidates) { if (value !== undefined && value !== "") { present += 1; if (typeof value !== "string" || !SHA.test(value) || value !== expectedSha) throw refused(); } }
   if (!present) throw refused();
 }
 async function liveRequest({ endpoint, teamId }) {
-  const { stdout } = await execFile("vercel", ["--scope", teamId, "api", endpoint, "--raw"], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", CI: "1", DO_NOT_TRACK: "1", VERCEL_TELEMETRY_DISABLED: "1" } }).catch(() => { throw refused(); });
+  const { stdout } = await execFile("vercel", ["--api", "https://api.vercel.com", "--scope", teamId, "api", endpoint, "--method", "GET", "--raw"], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", CI: "1", DO_NOT_TRACK: "1", VERCEL_TELEMETRY_DISABLED: "1", NODE_TLS_REJECT_UNAUTHORIZED: "1" } }).catch(() => { throw refused(); });
   try { return JSON.parse(stdout); } catch { throw refused(); }
 }
 async function liveRuntimeAndSource(sourceRoot, expectedSha) {
@@ -81,15 +81,15 @@ async function liveRuntimeAndSource(sourceRoot, expectedSha) {
   } catch { throw refused(); }
   if (head.trim() !== expectedSha || status !== "") throw refused();
 }
-export async function verifyDeploymentBytes({ sourceRoot, expectedSha, privateDir: privatePath, manifestPath, reportPath, deploymentId, projectId, teamId, base64Pointer, request }) {
-  if (!isAbsolute(sourceRoot) || !SHA.test(expectedSha) || !ID.test(deploymentId) || !ID.test(projectId) || !ID.test(teamId) || process.execPath !== REQUIRED_NODE) throw refused();
+export async function verifyDeploymentBytes({ sourceRoot, expectedSha, privateDir: privatePath, manifestPath, reportPath, deploymentId, projectId, teamId, deploymentUrl, base64Pointer, request }) {
+  if (!isAbsolute(sourceRoot) || !SHA.test(expectedSha) || !ID.test(deploymentId) || !ID.test(projectId) || !ID.test(teamId) || typeof deploymentUrl !== "string" || !/^https:\/\/[a-z0-9-]+\.vercel\.app$/u.test(deploymentUrl) || process.execPath !== REQUIRED_NODE) throw refused();
   const source = await lstat(sourceRoot).catch(() => { throw refused(); }); if (!source.isDirectory() || source.isSymbolicLink()) throw refused();
   if (!request) await liveRuntimeAndSource(sourceRoot, expectedSha);
   const directory = await privateDir(privatePath); const manifestFile = await privateFile(manifestPath, directory, true); const report = await privateFile(reportPath, directory, false);
   const files = parseManifest(JSON.parse(await readFile(manifestFile, "utf8")), expectedSha);
   const api = request ?? ((endpoint) => liveRequest({ endpoint, teamId }));
-  const deployment = await api(`/v13/deployments/${deploymentId}`); metadata(deployment, expectedSha, projectId, teamId);
-  const tree = await api(`/v6/deployments/${deploymentId}/files`); const providerFiles = flatten(tree);
+  const deployment = await api(`/v13/deployments/${deploymentId}`); metadata(deployment, expectedSha, deploymentId, projectId, teamId, deploymentUrl);
+  const tree = await api(`/v6/deployments/${deploymentId}/files`); const providerFiles = flatten(tree).sort((a, b) => a.path.localeCompare(b.path));
   if (providerFiles.length !== files.length || providerFiles.some((file, index) => file.path !== files[index].path)) throw refused();
   const verified = [];
   for (let index = 0; index < providerFiles.length; index += 1) {
@@ -100,5 +100,5 @@ export async function verifyDeploymentBytes({ sourceRoot, expectedSha, privateDi
   const result = { schemaVersion: 1, kind: "jobtracker-preview-deployment-byte-report", deploymentId, projectId, teamId, sourceSha: expectedSha, apiMode: "vercel-cli-read-only", files: verified };
   await writeFile(report, `${JSON.stringify(result)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" }).catch(() => { throw refused(); }); return result;
 }
-function args(values) { if (values.length !== 18) throw refused(); const flags = ["--source-root", "--expected-sha", "--private-dir", "--manifest", "--report", "--deployment-id", "--project-id", "--team-id", "--base64-pointer"]; const out = {}; for (let i = 0; i < values.length; i += 2) { if (values[i] !== flags.find((flag) => flag === values[i]) || Object.hasOwn(out, values[i]) || !values[i + 1] || values[i + 1].startsWith("--")) throw refused(); out[values[i]] = values[i + 1]; } return { sourceRoot: out["--source-root"], expectedSha: out["--expected-sha"], privateDir: out["--private-dir"], manifestPath: out["--manifest"], reportPath: out["--report"], deploymentId: out["--deployment-id"], projectId: out["--project-id"], teamId: out["--team-id"], base64Pointer: out["--base64-pointer"] }; }
+function args(values) { if (values.length !== 20) throw refused(); const flags = ["--source-root", "--expected-sha", "--private-dir", "--manifest", "--report", "--deployment-id", "--project-id", "--team-id", "--deployment-url", "--base64-pointer"]; const out = {}; for (let i = 0; i < values.length; i += 2) { if (values[i] !== flags.find((flag) => flag === values[i]) || Object.hasOwn(out, values[i]) || !values[i + 1] || values[i + 1].startsWith("--")) throw refused(); out[values[i]] = values[i + 1]; } return { sourceRoot: out["--source-root"], expectedSha: out["--expected-sha"], privateDir: out["--private-dir"], manifestPath: out["--manifest"], reportPath: out["--report"], deploymentId: out["--deployment-id"], projectId: out["--project-id"], teamId: out["--team-id"], deploymentUrl: out["--deployment-url"], base64Pointer: out["--base64-pointer"] }; }
 if (import.meta.url === new URL(process.argv[1], "file:").href) verifyDeploymentBytes(args(process.argv.slice(2))).then(() => process.stdout.write("Preview deployment bytes verified.\n")).catch(() => { process.stderr.write("Preview deployment byte verifier refused.\n"); process.exitCode = 1; });
