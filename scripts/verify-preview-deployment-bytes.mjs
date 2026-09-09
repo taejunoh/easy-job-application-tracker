@@ -62,7 +62,7 @@ function flatten(node, prefix = "", paths = new Set(), uids = new Set()) {
 }
 function metadata(deployment, expectedSha, deploymentId, projectId, teamId, deploymentUrl) {
   if (!object(deployment) || deployment.id !== deploymentId || deployment.target !== null || deployment.readyState !== "READY" || typeof deployment.url !== "string" || `https://${deployment.url}` !== deploymentUrl || !object(deployment.project) || deployment.project.id !== projectId || !object(deployment.team) || deployment.team.id !== teamId || (deployment.projectId !== undefined && deployment.projectId !== projectId) || (deployment.ownerId !== undefined && deployment.ownerId !== teamId)) throw refused();
-  const candidates = [deployment.meta?.githubCommitSha, deployment.gitMetadata?.commitSha]; let present = 0;
+  const candidates = [deployment.meta?.gitCommitSha, deployment.meta?.githubCommitSha, deployment.gitMetadata?.commitSha]; let present = 0;
   for (const value of candidates) { if (value !== undefined && value !== "") { present += 1; if (typeof value !== "string" || !SHA.test(value) || value !== expectedSha) throw refused(); } }
   if (!present) throw refused();
 }

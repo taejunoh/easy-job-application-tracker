@@ -36,7 +36,7 @@ function responses({ tree = validTree(), deployment = validDeployment(), content
 }
 
 function validDeployment() {
-  return { id: "dpl_fixture", target: null, readyState: "READY", url: "fixture.vercel.app", projectId: "prj_fixture", ownerId: "team_fixture", project: { id: "prj_fixture" }, team: { id: "team_fixture" }, meta: { githubCommitSha: sha }, gitMetadata: {} };
+  return { id: "dpl_fixture", target: null, readyState: "READY", url: "fixture.vercel.app", projectId: "prj_fixture", ownerId: "team_fixture", project: { id: "prj_fixture" }, team: { id: "team_fixture" }, meta: { gitCommitSha: sha }, gitMetadata: {} };
 }
 
 function validTree() {
@@ -85,6 +85,7 @@ test("refuses incomplete, extra, duplicate, unsupported, invalid-base64, mismatc
     ["unexpected content envelope", { contents: { u1: { data: { body: Buffer.from("hello").toString("base64") } }, u2: { payload: { body: Buffer.from("world").toString("base64") } } } }],
     ["missing all SHA metadata", { deployment: { ...validDeployment(), meta: {}, gitMetadata: {} } }],
     ["conflicting populated SHA metadata", { deployment: { ...validDeployment(), gitMetadata: { commitSha: "f".repeat(40) } } }],
+    ["malformed native SHA metadata", { deployment: { ...validDeployment(), meta: { gitCommitSha: "not-a-sha" } } }],
   ];
   for (const [name, options] of cases) {
     await temporary(async (directory) => {
