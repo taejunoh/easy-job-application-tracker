@@ -10,6 +10,7 @@ const productionSource = {
     "https://jobs.example.com,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
   APPLICATION_IDENTITY_WRITES_ENABLED: "1",
   APPLICATION_WRITES_ENABLED: "1",
+  VALIDATION_MANUAL_ENTRY_ENABLED: "1",
 };
 
 describe("parseServerEnv", () => {
@@ -140,6 +141,31 @@ describe("parseServerEnv", () => {
         ...productionSource,
         APPLICATION_WRITES_ENABLED: value,
       }, "production")).toThrow("APPLICATION_WRITES_ENABLED");
+    }
+  });
+
+  it("defaults manual entry off and accepts only exact binary values", () => {
+    const disabled = parseServerEnv({
+      ...productionSource,
+      VALIDATION_MANUAL_ENTRY_ENABLED: undefined,
+    }, "production");
+    const explicitDisabled = parseServerEnv({
+      ...productionSource,
+      VALIDATION_MANUAL_ENTRY_ENABLED: "0",
+    }, "production");
+    const enabled = parseServerEnv({
+      ...productionSource,
+      VALIDATION_MANUAL_ENTRY_ENABLED: "1",
+    }, "production");
+
+    expect(disabled.validationManualEntryEnabled).toBe(false);
+    expect(explicitDisabled.validationManualEntryEnabled).toBe(false);
+    expect(enabled.validationManualEntryEnabled).toBe(true);
+    for (const value of ["true", "yes", " 1 ", "2", ""]) {
+      expect(() => parseServerEnv({
+        ...productionSource,
+        VALIDATION_MANUAL_ENTRY_ENABLED: value,
+      }, "production")).toThrow("VALIDATION_MANUAL_ENTRY_ENABLED");
     }
   });
 
