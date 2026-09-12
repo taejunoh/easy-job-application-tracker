@@ -12,6 +12,7 @@
  *   corsAllowedOrigins: readonly string[],
  *   applicationIdentityWritesEnabled: boolean,
  *   applicationWritesEnabled: boolean,
+ *   validationManualEntryEnabled: boolean,
  * }>} ServerEnv
  */
 
@@ -69,6 +70,10 @@ function parseServerEnv(source, nodeEnv) {
     source,
     "APPLICATION_WRITES_ENABLED",
   );
+  const validationManualEntryEnabled = parseOptionalBinaryFlag(
+    source,
+    "VALIDATION_MANUAL_ENTRY_ENABLED",
+  );
 
   return Object.freeze({
     databaseUrl,
@@ -79,6 +84,7 @@ function parseServerEnv(source, nodeEnv) {
     corsAllowedOrigins,
     applicationIdentityWritesEnabled,
     applicationWritesEnabled,
+    validationManualEntryEnabled,
   });
 }
 

@@ -5,7 +5,15 @@ import { usePathname } from "next/navigation";
 import Sidebar from "@/components/Sidebar";
 import UrlInputWrapper from "@/components/UrlInputWrapper";
 
-export default function AppShell({ children }: { children: React.ReactNode }) {
+interface AppShellProps {
+  children?: React.ReactNode;
+  manualEntryEnabled?: boolean;
+}
+
+export default function AppShell({
+  children,
+  manualEntryEnabled = false,
+}: AppShellProps) {
   const pathname = usePathname();
 
   if (pathname === "/connect") {
@@ -17,7 +25,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <Sidebar />
       <main className="flex-1 p-6">
         <div className="mb-6">
-          <UrlInputWrapper />
+          <UrlInputWrapper manualEntryEnabled={manualEntryEnabled} />
         </div>
         {children}
       </main>

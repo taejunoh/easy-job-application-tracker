@@ -16,7 +16,8 @@ jest.mock("@/components/Sidebar", () => ({
 
 jest.mock("@/components/UrlInputWrapper", () => ({
   __esModule: true,
-  default: () => "URL_INPUT_SENTINEL",
+  default: ({ manualEntryEnabled = false }: { manualEntryEnabled?: boolean }) =>
+    manualEntryEnabled ? "URL_INPUT_MANUAL_ENABLED" : "URL_INPUT_SENTINEL",
 }));
 
 describe("AppShell", () => {
@@ -55,6 +56,25 @@ describe("AppShell", () => {
     expect(markup).toContain('<main class="flex-1 p-6">');
     expect(markup).toContain('<section id="page-content">Dashboard</section>');
     expect(countMainLandmarks(markup)).toBe(1);
+  });
+
+  it("defaults manual entry off and forwards the enabled prop", () => {
+    mockPathname = "/";
+
+    const disabledMarkup = renderToStaticMarkup(
+      createElement(AppShell, null, createElement("section", null, "Dashboard")),
+    );
+    const enabledMarkup = renderToStaticMarkup(
+      createElement(
+        AppShell,
+        { manualEntryEnabled: true },
+        createElement("section", null, "Dashboard"),
+      ),
+    );
+
+    expect(disabledMarkup).toContain("URL_INPUT_SENTINEL");
+    expect(disabledMarkup).not.toContain("URL_INPUT_MANUAL_ENABLED");
+    expect(enabledMarkup).toContain("URL_INPUT_MANUAL_ENABLED");
   });
 });
 
