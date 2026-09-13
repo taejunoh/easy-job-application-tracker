@@ -84,51 +84,67 @@ export default function ApplicationsPage() {
   }
 
   return (
-    <div aria-busy={loading}>
-      <h1 className="text-xl font-semibold mb-6">Applications</h1>
+    <div className="applications-page" aria-busy={loading}>
+      <header className="page-header">
+        <p className="eyebrow">Your opportunity log</p>
+        <h1 className="page-title">Applications</h1>
+        <p className="page-subtitle">Keep every application, conversation, and next step in view.</p>
+      </header>
 
-      <div className="flex gap-3 mb-4">
-        <input
-          type="text"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search by title or company..."
-          className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
-        />
-        <select
-          value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}
-          className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300 focus:outline-none"
-        >
-          {STATUSES.map((s) => (
-            <option key={s} value={s}>
-              {s === "All" ? "All Statuses" : s}
-            </option>
-          ))}
-        </select>
-        <select
-          value={jobTypeFilter}
-          onChange={(e) => setJobTypeFilter(e.target.value)}
-          className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300 focus:outline-none"
-        >
-          {JOB_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t === "All" ? "All Types" : t}
-            </option>
-          ))}
-        </select>
+      <div className="applications-toolbar card">
+        <label className="filter-field filter-search">
+          <span className="input-label">Search applications</span>
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by title or company"
+            className="field"
+          />
+        </label>
+        <label className="filter-field">
+          <span className="input-label">Status</span>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="field">
+            {STATUSES.map((s) => (
+              <option key={s} value={s}>
+                {s === "All" ? "All statuses" : s}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="filter-field">
+          <span className="input-label">Job type</span>
+          <select value={jobTypeFilter} onChange={(e) => setJobTypeFilter(e.target.value)} className="field">
+            {JOB_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {t === "All" ? "All types" : t}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
 
       {error && (
-        <div role="alert" className="mb-4 text-sm text-red-400">
+        <div role="alert" className="inline-alert mb-4">
           {error}
         </div>
       )}
+
+      {loading && <p className="loading-state" role="status">Loading applications…</p>}
 
       <ApplicationTable
         applications={applications}
         onStatusChange={handleStatusChange}
       />
+      <style>{`
+        .applications-toolbar { align-items: end; display: grid; gap: 0.8rem; grid-template-columns: minmax(0, 1.6fr) repeat(2, minmax(9rem, 0.7fr)); margin-bottom: 1rem; padding: 0.9rem 1rem 1rem; }
+        .applications-toolbar .field { background: var(--surface); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); padding: 0.55rem 0.7rem; width: 100%; }
+        .applications-toolbar .field::placeholder { color: var(--muted); opacity: 1; }
+        .applications-toolbar .field:focus-visible { border-color: var(--primary); outline: 3px solid var(--primary); outline-offset: 2px; }
+        @media (max-width: 768px) {
+          .applications-toolbar { grid-template-columns: 1fr; }
+        }
+      `}</style>
     </div>
   );
 }
