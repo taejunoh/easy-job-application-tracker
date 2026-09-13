@@ -8,6 +8,15 @@
 
 **Tech Stack:** Next.js 16, React 19, TypeScript, Tailwind CSS 4, Jest + Testing Library, existing Playwright fixture data (inspection only), CUA browser for final visual review.
 
+## Completion record — 2026-09-13
+
+- Tasks 1–3 are implemented and passed specification and code-quality review. Local commits: `c19ea5d`, `3846e82`, `b7cf38f`.
+- Full regression: 90 suites / 2,669 tests passed; 6 suites / 36 tests skipped. Latest UI and Connect rerun: 12 suites / 59 tests passed, including the new detail tests and final corrections.
+- `npm run typecheck` and `git diff --check` passed. `npm run lint` passed with one pre-existing unused-import warning in ignored local preview tooling.
+- CUA verified synthetic local previews at 1440, 1024, 768, and 375px, including mobile menu Escape, draft retention, combined filters, status refresh, detail save/confirmation/cancel, and standalone Connect rendering/error feedback.
+- Implementation refinement: the Applications table becomes cards through scoped responsive CSS on one semantic data tree, avoiding duplicated interactive controls. All six fields remain present.
+- No API, authentication, environment, database, provider, or feature-gate changes; no production writes, push, or deployment.
+
 ---
 
 ## Fixed boundaries
