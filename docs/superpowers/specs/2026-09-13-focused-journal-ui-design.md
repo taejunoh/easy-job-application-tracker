@@ -1,6 +1,6 @@
 # Focused Journal UI Design
 
-상태: 하이브리드 방향 승인 완료. 이 상세 명세는 사용자 검토 대기이며 앱 구현은 아직 시작하지 않았다.
+상태: 노란 좌측 메뉴 accent를 제거하는 조건으로 하이브리드 상세 명세 승인 완료. 승인된 UI 구현 진행 중.
 
 ## 목적과 범위
 
@@ -25,9 +25,9 @@
 
 ### 공통 AppShell
 
-데스크톱에서는 좌측 탐색과 콘텐츠 작업대의 2열 구조를 사용한다. 탐색은 로고 `JobTracker`와 `Dashboard`, `Applications`, `Settings`를 유지하되, 화면을 고정 폭으로 계속 점유하는 이전 sidebar가 아니라 스크롤 문서 안의 안정적인 좁은 rail로 만든다. 현재 위치는 deep green의 채워진 배경과 텍스트/아이콘 상태로 함께 표시한다.
+데스크톱에서는 좌측 탐색과 콘텐츠 작업대의 2열 구조를 사용한다. 탐색은 로고 `JobTracker`와 `Dashboard`, `Applications`, `Settings`를 유지하되, 화면을 고정 폭으로 계속 점유하는 이전 sidebar가 아니라 스크롤 문서 안의 안정적인 좁은 rail로 만든다. 현재 위치는 deep green의 채워진 배경과 텍스트/아이콘 상태로 함께 표시하며, active 메뉴에는 별도의 색상 좌측 stripe를 사용하지 않는다. `aria-current`와 키보드 `focus-visible` 상태는 유지한다.
 
-콘텐츠 영역의 상단에는 페이지 제목과 필요한 경우 페이지별 보조 행동을 둔다. 전역 `UrlInputWrapper`는 모든 페이지의 무맥락 입력줄이 아니라 Dashboard의 기본 CTA 영역으로 이동한다. Applications와 detail에서 새 지원서를 추가해야 할 때는 같은 입력 컴포넌트를 여는 명시적 `Add application` 버튼/패널을 사용한다. 이는 URL, Paste Text, Manual의 현재 상태·요청·검증을 재사용할 뿐, 새 흐름을 만들지 않는다.
+콘텐츠 영역의 상단에는 페이지 제목과 필요한 경우 페이지별 보조 행동을 둔다. 전역 `UrlInputWrapper` 인스턴스는 `AppShell` 안에 하나만 항상 mount한 채 유지하되, Dashboard에서는 기본 CTA card로 펼쳐 보이고 Applications·detail·Settings에서는 같은 인스턴스를 여는 명시적 `Add application` 버튼/패널로 보인다. 패널을 닫거나 이들 페이지 사이를 이동해도 입력·추출 확인 상태를 삭제하지 않는다. 이는 URL, Paste Text, Manual의 현재 상태·요청·검증을 재사용할 뿐, 새 흐름을 만들지 않는다.
 
 모바일에서는 sidebar를 고정하지 않는다. 메뉴 버튼으로 문서 흐름 안의 접힌 navigation을 펼친다. 버튼은 `aria-expanded`와 `aria-controls`를 가지며, 현재 페이지 표시·Esc로 닫기·닫을 때 trigger로 포커스 복귀를 제공한다. 비모달 구조이므로 focus trap은 사용하지 않는다. 콘텐츠는 한 열이다.
 
