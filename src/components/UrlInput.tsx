@@ -284,7 +284,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
         <form id="url-panel" role="tabpanel" aria-labelledby="url-tab" onSubmit={handleExtractUrl} className="flex items-center gap-2">
           <label className="inline-field-label" htmlFor="url-input">
             <span className="input-label">Job URL</span>
-            <input id="url-input" type="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="Paste job URL here..." className="field flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500" disabled={loading} />
+            <input id="url-input" type="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="Paste job URL here..." className="field w-full min-w-0 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500" disabled={loading} />
           </label>
           <button
             type="submit"
@@ -306,7 +306,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           <div className="flex items-center gap-2">
             <label className="inline-field-label" htmlFor="text-url-input">
               <span className="input-label">Job URL</span>
-              <input id="text-url-input" type="url" value={textUrl} onChange={(e) => setTextUrl(e.target.value)} placeholder="Job URL (required)" className="field flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500" disabled={loading} />
+              <input id="text-url-input" type="url" value={textUrl} onChange={(e) => setTextUrl(e.target.value)} placeholder="Job URL (required)" className="field w-full min-w-0 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500" disabled={loading} />
             </label>
             <button
               type="submit"
