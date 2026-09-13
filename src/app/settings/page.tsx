@@ -93,20 +93,24 @@ export default function SettingsPage() {
   }
 
   return (
-    <div>
-      <h1 className="text-xl font-semibold mb-6">Settings</h1>
+    <div className="settings-page">
+      <header className="page-header">
+        <p className="eyebrow">Workspace preferences</p>
+        <h1 className="page-title">Settings</h1>
+      </header>
 
-      <div className="bg-gray-900 rounded-lg p-6 max-w-lg">
-        <h2 className="text-sm font-medium text-gray-400 uppercase mb-4">
+      <div className="settings-card card">
+        <h2 className="panel-heading">
           LLM Provider
         </h2>
 
-        <div className="mb-4">
-          <label className="text-xs text-gray-500 block mb-1">Provider</label>
+        <div className="settings-field">
+          <label htmlFor="settings-provider" className="input-label">Provider</label>
           <select
+            id="settings-provider"
             value={provider}
             onChange={(e) => setProvider(e.target.value)}
-            className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300 w-full focus:outline-none"
+            className="field"
           >
             {PROVIDERS.map((p) => (
               <option key={p.value} value={p.value}>
@@ -116,21 +120,22 @@ export default function SettingsPage() {
           </select>
         </div>
 
-        <div className="mb-4">
-          <label className="text-xs text-gray-500 block mb-1">
+        <div className="settings-field">
+          <label htmlFor="settings-api-key" className="input-label">
             API Key {hasExistingKey && "(key saved - enter new to replace)"}
           </label>
-          <div className="flex gap-2">
+          <div className="settings-key-row">
             <input
+              id="settings-api-key"
               type={showKey ? "text" : "password"}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder={hasExistingKey ? "Enter new key to replace" : "Enter your API key"}
-              className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              className="field"
             />
             <button
               onClick={() => setShowKey(!showKey)}
-              className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-400 hover:text-gray-200"
+              className="secondary-button settings-visibility-button"
             >
               {showKey ? "Hide" : "Show"}
             </button>
@@ -139,57 +144,59 @@ export default function SettingsPage() {
 
         {/* Current status */}
         {hasExistingKey && (
-          <div className="mb-4 bg-gray-800 border border-gray-700 rounded p-3">
-            <div className="text-xs text-gray-500 uppercase mb-1">Current Configuration</div>
-            <div className="text-sm text-gray-200">
+          <div className="settings-status">
+            <div className="input-label">Current Configuration</div>
+            <div className="settings-status-value">
               {PROVIDERS.find((p) => p.value === provider)?.label || provider}
-              <span className="ml-2 text-green-400 text-xs">-- API key configured</span>
+              <span className="status-ok">-- API key configured</span>
             </div>
           </div>
         )}
 
         <hr className="border-gray-700 my-6" />
 
-        <h2 className="text-sm font-medium text-gray-400 uppercase mb-4">
+        <h2 className="panel-heading">
           Profile URLs
         </h2>
-        <p className="text-xs text-gray-500 mb-3">
+        <p className="panel-copy">
           Used by the extension to auto-fill application forms.
         </p>
 
-        <div className="mb-4">
-          <label className="text-xs text-gray-500 block mb-1">LinkedIn Profile</label>
+        <div className="settings-field">
+          <label htmlFor="settings-linkedin" className="input-label">LinkedIn Profile</label>
           <input
+            id="settings-linkedin"
             type="url"
             value={linkedinUrl}
             onChange={(e) => setLinkedinUrl(e.target.value)}
             placeholder="https://linkedin.com/in/yourprofile"
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+            className="field"
           />
         </div>
 
-        <div className="mb-4">
-          <label className="text-xs text-gray-500 block mb-1">GitHub Profile</label>
+        <div className="settings-field">
+          <label htmlFor="settings-github" className="input-label">GitHub Profile</label>
           <input
+            id="settings-github"
             type="url"
             value={githubUrl}
             onChange={(e) => setGithubUrl(e.target.value)}
             placeholder="https://github.com/yourusername"
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+            className="field"
           />
         </div>
 
         <hr className="border-gray-700 my-6" />
 
-        <h2 className="text-sm font-medium text-gray-400 uppercase mb-4">
+        <h2 className="panel-heading">
           Resume
         </h2>
-        <p className="text-xs text-gray-500 mb-3">
+        <p className="panel-copy">
           Upload your resume file or paste text to compare keywords against job descriptions.
         </p>
 
-        <div className="mb-3">
-          <label className="inline-flex items-center gap-2 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 hover:bg-gray-700 cursor-pointer">
+        <div className="settings-field">
+          <label className="upload-control">
             <span>{uploading ? "Parsing..." : "Upload Resume (.pdf, .txt)"}</span>
             <input
               type="file"
@@ -223,28 +230,30 @@ export default function SettingsPage() {
           </label>
         </div>
 
-        <div className="mb-4">
+        <div className="settings-field">
+          <label htmlFor="settings-resume" className="sr-only">Resume text</label>
           <textarea
+            id="settings-resume"
             value={resumeText}
             onChange={(e) => setResumeText(e.target.value)}
             placeholder="Or paste your resume text here..."
             rows={10}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500 resize-y"
+            className="field resume-textarea"
           />
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="settings-actions">
           <button
             onClick={handleSave}
             disabled={saving}
-            className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50"
+            className="primary-button"
           >
             {saving ? "Saving..." : "Save Settings"}
           </button>
           <button
             onClick={handleTest}
             disabled={testing || !hasExistingKey}
-            className="px-4 py-2 bg-gray-700 text-gray-300 text-sm rounded hover:bg-gray-600 disabled:opacity-50"
+            className="secondary-button"
           >
             {testing ? "Testing..." : "Test Connection"}
           </button>
@@ -260,9 +269,28 @@ export default function SettingsPage() {
         )}
       </div>
       <ExtensionInstallations api={api} />
+      <style>{settingsStyles}</style>
     </div>
   );
 }
+
+const settingsStyles = `
+.settings-card { max-width: 46rem; padding: clamp(1rem, 3vw, 1.6rem); }
+.settings-field { margin-top: 1rem; min-width: 0; }
+.settings-key-row { align-items: stretch; display: flex; gap: 0.5rem; min-width: 0; }
+.settings-key-row .field { flex: 1 1 auto; min-width: 0; }
+.settings-card > .panel-heading:not(:first-child) { border-top: 1px solid var(--border); margin-top: 1.5rem; padding-top: 1.5rem; }
+.settings-status { background: #f2f5f0; border: 1px solid var(--border); border-radius: 0.5rem; margin-top: 1rem; padding: 0.8rem; }
+.settings-status-value { color: var(--text); font-size: 0.9rem; }
+.status-ok { color: #245e3a; font-size: 0.8rem; margin-left: 0.5rem; }
+.settings-card .field { background: var(--surface); color: var(--text); }
+.settings-card .field::placeholder { color: var(--muted); opacity: 1; }
+.settings-card .secondary-button { background: var(--surface); border: 1px solid var(--border); color: var(--text); min-height: 44px; min-width: 44px; }
+.settings-visibility-button { flex: 0 0 44px; padding-left: 0.25rem; padding-right: 0.25rem; width: 44px; }
+.settings-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 1rem; }
+.upload-control { align-items: center; background: #eef4ef; border: 1px solid #b9cec3; border-radius: 0.5rem; color: var(--primary); cursor: pointer; display: inline-flex; font-size: 0.85rem; font-weight: 700; min-height: 44px; padding: 0.6rem 0.8rem; }
+.resume-textarea { line-height: 1.5; resize: vertical; }
+`;
 
 interface SettingsResponse {
   llmProvider: string;

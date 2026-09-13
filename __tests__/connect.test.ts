@@ -1,5 +1,8 @@
+/** @jest-environment jsdom */
+
 import { createElement } from "react";
-import { renderToStaticMarkup } from "react-dom/server";
+import { fireEvent, render, screen } from "@testing-library/react";
+import "@testing-library/jest-dom";
 
 import ConnectPage, {
   connectDestination,
@@ -14,13 +17,32 @@ jest.mock("next/navigation", () => ({
   useRouter: () => ({ replace: jest.fn(), refresh: jest.fn() }),
 }));
 
+class TestResponse {
+  readonly ok: boolean;
+  constructor(readonly body: unknown, readonly status = 200) {
+    this.ok = status >= 200 && status < 300;
+  }
+  async json() { return this.body; }
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new TestResponse(body, status) as unknown as Response;
+}
+
 describe("connectWithAccessToken", () => {
-  beforeEach(() => {
-    resetClientApiSessionRedirect();
-  });
+beforeEach(() => {
+  resetClientApiSessionRedirect();
+  if (!globalThis.fetch) {
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      writable: true,
+      value: jest.fn(),
+    });
+  }
+});
 
   it("posts the token only in same-origin JSON without client persistence", async () => {
-    const response = Response.json({ authenticated: true });
+    const response = jsonResponse({ authenticated: true });
     const fetchMock = jest
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(response);
@@ -42,7 +64,7 @@ describe("connectWithAccessToken", () => {
     const navigate = jest.fn();
     const expiredFetch = jest.fn() as jest.MockedFunction<typeof fetch>;
     expiredFetch.mockResolvedValue(
-      Response.json({ error: "Authentication required" }, { status: 401 }),
+      jsonResponse({ error: "Authentication required" }, 401),
     );
     const api = createClientApi(navigate, {
       fetchImpl: expiredFetch,
@@ -52,7 +74,7 @@ describe("connectWithAccessToken", () => {
     await expect(api("/api/settings")).rejects.toMatchObject({ status: 401 });
     jest
       .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(Response.json({ authenticated: true }));
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true }));
     await connectWithAccessToken("rotated-token");
     await expect(api("/api/settings")).rejects.toMatchObject({ status: 401 });
 
@@ -81,14 +103,30 @@ describe("connectDestination", () => {
 });
 
 describe("ConnectPage accessibility", () => {
-  it("uses one live-region role and AA-oriented muted text classes", () => {
-    const markup = renderToStaticMarkup(createElement(ConnectPage));
+  it("labels the secure token field, exposes a live status, and enables Connect after input", () => {
+    render(createElement(ConnectPage));
+    const input = screen.getByLabelText("Access token");
+    const status = screen.getByRole("status");
+    const button = screen.getByRole("button", { name: "Connect" });
 
-    expect(markup.match(/role="status"/gu)).toHaveLength(1);
-    expect(markup).not.toContain("aria-live=");
-    expect(markup).not.toContain("text-gray-500");
-    expect(markup).not.toContain("text-gray-600");
-    expect(markup).not.toContain("placeholder:text-gray-600");
-    expect(markup).toContain("placeholder:text-gray-400");
+    expect(input).toHaveAttribute("type", "password");
+    expect(input).toHaveAttribute("autocomplete", "off");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(button).toBeDisabled();
+    fireEvent.change(input, { target: { value: "secret-access-token" } });
+    expect(button).toBeEnabled();
+  });
+
+  it("announces a failed connection as an alert without persisting the token", async () => {
+    jest.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse({ error: "no" }, 401),
+    );
+    render(createElement(ConnectPage));
+    const input = screen.getByLabelText("Access token");
+    fireEvent.change(input, { target: { value: "secret-access-token" } });
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("That access token was not accepted.");
+    expect(input).toHaveValue("secret-access-token");
+    jest.restoreAllMocks();
   });
 });
