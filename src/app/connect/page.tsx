@@ -49,38 +49,38 @@ export default function ConnectPage() {
   }
 
   return (
-    <div className="flex min-h-dvh items-center justify-center bg-gray-950 px-4 py-10 sm:px-6">
+    <div className="connect-page">
       <main className="w-full max-w-md" aria-labelledby="connect-title">
-        <div className="mb-5 flex items-center justify-between border-b border-gray-800 pb-3">
-          <div className="font-mono text-sm font-semibold tracking-wide text-blue-400">
+        <div className="connect-topline">
+          <div className="connect-brand">
             JOBTRACKER
           </div>
-          <div className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.16em] text-gray-400">
+          <div className="connect-state">
             <span className="h-1.5 w-1.5 rounded-full bg-amber-400" aria-hidden="true" />
             Access locked
           </div>
         </div>
 
-        <section className="border border-gray-800 bg-gray-900 p-6 shadow-2xl shadow-black/30 sm:p-8">
-          <p className="mb-3 font-mono text-[11px] uppercase tracking-[0.18em] text-gray-400">
+        <section className="connect-card">
+          <p className="connect-eyebrow">
             Single-user console
           </p>
-          <h1 id="connect-title" className="text-2xl font-semibold text-gray-100">
+          <h1 id="connect-title" className="page-title">
             Connect to your tracker
           </h1>
-          <p className="mt-3 text-sm leading-6 text-gray-400">
+          <p className="connect-copy">
             Enter the server access token configured for this JobTracker instance.
             It is exchanged for a secure browser session and is not saved here.
           </p>
 
           <form
             onSubmit={handleSubmit}
-            className="mt-7"
+            className="connect-form"
             aria-busy={loading}
           >
             <label
               htmlFor="access-token"
-              className="mb-2 block text-xs font-medium uppercase tracking-wider text-gray-400"
+              className="input-label"
             >
               Access token
             </label>
@@ -96,21 +96,22 @@ export default function ConnectPage() {
               required
               autoFocus
               disabled={loading}
-              className="w-full border border-gray-700 bg-gray-950 px-3 py-3 font-mono text-sm text-gray-100 outline-none transition placeholder:text-gray-400 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30 disabled:cursor-wait disabled:opacity-60"
+            className="connect-token field"
               placeholder="Paste server access token"
               aria-describedby="token-help connect-status"
               aria-invalid={Boolean(error)}
             />
-            <p id="token-help" className="mt-2 text-xs leading-5 text-gray-400">
+            <p id="token-help" className="connect-help">
               The token stays in this field only until the session is created.
             </p>
 
             <p
               id="connect-status"
               role={error ? "alert" : "status"}
-              className={`mt-4 min-h-5 text-sm ${
-                error ? "text-red-400" : "text-gray-400"
+              className={`connect-status ${
+                error ? "connect-error" : ""
               }`}
+              aria-live="polite"
               aria-atomic="true"
             >
               {error || (loading ? "Verifying access…" : "")}
@@ -119,20 +120,45 @@ export default function ConnectPage() {
             <button
               type="submit"
               disabled={loading || token.length === 0}
-              className="mt-5 w-full border border-blue-500 bg-blue-600 px-4 py-3 text-sm font-semibold text-white outline-none transition hover:bg-blue-500 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-gray-900 disabled:cursor-not-allowed disabled:border-gray-700 disabled:bg-gray-800 disabled:text-gray-400"
+              className="primary-button connect-submit"
             >
               {loading ? "Connecting…" : "Connect"}
             </button>
           </form>
         </section>
 
-        <p className="mt-4 text-center font-mono text-[11px] uppercase tracking-[0.12em] text-gray-400">
+        <p className="connect-footer">
           Private operations workspace
         </p>
       </main>
+      <style>{connectStyles}</style>
     </div>
   );
 }
+
+const connectStyles = `
+.connect-page { align-items: center; background: var(--canvas); display: flex; justify-content: center; min-height: 100dvh; padding: 2.5rem 1rem; }
+.connect-page main { min-width: 0; width: 100%; }
+.connect-topline { align-items: center; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; margin-bottom: 1.25rem; padding-bottom: 0.8rem; }
+.connect-brand { color: var(--primary); font-family: var(--font-mono); font-size: 0.85rem; font-weight: 800; letter-spacing: 0.08em; }
+.connect-state { align-items: center; color: var(--muted); display: flex; font-family: var(--font-mono); font-size: 0.68rem; gap: 0.45rem; letter-spacing: 0.1em; text-transform: uppercase; }
+.connect-card { background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem; box-shadow: var(--shadow); padding: clamp(1.25rem, 4vw, 2rem); }
+.connect-eyebrow, .connect-footer { color: var(--muted); font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.12em; text-transform: uppercase; }
+.connect-eyebrow { margin: 0 0 0.75rem; }
+.connect-card .page-title { font-size: clamp(1.8rem, 5vw, 2.4rem); }
+.connect-copy, .connect-help { color: var(--muted); line-height: 1.55; }
+.connect-copy { font-size: 0.9rem; margin: 0.75rem 0 0; }
+.connect-form { margin-top: 1.75rem; }
+.connect-token { background: var(--surface); border: 1px solid var(--border); color: var(--text); display: block; font-family: var(--font-mono); margin-top: 0.1rem; min-width: 0; width: 100%; }
+.connect-token::placeholder { color: var(--muted); opacity: 1; }
+.connect-token:disabled { cursor: wait; opacity: 0.6; }
+.connect-help { font-size: 0.78rem; margin: 0.45rem 0 0; }
+.connect-status { color: var(--muted); font-size: 0.88rem; min-height: 1.5rem; margin: 0.9rem 0 0; }
+.connect-error { color: var(--destructive); }
+.connect-submit { margin-top: 0.7rem; width: 100%; }
+.connect-submit:disabled { background: #dfe5df; border-color: #c8d1c9; color: var(--muted); cursor: not-allowed; opacity: 0.72; }
+.connect-footer { margin: 1rem 0 0; text-align: center; }
+`;
 
 function connectionError(status: number): string {
   if (status === 401) {
