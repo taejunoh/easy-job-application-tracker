@@ -189,13 +189,45 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
     setError("");
   }
 
+  function handleTabKeyDown(event: React.KeyboardEvent<HTMLElement>) {
+    const tabs = Array.from(
+      event.currentTarget.closest("[role=tablist]")?.querySelectorAll<HTMLButtonElement>("button[role~='tab']:not(:disabled)") ?? [],
+    );
+    if (!tabs.length) return;
+    const currentIndex = tabs.indexOf(event.currentTarget as HTMLButtonElement);
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (currentIndex + 1) % tabs.length;
+    if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = tabs.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    tabs[nextIndex].focus();
+    tabs[nextIndex].click();
+  }
+
+  function selectMode(nextMode: InputMode) {
+    setMode(nextMode);
+    setError("");
+    setExtracted(null);
+  }
+
   return (
-    <div>
+    <div className="url-input" aria-busy={loading}>
       {/* Mode tabs */}
-      <div className="flex gap-1 mb-2">
+      <div className="input-tabs" role="tablist" aria-label="Application source">
         <button
-          onClick={() => { setMode("url"); setError(""); setExtracted(null); }}
-          className={`px-3 py-1 text-xs rounded ${
+          type="button"
+          role="tab"
+          id="url-tab"
+          aria-controls="url-panel"
+          aria-selected={mode === "url"}
+          aria-disabled={loading}
+          tabIndex={loading ? -1 : mode === "url" ? 0 : -1}
+          onKeyDown={handleTabKeyDown}
+          onClick={() => selectMode("url")}
+          disabled={loading}
+          className={`input-tab px-3 py-1 text-xs rounded ${
             mode === "url"
               ? "bg-gray-700 text-white"
               : "text-gray-400 hover:text-gray-200"
@@ -204,8 +236,17 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           URL
         </button>
         <button
-          onClick={() => { setMode("text"); setError(""); setExtracted(null); }}
-          className={`px-3 py-1 text-xs rounded ${
+          type="button"
+          role="tab"
+          id="text-tab"
+          aria-controls="text-panel"
+          aria-selected={mode === "text"}
+          aria-disabled={loading}
+          tabIndex={loading ? -1 : mode === "text" ? 0 : -1}
+          onKeyDown={handleTabKeyDown}
+          onClick={() => selectMode("text")}
+          disabled={loading}
+          className={`input-tab px-3 py-1 text-xs rounded ${
             mode === "text"
               ? "bg-gray-700 text-white"
               : "text-gray-400 hover:text-gray-200"
@@ -214,14 +255,19 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           Paste Text
         </button>
         {manualEntryEnabled && (
+          <>
           <button
             type="button"
-            onClick={() => {
-              setMode("manual");
-              setError("");
-              setExtracted(null);
-            }}
-            className={`px-3 py-1 text-xs rounded ${
+            role="tab"
+            id="manual-tab"
+            aria-controls="manual-panel"
+            aria-selected={mode === "manual"}
+            aria-disabled={loading}
+            tabIndex={loading ? -1 : mode === "manual" ? 0 : -1}
+            onKeyDown={handleTabKeyDown}
+            onClick={() => selectMode("manual")}
+            disabled={loading}
+            className={`input-tab px-3 py-1 text-xs rounded ${
               mode === "manual"
                 ? "bg-gray-700 text-white"
                 : "text-gray-400 hover:text-gray-200"
@@ -229,24 +275,21 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           >
             Manual
           </button>
+          </>
         )}
       </div>
 
       {/* URL mode */}
       {mode === "url" && !extracted && (
-        <form onSubmit={handleExtractUrl} className="flex items-center gap-2">
-          <input
-            type="url"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="Paste job URL here..."
-            className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
-            disabled={loading}
-          />
+        <form id="url-panel" role="tabpanel" aria-labelledby="url-tab" onSubmit={handleExtractUrl} className="flex items-center gap-2">
+          <label className="inline-field-label" htmlFor="url-input">
+            <span className="input-label">Job URL</span>
+            <input id="url-input" type="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="Paste job URL here..." className="field flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500" disabled={loading} />
+          </label>
           <button
             type="submit"
             disabled={loading || !url.trim()}
-            className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="primary-button px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? "Extracting..." : "+ Add"}
           </button>
@@ -255,28 +298,20 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
 
       {/* Text paste mode */}
       {mode === "text" && !extracted && (
-        <form onSubmit={handleExtractText} className="space-y-2">
-          <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            placeholder="Paste the job description text here (copy from LinkedIn, Indeed, etc.)..."
-            rows={4}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-none"
-            disabled={loading}
-          />
+        <form id="text-panel" role="tabpanel" aria-labelledby="text-tab" onSubmit={handleExtractText} className="space-y-2">
+          <label className="field-label" htmlFor="text-input">
+            <span className="input-label">Job description</span>
+            <textarea id="text-input" value={text} onChange={(e) => setText(e.target.value)} placeholder="Paste the job description text here (copy from LinkedIn, Indeed, etc.)..." rows={4} className="field w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-none" disabled={loading} />
+          </label>
           <div className="flex items-center gap-2">
-            <input
-              type="url"
-              value={textUrl}
-              onChange={(e) => setTextUrl(e.target.value)}
-              placeholder="Job URL (required)"
-              className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
-              disabled={loading}
-            />
+            <label className="inline-field-label" htmlFor="text-url-input">
+              <span className="input-label">Job URL</span>
+              <input id="text-url-input" type="url" value={textUrl} onChange={(e) => setTextUrl(e.target.value)} placeholder="Job URL (required)" className="field flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500" disabled={loading} />
+            </label>
             <button
               type="submit"
               disabled={loading || !text.trim()}
-              className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="primary-button px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {loading ? "Extracting..." : "Extract"}
             </button>
@@ -286,8 +321,8 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
 
       {/* Manual mode */}
       {manualEntryEnabled && mode === "manual" && (
-        <form onSubmit={handleManualSave} className="space-y-2">
-          <div className="grid grid-cols-3 gap-2">
+        <form id="manual-panel" role="tabpanel" aria-labelledby="manual-tab" onSubmit={handleManualSave} className="space-y-2">
+          <div className="grid grid-cols-3 gap-2 manual-fields">
             <div>
               <label htmlFor="manual-job-url" className="text-xs text-gray-500 block mb-1">
                 Job URL
@@ -298,7 +333,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
                 value={manualUrl}
                 onChange={(e) => setManualUrl(e.target.value)}
                 placeholder="https://example.com/job"
-                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                className="field w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
                 disabled={loading}
                 required
               />
@@ -313,7 +348,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
                 onChange={(e) => setManualTitle(e.target.value)}
                 placeholder="Enter job title"
                 maxLength={256}
-                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                className="field w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
                 disabled={loading}
                 required
               />
@@ -328,7 +363,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
                 onChange={(e) => setManualCompany(e.target.value)}
                 placeholder="Enter company name"
                 maxLength={256}
-                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                className="field w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
                 disabled={loading}
                 required
               />
@@ -337,7 +372,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           <button
             type="submit"
             disabled={loading}
-            className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="primary-button px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? "Saving..." : "Save Application"}
           </button>
@@ -346,33 +381,35 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
 
       {/* Confirmation form */}
       {extracted && (
-        <div className="mt-3 bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <div id={`${mode}-panel`} role="tabpanel" aria-labelledby={`${mode}-tab`} className="confirmation-card mt-3 bg-gray-900 border border-gray-700 rounded-lg p-4">
           {extracted.warning && (
-            <div className="text-yellow-400 text-xs mb-3">
+            <div className="extracted-warning text-yellow-400 text-xs mb-3">
               {extracted.warning}
             </div>
           )}
-          <div className="grid grid-cols-2 gap-3 mb-3">
+          <div className="grid grid-cols-2 gap-3 mb-3 confirmation-fields">
             <div>
-              <label className="text-xs text-gray-500 block mb-1">
+              <label htmlFor="confirmation-title" className="text-xs text-gray-500 block mb-1">
                 Job Title
               </label>
               <input
+                id="confirmation-title"
                 value={editTitle}
                 onChange={(e) => setEditTitle(e.target.value)}
                 placeholder="Enter job title"
-                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                className="field w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
               />
             </div>
             <div>
-              <label className="text-xs text-gray-500 block mb-1">
+              <label htmlFor="confirmation-company" className="text-xs text-gray-500 block mb-1">
                 Company
               </label>
               <input
+                id="confirmation-company"
                 value={editCompany}
                 onChange={(e) => setEditCompany(e.target.value)}
                 placeholder="Enter company name"
-                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                className="field w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
               />
             </div>
           </div>
@@ -380,7 +417,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
             <button
               onClick={handleSave}
               disabled={loading}
-              className="px-3 py-1.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:opacity-50"
+              className="primary-button px-3 py-1.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:opacity-50"
             >
               {loading ? "Saving..." : "Save Application"}
             </button>
