@@ -11,12 +11,15 @@ This guide starts with a local setup so you can verify the complete workflow bef
 ## What You Can Do
 
 - Save jobs from LinkedIn, Indeed, Glassdoor, Lever, Greenhouse, Workday, and other career pages.
-- Review, search, filter, edit, and delete applications from one dashboard.
+- Use the Dashboard for pipeline metrics, status summaries, and recent applications.
+- Search and filter applications, update their status, and open records for editing from Applications.
 - Compare a job description with a saved resume and review matched and missing keywords.
 - Fill saved LinkedIn and GitHub profile URLs into supported application forms.
 - Use standard page metadata or optional AI-assisted extraction.
 
 ![JobTracker dashboard](docs/screenshots/01-dashboard.png)
+
+Documentation screenshots were captured before the current UI refresh and may show an older visual style; they are illustrative only.
 
 ## How JobTracker Works
 
@@ -32,6 +35,16 @@ JobTracker has two interfaces:
 - The unpacked Chrome extension in [`extension/`](extension/), which connects to that server and works on supported job pages.
 
 There are no separate native macOS, Windows, or Linux applications. Use Google Chrome for the extension and run the Node.js server with access to PostgreSQL.
+
+### Web workspace flow
+
+The web workspace includes **Dashboard**, **Applications**, and **Settings**. On Dashboard, the **Add application** card is open by default. Choose **URL** or **Paste Text**, submit the source, review the extracted details in the confirmation step, and choose **Save Application**. **Paste Text** requires both a job description and job URL. On Applications, application detail pages, and Settings, use the explicit **+ Add application** toggle to open or close that card.
+
+Draft fields remain when you close the card or move between the Dashboard, Applications, application detail, and Settings routes using the app's navigation. Drafts are not persisted across a browser reload or reconnection.
+
+The optional **Manual** entry tab is controlled by `VALIDATION_MANUAL_ENTRY_ENABLED`, a validation-only gate that defaults to off. Keep it off for normal deployments; it is intended for validation, not normal use.
+
+At viewport widths up to 768px, the sidebar becomes an inline menu and Applications rows become cards. Each card retains six fields: Job Title, Company, Status, Date Applied, Location, and Type.
 
 ## Prerequisites
 
@@ -189,7 +202,7 @@ Use **Disconnect** to remove the stored connection and revoke the runtime-reques
 2. Click the JobTracker toolbar icon. The popup extracts the title, company, location, description, and page URL when available.
 3. Check the extracted title, company, and location. Edit those fields if the source page is ambiguous.
 4. Click **Save Application**.
-5. Open the JobTracker dashboard and confirm that the application appears. From there you can change its status, add notes, edit details, search, filter, or delete it.
+5. Open **Applications** and confirm that the application appears. From there you can change its status, add notes, edit details, search, filter, or delete it.
 
 ![JobTracker extension on a job posting](docs/screenshots/03-extension-popup.png)
 
@@ -200,7 +213,7 @@ If the page changes after the popup opens, use **Re-extract** before saving. A s
 1. Open **Settings** in the JobTracker web app.
 2. Under **Resume**, upload a PDF resume or paste a text resume.
 3. Save the settings.
-4. Return to a job in the dashboard or extension and select **Analyze Keywords**.
+4. In the web app, open an application detail page. When a saved resume and job description are available, keyword analysis is calculated automatically; use the full **Keyword Match Analysis** header to expand or collapse its details. In the Chrome extension, click **Analyze Keywords**.
 
 ![Upload a PDF or text resume in Settings](docs/screenshots/02-settings-resume.png)
 
