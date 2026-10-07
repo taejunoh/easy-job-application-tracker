@@ -1,0 +1,15 @@
+{
+  "name": "@jobtracker/next-root-glob",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Restricted directory-glob adapter for Next ESLint rootDir settings",
+  "main": "index.cjs",
+  "files": [
+    "index.cjs",
+    "README.md"
+  ],
+  "dependencies": {
+    "tinyglobby": "0.2.17",
+    "picomatch": "4.0.4"
+  }
+}

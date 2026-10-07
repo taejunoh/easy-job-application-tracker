@@ -52,6 +52,7 @@
     "undici": "7.29.1"
   },
   "devDependencies": {
+    "@jobtracker/next-root-glob": "file:tools/vendor/jobtracker-next-root-glob-1.0.0.tgz",
     "@tailwindcss/postcss": "^4",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
@@ -74,6 +75,12 @@
     "yaml": "^2.9.0"
   },
   "overrides": {
+    "@next/eslint-plugin-next@16.3.6": {
+      "fast-glob": "$@jobtracker/next-root-glob"
+    },
+    "@istanbuljs/load-nyc-config@1.1.0": {
+      "js-yaml": "4.3.2"
+    },
     "@humanfs/node": "0.16.8",
     "browserslist": "4.28.8",
     "fast-uri": "3.1.8",
