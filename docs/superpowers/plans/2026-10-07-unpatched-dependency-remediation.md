@@ -14,7 +14,7 @@ Use the existing isolated worktree `/Users/taejunoh/Developer/LFG/easy-job-appli
 
 ## Task 1: Scoped dependency removal and compatibility proof
 
-**Owner:** integration implementer; exclusive ownership of `package.json`, `package-lock.json`, `tools/next-root-glob/package.json`, `tools/next-root-glob/index.cjs`, `tools/next-root-glob/README.md`, `tools/vendor/jobtracker-next-root-glob-1.0.0.tgz`, `__tests__/dependencies/next-root-glob.test.ts`, `__tests__/dependencies/nyc-yaml-compat.test.ts` and a narrowly named golden fixture if needed.
+**Owner:** integration implementer; exclusive ownership of `package.json`, `package-lock.json`, `tools/next-root-glob/package.json`, `tools/next-root-glob/index.cjs`, `tools/next-root-glob/README.md`, `tools/vendor/jobtracker-next-root-glob-1.0.1.tgz` (and removal of superseded 1.0.0), `__tests__/dependencies/next-root-glob.test.ts`, `__tests__/dependencies/nyc-yaml-compat.test.ts` and a narrowly named golden fixture if needed. A separate worker owns `Dockerfile` and `__tests__/dependencies/docker-local-package.test.ts` for the explicit pre-install artifact copy.
 
 - [ ] Before removing fast-glob, capture reference result sets in a disposable directory tree containing literal directories, nested `packages/*/web`, hidden directories, spaces, scoped package names, symlinks and missing paths. Preserve source/version provenance in the fixture. Add failing tests for the absent adapter and the actual pinned Next rule/config contracts.
 - [ ] Create a private CommonJS package with this dependency identity:
@@ -22,7 +22,7 @@ Use the existing isolated worktree `/Users/taejunoh/Developer/LFG/easy-job-appli
 ```json
 {
   "name": "@jobtracker/next-root-glob",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "main": "index.cjs",
   "dependencies": { "tinyglobby": "0.2.17", "picomatch": "4.0.4" }
@@ -35,7 +35,7 @@ Use the existing isolated worktree `/Users/taejunoh/Developer/LFG/easy-job-appli
 ```json
 {
   "devDependencies": {
-    "@jobtracker/next-root-glob": "file:tools/vendor/jobtracker-next-root-glob-1.0.0.tgz"
+    "@jobtracker/next-root-glob": "file:tools/vendor/jobtracker-next-root-glob-1.0.1.tgz"
   },
   "overrides": {
     "@next/eslint-plugin-next@16.3.6": {
@@ -57,6 +57,8 @@ The existing full-app lock also reproduces the consumer-relative resolution bug.
 - [ ] Through the actual nyc loader test `.yml/.yaml`, relative extends, arrays, booleans, paths and thresholds, plus intentional YAML 4 unsafe-tag rejection and numeric semantics. Document supported/rejected differences rather than claiming universal YAML 3 compatibility.
 - [ ] Run normal `npm ci`, `npm ls --all` peer validation, both new suites, existing dependency/version and audit suites, lint and typecheck. Verify lock **and installed tree** contain no vulnerable braces/micromatch/fast-glob/sprintf-js nodes. Run full and production raw audits; expect zero. The policy command may still fail solely because the review date has not yet been renewed; report exact evidence.
 - [ ] Self-review and commit exact owned files. Independent specification review must pass before independent security/quality review. Fix/re-review findings before final integration. No pushes during implementation.
+
+Review of initial adapter commit `ba760b7` found a missing pinned-consumer contract guard, an unexpected `readdirSync` error swallowed by the underlying matcher, a Windows-only test contradiction and the Docker dependency-stage artifact omission. Source fixes in `1b9a911` released private version 1.0.1 without overwriting committed 1.0.0; Docker fixes are in `9a3c393` / `b53ed8b`. Independent specification and high-risk quality re-reviews passed after all four findings were closed. Controller verification: five targeted suites / 99 tests passed (3.048s), synthetic-environment production build, startup-environment and extension checks passed; raw full and production audits again returned zero at approximately 18:08 UTC. Broader integration remains pending; the initial targeted green run or zero audit alone was not final approval.
 
 ## Task 2: Expiry regression and evidence-based review renewal
 
