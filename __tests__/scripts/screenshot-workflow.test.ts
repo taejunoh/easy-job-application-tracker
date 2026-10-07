@@ -37,7 +37,7 @@ if (scenario.kind === "origin") {
   };
   await workflow.waitForDashboardReady(page);
   events.push({ type: mounted ? "capture-after-form" : "capture-before-form" });
-  process.stdout.write(JSON.stringify({ events }));
+  process.stdout.write(JSON.stringify({ events, error: null }));
 } else if (scenario.kind === "authenticate") {
   const context = {
     request: {
@@ -156,7 +156,7 @@ type DashboardReadyScenario = { kind: "dashboard-ready" };
 function runScenario(
   scenario: WorkflowScenario | AuthenticateScenario | OriginScenario | DashboardReadyScenario,
 ): {
-  events?: Array<string | Record<string, unknown>>;
+  events: Array<string | Record<string, unknown>>;
   error: string | null;
   value?: string | null;
 } {
@@ -170,10 +170,15 @@ function runScenario(
   );
 
   expect(result.status).toBe(0);
-  return JSON.parse(result.stdout) as {
+  const parsed = JSON.parse(result.stdout) as {
     events?: Array<string | Record<string, unknown>>;
-    error: string | null;
+    error?: string | null;
     value?: string | null;
+  };
+  return {
+    events: parsed.events ?? [],
+    error: parsed.error ?? null,
+    value: parsed.value,
   };
 }
 
