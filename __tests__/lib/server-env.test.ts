@@ -14,6 +14,49 @@ const productionSource = {
 };
 
 describe("parseServerEnv", () => {
+  describe("explicit isolated local Docker HTTP mode", () => {
+    const localSource = {
+      ...productionSource,
+      LOCAL_DOCKER_HTTP_ENABLED: "1",
+      APP_BASE_URL: "http://127.0.0.1:3000",
+      CORS_ALLOWED_ORIGINS: "http://127.0.0.1:3000,chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+    };
+
+    it.each(["localhost", "127.0.0.1"])("allows literal HTTP %s in production", (host) => {
+      const origin = `http://${host}:3000`;
+      expect(parseServerEnv({ ...localSource, APP_BASE_URL: origin, CORS_ALLOWED_ORIGINS: origin }, "production").appOrigin).toBe(origin);
+    });
+
+    it("normalizes an explicit standard HTTP port consistently for app and CORS", () => {
+      const origin = "http://127.0.0.1:80";
+      const config = parseServerEnv({ ...localSource, APP_BASE_URL: origin, CORS_ALLOWED_ORIGINS: origin }, "production");
+      expect(config.appOrigin).toBe("http://127.0.0.1");
+      expect(config.corsAllowedOrigins).toEqual(["http://127.0.0.1"]);
+    });
+
+    it.each(["true", "false", "", " 1", "1 ", "2"])("rejects nonbinary local flag %s", (flag) => {
+      expect(() => parseServerEnv({ ...productionSource, LOCAL_DOCKER_HTTP_ENABLED: flag }, "production")).toThrow("LOCAL_DOCKER_HTTP_ENABLED");
+    });
+
+    it.each([
+      "http://127.1:3000", "http://2130706433:3000", "http://0x7f000001:3000", "http://0177.0.0.1:3000",
+      "http://localhost.:3000", "http://[::1]:3000", "http://remote.example:3000", "https://localhost:3000",
+      "https://remote.example", "http://owner@localhost:3000", "http://localhost:3000/path", "http://localhost:3000/?x=1",
+      "http://localhost:3000/#x", "http://LOCALHOST:3000", "http://localhost:3000/", "http://localhost:3000\\path",
+    ])("rejects nonliteral local origin %s before URL normalization", (origin) => {
+      expect(() => parseServerEnv({ ...localSource, APP_BASE_URL: origin, CORS_ALLOWED_ORIGINS: origin }, "production")).toThrow("APP_BASE_URL");
+    });
+
+    it.each(["https://remote.example", "https://localhost:3000", "http://localhost:3000", "http://127.0.0.1:3001", "http://127.1:3000", "chrome-extension://" + "A".repeat(32)])("rejects alternate local CORS origin %s", (origin) => {
+      expect(() => parseServerEnv({ ...localSource, CORS_ALLOWED_ORIGINS: `${localSource.APP_BASE_URL},${origin}` }, "production")).toThrow("CORS_ALLOWED_ORIGINS");
+    });
+
+    it("keeps the default production policy when disabled", () => {
+      expect(parseServerEnv({ ...productionSource, LOCAL_DOCKER_HTTP_ENABLED: "0" }, "production").appOrigin).toBe("https://jobs.example.com");
+      expect(() => parseServerEnv({ ...localSource, LOCAL_DOCKER_HTTP_ENABLED: "0" }, "production")).toThrow("APP_BASE_URL");
+    });
+  });
+
   it("parses and normalizes a valid production configuration", () => {
     const config = parseServerEnv(productionSource, "production");
 

@@ -6,6 +6,12 @@
     "node": ">=22.22.2 <23"
   },
   "scripts": {
+    "setup": "node scripts/local-setup.mjs setup",
+    "local:start": "node scripts/local-setup.mjs start",
+    "local:stop": "node scripts/local-setup.mjs stop",
+    "local:logs": "node scripts/local-setup.mjs logs",
+    "local:token": "node scripts/local-setup.mjs token",
+    "local:extension": "node scripts/local-setup.mjs extension",
     "dev": "node --import ./scripts/validate-startup-env-development.mjs node_modules/next/dist/bin/next dev",
     "build": "prisma generate && next build",
     "start": "node --import ./scripts/validate-startup-env-production.mjs node_modules/next/dist/bin/next start",
