@@ -14,6 +14,20 @@ function isLocalEndpoint(endpoint) {
   return typeof endpoint === "string" && (/^unix:\/\/\//u.test(endpoint) || /^npipe:\/\/\/\/\.\/pipe\//u.test(endpoint));
 }
 
+function dockerFailureDetails(result, secrets) {
+  const output = [result.stdout, result.stderr].map(value => value == null ? "" : String(value)).filter(Boolean).join("\n")
+    .replace(/\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/gu, "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "");
+  let sanitized = output;
+  for (const secret of secrets.filter(Boolean).sort((left, right) => right.length - left.length)) {
+    sanitized = sanitized.split(secret).join("[REDACTED]");
+  }
+  sanitized = sanitized.replace(/([a-z][a-z\d+.-]*:\/\/)[^\s/@:]+(?::[^\s/@]*)?@/giu, "$1[REDACTED]@");
+  const tail = sanitized.trimEnd().slice(-4000);
+  const status = result.status == null ? "unknown" : String(result.status);
+  return `Docker command failed (exit code ${status}).${tail ? `\n${tail}` : ""}`;
+}
+
 export async function runLocalCommand({
   argv = process.argv.slice(2), repoRoot = defaultRepoRoot,
   configDir = join(repoRoot, ".jobtracker"), env = process.env,
@@ -42,11 +56,18 @@ export async function runLocalCommand({
     const childEnv = isolatedDockerEnv(env);
     const childOptions = { cwd: resolve(repoRoot), env: childEnv, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 };
     let pinnedEndpoint;
+    let managed;
     const docker = (args, message, extraOptions = {}) => {
       let result;
       const pinnedArgs = pinnedEndpoint ? ["--host", pinnedEndpoint, ...args] : args;
       try { result = run("docker", pinnedArgs, { ...childOptions, ...extraOptions }); } catch { throw new Error(message); }
-      if (result.status !== 0 || result.error) throw new Error(message);
+      if (result.status !== 0 || result.error) {
+        if (managed && result.status !== 0 && args.includes("--build")) {
+          const secrets = [managed.config.APP_ACCESS_TOKEN, managed.config.ENCRYPTION_SECRET, managed.config.POSTGRES_PASSWORD, managed.config.DATABASE_URL];
+          throw new Error(`${message}\n${dockerFailureDetails(result, secrets)}`);
+        }
+        throw new Error(message);
+      }
       return result.stdout ?? "";
     };
     if (env.DOCKER_HOST && !isLocalEndpoint(env.DOCKER_HOST)) throw new Error("Use a local Docker daemon; remote Docker hosts are not supported for loopback-only setup.");
@@ -60,7 +81,7 @@ export async function runLocalCommand({
     pinnedEndpoint = endpoint;
     docker(["info", "--format", "{{.ServerVersion}}"], "The local Docker daemon is not running. Start Docker, then retry.");
     if (command === "setup") stdout("Creating or reusing private local configuration...");
-    let managed = command === "setup" ? ensureLocalConfig({ configDir, port }) : readLocalConfig({ configDir });
+    managed = command === "setup" ? ensureLocalConfig({ configDir, port }) : readLocalConfig({ configDir });
     const compose = (args, message, extraOptions) => docker([
       "compose", "--file", join(resolve(repoRoot), "compose.yaml"), "--env-file", managed.path,
       "--project-name", managed.config.JOBTRACKER_PROJECT_NAME, ...args,

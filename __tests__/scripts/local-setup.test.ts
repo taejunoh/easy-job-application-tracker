@@ -153,7 +153,7 @@ describe("local CLI isolation", () => {
         run: (command, args, options) => {
           if (args[0] === "--host") args = args.slice(2);
           calls.push({ command, args, env: options.env });
-          if (input.fail && args.includes(input.fail)) return { status: 1, stdout: "", stderr: "RAW_SECRET_DATABASE_URL" };
+          if (input.fail && args.includes(input.fail) && (!input.payload || args.includes("--build"))) return { status: 1, stdout: input.payload ?? "", stderr: "RAW_SECRET_DATABASE_URL" };
           if (args[0] === "context") return { status: 0, stdout: JSON.stringify(input.endpoint ?? "unix:///var/run/docker.sock") };
           if (args.includes("--help")) return { status: 0, stdout: input.noWait ? "" : "--wait --wait-timeout" };
           return { status: 0, stdout: "ok" };
@@ -174,9 +174,25 @@ describe("local CLI isolation", () => {
       expect(call.args.slice(1, 5)).toEqual(["--file", join(configDir, "../compose.yaml"), "--env-file", join(configDir, "local.env")]);
       expect(call.args[5]).toBe("--project-name");
       expect(call.args[6]).toMatch(/^jobtracker-[a-f0-9]{12}$/);
-      expect(call.env).toEqual({ KEEP_ME: "yes" });
+      expect(call.env).toEqual({ KEEP_ME: "yes", BUILDX_BUILDER: "default" });
     }
     expect(composeCalls.at(-1).args.slice(7)).toEqual(["up", "--build", "--wait", "--wait-timeout", "180"]);
+  });
+
+  it("forces every Docker call to use the local default Buildx builder", () => {
+    const { configDir } = fixture();
+    const result = cli(configDir, { env: {
+      BUILDX_BUILDER: "remote-cloud", BUILDX_CONFIG: "/private/buildx", BUILDKIT_HOST: "tcp://remote.example:1234",
+      KEEP_ME: "yes",
+    } });
+    expect(result.status).toBe(0);
+    expect(result.calls.length).toBeGreaterThan(0);
+    for (const call of result.calls) {
+      expect(call.env.BUILDX_BUILDER).toBe("default");
+      expect(call.env.BUILDX_CONFIG).toBeUndefined();
+      expect(call.env.BUILDKIT_HOST).toBeUndefined();
+      expect(call.env.KEEP_ME).toBe("yes");
+    }
   });
 
   it.each(["21.9.0", "22.22.1", "23.0.0", "24.0.0"])("rejects unsupported Node %s before Docker or file creation", (nodeVersion) => {
@@ -196,6 +212,22 @@ describe("local CLI isolation", () => {
     expect(result.output.join()).not.toMatch(/http:\/\/127\.0\.0\.1|RAW_SECRET|remote\.example/);
     expect(result.errors.join()).not.toMatch(/RAW_SECRET|remote\.example/);
     expect(result.errors.join().length).toBeGreaterThan(10);
+  });
+
+  it("reports bounded Docker failure context after removing managed secrets", () => {
+    const { configDir } = fixture(); const { config } = create(configDir);
+    const dbUrl = config.DATABASE_URL;
+    const payload = `${"ordinary output ".repeat(500)}${config.APP_ACCESS_TOKEN} ${config.ENCRYPTION_SECRET} ${config.POSTGRES_PASSWORD} ${dbUrl}\nNo space left on device\u001b[31m`;
+    const result = cli(configDir, { fail: "up", payload });
+    expect(result.status).toBe(1);
+    const diagnostic = result.errors.join("\n");
+    for (const secret of [config.APP_ACCESS_TOKEN, config.ENCRYPTION_SECRET, config.POSTGRES_PASSWORD, dbUrl]) {
+      expect(diagnostic).not.toContain(secret);
+    }
+    expect(diagnostic).toContain("exit code 1");
+    expect(diagnostic).toContain("No space left on device");
+    expect(diagnostic).not.toContain("\u001b");
+    expect(diagnostic.length).toBeLessThan(5000);
   });
 
   it("keeps failed setup configuration byte-identical on retry", () => {
