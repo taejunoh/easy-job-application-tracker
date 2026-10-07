@@ -277,6 +277,12 @@ export async function verifyLocalOnboarding() {
     await inspectRuntime();
     assert.equal(await readFile(join(checkout, ".env"), "utf8"), rootEnv);
     checked("extension command idempotent, runtime CORS valid, original credentials/session/data preserved");
+
+    step("delete the saved application through the authenticated API");
+    const deleted = await context.request.delete(origin + applicationPath, { headers: { Origin: origin } });
+    assert.equal(deleted.status(), 200);
+    assert.equal((await context.request.get(origin + applicationPath)).status(), 404);
+    checked("real authenticated DELETE removes the saved record; subsequent GET returns 404");
     report.passed = true;
   } catch {
     // Assertion messages can contain config, cookies, or response bodies. Persist only safe stage/status metadata.
