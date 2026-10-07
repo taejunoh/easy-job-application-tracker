@@ -233,7 +233,7 @@ describe("task-first README user guide", () => {
 
     expect(screenshotDocs).toContain("npm run screenshots:setup");
     expect(screenshotDocs).toContain("synthetic");
-    expect(screenshotDocs).toContain("authenticated local browser session");
+    expect(screenshotDocs).toMatch(/authenticates? (?:its |the )?local browser session/iu);
     expect(screenshotDocs).toContain("separate network-blocked browser context");
     expect(generator).not.toContain(
       "easy-job-application-tracker.vercel.app",
@@ -286,42 +286,52 @@ describe("task-first README user guide", () => {
 
   test("guides a new user from local server setup to the first saved job", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
-    const expectedH2Headings = [
-      "## What You Can Do",
-      "## How JobTracker Works",
-      "## Prerequisites",
-      "## Local Quick Start",
-      "## Install the Chrome Extension",
-      "## Connect the Extension",
-      "## Save Your First Job",
-      "## Set Up Resume Matching",
-      "## Optional Features",
-      "## Troubleshooting",
-      "## Production Deployment",
-      "## Database Migration Notes",
-      "## Development and Verification",
-      "## Documentation",
-      "## License",
-    ];
+    const manual = readFileSync(join(root, "docs/setup/manual.md"), "utf8");
     const requiredText = [
-      "Chrome extension → JobTracker server → PostgreSQL",
-      "The extension is not standalone",
-      "Node.js 22.22.2",
-      "npm ci",
-      "node:crypto",
-      "APP_ACCESS_TOKEN",
-      "chrome-extension://<extension-id>",
-      "CORS_ALLOWED_ORIGINS",
+      "private, self-hosted web app",
+      "one person",
+      "Git",
+      ">=22.22.2 <23",
+      "Docker Compose",
+      "daemon running",
+      "npm run setup",
+      "applies migrations",
+      "does not require `npm ci`",
+      "http://127.0.0.1:3000",
+      "npm run local:token",
+      "local `/connect` page",
+      "Never put it in the extension",
+      "Title, company, and job URL are required",
+      "Save Application",
+      "Applications",
+      "Drafts survive navigation",
+      "not a browser refresh",
+      ".jobtracker/local.env",
+      "Docker-managed PostgreSQL volume",
+      "npm run local:stop",
+      "npm run local:start",
+      "ENCRYPTION_SECRET",
+      "without that exact secret",
+      "Do not delete either",
+      "web app works without Chrome or the extension",
       "chrome://extensions",
       "Load unpacked",
-      "The pairing-code field is cleared after a successful connection",
+      "npm run local:extension",
       "Settings → Chrome extension installations",
-      "one-time pairing code",
+      "ten minutes",
+      "can be used once",
+      "OpenAI, Google Gemini, or Anthropic",
+      "metadata extraction does not require an AI key",
+      "Paste Text",
+      "saved provider API key",
+      "PDF or TXT resume",
+      "off by default",
+      "768px",
+      "docs/setup/manual.md",
+      "docs/setup/deployment.md",
       "docs/operations/production-runbook.md",
+      "MIT",
     ];
-    const requiredSetupImageReferences = setupImages.map(
-      (setupImage) => `docs/screenshots/${setupImage}`,
-    );
 
     expect(readme).not.toContain("GENERATE_WITH_OPENSSL_RAND_BASE64_32");
     expect(readme).not.toContain(
@@ -329,73 +339,57 @@ describe("task-first README user guide", () => {
     );
 
     const unsafeTokenAssignments = readDocumentedTokenAssignments(
-      readme,
+      `${readme}\n${manual}`,
     ).filter(
       ({ expression }) => !isSafeDocumentedTokenExpression(expression),
     );
 
     expect(unsafeTokenAssignments).toEqual([]);
 
-    const actualH2Headings = readme.match(/^## [^\r\n]+$/gmu) ?? [];
-
-    expect({
-      actualH2Headings,
-      missingSetupImageReferences: requiredSetupImageReferences.filter(
-        (imageReference) => !readme.includes(imageReference),
-      ),
-      missingText: requiredText.filter((text) => !readme.includes(text)),
-    }).toEqual({
-      actualH2Headings: expectedH2Headings,
-      missingSetupImageReferences: [],
-      missingText: [],
-    });
-
-    expect(readme).toContain(
-      "Chrome asks for access to the configured JobTracker server origin",
-    );
+    expect(requiredText.filter((text) => !readme.includes(text))).toEqual([]);
+    const signIn = readme.indexOf("local `/connect` page");
+    const firstSave = readme.indexOf("## Save your first application");
+    const optionalExtension = readme.indexOf("## Optional: Chrome extension");
+    expect(signIn).toBeGreaterThan(readme.indexOf("npm run setup"));
+    expect(firstSave).toBeGreaterThan(signIn);
+    expect(optionalExtension).toBeGreaterThan(firstSave);
+    expect(readme).toContain("Approve Chrome's server-origin permission prompt");
     expect(readme).not.toContain(
       "Site Access permission request for the current job site",
     );
-    expect(readme).toContain(
-      "placeholder values copied from `.env.example` are intentionally rejected",
-    );
-    expect(readme).toContain("fs.constants.COPYFILE_EXCL");
-    expect(readme).toContain(
-      "preserves it and does not overwrite your credentials",
-    );
-    expect(readme).toContain(
+    expect(readme).toContain("does not overwrite existing credentials");
+    expect(manual).toContain("fs.constants.COPYFILE_EXCL");
+    expect(manual).toContain("placeholder values copied from `.env.example` are intentionally rejected");
+    expect(manual).toContain(
       "npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code",
     );
-    expect(readme).toContain("createdb jobtracker");
-    expect(readme).not.toContain("createdb <db-name>");
-    expect(readme).toContain("| Symptom | Likely cause | Action |");
-    expect(readme).toMatch(
-      /\| Resume upload fails \|[^\r\n]+\|[^\r\n]+\|/u,
-    );
+    for (const command of ["createdb jobtracker", "npx prisma validate", "npx prisma generate", "npx prisma migrate deploy"]) {
+      expect(manual).toContain(command);
+    }
+    expect(manual).not.toContain("createdb <db-name>");
+    expect(manual).toContain("../screenshots/README.md");
   });
 
   test("documents final-review operational accuracy corrections", () => {
-    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const manual = readFileSync(join(root, "docs/setup/manual.md"), "utf8");
 
-    expect(readme).not.toContain("API key and model settings");
-    expect(readme).toContain("Provider models are selected internally");
-    expect(readme).toContain(
-      "Reserved URL characters in the database username, password, or database name must be percent-encoded",
-    );
-    expect(readme).toContain(
+    expect(manual).not.toContain("API key and model settings");
+    expect(manual).toContain("Provider models are selected internally");
+    expect(manual).toMatch(/Percent-encode reserved characters in database URL components/iu);
+    expect(manual).toContain(
       "Some Chrome versions may retain a previously requested server origin",
     );
-    expect(readme).toContain(
+    expect(manual).toContain(
       "The popup cleanup warning and the server-origin permission toggle are authoritative",
     );
-    expect(readme).toContain("npm run check:audit");
-    expect(readme).toContain(
+    expect(manual).toContain("npm run check:audit");
+    expect(manual).toContain(
       "CI enforces the dependency-audit policy",
     );
   });
 
   test("summarizes the staged two-gate Production rollout", () => {
-    const readme = readFileSync(join(root, "README.md"), "utf8").replace(
+    const deployment = readFileSync(join(root, "docs/setup/deployment.md"), "utf8").replace(
       /\s+/gu,
       " ",
     );
@@ -406,7 +400,7 @@ describe("task-first README user guide", () => {
       "server-only",
       "missing value defaults closed",
       "invalid value",
-      "Production must set it explicitly",
+      "Production must set both gates explicitly",
       "identity=0,writes=1",
       "identity=1,writes=0",
       "identity=1,writes=1",
@@ -428,19 +422,19 @@ describe("task-first README user guide", () => {
       "external writers are resumed last",
       "rollback target",
     ]) {
-      expect(readme).toContain(requiredText);
+      expect(deployment).toContain(requiredText);
     }
-    expect(readme).not.toMatch(
+    expect(deployment).not.toMatch(
       /(?:build|deploy|deployment|promotion)[^.]{0,100}(?:while|remains) Vercel (?:was|remains) paused/iu,
     );
   });
 
   test("keeps the Production identity summary factual and requirement-scoped", () => {
-    const readme = readFileSync(join(root, "README.md"), "utf8");
-    const start = readme.indexOf("### Production identity maintenance");
-    const end = readme.indexOf("\n## Development and Verification", start);
-    const section = readme
-      .slice(start, end === -1 ? readme.length : end)
+    const deployment = readFileSync(join(root, "docs/setup/deployment.md"), "utf8");
+    const start = deployment.indexOf("## Production identity maintenance overview");
+    const end = deployment.indexOf("\n## ", start + 1);
+    const section = deployment
+      .slice(start, end === -1 ? deployment.length : end)
       .replace(/\s+/gu, " ");
     const sentences = section.split(/(?<=[.!?])\s+/u);
 
@@ -490,11 +484,11 @@ describe("task-first README user guide", () => {
   });
 
   test("keeps the Stage 1 promotion, drain, and probe order explicit", () => {
-    const readme = readFileSync(join(root, "README.md"), "utf8");
-    const start = readme.indexOf("### Production identity maintenance");
-    const end = readme.indexOf("\n## Development and Verification", start);
-    const section = readme
-      .slice(start, end === -1 ? readme.length : end)
+    const deployment = readFileSync(join(root, "docs/setup/deployment.md"), "utf8");
+    const start = deployment.indexOf("## Production identity maintenance overview");
+    const end = deployment.indexOf("\n## ", start + 1);
+    const section = deployment
+      .slice(start, end === -1 ? deployment.length : end)
       .replace(/\s+/gu, " ");
     const promotion = section.indexOf("promote only while unpaused");
     const drain = section.indexOf("post-promotion acceptance gate");

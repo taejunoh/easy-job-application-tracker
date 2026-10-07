@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import AppShell from "@/components/AppShell";
+import { getServerEnv } from "@/lib/server-env";
 
 export const metadata: Metadata = {
   title: "JobTracker",
@@ -12,10 +13,14 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const { validationManualEntryEnabled } = getServerEnv();
+
   return (
     <html lang="en" className="h-full antialiased">
       <body className="min-h-full">
-        <AppShell>{children}</AppShell>
+        <AppShell manualEntryEnabled={validationManualEntryEnabled}>
+          {children}
+        </AppShell>
       </body>
     </html>
   );

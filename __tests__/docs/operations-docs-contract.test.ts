@@ -6,19 +6,23 @@ const root = join(__dirname, "../..");
 describe("production operations documentation contract", () => {
   it("describes both local and hosted storage without the stale local-only claim", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
+    const deployment = readFileSync(join(root, "docs/setup/deployment.md"), "utf8");
 
     for (const staleText of [
       "stay on your machine",
       "SQLite",
       "better-sqlite3",
-      "3001",
       "db push --force-reset",
     ]) {
       expect(readme).not.toContain(staleText);
     }
     expect(readme).toContain("PostgreSQL");
-    expect(readme).toContain("Neon");
-    expect(readme).toContain("Vercel");
+    expect(readme).toContain("by default, `http://127.0.0.1:3000`");
+    expect(readme).toContain("non-default port");
+    expect(readme).toContain("npm run setup -- --port 3001");
+    expect(readme).toContain("docs/setup/deployment.md");
+    expect(deployment).toContain("Neon");
+    expect(deployment).toContain("Vercel");
     expect(readme).toContain("docs/operations/production-runbook.md");
   });
 
@@ -65,7 +69,7 @@ describe("production operations documentation contract", () => {
 
   it("documents the closed application-write gate", () => {
     const documents = [
-      readFileSync(join(root, "README.md"), "utf8"),
+      readFileSync(join(root, "docs/setup/deployment.md"), "utf8"),
       readFileSync(join(root, "docs/operations/production-runbook.md"), "utf8"),
     ].map((document) => document.replace(/\s+/gu, " "));
 
@@ -77,15 +81,15 @@ describe("production operations documentation contract", () => {
       expect(document).toMatch(/invalid[^\n]*(?:blank|whitespace|true)/iu);
       expect(document).toMatch(/Production[^\n]*set[^\n]*explicit/iu);
     }
-    const readme = documents[0];
-    expect(readme).toMatch(/normal local\/CI[^\n]*["`]1["`]/iu);
-    expect(readme).toMatch(/maintenance[^\n]*["`]0["`]/iu);
-    expect(readme).toMatch(/identity[^\n]*distinct|distinction[^\n]*identity/iu);
+    const deployment = documents[0];
+    expect(deployment).toMatch(/normal local\/CI[^\n]*["`]1["`]/iu);
+    expect(deployment).toMatch(/maintenance[^\n]*["`]0["`]/iu);
+    expect(deployment).toMatch(/identity[^\n]*distinct|distinction[^\n]*identity/iu);
   });
 
   it("requires the staged two-gate hosted rollout and rejects the paused-build path", () => {
     const documents = [
-      readFileSync(join(root, "README.md"), "utf8"),
+      readFileSync(join(root, "docs/setup/deployment.md"), "utf8"),
       readFileSync(join(root, "docs/operations/production-runbook.md"), "utf8"),
       readFileSync(
         join(root, "docs/superpowers/plans/2026-09-03-hosted-production-rollout.md"),
@@ -187,7 +191,7 @@ describe("production operations documentation contract", () => {
 
   it("publishes the guarded Production identity maintenance operator workflow", () => {
     const documents = [
-      readFileSync(join(root, "README.md"), "utf8"),
+      readFileSync(join(root, "docs/setup/deployment.md"), "utf8"),
       readFileSync(
         join(root, "docs/operations/production-runbook.md"),
         "utf8",
@@ -311,11 +315,14 @@ describe("production operations documentation contract", () => {
     );
   });
 
-  it("keeps the README concise and free of an unbound apply run ID", () => {
+  it("keeps the README concise and the deployment overview free of an unbound apply run ID", () => {
     const readme = readFileSync(join(root, "README.md"), "utf8");
+    const deployment = readFileSync(join(root, "docs/setup/deployment.md"), "utf8");
 
-    expect(readme).toMatch(/capture\s+and\s+wait\s+for\s+numeric\s+`?PREPARE_RUN_ID`?/iu);
-    expect(readme).not.toContain(
+    expect(readme).toContain("docs/setup/deployment.md");
+    expect(readme).not.toContain("gh workflow run production-identity-maintenance.yml");
+    expect(deployment).toMatch(/capture\s+and\s+wait\s+for\s+numeric\s+`?PREPARE_RUN_ID`?/iu);
+    expect(deployment).not.toContain(
       'gh workflow run production-identity-maintenance.yml --ref main -f phase=apply -f writers_stopped=true -f prepare_run_id="$PREPARE_RUN_ID"',
     );
   });
@@ -558,14 +565,14 @@ describe("production operations documentation contract", () => {
   });
 
   it("publishes the complete quarantine operator workflow", () => {
-    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const manual = readFileSync(join(root, "docs/setup/manual.md"), "utf8");
     const runbook = readFileSync(
       join(root, "docs/operations/quarantine-runbook.md"),
       "utf8",
     );
     const normalized = runbook.replace(/\s+/gu, " ");
 
-    expect(readme).toContain("docs/operations/quarantine-runbook.md");
+    expect(manual).toContain("../operations/quarantine-runbook.md");
     for (const requiredText of [
       "$REPO_ROOT",
       "$QUARANTINE_ROOT",
@@ -615,7 +622,7 @@ describe("production operations documentation contract", () => {
 
   it("distinguishes Vercel validation from self-hosted Node startup", () => {
     const documents = [
-      readFileSync(join(root, "README.md"), "utf8"),
+      readFileSync(join(root, "docs/setup/deployment.md"), "utf8"),
       readFileSync(
         join(root, "docs/operations/production-runbook.md"),
         "utf8",
@@ -660,7 +667,7 @@ describe("production operations documentation contract", () => {
   });
 
   it("documents the isolated bundled-Chromium extension E2E contract", () => {
-    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const manual = readFileSync(join(root, "docs/setup/manual.md"), "utf8");
     const smokeRunbook = readFileSync(
       join(root, "docs/operations/chrome-extension-smoke.md"),
       "utf8",
@@ -682,9 +689,9 @@ describe("production operations documentation contract", () => {
       "PostgreSQL 17",
       "jobtracker_extension_e2e_test",
       "bundled Chromium",
-      "docs/operations/chrome-extension-smoke.md",
+      "../operations/chrome-extension-smoke.md",
     ]) {
-      expect(readme).toContain(requiredText);
+      expect(manual).toContain(requiredText);
     }
 
     for (const requiredText of [

@@ -1,8 +1,15 @@
 const statusStyles: Record<string, string> = {
-  Applied: "bg-blue-900/50 text-blue-400",
-  Interview: "bg-yellow-900/50 text-yellow-400",
-  Offer: "bg-green-900/50 text-green-400",
-  Rejected: "bg-red-900/50 text-red-400",
+  Applied: "status-applied",
+  Interview: "status-interview",
+  Offer: "status-offer",
+  Rejected: "status-rejected",
+};
+
+const statusIcons: Record<string, string> = {
+  Applied: "○",
+  Interview: "◐",
+  Offer: "★",
+  Rejected: "×",
 };
 
 interface StatusBadgeProps {
@@ -16,7 +23,8 @@ export default function StatusBadge({ status }: StatusBadgeProps) {
         statusStyles[status] || "bg-gray-800 text-gray-400"
       }`}
     >
-      {status}
+      <span aria-hidden="true">{statusIcons[status] || "•"}</span>
+      <span data-status-label>{status}</span>
     </span>
   );
 }

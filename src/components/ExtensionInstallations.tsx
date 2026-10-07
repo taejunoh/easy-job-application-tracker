@@ -45,16 +45,16 @@ export function PairingCodePanel({
 }>) {
   if (secret === null) return null;
   return (
-    <div className="bg-gray-800 border border-blue-700 rounded p-3 mb-4">
-      <p className="text-xs text-gray-400 mb-2">
+    <div className="pairing-secret-panel">
+      <p className="panel-copy">
         Shown once. Expires {new Date(secret.expiresAt).toLocaleString()}.
       </p>
-      <code className="block break-all text-sm text-blue-300">{secret.code}</code>
+      <code className="pairing-secret">{secret.code}</code>
       <button
         type="button"
         aria-label="Dismiss pairing code"
         onClick={onDismiss}
-        className="mt-3 text-xs text-gray-400 hover:text-white"
+        className="secondary-button pairing-dismiss"
       >
         Dismiss
       </button>
@@ -129,33 +129,37 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
   return (
     <section
       id="extension-installations"
-      className="bg-gray-900 rounded-lg p-6 max-w-lg mt-6"
+      aria-labelledby="extension-installations-heading"
+      className="extension-installations card"
     >
-      <h2 className="text-sm font-medium text-gray-400 uppercase mb-4">
+      <h2 id="extension-installations-heading" className="panel-heading">
         Chrome extension installations
       </h2>
-      <p className="text-xs text-gray-500 mb-4">
+      <p className="panel-copy">
         Create a ten-minute, one-time pairing code for a configured extension.
       </p>
 
-      <div className="flex gap-2 mb-4">
-        <select
-          aria-label="Extension origin"
-          value={origin}
-          onChange={(event) => setOrigin(event.target.value)}
-          className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-xs"
-        >
-          {configuredOrigins.map((configuredOrigin) => (
-            <option key={configuredOrigin} value={configuredOrigin}>
-              {configuredOrigin}
-            </option>
-          ))}
-        </select>
+      <div className="extension-controls">
+        <label htmlFor="extension-origin" className="field-label">
+          <span className="input-label">Extension origin</span>
+          <select
+            id="extension-origin"
+            value={origin}
+            onChange={(event) => setOrigin(event.target.value)}
+            className="field"
+          >
+            {configuredOrigins.map((configuredOrigin) => (
+              <option key={configuredOrigin} value={configuredOrigin}>
+                {configuredOrigin}
+              </option>
+            ))}
+          </select>
+        </label>
         <button
           type="button"
           disabled={busy || origin === ""}
           onClick={createPairingCode}
-          className="px-3 py-2 bg-blue-600 text-white text-xs rounded disabled:opacity-50"
+          className="primary-button"
         >
           Create pairing code
         </button>
@@ -167,16 +171,16 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
       />
 
       {installations.length === 0 ? (
-        <p className="text-xs text-gray-500">No extension installations yet.</p>
+        <p className="panel-copy">No extension installations yet.</p>
       ) : (
         <ul className="space-y-2">
           {installations.map((installation) => (
-            <li key={installation.id} className="bg-gray-800 rounded p-3 text-xs">
-              <div className="break-all text-gray-300">{installation.origin}</div>
-              <div className="text-gray-500 mt-1 break-all">
+            <li key={installation.id} className="installation-item">
+              <div className="installation-origin">{installation.origin}</div>
+              <div className="installation-id">
                 Installation ID <code>{installation.id}</code>
               </div>
-              <div className="text-gray-500 mt-1">
+              <div className="installation-status">
                 {installation.revokedAt
                   ? "Revoked"
                   : `Expires ${new Date(installation.expiresAt).toLocaleDateString()}`}
@@ -186,7 +190,7 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
                   type="button"
                   disabled={busy}
                   onClick={() => revoke(installation.id)}
-                  className="mt-2 text-red-400 hover:text-red-300 disabled:opacity-50"
+                  className="danger-link"
                 >
                   Revoke
                 </button>
@@ -195,10 +199,29 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
           ))}
         </ul>
       )}
-      {message && <p role="alert" className="text-xs text-red-400 mt-3">{message}</p>}
+      {message && <p role="alert" className="inline-alert">{message}</p>}
+      <style>{extensionInstallationsStyles}</style>
     </section>
   );
 }
+
+const extensionInstallationsStyles = `
+.extension-installations { margin-top: 1.25rem; max-width: 46rem; padding: clamp(1rem, 3vw, 1.6rem); }
+.extension-controls { align-items: end; display: grid; gap: 0.75rem; grid-template-columns: minmax(0, 1fr) auto; margin-top: 1rem; }
+.extension-installations .field { background: var(--surface); color: var(--text); min-width: 0; }
+.extension-installations ul { list-style: none; margin: 1rem 0 0; padding: 0; }
+.extension-installations .primary-button { white-space: nowrap; }
+.pairing-secret-panel { background: #eef4ef; border: 1px solid #b9cec3; border-radius: 0.5rem; margin: 1rem 0; padding: 0.9rem; }
+.pairing-secret { color: var(--primary); display: block; font-size: 0.9rem; overflow-wrap: anywhere; }
+.pairing-dismiss { margin-top: 0.65rem; }
+.installation-item { background: #f7f8f4; border: 1px solid var(--border); border-radius: 0.5rem; list-style: none; margin-top: 0.65rem; padding: 0.85rem; }
+.installation-origin, .installation-id, .installation-status { overflow-wrap: anywhere; }
+.installation-origin { color: var(--text); font-size: 0.9rem; font-weight: 700; }
+.installation-id, .installation-status { color: var(--muted); font-size: 0.78rem; margin-top: 0.35rem; }
+.extension-installations .danger-link { font-size: 0.8rem; min-height: 44px; }
+.extension-installations .inline-alert { margin-top: 0.8rem; padding: 0.65rem 0.8rem; }
+@media (max-width: 560px) { .extension-controls { grid-template-columns: 1fr; } .extension-installations .primary-button { width: 100%; } }
+`;
 
 export function createExtensionPairingCode(api: ClientApi, origin: string) {
   return api<{ code: string; expiresAt: string }>("/api/extension/pairing", {

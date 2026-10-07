@@ -26,15 +26,14 @@ export const settingsFixture = {
   linkedinUrl: "https://linkedin.com/in/jane-doe",
   githubUrl: "https://github.com/jane-doe",
   resumeText:
-    "Jane Doe\nSoftware Engineer\n\n" +
-    "Experience\n" +
-    "- Senior Frontend Engineer at Example Co (2023-present)\n" +
-    "  Built React/TypeScript apps, optimized bundle size,\n" +
-    "  led design system migration.\n" +
-    "- Software Engineer at Demo Inc (2020-2023)\n" +
-    "  Node.js APIs, PostgreSQL schema design, REST endpoints.\n\n" +
-    "Skills\n" +
-    "React, TypeScript, Node.js, PostgreSQL, REST, Git, CI/CD",
+    "Jordan Example\nSoftware Engineer\n\n" +
+    "Frontend Engineer at Sample Co\n\n" +
+    "React, TypeScript, Node.js, PostgreSQL",
+};
+
+export const extensionInstallationsFixture = {
+  installations: [],
+  configuredOrigins: [],
 };
 
 export const popupFormFixture = {

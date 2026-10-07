@@ -1,0 +1,25 @@
+{
+  "provenance": "Captured 2026-10-07 before replacement from the installed and locked fast-glob 3.3.1, globSync(pattern, {onlyDirectories:true}), on disposable fixtures identical to next-root-glob.test.ts. The alias fixture adds nested directory aliases, file/broken links, cycle->., parent->.., ENOTDIR and ELOOP links; all six alias cases were recaptured after adding the latter two links with unchanged results. Paths and realpath identities are normalized relative to the canonical fixture root; order and trailing slash spelling are intentionally ignored. No reference implementation is needed at test runtime.",
+  "cases": [
+    {"pattern":".","paths":["."],"identities":["."]},
+    {"pattern":"packages/a/web","paths":["packages/a/web"],"identities":["packages/a/web"]},
+    {"pattern":"packages/*/web","paths":["packages/a/web","packages/b/web"],"identities":["packages/a/web","packages/b/web"]},
+    {"pattern":"./packages/*/web","paths":["packages/a/web","packages/b/web"],"identities":["packages/a/web","packages/b/web"]},
+    {"pattern":"@scope/*/web","paths":["@scope/app/web"],"identities":["@scope/app/web"]},
+    {"pattern":"with space/web","paths":["with space/web"],"identities":["with space/web"]},
+    {"pattern":"link/web","paths":["link/web"],"identities":["packages/a/web"]},
+    {"pattern":".hidden","paths":[".hidden"],"identities":[".hidden"]},
+    {"pattern":"missing","paths":[],"identities":[]},
+    {"pattern":"packages/a/web/","paths":["packages/a/web"],"identities":["packages/a/web"]},
+    {"pattern":"ABS:packages/*/web","paths":["packages/a/web","packages/b/web"],"identities":["packages/a/web","packages/b/web"]},
+    {"pattern":"*","paths":["@scope","link","packages","with space"],"identities":["@scope","packages","packages/a","with space"]}
+  ],
+  "aliasCases": [
+    {"pattern":"*","paths":["@scope","cycle","link","nested-alias","packages","with space"],"identities":[".","@scope","packages","packages/a","with space"]},
+    {"pattern":"*/web","paths":["link/web","nested-alias/web","with space/web"],"identities":["packages/a/web","with space/web"]},
+    {"pattern":"nested-alias/web","paths":["nested-alias/web"],"identities":["packages/a/web"]},
+    {"pattern":"cycle/packages/*/web","paths":["cycle/packages/a/web","cycle/packages/b/web"],"identities":["packages/a/web","packages/b/web"]},
+    {"pattern":"packages/a/parent/*/web","paths":["packages/a/parent/a/web","packages/a/parent/b/web"],"identities":["packages/a/web","packages/b/web"]},
+    {"pattern":"cycle/*","paths":["cycle/@scope","cycle/cycle","cycle/link","cycle/nested-alias","cycle/packages","cycle/with space"],"identities":[".","@scope","packages","packages/a","with space"]}
+  ]
+}

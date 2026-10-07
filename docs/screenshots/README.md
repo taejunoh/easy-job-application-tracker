@@ -4,17 +4,27 @@ These PNGs are referenced from the main [README](../../README.md) and are genera
 
 ## Regenerating
 
-Start the Next.js dev server in one terminal:
+For the managed local app, run:
+
+```bash
+npm run screenshots -- --local
+```
+
+This reads the private `.jobtracker/local.env` configuration without loading
+the repository root `.env`; the saved token is used only to authenticate the
+local browser session and is never printed. The managed server must already be
+running. Captures reject any base URL other than literal `http://localhost` or
+`http://127.0.0.1` origins.
+
+For a manually started development server, start it with local development
+credentials in one terminal:
 
 ```bash
 npm run dev
 ```
 
-Then in another terminal run:
-
-```bash
-npm run screenshots
-```
+Then run `npm run screenshots`. The capture origin must still be an HTTP
+localhost or 127.0.0.1 origin; remote and production hosts are rejected.
 
 The script writes all eight files here:
 
@@ -27,9 +37,18 @@ The script writes all eight files here:
 - `07-extension-connect.png` — disconnected extension connection form
 - `08-extension-connected.png` — connected extension status
 
-The full command creates an authenticated local browser session for protected app pages. App captures use the fixed `en-US` locale and `UTC` timezone so date rendering does not depend on the host machine. No real database data is used — API calls are intercepted by Playwright and served from `scripts/screenshot-fixtures.mjs`.
+No real database data is used — every app API request is intercepted by
+Playwright and served from `scripts/screenshot-fixtures.mjs`. The only allowed
+app reads are dashboard stats, settings (including synthetic resume text), and
+an empty extension-installation list. Unknown API paths, query strings, or
+methods are blocked and fail generation with a sanitized diagnostic.
 
-Images 06–08 always run in a separate network-blocked browser context, including during the full command. Any attempted HTTP(S) or WebSocket request fails the generation instead of reaching a real service.
+The full run authenticates its local browser session before app captures. It
+uses fixed `en-US` and `UTC` settings so dates do not depend on the host.
+
+Images 06–08 always run in a separate network-blocked browser context,
+including during the full command. Any attempted HTTP(S) or WebSocket request
+fails the generation instead of reaching a real service.
 
 To generate only the three extension setup images, run:
 
@@ -49,4 +68,4 @@ Only when the UI visibly changes. These PNGs are deterministic (modulo font anti
 
 - `playwright` devDependency (already in `package.json`)
 - Chromium browser binary (one-time: `npx playwright install chromium`)
-- Next.js dev server running at `http://localhost:3000` (not required for `screenshots:setup`)
+- Managed local server running at the origin stored in `.jobtracker/local.env`, or a manually started local development server (not required for `screenshots:setup`)

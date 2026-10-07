@@ -6,6 +6,12 @@
     "node": ">=22.22.2 <23"
   },
   "scripts": {
+    "setup": "node scripts/local-setup.mjs setup",
+    "local:start": "node scripts/local-setup.mjs start",
+    "local:stop": "node scripts/local-setup.mjs stop",
+    "local:logs": "node scripts/local-setup.mjs logs",
+    "local:token": "node scripts/local-setup.mjs token",
+    "local:extension": "node scripts/local-setup.mjs extension",
     "dev": "node --import ./scripts/validate-startup-env-development.mjs node_modules/next/dist/bin/next dev",
     "build": "prisma generate && next build",
     "start": "node --import ./scripts/validate-startup-env-production.mjs node_modules/next/dist/bin/next start",
@@ -15,6 +21,7 @@
     "test:extension:e2e": "node scripts/extension-e2e.mjs",
     "test:extension:e2e:local": "node scripts/extension-e2e-local.mjs",
     "test:backup:docker": "RUN_BACKUP_DOCKER_INTEGRATION=1 jest --runInBand __tests__/scripts/create-snapshot-backup.docker.integration.test.ts",
+    "test:onboarding:docker": "node scripts/verify-local-onboarding.mjs",
     "typecheck": "next typegen && tsc --noEmit",
     "check:extension": "node --check extension/background.js && node --check extension/content.js && node --check extension/popup.js && node -e \"const manifest=JSON.parse(require('node:fs').readFileSync('extension/manifest.json','utf8')); if (manifest.manifest_version !== 3) process.exit(1)\"",
     "check:audit": "node scripts/check-audit.mjs",
@@ -28,23 +35,24 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.111.0",
-    "@fastify/busboy": "^3.2.0",
+    "@fastify/busboy": "^3.2.2",
     "@google/generative-ai": "^0.24.1",
-    "@next/env": "16.3.0",
+    "@next/env": "16.3.6",
     "@prisma/adapter-pg": "7.9.1",
     "@prisma/client": "7.9.1",
     "cheerio": "^1.2.0",
     "dotenv": "^17.4.1",
-    "next": "16.3.0",
+    "next": "16.3.6",
     "openai": "^6.33.0",
     "pdfjs-dist": "^4.10.38",
     "pg": "^8.20.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "server-only": "^0.0.1",
-    "undici": "7.29.0"
+    "undici": "7.29.1"
   },
   "devDependencies": {
+    "@jobtracker/next-root-glob": "file:tools/vendor/jobtracker-next-root-glob-1.0.1.tgz",
     "@tailwindcss/postcss": "^4",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
@@ -54,8 +62,9 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.3.0",
-    "jest": "^30.3.0",
+    "eslint-config-next": "16.3.6",
+    "jest": "^30.5.2",
+    "jest-environment-jsdom": "^30.5.2",
     "pg-connection-string": "^2.12.0",
     "playwright": "^1.59.1",
     "postcss": "8.5.26",
@@ -66,9 +75,15 @@
     "yaml": "^2.9.0"
   },
   "overrides": {
+    "@next/eslint-plugin-next@16.3.6": {
+      "fast-glob": "$@jobtracker/next-root-glob"
+    },
+    "@istanbuljs/load-nyc-config@1.1.0": {
+      "js-yaml": "4.3.2"
+    },
     "@humanfs/node": "0.16.8",
     "browserslist": "4.28.8",
-    "fast-uri": "3.1.6",
+    "fast-uri": "3.1.8",
     "@prisma/config@7.9.1": {
       "deepmerge-ts": "8.0.2"
     },
@@ -76,7 +91,7 @@
       "mysql2": "3.24.3"
     },
     "minimatch@3.1.5": {
-      "brace-expansion": "1.1.18"
+      "brace-expansion": "1.1.21"
     }
   }
 }
