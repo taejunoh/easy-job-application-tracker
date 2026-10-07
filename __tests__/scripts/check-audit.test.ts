@@ -300,6 +300,19 @@ describe("npm audit exception policy", () => {
     expect(runGenerated(allowedAudit, stale).status).toBe(1);
   });
 
+  it("rejects an expired review date with zero vulnerabilities and zero exceptions", () => {
+    const expired = emptyPolicy();
+    expired.reviewBy = "2026-07-13";
+
+    const result = runGenerated(emptyAuditReport(), expired);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr.trim()).toBe(
+      "Audit policy failed: full critical=0 high=0 moderate=0 low=0 exceptions=0",
+    );
+  });
+
   it("rejects malformed policy fields, mismatched wrapper scope, URL, and references", () => {
     const malformed = structuredClone(allowedExceptions);
     malformed.exceptions[0].rationale = "";
