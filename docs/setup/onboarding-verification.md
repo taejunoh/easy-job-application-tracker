@@ -36,3 +36,5 @@ The full Jest regression run passed with `npm test -- --maxWorkers=3`: 94 suites
 The existing dependency audit fails on the unchanged live-main dependency baseline. Findings include an unpatched high-severity [`braces` advisory](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm), and the existing exception policy's review date has expired. This onboarding work does not update vulnerable dependencies, waive findings or extend the exception policy.
 
 The changes may be published as a **draft pull request**, but must not merge to `main` until separately scoped security remediation restores the relevant gate. Passing local onboarding checks does not override that release limitation.
+
+Subsequent user-approved security patches and their remaining blockers are recorded in the [2026-10-07 security remediation review](../security/dependency-audit-2026-10-07.md). This onboarding record describes its original acceptance revision, not the latest dependency inventory; the full security gate remains blocked after the partial patch batch.
