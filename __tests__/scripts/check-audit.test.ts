@@ -304,12 +304,17 @@ describe("npm audit exception policy", () => {
     const expired = emptyPolicy();
     expired.reviewBy = "2026-07-13";
 
-    const result = runGenerated(emptyAuditReport(), expired);
+    const emptyAudit = emptyAuditReport();
+    const result = runPolicy(
+      writeFixture("empty-audit.json", emptyAudit),
+      writeFixture("expired-empty-policy.json", expired),
+      writeFixture("empty-production-audit.json", emptyAudit),
+    );
 
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
     expect(result.stderr.trim()).toBe(
-      "Audit policy failed: full critical=0 high=0 moderate=0 low=0 exceptions=0",
+      "Audit policy failed: full critical=0 high=0 moderate=0 low=0 production critical=0 high=0 moderate=0 low=0 exceptions=0",
     );
   });
 
