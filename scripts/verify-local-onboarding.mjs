@@ -201,26 +201,37 @@ export async function verifyLocalOnboarding() {
     page.setDefaultTimeout(30_000);
     await page.goto(`${origin}/connect`);
     await page.getByLabel("Access token", { exact: true }).fill(token);
-    const login = page.waitForResponse(response => new URL(response.url()).pathname === "/api/auth/session" && response.request().method() === "POST");
-    await page.getByRole("button", { name: "Connect", exact: true }).click();
-    assert.equal((await login).status(), 200);
+    const [login] = await Promise.all([
+      page.waitForResponse(response => new URL(response.url()).pathname === "/api/auth/session" && response.request().method() === "POST"),
+      page.getByRole("button", { name: "Connect", exact: true }).click(),
+    ]);
+    assert.equal(login.status(), 200);
     await page.getByRole("heading", { name: "Dashboard", exact: true }).waitFor();
     const fixture = { url: "https://example.com/jobs/onboarding-synthetic", jobTitle: "Synthetic Onboarding Engineer", company: "Synthetic Acceptance Company" };
     let extracted = 0;
+    let extractionSucceeded, extractionFailed;
+    const extraction = new Promise((accept, reject) => { extractionSucceeded = accept; extractionFailed = reject; });
     // This is the only intercepted endpoint. Auth, application CRUD, and PostgreSQL remain real.
     await page.route(`${origin}/api/extract`, async route => {
-      assert.equal(route.request().method(), "POST");
-      assert.deepEqual(route.request().postDataJSON(), { url: fixture.url });
-      extracted += 1;
-      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fixture) });
+      try {
+        assert.equal(route.request().method(), "POST");
+        assert.deepEqual(route.request().postDataJSON(), { url: fixture.url });
+        extracted += 1;
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fixture) });
+        extractionSucceeded();
+      } catch (error) {
+        try { await route.abort(); } catch { /* The route may already be handled or the browser closed. */ }
+        extractionFailed(error);
+      }
     });
     await page.getByLabel("Job URL", { exact: true }).fill(fixture.url);
-    await page.getByRole("button", { name: "+ Add", exact: true }).click();
+    await Promise.all([extraction, page.getByRole("button", { name: "+ Add", exact: true }).click()]);
     assert.equal(await page.getByLabel("Job Title", { exact: true }).inputValue(), fixture.jobTitle);
     assert.equal(await page.getByLabel("Company", { exact: true }).inputValue(), fixture.company);
-    const savedResponse = page.waitForResponse(response => new URL(response.url()).pathname === "/api/applications" && response.request().method() === "POST");
-    await page.getByRole("button", { name: "Save Application", exact: true }).click();
-    const saved = await savedResponse;
+    const [saved] = await Promise.all([
+      page.waitForResponse(response => new URL(response.url()).pathname === "/api/applications" && response.request().method() === "POST"),
+      page.getByRole("button", { name: "Save Application", exact: true }).click(),
+    ]);
     assert.equal(saved.status(), 201);
     const application = await saved.json();
     assert.equal(extracted, 1);
