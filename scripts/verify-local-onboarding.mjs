@@ -225,7 +225,9 @@ export async function verifyLocalOnboarding() {
       }
     });
     await page.getByLabel("Job URL", { exact: true }).fill(fixture.url);
-    await Promise.all([extraction, page.getByRole("button", { name: "+ Add", exact: true }).click()]);
+    const extractionTimeout = setTimeout(() => extractionFailed(new Error("extraction timed out")), 30_000);
+    try { await Promise.all([extraction, page.getByRole("button", { name: "+ Add", exact: true }).click()]); }
+    finally { clearTimeout(extractionTimeout); }
     assert.equal(await page.getByLabel("Job Title", { exact: true }).inputValue(), fixture.jobTitle);
     assert.equal(await page.getByLabel("Company", { exact: true }).inputValue(), fixture.company);
     const [saved] = await Promise.all([

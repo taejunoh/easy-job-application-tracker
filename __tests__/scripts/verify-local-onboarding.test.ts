@@ -30,6 +30,7 @@ async function isolatedFailure(scriptUrl: string, kind: string) {
       if ((name === "Connect" && kind === "login-click") || (name === "Save Application" && kind === "save-click")) throw failure();
       if (name === "Connect" && kind === "login-response") await new Promise(resolve => setTimeout(resolve, 30));
       if (name === "+ Add") {
+        if (kind === "route-missing") return;
         // Playwright dispatches route callbacks independently of locator actions.
         void routeHandler({
           request: () => ({ method: () => kind === "route-method" ? "GET" : "POST", postDataJSON: () => {
@@ -101,7 +102,7 @@ async function isolatedFailure(scriptUrl: string, kind: string) {
     return dependency;
   };
   const { createContext } = await importModule("node:vm");
-  const context = createContext({ Buffer, URL, setTimeout, clearTimeout, process: {
+  const context = createContext({ Buffer, URL, setTimeout: (callback: () => void, delay: number) => setTimeout(callback, delay === 30_000 ? 5 : delay), clearTimeout, process: {
     versions: process.versions, platform: process.platform, argv: [], env: {},
     on: process.on.bind(process), off: process.off.bind(process),
     stdout: { write: (value: string) => output.push(value) }, stderr: { write: (value: string) => output.push(value) },
@@ -147,7 +148,7 @@ function containers(): ContainerFixture[] {
 }
 
 describe("Docker onboarding acceptance safety", () => {
-  it.each(["login-click", "login-response", "save-click", "save-response", "route-method", "route-json", "route-body", "route-fulfill", "route-abort"])("contains %s failures in the main flow and cleans up without leaking diagnostics", kind => {
+  it.each(["login-click", "login-response", "save-click", "save-response", "route-method", "route-json", "route-body", "route-fulfill", "route-abort", "route-missing"])("contains %s failures in the main flow and cleans up without leaking diagnostics", kind => {
     const result = spawnSync(process.execPath, ["--no-warnings", "--experimental-vm-modules", "--input-type=module", "-e",
       `await (${isolatedFailure.toString()})(${JSON.stringify(script)}, ${JSON.stringify(kind)});`], { encoding: "utf8", timeout: 10_000 });
     expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" });
@@ -159,7 +160,7 @@ describe("Docker onboarding acceptance safety", () => {
     expect(actual.temporaryRemoved).toBe(true);
     expect(actual.ownedCleanup).toBe(true);
     if (kind.startsWith("route-")) {
-      expect(actual.aborted).toBe(true);
+      expect(actual.aborted).toBe(kind !== "route-missing");
       expect(actual.afterExtractionRead).toBe(false);
     }
     expect(actual.output).not.toContain("SYNTHETIC_PRIVATE_RESPONSE_COOKIE");
