@@ -9,7 +9,14 @@ const picomatch = require("picomatch");
 // fdir otherwise traverses a directory symlink without emitting the alias itself.
 // Use tinyglobby's public filesystem hook, not a separate walker or glob parser.
 function readdirWithDirectoryLinks(directory, options, recordError) {
-  return fs.readdirSync(directory, options).map(entry => {
+  let entries;
+  try {
+    entries = fs.readdirSync(directory, options);
+  } catch (error) {
+    if (!["ENOENT", "ENOTDIR"].includes(error.code)) recordError(error);
+    throw error;
+  }
+  return entries.map(entry => {
     if (!entry.isSymbolicLink()) return entry;
     let stat;
     try {
@@ -62,19 +69,19 @@ function globSync(pattern, options) {
     throw new TypeError("Next rootDir does not support dot path segments after a wildcard");
   }
 
-  let unexpectedStatError;
+  let unexpectedFsError;
   const matches = tinyGlobSync(normalized, {
     expandDirectories: false,
     onlyDirectories: true,
     absolute: path.isAbsolute(normalized),
     fs: {
       readdirSync: (directory, options) => readdirWithDirectoryLinks(directory, options, error => {
-        unexpectedStatError = error;
+        unexpectedFsError = error;
       }),
     },
   });
   // fdir suppresses readdir errors; preserve this hook's explicit error boundary.
-  if (unexpectedStatError) throw unexpectedStatError;
+  if (unexpectedFsError) throw unexpectedFsError;
   return matches;
 }
 

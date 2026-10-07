@@ -36,9 +36,11 @@ inputs.
 The public `tinyglobby` filesystem hook classifies symlinks to directories as
 directory Dirents, preserving both matched aliases and traversal through them.
 It leaves file and broken links unchanged, tolerates only `ENOENT`, `ENOTDIR` and
-`ELOOP` from link stat, and propagates other errors. There is no extra traversal
+`ELOOP` from link stat, and propagates other errors. Directory reads preserve
+missing/not-directory `ENOENT`/`ENOTDIR` behavior but propagate other errors.
+There is no extra traversal
 or realpath deduplication. Because fdir suppresses directory-read exceptions, each
-call records an unexpected stat error and rethrows the original error after the
+call records an unexpected filesystem error and rethrows the original error after the
 synchronous crawl; no error state is shared between calls. Finite-pattern tests cover nested aliases, self/parent
 cycles, file links and broken links in a bounded child process.
 
@@ -67,7 +69,7 @@ review of the security boundary, not a fallback to another parser.
 
 ## Reproducible local package
 
-The dependency is the committed `tools/vendor/jobtracker-next-root-glob-1.0.0.tgz`,
+The dependency is the committed `tools/vendor/jobtracker-next-root-glob-1.0.1.tgz`,
 not a directory link. npm 10 resolves a scoped override's relative directory file
 reference against the consumer package and creates a dangling link. A local
 tarball retains this package's honest identity and works with the same scoped

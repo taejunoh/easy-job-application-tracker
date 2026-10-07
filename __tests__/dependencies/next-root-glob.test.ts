@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -34,7 +35,7 @@ describe("restricted Next root-directory adapter", () => {
   it("provides its own private package rather than impersonating fast-glob", () => {
     expect(existsSync(adapterPath)).toBe(true);
     const pkg = JSON.parse(readFileSync(join(root, "tools/next-root-glob/package.json"), "utf8"));
-    expect(pkg).toMatchObject({ name: "@jobtracker/next-root-glob", private: true, version: "1.0.0", main: "index.cjs", dependencies: { tinyglobby: "0.2.17", picomatch: "4.0.4" } });
+    expect(pkg).toMatchObject({ name: "@jobtracker/next-root-glob", private: true, version: "1.0.1", main: "index.cjs", dependencies: { tinyglobby: "0.2.17", picomatch: "4.0.4" } });
     expect(Object.keys(adapter())).toEqual(["globSync"]);
   });
 
@@ -51,7 +52,7 @@ describe("restricted Next root-directory adapter", () => {
     }
   });
 
-  it.each(["src/**", "src/{**,lib}", "src/!(lib)/**", "src/{a,b}", "src/[ab]", "src/?", "src/a*", "a*", "src/*a", "src/***", "!src", "src/@(lib)", "src/+(lib)", "src/(lib)", "src/\\*", "src/\nlib", "src/\u0000lib", "src/\u0085lib", "x".repeat(4097), ""])("throws for unsupported pattern %j", pattern => {
+  it.each(["src/**", "src/{**,lib}", "src/!(lib)/**", "src/{a,b}", "src/[ab]", "src/?", "src/a*", "a*", "src/*a", "src/***", "!src", "src/@(lib)", "src/+(lib)", "src/(lib)", ...(process.platform === "win32" ? [] : ["src/\\*"]), "src/\nlib", "src/\u0000lib", "src/\u0085lib", "x".repeat(4097), ""])("throws for unsupported pattern %j", pattern => {
     expect(() => adapter().globSync(pattern, { onlyDirectories: true })).toThrow(TypeError);
   });
 
@@ -128,6 +129,24 @@ describe("restricted Next root-directory adapter", () => {
     expect(child.stderr).toBe("");
   });
 
+  it("propagates a directory-read failure with its identity and clears per-call error state", () => {
+    const child = spawnSync(process.execPath, ["-e", `
+      const fs=require('node:fs'), path=require('node:path');
+      const {globSync}=require(process.argv[1]);
+      const directory=process.argv[2], original=fs.readdirSync;
+      const failure=Object.assign(new Error('injected directory-read failure'),{code:'EACCES'});
+      fs.readdirSync=(file,...rest)=>{if(path.resolve(file)===directory)throw failure;return original(file,...rest);};
+      process.chdir(directory);
+      try {globSync('*',{onlyDirectories:true});process.exitCode=2;}
+      catch(error){if(error!==failure)throw new Error('original error lost');}
+      finally {fs.readdirSync=original;}
+      if(globSync('*',{onlyDirectories:true}).length===0)throw new Error('per-call state leaked');
+    `, adapterPath, fixture], { encoding: "utf8", timeout: 3000 });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(child.stderr).toBe("");
+  });
+
   it("rejects POSIX backslash escapes, or normalizes native Windows separators", () => {
     process.chdir(fixture);
     try {
@@ -161,7 +180,7 @@ describe("committed private package artifact", () => {
     const [pack] = JSON.parse(child.stdout) as { filename: string; files: { path: string }[] }[];
     expect(pack.files.map(file => file.path).sort()).toEqual(["README.md", "index.cjs", "package.json"]);
     const generated = join(fixture, pack.filename);
-    const committed = join(root, "tools/vendor/jobtracker-next-root-glob-1.0.0.tgz");
+    const committed = join(root, "tools/vendor/jobtracker-next-root-glob-1.0.1.tgz");
     expect(readFileSync(generated)).toEqual(readFileSync(committed));
     const archive = spawnSync("tar", ["-tzf", committed], { encoding: "utf8", timeout: 3000 });
     expect(archive.status).toBe(0);
@@ -172,7 +191,7 @@ describe("committed private package artifact", () => {
     const nextRequire = createRequire(localRequire.resolve("@next/eslint-plugin-next"));
     const installed = nextRequire.resolve("fast-glob");
     const pkg = nextRequire("fast-glob/package.json");
-    expect(pkg).toMatchObject({ name: "@jobtracker/next-root-glob", version: "1.0.0", private: true });
+    expect(pkg).toMatchObject({ name: "@jobtracker/next-root-glob", version: "1.0.1", private: true });
     expect(pkg.dependencies).toEqual({ tinyglobby: "0.2.17", picomatch: "4.0.4" });
     for (const file of ["index.cjs", "README.md", "package.json"]) {
       expect(readFileSync(join(dirname(installed), file))).toEqual(readFileSync(join(dirname(sourcePath), file)));
@@ -182,6 +201,85 @@ describe("committed private package artifact", () => {
 });
 
 describe("real Next 16.3.6 consumer", () => {
+  const pluginPackage = localRequire("@next/eslint-plugin-next/package.json") as { version: string };
+  const pluginDist = dirname(localRequire.resolve("@next/eslint-plugin-next"));
+  const consumerPath = join(pluginDist, "utils/get-root-dirs.js");
+  const consumerSource = readFileSync(consumerPath, "utf8");
+  const checkConsumerContract = (source = consumerSource, version = pluginPackage.version) => spawnSync(process.execPath, ["-e", `
+    const vm=require('node:vm'), assert=require('node:assert/strict');
+    const source=process.argv[1], version=process.argv[2];
+    assert.equal(version,'16.3.6');
+    const imports=[], members=[], calls=[];
+    const dependency=new Proxy({}, {get(_,member){
+      members.push(member);
+      if(member!=='globSync')throw new Error('unsupported fast-glob API');
+      return (...args)=>{
+        assert.equal(args.length,2);
+        assert.equal(typeof args[0],'string');
+        assert.deepEqual(Reflect.ownKeys(args[1]),['onlyDirectories']);
+        assert.equal(Object.getOwnPropertyDescriptor(args[1],'onlyDirectories').value,true);
+        calls.push(args);return ['matched:'+args[0]];
+      };
+    }});
+    const sandbox={exports:{},require(specifier){imports.push(specifier);if(specifier!=='fast-glob')throw new Error('unexpected import');return dependency;}};
+    vm.runInNewContext(source,sandbox,{filename:'installed-next-get-root-dirs.js',timeout:1000});
+    const {getRootDirs}=sandbox.exports;
+    const defaultRoots=getRootDirs({cwd:'/default-only',settings:{}});
+    assert.equal(calls.length,0);
+    const literalRoots=getRootDirs({cwd:'/unused',settings:{next:{rootDir:'packages\\\\app\\\\web'}}});
+    const arrayRoots=getRootDirs({cwd:'/unused',settings:{next:{rootDir:['packages\\\\a\\\\web',42,null,['ignored/nested'],'packages/*/web']}}});
+    assert.deepEqual(imports,['fast-glob']);
+    assert.deepEqual(members,['globSync','globSync','globSync']);
+    assert.deepEqual(calls.map(args=>args[0]),['packages/app/web','packages/a/web','packages/*/web']);
+    assert.deepEqual(JSON.parse(JSON.stringify(defaultRoots)),['/default-only']);
+    assert.deepEqual(JSON.parse(JSON.stringify(literalRoots)),['matched:packages/app/web']);
+    assert.deepEqual(JSON.parse(JSON.stringify(arrayRoots)),['matched:packages/a/web','matched:packages/*/web']);
+    console.log(JSON.stringify({version,imports,members,calls,defaultRoots,literalRoots,arrayRoots}));
+  `, source, version], { encoding: "utf8", timeout: 3000 });
+
+  it("pins the installed consumer version, reviewed source and sole fast-glob import scope", () => {
+    expect(pluginPackage.version).toBe("16.3.6");
+    // Deliberate narrow maintenance sentinel: changed consumer source requires review.
+    expect(createHash("sha256").update(consumerSource).digest("hex")).toBe("886677432990a735e5ebdfb345ff1cbd40e264f9947a8432eeeb254b3a926bde");
+    const importSites: string[] = [];
+    const scan = (directory: string) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const file = join(directory, entry.name);
+        if (entry.isDirectory()) scan(file);
+        else if (entry.name.endsWith(".js") && /["']fast-glob(?:\/[^"']*)?["']/u.test(readFileSync(file, "utf8"))) {
+          importSites.push(relative(pluginDist, file).replace(/\\/g, "/"));
+        }
+      }
+    };
+    scan(pluginDist);
+    expect(importSites.sort()).toEqual(["utils/get-root-dirs.js"]);
+  });
+
+  it("guards actual consumer string calls, exact own options, normalization and array fanout", () => {
+    const child = checkConsumerContract();
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+  });
+
+  it.each([
+    ["broader options", "onlyDirectories: true", "onlyDirectories: true, dot: true"],
+    ["another API", ".globSync", ".sync"],
+    ["lost backslash normalization", "rootDir.replace(/\\\\/g, '/')", "rootDir"],
+    ["lost array flattening", "}).flat();", "});"],
+  ])("rejects isolated consumer mutation: %s", (_, search, replacement) => {
+    const mutated = consumerSource.replace(search, replacement);
+    expect(mutated).not.toBe(consumerSource);
+    const child = checkConsumerContract(mutated);
+    expect(child.error).toBeUndefined();
+    expect(child.status).not.toBe(0);
+  });
+
+  it("rejects an isolated installed-version mutation", () => {
+    const child = checkConsumerContract(consumerSource, "16.3.7");
+    expect(child.error).toBeUndefined();
+    expect(child.status).not.toBe(0);
+  });
+
   const lintNext = (setting: unknown, cwd: string) => {
     const child = spawnSync(process.execPath, ["-e", `
       const {createRequire}=require('node:module');

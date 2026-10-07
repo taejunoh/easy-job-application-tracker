@@ -1,6 +1,6 @@
 {
   "name": "@jobtracker/next-root-glob",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Restricted directory-glob adapter for Next ESLint rootDir settings",
   "main": "index.cjs",
