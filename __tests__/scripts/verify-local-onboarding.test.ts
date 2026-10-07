@@ -1,8 +1,10 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const script = pathToFileURL(join(__dirname, "../../scripts/verify-local-onboarding.mjs")).href;
+const describeSignal = process.env.RUN_LOCAL_ONBOARDING_SIGNAL_INTEGRATION === "1" ? describe : describe.skip;
 
 function verify(containers: unknown[], project = "jobtracker-123456abcdef", port = 43210) {
   return spawnSync(process.execPath, ["--input-type=module", "-e", `
@@ -70,4 +72,34 @@ describe("Docker onboarding acceptance safety", () => {
     expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe("rejected");
   });
+});
+
+describeSignal("Docker onboarding interruption cleanup", () => {
+  it("returns through finally instead of Playwright exiting before owned cleanup", async () => {
+    const child = spawn(process.execPath, [join(__dirname, "../../scripts/verify-local-onboarding.mjs")], {
+      cwd: join(__dirname, "../.."), stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "", signalled = false;
+    const timeout = setTimeout(() => child.kill("SIGINT"), 60_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+      if (!signalled && output.includes("run first-time npm setup")) {
+        signalled = true;
+        setTimeout(() => child.kill("SIGINT"), 750);
+      }
+    });
+    child.stderr.resume(); // The harness prints only sanitized status; raw subprocess errors never reach this stream.
+    const status = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", resolve);
+    }).finally(() => clearTimeout(timeout));
+    expect(signalled).toBe(true);
+    expect(status).toBe(1);
+    const reportPath = /Redacted report: (.+)/u.exec(output)?.[1];
+    expect(reportPath).toBeDefined();
+    const report = JSON.parse(readFileSync(reportPath!, "utf8"));
+    expect(report.interrupted).toBe(true);
+    expect(report.cleanup).toBe(true);
+    expect(report.passed).toBe(false);
+  }, 120_000);
 });

@@ -67,8 +67,7 @@ export async function verifyLocalOnboarding() {
     } catch { /* The child may already have exited. */ }
   };
   const signal = () => { interrupted = true; terminateChild(); };
-  process.on("SIGINT", signal);
-  process.on("SIGTERM", signal);
+  for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(name, signal);
   const step = name => { report.stage = name; process.stdout.write(`[onboarding] ${name}\n`); };
   const checked = name => report.checks.push(name);
   const run = (command, args, cwd = checkout ?? root, { input, timeout = 15 * 60_000, cleanup = false } = {}) => new Promise((accept, reject) => {
@@ -127,7 +126,7 @@ export async function verifyLocalOnboarding() {
     assert.ok(major === 22 && (minor > 22 || (minor === 22 && patch >= 2)));
     const { chromium, request } = await import("playwright");
     // launch() supports CI's --only-shell Chromium install; executablePath() points at the full browser instead.
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false });
     const localEndpoint = endpoint => typeof endpoint === "string" && (/^unix:\/\/\//u.test(endpoint) || /^npipe:\/\/\/\/\.\/pipe\//u.test(endpoint));
     assert.ok(!process.env.DOCKER_HOST || localEndpoint(process.env.DOCKER_HOST));
     const selected = JSON.parse((await docker(["context", "inspect", ...(process.env.DOCKER_CONTEXT ? [process.env.DOCKER_CONTEXT] : []), "--format", "{{json .Endpoints.docker.Host}}"])).toString());
@@ -298,7 +297,7 @@ export async function verifyLocalOnboarding() {
     if (temporary) await rm(temporary, { recursive: true, force: true });
     if (failure || interrupted) report.passed = false;
     report.interrupted = interrupted;
-    process.off("SIGINT", signal); process.off("SIGTERM", signal);
+    for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.off(name, signal);
     const diagnostics = join(root, ".artifacts", "onboarding", `${Date.now()}.json`);
     await mkdir(dirname(diagnostics), { recursive: true });
     await writeFile(diagnostics, JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });

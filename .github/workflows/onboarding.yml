@@ -21,5 +21,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps --only-shell chromium
       - run: npm run test:onboarding:docker
+      - name: Verify interrupted onboarding cleanup
+        run: RUN_LOCAL_ONBOARDING_SIGNAL_INTEGRATION=1 npm test -- --runInBand __tests__/scripts/verify-local-onboarding.test.ts
       - name: Verify Docker build context isolation
         run: RUN_LOCAL_DOCKER_CONTEXT_INTEGRATION=1 npm test -- --runInBand __tests__/scripts/local-docker-context.integration.test.ts
