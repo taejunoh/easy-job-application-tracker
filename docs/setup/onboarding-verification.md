@@ -38,3 +38,9 @@ At `1a360b6ea3f736440c87d4a31c2138e71236d66d`, fresh tracked-export Docker accep
 The fresh full regression passed 97 suites with seven skipped; 2,820 tests passed, 38 skipped, zero failed (483.558s). Production build, startup-environment and extension checks passed. The existing local preview was rebuilt with identical managed configuration and permissions, the same project/port and database volume, unchanged read-only data count and healthy containers.
 
 The original baseline's audit and expired-policy blockers were addressed in the separately scoped [2026-10-07 security remediation review](../security/dependency-audit-2026-10-07.md). Full and production audits now report zero; the unchanged gate passes with no exceptions and evidence-based review dates. These local results do not authorize main merge or production deployment. PR #12 remains draft pending final updated-head CI review.
+
+## Remote CI follow-up
+
+Remote fresh Docker onboarding and backup-interruption checks passed at `a2badb8`. The general verification job exposed an unrelated, pre-existing quarantine test-harness attack that was not explicitly selected. Test-only commit `43747b3` adds the missing opt-in guard and an instrumentation-only regression; the five affected cases pass on both host and disposable Linux environments. Production restore behavior and safety assertions are unchanged.
+
+The extension job separately timed out during system-package installation before its build/E2E steps. The follow-up uses unchanged browser coverage on a fresh runner. These failures are not relabeled as passes; current full-suite and remote CI status is recorded in draft PR #12.

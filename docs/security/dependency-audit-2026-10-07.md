@@ -18,6 +18,14 @@ Verified source: `1a360b6ea3f736440c87d4a31c2138e71236d66d`, including adapter f
 
 The Docker runtime still includes development dependencies for the existing Prisma CLI. This is why the **full** graph remains mandatory; production-classification zero alone would not describe the image. The fresh image is built from the verified lock and actual runtime identities were checked, but this record is not a general container/OS vulnerability scan or production approval.
 
+## Updated-head CI follow-up
+
+Remote CI at `a2badb8` passed fresh Docker onboarding, backup interruption and the audit gate, but was not green. Linux exposed an existing test-harness hook that injected a descendant swap even when that attack was not requested, preempting the intended queued-child phase. Commit `43747b3` requires explicit opt-in for that hook and adds an instrumentation-only control. Production quarantine code and the existing safety/close-count assertions are unchanged.
+
+The new control reproduced the unintended ELOOP before the guard. Afterward, the control, both explicit descendant attacks and both queued-child phases passed: five tests on the host and five in a disposable Linux container, with cleanup confirmed. Independent specification and quality review and fresh full/remote regression results are tracked in PR #12; the earlier full-suite evidence above remains tied to its stated revision.
+
+The same remote run's extension job reached its 25-minute limit during `playwright install --with-deps chromium`, before browser download, build or E2E execution. The underlying package-install stall was not established. No workflow or browser-coverage weakening is included; the follow-up push must rerun the unchanged coverage on a fresh runner.
+
 ## Historical published patch batch
 
 Implementation revision: `5a6d1fc019550de1dbe74bad7b4ec274b68ebbe9`.
