@@ -23,7 +23,7 @@ The fresh-install harness checks:
 
 The harness removes only its disposable project, volume and temporary credentials. It never targets the user's normal managed configuration. A separate interrupted-run regression exercises cleanup when the process receives a signal.
 
-At final implementation revision `c7ea3a6f2d16157ae21cfbdc52188ca676762cc1`, all eight checks and resource cleanup passed. A separate real SIGINT regression also passed on that revision. Ten isolated fault regressions cover failed clicks/responses, malformed or failed extraction callbacks, abort failure and a missing extraction request; they confirm that failures remain in the awaited flow and reach redacted reporting and cleanup. Independent specification and quality reviews approved the repair.
+At the original onboarding implementation revision `c7ea3a6f2d16157ae21cfbdc52188ca676762cc1`, all eight checks and resource cleanup passed. A separate real SIGINT regression also passed on that revision. Ten isolated fault regressions cover failed clicks/responses, malformed or failed extraction callbacks, abort failure and a missing extraction request; they confirm that failures remain in the awaited flow and reach redacted reporting and cleanup. Independent specification and quality reviews approved the repair.
 
 Documentation contracts: seven suites and 71 tests passed at `0d84005`. Independent specification and quality reviews approved the guide split and preservation of existing deployment safeguards.
 
@@ -31,10 +31,10 @@ The final smoke suite has 22 passing tests and one deliberately opt-in signal te
 
 The full Jest regression run passed with `npm test -- --maxWorkers=3`: 94 suites passed, seven opt-in suites skipped; 2,734 tests passed, 38 skipped, zero failed (490.372 seconds, exit 0). The final smoke suite was included with all 23 assertions. The existing preview was rebuilt successfully with its managed configuration byte-identical afterward.
 
-## Release limitation
+## Subsequent security-remediated acceptance
 
-The existing dependency audit fails on the unchanged live-main dependency baseline. Findings include an unpatched high-severity [`braces` advisory](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm), and the existing exception policy's review date has expired. This onboarding work does not update vulnerable dependencies, waive findings or extend the exception policy.
+At `1a360b6ea3f736440c87d4a31c2138e71236d66d`, fresh tracked-export Docker acceptance again passed all eight checks with owned cleanup. The explicit signal-enabled suite passed 26/26 (4.418s). Redacted local reports are `.artifacts/onboarding/1791396870006.json` and `1791396900435.json` (ignored). The runtime uses private adapter 1.0.1; its required tarball is copied before Docker's dependency install.
 
-The changes may be published as a **draft pull request**, but must not merge to `main` until separately scoped security remediation restores the relevant gate. Passing local onboarding checks does not override that release limitation.
+The fresh full regression passed 97 suites with seven skipped; 2,820 tests passed, 38 skipped, zero failed (483.558s). Production build, startup-environment and extension checks passed. The existing local preview was rebuilt with identical managed configuration and permissions, the same project/port and database volume, unchanged read-only data count and healthy containers.
 
-Subsequent user-approved security patches and their remaining blockers are recorded in the [2026-10-07 security remediation review](../security/dependency-audit-2026-10-07.md). This onboarding record describes its original acceptance revision, not the latest dependency inventory; the full security gate remains blocked after the partial patch batch.
+The original baseline's audit and expired-policy blockers were addressed in the separately scoped [2026-10-07 security remediation review](../security/dependency-audit-2026-10-07.md). Full and production audits now report zero; the unchanged gate passes with no exceptions and evidence-based review dates. These local results do not authorize main merge or production deployment. PR #12 remains draft pending final updated-head CI review.

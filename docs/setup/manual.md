@@ -137,4 +137,4 @@ With the development server running, regenerate all documentation screenshots wi
 - [Quarantine operations runbook](../operations/quarantine-runbook.md) — repository data cleanup and recovery procedure.
 - [Sanitized production cutover record](../operations/production-cutover-2026-07-14.md) — release evidence record.
 - [Screenshot generation guide](../screenshots/README.md) — synthetic screenshot workflow.
-- [Dependency audit report](../security/dependency-audit-2026-07-14.md) — recorded dependency review.
+- [Dependency audit report](../security/dependency-audit-2026-10-07.md) — current remediation, verification and local-adapter maintenance scope.
