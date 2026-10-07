@@ -54,7 +54,7 @@ async function freePort() {
 }
 
 export async function verifyLocalOnboarding() {
-  const report = { sourceRevision: null, checks: [], stage: "prerequisites", passed: false, cleanup: false };
+  const report = { sourceRevision: null, checks: [], stage: "prerequisites", passed: false, cleanup: false, cleanupFailureCategory: null };
   let temporary, checkout, managed, originalConfig, browser, context, activeChild, dockerHost;
   let interrupted = false;
   let failure = false;
@@ -305,13 +305,19 @@ export async function verifyLocalOnboarding() {
     try { await browser?.close(); } catch { failure = true; }
     try {
       if (managed) {
-        await compose(["down", "--volumes", "--remove-orphans"], { cleanup: true, timeout: 120_000 });
-        const remaining = (await docker(["ps", "--all", "--quiet", "--filter", `label=com.docker.compose.project=${managed.config.JOBTRACKER_PROJECT_NAME}`], { cleanup: true })).toString().trim();
-        const volumes = (await docker(["volume", "ls", "--quiet", "--filter", `label=com.docker.compose.project=${managed.config.JOBTRACKER_PROJECT_NAME}`], { cleanup: true })).toString().trim();
-        assert.equal(remaining, ""); assert.equal(volumes, "");
+        try { await compose(["down", "--volumes", "--remove-orphans"], { cleanup: true, timeout: 120_000 }); }
+        catch { report.cleanupFailureCategory = "compose-down"; throw new Error("cleanup failed"); }
+        let remaining;
+        try { remaining = (await docker(["ps", "--all", "--quiet", "--filter", `label=com.docker.compose.project=${managed.config.JOBTRACKER_PROJECT_NAME}`], { cleanup: true })).toString().trim(); }
+        catch { report.cleanupFailureCategory = "remaining-containers"; throw new Error("cleanup failed"); }
+        if (remaining) { report.cleanupFailureCategory = "remaining-containers"; throw new Error("cleanup failed"); }
+        let volumes;
+        try { volumes = (await docker(["volume", "ls", "--quiet", "--filter", `label=com.docker.compose.project=${managed.config.JOBTRACKER_PROJECT_NAME}`], { cleanup: true })).toString().trim(); }
+        catch { report.cleanupFailureCategory = "remaining-volumes"; throw new Error("cleanup failed"); }
+        if (volumes) { report.cleanupFailureCategory = "remaining-volumes"; throw new Error("cleanup failed"); }
       }
       report.cleanup = true;
-    } catch { failure = true; process.stderr.write("[onboarding] Owned-resource cleanup failed; inspect the recorded project only.\n"); }
+    } catch { failure = true; process.stderr.write(`[onboarding] Owned-resource cleanup failed (${report.cleanupFailureCategory}); inspect the recorded project only.\n`); }
     if (managed) report.ownedProject = managed.config.JOBTRACKER_PROJECT_NAME;
     if (temporary) await rm(temporary, { recursive: true, force: true });
     if (failure || interrupted) report.passed = false;

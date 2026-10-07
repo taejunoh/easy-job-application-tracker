@@ -72,8 +72,10 @@ async function isolatedFailure(scriptUrl: string, kind: string) {
             NetworkSettings: { Ports: service === "app" ? { "3000/tcp": [{ HostIp: "127.0.0.1", HostPort: "43210" }] } : {} },
           })));
           else if (args.includes("compose") && args.includes("ps")) body = "app-id db-id";
+          else if (kind === "cleanup-containers" && args.includes("ps")) body = "remaining-container-id";
+          else if (kind === "cleanup-volumes" && args.includes("volume") && args.includes("ls")) body = "remaining-volume-name";
           child.stdout.emit("data", Buffer.from(body));
-          child.emit("close", 0);
+          child.emit("close", kind === "cleanup-compose-down" && args.includes("down") ? 1 : 0);
         }) },
       });
       return child;
@@ -180,6 +182,20 @@ describe("Docker onboarding acceptance safety", () => {
     expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe(expected);
     expect(result.stdout).not.toContain("private");
+  });
+
+  it.each([
+    ["cleanup-compose-down", "compose-down"],
+    ["cleanup-containers", "remaining-containers"],
+    ["cleanup-volumes", "remaining-volumes"],
+  ])("reports only the safe %s cleanup category", async (kind, expected) => {
+    const result = spawnSync(process.execPath, ["--no-warnings", "--experimental-vm-modules", "--input-type=module", "-e",
+      `await (${isolatedFailure.toString()})(${JSON.stringify(script)}, ${JSON.stringify(kind)});`], { encoding: "utf8", timeout: 10_000 });
+    expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" });
+    const actual = JSON.parse(result.stdout);
+    expect(JSON.parse(actual.diagnostics)).toMatchObject({ cleanup: false, cleanupFailureCategory: expected });
+    expect(actual.diagnostics).not.toContain("remaining-container-id");
+    expect(actual.diagnostics).not.toContain("remaining-volume-name");
   });
 
   it("accepts only the healthy owned pair with loopback web and no database publication", () => {
