@@ -119,6 +119,31 @@ describe("managed local configuration", () => {
 });
 
 describe("local CLI isolation", () => {
+  it("pins all later calls to the verified daemon even if the active context changes", () => {
+    const { root, configDir } = fixture();
+    const result = run(`
+      let currentEndpoint = "unix:///verified/docker.sock";
+      const targets = [], errors = [];
+      const status = await runLocalCommand({ argv: ["setup"], configDir: input.configDir,
+        repoRoot: input.root, nodeVersion: "22.22.2",
+        env: { DOCKER_CONTEXT: "local", DOCKER_HOST: "unix:///other/docker.sock" },
+        stdout: () => {}, stderr: value => errors.push(value),
+        run: (command, args, options) => {
+          if (args[0] === "context") {
+            currentEndpoint = "ssh://remote.example";
+            return { status: 0, stdout: JSON.stringify("unix:///verified/docker.sock") };
+          }
+          const target = args[0] === "--host" ? args[1] : currentEndpoint;
+          targets.push({ target, host: options.env.DOCKER_HOST, context: options.env.DOCKER_CONTEXT });
+          return { status: 0, stdout: args.includes("--help") ? "--wait --wait-timeout" : "ok" };
+        } });
+      process.stdout.write(JSON.stringify({ status, targets, errors }));
+    `, { root, configDir });
+    expect(result.status).toBe(0);
+    expect(result.targets.length).toBeGreaterThanOrEqual(3);
+    for (const target of result.targets) expect(target).toEqual({ target: "unix:///verified/docker.sock" });
+  });
+
   function cli(configDir: string, scenario: Record<string, unknown> = {}) {
     return run(`
       const calls = [], output = [], errors = [];
@@ -126,6 +151,7 @@ describe("local CLI isolation", () => {
         repoRoot: input.repoRoot, nodeVersion: input.nodeVersion ?? "22.22.2", env: input.env ?? {},
         stdout: value => output.push(value), stderr: value => errors.push(value),
         run: (command, args, options) => {
+          if (args[0] === "--host") args = args.slice(2);
           calls.push({ command, args, env: options.env });
           if (input.fail && args.includes(input.fail)) return { status: 1, stdout: "", stderr: "RAW_SECRET_DATABASE_URL" };
           if (args[0] === "context") return { status: 0, stdout: JSON.stringify(input.endpoint ?? "unix:///var/run/docker.sock") };

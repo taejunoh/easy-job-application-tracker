@@ -5,6 +5,13 @@ const SHARED_SCREENSHOT_CONTEXT_OPTIONS = Object.freeze({
 });
 
 export function assertLocalCaptureBaseUrl(value) {
+  if (
+    typeof value !== "string" ||
+    !/^http:\/\/(?:localhost|127\.0\.0\.1)(?::[0-9]{1,5})?\/?$/u.test(value)
+  ) {
+    throw new Error("Screenshot captures require a local HTTP origin (localhost or 127.0.0.1).");
+  }
+
   let url;
   try {
     url = new URL(value);
@@ -44,6 +51,12 @@ export async function waitForScreenshotReady(page) {
     await new Promise((resolve) => {
       requestAnimationFrame(() => requestAnimationFrame(resolve));
     });
+  });
+}
+
+export async function waitForDashboardReady(page) {
+  await page.waitForSelector("#add-application-panel #url-input", {
+    state: "visible",
   });
 }
 

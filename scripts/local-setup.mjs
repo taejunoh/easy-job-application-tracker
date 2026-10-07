@@ -41,9 +41,11 @@ export async function runLocalCommand({
 
     const childEnv = isolatedDockerEnv(env);
     const childOptions = { cwd: resolve(repoRoot), env: childEnv, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 };
+    let pinnedEndpoint;
     const docker = (args, message, extraOptions = {}) => {
       let result;
-      try { result = run("docker", args, { ...childOptions, ...extraOptions }); } catch { throw new Error(message); }
+      const pinnedArgs = pinnedEndpoint ? ["--host", pinnedEndpoint, ...args] : args;
+      try { result = run("docker", pinnedArgs, { ...childOptions, ...extraOptions }); } catch { throw new Error(message); }
       if (result.status !== 0 || result.error) throw new Error(message);
       return result.stdout ?? "";
     };
@@ -52,7 +54,10 @@ export async function runLocalCommand({
     const context = docker(contextArgs, "Docker is unavailable. Install and start Docker with a local context, then retry.");
     let endpoint;
     try { endpoint = JSON.parse(context.trim()); } catch { throw new Error("Cannot verify the Docker context. Select a local Docker context, then retry."); }
+    if (!env.DOCKER_CONTEXT && env.DOCKER_HOST) endpoint = env.DOCKER_HOST;
     if (!isLocalEndpoint(endpoint)) throw new Error("Select a local Docker context; remote contexts are not supported for loopback-only setup.");
+    // Never resolve the mutable active context again after this locality check.
+    pinnedEndpoint = endpoint;
     docker(["info", "--format", "{{.ServerVersion}}"], "The local Docker daemon is not running. Start Docker, then retry.");
     if (command === "setup") stdout("Creating or reusing private local configuration...");
     let managed = command === "setup" ? ensureLocalConfig({ configDir, port }) : readLocalConfig({ configDir });

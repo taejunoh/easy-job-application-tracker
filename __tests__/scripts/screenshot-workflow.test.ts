@@ -23,6 +23,21 @@ if (scenario.kind === "origin") {
   let error = null;
   try { value = assertLocalCaptureBaseUrl(scenario.url); } catch (cause) { error = cause.message; }
   process.stdout.write(JSON.stringify({ value, error }));
+} else if (scenario.kind === "dashboard-ready") {
+  const workflow = await import(${JSON.stringify(workflowUrl)});
+  const events = [];
+  let mounted = false;
+  const page = {
+    async waitForSelector(selector, options) {
+      events.push({ type: "wait", selector, options });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      mounted = true;
+      events.push({ type: "form-mounted" });
+    },
+  };
+  await workflow.waitForDashboardReady(page);
+  events.push({ type: mounted ? "capture-after-form" : "capture-before-form" });
+  process.stdout.write(JSON.stringify({ events }));
 } else if (scenario.kind === "authenticate") {
   const context = {
     request: {
@@ -136,9 +151,10 @@ type AuthenticateScenario = {
 };
 
 type OriginScenario = { kind: "origin"; url: string };
+type DashboardReadyScenario = { kind: "dashboard-ready" };
 
 function runScenario(
-  scenario: WorkflowScenario | AuthenticateScenario | OriginScenario,
+  scenario: WorkflowScenario | AuthenticateScenario | OriginScenario | DashboardReadyScenario,
 ): {
   events?: Array<string | Record<string, unknown>>;
   error: string | null;
@@ -162,6 +178,20 @@ function runScenario(
 }
 
 describe("screenshot workflow orchestration", () => {
+  test("waits for the dynamically loaded dashboard application form before capture", () => {
+    const result = runScenario({ kind: "dashboard-ready" });
+
+    expect(result.events).toEqual([
+      {
+        type: "wait",
+        selector: "#add-application-panel #url-input",
+        options: { state: "visible" },
+      },
+      { type: "form-mounted" },
+      { type: "capture-after-form" },
+    ]);
+  });
+
   test("authenticates app captures before using a separate offline setup context", () => {
     const result = runScenario({ kind: "workflow", setupOnly: false });
 
@@ -304,6 +334,10 @@ describe("screenshot capture origin", () => {
     "https://127.0.0.1:3000",
     "http://example.invalid",
     "http://localhost.evil.invalid",
+    "http://127.1:3107",
+    "http://2130706433:3107",
+    "http://0x7f000001:3107",
+    "http://0177.0.0.1:3107",
     "http://user:pass@localhost:3000",
     "http://localhost:3000/path",
   ])("rejects non-local or non-origin capture URLs (%s)", (origin) => {

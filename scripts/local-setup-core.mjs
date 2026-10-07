@@ -142,5 +142,9 @@ export function addLocalExtension({ configDir, extensionId }) {
 }
 
 export function isolatedDockerEnv(env) {
-  return Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("COMPOSE_") && !LOCAL_CONFIG_KEYS.includes(key) && key !== "NODE_ENV" && key !== "POSTGRES_USER" && key !== "POSTGRES_DB"));
+  return Object.fromEntries(Object.entries(env).filter(([key]) => {
+    const name = key.toUpperCase();
+    return !name.startsWith("COMPOSE_") && !LOCAL_CONFIG_KEYS.includes(name) &&
+      !["NODE_ENV", "POSTGRES_USER", "POSTGRES_DB", "DOCKER_HOST", "DOCKER_CONTEXT"].includes(name);
+  }));
 }

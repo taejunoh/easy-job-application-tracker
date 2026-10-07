@@ -13,6 +13,7 @@ import {
   authenticateScreenshotContext,
   openStableScreenshotPage,
   runScreenshotWorkflow,
+  waitForDashboardReady,
   waitForScreenshotReady,
 } from "./screenshot-workflow.mjs";
 import {
@@ -103,6 +104,7 @@ async function captureDashboard(context, baseUrl) {
     await page.waitForSelector("h1:has-text('Dashboard')");
     await page.waitForSelector("text=Total Applied");
 
+    await waitForDashboardReady(page);
     await waitForScreenshotReady(page);
     await page.screenshot({
       path: path.join(OUT_DIR, "01-dashboard.png"),
