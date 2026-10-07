@@ -22,7 +22,7 @@ function dockerFailureDetails(result, secrets) {
   for (const secret of secrets.filter(Boolean).sort((left, right) => right.length - left.length)) {
     sanitized = sanitized.split(secret).join("[REDACTED]");
   }
-  sanitized = sanitized.replace(/([a-z][a-z\d+.-]*:\/\/)[^\s/@:]+(?::[^\s/@]*)?@/giu, "$1[REDACTED]@");
+  sanitized = sanitized.replace(/([a-z][a-z\d+.-]*:\/\/)[^/?#\s]*@/giu, "$1[REDACTED]@");
   const tail = sanitized.trimEnd().slice(-4000);
   const status = result.status == null ? "unknown" : String(result.status);
   return `Docker command failed (exit code ${status}).${tail ? `\n${tail}` : ""}`;

@@ -217,13 +217,19 @@ describe("local CLI isolation", () => {
   it("reports bounded Docker failure context after removing managed secrets", () => {
     const { configDir } = fixture(); const { config } = create(configDir);
     const dbUrl = config.DATABASE_URL;
-    const payload = `${"ordinary output ".repeat(500)}${config.APP_ACCESS_TOKEN} ${config.ENCRYPTION_SECRET} ${config.POSTGRES_PASSWORD} ${dbUrl}\nNo space left on device\u001b[31m`;
+    const payload = `${"ordinary output ".repeat(500)}${config.APP_ACCESS_TOKEN} ${config.ENCRYPTION_SECRET} ${config.POSTGRES_PASSWORD} ${dbUrl}\nhttps://:synthetic-password@example.invalid/build\nhttps://user%3Aencoded-password@example.invalid/encoded\nhttps://user:raw-password@leftover-password@example.invalid/raw\nNo space left on device\u001b[31m`;
     const result = cli(configDir, { fail: "up", payload });
     expect(result.status).toBe(1);
     const diagnostic = result.errors.join("\n");
     for (const secret of [config.APP_ACCESS_TOKEN, config.ENCRYPTION_SECRET, config.POSTGRES_PASSWORD, dbUrl]) {
       expect(diagnostic).not.toContain(secret);
     }
+    for (const secret of ["synthetic-password", "encoded-password", "raw-password", "leftover-password"]) {
+      expect(diagnostic).not.toContain(secret);
+    }
+    expect(diagnostic).toContain("https://[REDACTED]@example.invalid/build");
+    expect(diagnostic).toContain("https://[REDACTED]@example.invalid/encoded");
+    expect(diagnostic).toContain("https://[REDACTED]@example.invalid/raw");
     expect(diagnostic).toContain("exit code 1");
     expect(diagnostic).toContain("No space left on device");
     expect(diagnostic).not.toContain("\u001b");
