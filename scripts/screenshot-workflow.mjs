@@ -4,6 +4,23 @@ const SHARED_SCREENSHOT_CONTEXT_OPTIONS = Object.freeze({
   serviceWorkers: "block",
 });
 
+export function assertLocalCaptureBaseUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Screenshot captures require a local HTTP origin (localhost or 127.0.0.1).");
+  }
+  if (
+    url.protocol !== "http:" ||
+    !["localhost", "127.0.0.1"].includes(url.hostname) ||
+    url.username || url.password || url.pathname !== "/" || url.search || url.hash
+  ) {
+    throw new Error("Screenshot captures require a local HTTP origin (localhost or 127.0.0.1).");
+  }
+  return url.origin;
+}
+
 export const APP_SCREENSHOT_CONTEXT_OPTIONS = Object.freeze({
   ...SHARED_SCREENSHOT_CONTEXT_OPTIONS,
   locale: "en-US",
@@ -53,6 +70,7 @@ export async function runScreenshotWorkflow({
   appContextOptions,
   setupContextOptions,
   authenticateAppContext,
+  installAppApiPolicy,
   captureAppScreenshots,
   installSetupNetworkPolicy,
   captureSetupScreenshots,
@@ -65,7 +83,27 @@ export async function runScreenshotWorkflow({
     if (!setupOnly) {
       appContext = await browser.newContext(appContextOptions);
       await authenticateAppContext(appContext);
-      await captureAppScreenshots(appContext);
+      const appApiPolicy = await installAppApiPolicy(appContext);
+      let appCaptureError;
+      let appPolicyError;
+      try {
+        await captureAppScreenshots(appContext);
+      } catch (error) {
+        appCaptureError = error;
+      }
+      try {
+        appApiPolicy.assertOnlySyntheticApiRequests();
+      } catch (error) {
+        appPolicyError = error;
+      }
+      if (appCaptureError && appPolicyError) {
+        throw new AggregateError(
+          [appCaptureError, appPolicyError],
+          "App screenshot capture violated the synthetic API policy."
+        );
+      }
+      if (appCaptureError) throw appCaptureError;
+      if (appPolicyError) throw appPolicyError;
     }
 
     setupContext = await browser.newContext(setupContextOptions);
