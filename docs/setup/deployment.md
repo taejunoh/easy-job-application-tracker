@@ -1,0 +1,7 @@
+# Deployment overview
+
+The Docker setup documented in the [README](../../README.md#run-it-locally) is for private local use on one computer. It binds the web app to loopback and is not a public-server deployment. A hosted deployment needs a canonical HTTPS origin, a managed PostgreSQL database, private server credentials, and an approved Chrome extension origin if the extension will be used.
+
+The supported hosted topology is a Vercel deployment of the Next.js app with Neon PostgreSQL (or another managed PostgreSQL provider). Configure the five required server variables—`DATABASE_URL`, `ENCRYPTION_SECRET`, `APP_ACCESS_TOKEN`, `APP_BASE_URL`, and `CORS_ALLOWED_ORIGINS`—plus both server-only write gates. Use the same canonical HTTPS origin for `APP_BASE_URL` and as an exact entry in `CORS_ALLOWED_ORIGINS`; add only approved `chrome-extension://` origins. Keep Preview credentials and databases separate from Production.
+
+This overview is not an operator procedure and does not assert current production rollout state. The [production operations runbook](../operations/production-runbook.md) is the authoritative source for environment contracts, validation, deployment and promotion, migrations, extension pairing, backups, restore, recovery, and incident response. Follow it before changing a hosted environment or database. Do not copy local `.jobtracker/local.env` credentials to a hosted service, expose the local Docker app to the internet, or treat the manual development guide as a production checklist.
