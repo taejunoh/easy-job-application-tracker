@@ -44,6 +44,8 @@ APPLICATION_WRITES_ENABLED="1"
 
 Replace every placeholder. If you have not installed the extension yet, you can omit its origin from `CORS_ALLOWED_ORIGINS` until you do. Percent-encode reserved characters in database URL components (for example, `@` becomes `%40`). `APP_BASE_URL` must be an origin without a path, and CORS origins must be exact.
 
+Startup rejects invalid configuration: placeholder values copied from `.env.example` are intentionally rejected. Keep any existing `.env` and credentials when diagnosing a startup error; do not replace them with new secrets.
+
 The access token is used only to sign in to the web app at `/connect`; never give it to the extension. The encryption secret protects provider API keys stored in settings. Do not reuse one value for both or commit `.env`.
 
 For a new empty database, apply the checked-in migrations:
@@ -66,11 +68,19 @@ Open the configured app origin and sign in at its `/connect` page with `APP_ACCE
 
 Do not point these instructions at an existing database containing data unless you have reviewed the migration state and have a verified backup. For an existing or production database, follow the [production operations runbook](../operations/production-runbook.md); never use destructive reset or `db push` as a shortcut.
 
+## Validated startup contract
+
+Use `npm run dev` for development and `npm start` for self-hosted production after a validated `npm run build`. They load `validate-startup-env-development.mjs` and `validate-startup-env-production.mjs`, respectively, before Next.js opens a listener. Production requires a canonical HTTPS origin and exact CORS entries; the HTTP development example above is not a hosted production configuration. Follow the [production operations runbook](../operations/production-runbook.md) for production setup and release verification.
+
+Direct `next start` and `npx next` launches without the checked-in validation preloader are unsupported: runtime instrumentation is request-blocking defense in depth, not a substitute for pre-listen validation. The managed Docker helper is a supported wrapper: it applies migrations and launches Next.js with the production `--import` validation preloader. Its explicit loopback-only HTTP contract does not permit exposing the app publicly.
+
 ## Optional Chrome extension
 
 Chrome 140 or newer is required. In Chrome, open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select the repository's `extension/` folder. Copy the extension ID shown on its details card, then add the exact origin `chrome-extension://<extension-id>` to `CORS_ALLOWED_ORIGINS` and restart `npm run dev` so the server reads the change.
 
 To pair it, sign in to the web app and open **Settings → Chrome extension installations**. Select the exact extension origin and choose **Create pairing code**. In the extension popup, enter the exact server origin (for example, `http://localhost:3000`) and the short-lived one-time code. Choose **Connect** and approve Chrome's server-origin permission prompt if it appears. The pairing code is not the web access token or an AI provider key; it can be used only once and expires after ten minutes. Never put credentials in URLs, screenshots, chats, or commits.
+
+The pairing-code field is cleared after a successful connection. Chrome asks for access to the configured JobTracker server origin, not a new site-access grant for the current job page. Some Chrome versions may retain a previously requested server origin after disconnecting or changing servers. The popup cleanup warning and the server-origin permission toggle are authoritative; inspect the extension's Chrome permissions and remove unwanted server-origin access if cleanup remains pending.
 
 ## Optional settings
 
@@ -79,6 +89,8 @@ To pair it, sign in to the web app and open **Settings → Chrome extension inst
 - **Profile URLs:** LinkedIn and GitHub profile URLs can be saved in Settings and used by the extension on supported application forms.
 
 The Manual tab is gated by `VALIDATION_MANUAL_ENTRY_ENABLED` and is intended only for validation. It is off by default; keep it off for normal use.
+
+Provider models are selected internally; the Settings UI does not offer a model selector.
 
 ## Development checks
 
@@ -92,7 +104,11 @@ npm run lint
 npm run typecheck
 npm run build
 npm run check:startup-env
+npx prisma migrate status
+npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
 ```
+
+CI enforces the dependency-audit policy through `npm run check:audit`; do not bypass that gate when dependency checks fail.
 
 Changes to backup or restore behavior also require the guarded PostgreSQL 17 Docker integration check:
 
@@ -106,7 +122,7 @@ The guarded local Chrome extension E2E wrapper is:
 npm run test:extension:e2e:local
 ```
 
-It requires PostgreSQL 17 on `127.0.0.1:5432`, creates and removes the exact disposable database `jobtracker_extension_e2e_test`, and uses isolated Playwright Chromium profiles. It does not use the system Chrome profile. Do not run the lower-level `npm run test:extension:e2e` directly unless its destructive-test sentinels, disposable database, build, and browser prerequisites have been prepared; CI invokes that lower-level command in its guarded environment. For coverage, privacy rules, and production system-Chrome steps, see the [Chrome extension smoke runbook](../operations/chrome-extension-smoke.md).
+It requires PostgreSQL 17 on `127.0.0.1:5432`, creates and removes the exact disposable database `jobtracker_extension_e2e_test`, and uses isolated Playwright bundled Chromium profiles. It does not use the system Chrome profile. Do not run the lower-level `npm run test:extension:e2e` directly unless its destructive-test sentinels, disposable database, build, and browser prerequisites have been prepared; CI invokes that lower-level command in its guarded environment. For coverage, privacy rules, and production system-Chrome steps, see the [Chrome extension smoke runbook](../operations/chrome-extension-smoke.md).
 
 ## Screenshot maintenance
 

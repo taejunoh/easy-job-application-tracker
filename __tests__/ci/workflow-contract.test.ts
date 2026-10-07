@@ -98,7 +98,7 @@ describe("deployment verification contract", () => {
   });
 
   it("documents the only startup commands that enforce pre-listen validation", () => {
-    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const manual = readFileSync(join(root, "docs/setup/manual.md"), "utf8");
     const loader = readFileSync(
       join(root, "scripts/load-and-validate-startup-env.mjs"),
       "utf8",
@@ -120,13 +120,13 @@ describe("deployment verification contract", () => {
     expect(productionPreloader).toContain(
       "loadAndValidateStartupEnv(false)",
     );
-    expect(readme).toContain("npm start");
-    expect(readme).toContain("npm run dev");
-    expect(readme).toContain("Direct `next start` and `npx next`");
-    expect(readme).toContain("unsupported");
-    expect(readme).toContain("request-blocking defense in depth");
-    expect(readme).toContain("validate-startup-env-development.mjs");
-    expect(readme).toContain("validate-startup-env-production.mjs");
+    expect(manual).toContain("npm start");
+    expect(manual).toContain("npm run dev");
+    expect(manual).toContain("Direct `next start` and `npx next`");
+    expect(manual).toContain("unsupported");
+    expect(manual).toContain("request-blocking defense in depth");
+    expect(manual).toContain("validate-startup-env-development.mjs");
+    expect(manual).toContain("validate-startup-env-production.mjs");
   });
 
   it("parses as the exact Node and PostgreSQL deployment gate", () => {
