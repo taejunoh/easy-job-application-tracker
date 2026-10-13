@@ -3,18 +3,20 @@ import { readFile, mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { installScreenshotNetworkPolicy } from "./screenshot-network-policy.mjs";
+import { installSyntheticApiPolicy } from "./screenshot-api-policy.mjs";
 import { loadAndValidateStartupEnv } from "./load-and-validate-startup-env.mjs";
+import { readLocalConfig } from "./local-setup-core.mjs";
 import {
   APP_SCREENSHOT_CONTEXT_OPTIONS,
   SETUP_SCREENSHOT_CONTEXT_OPTIONS,
+  assertLocalCaptureBaseUrl,
   authenticateScreenshotContext,
   openStableScreenshotPage,
   runScreenshotWorkflow,
+  waitForDashboardReady,
   waitForScreenshotReady,
 } from "./screenshot-workflow.mjs";
 import {
-  statsFixture,
-  settingsFixture,
   popupFormFixture,
   keywordAnalysisFixture,
   popupConnectionFixture,
@@ -30,23 +32,23 @@ const CHROME_EXTENSIONS_SETUP_PATH = path.join(
   "scripts",
   "chrome-extensions-setup.html"
 );
-const BASE_URL = "http://localhost:3000";
 const SETUP_ONLY = process.argv.includes("--setup-only");
+const LOCAL_MODE = process.argv.includes("--local");
 
-async function assertDevServerUp() {
+async function assertDevServerUp(baseUrl) {
   let res;
   try {
-    res = await fetch(BASE_URL, { signal: AbortSignal.timeout(3000) });
+    res = await fetch(baseUrl, { signal: AbortSignal.timeout(3000) });
   } catch (cause) {
     throw new Error(
-      "\n✗ Next.js dev server not reachable at " + BASE_URL + "\n" +
+      "\n✗ Next.js dev server not reachable at " + baseUrl + "\n" +
         "  Run `npm run dev` in another terminal first.\n",
       { cause }
     );
   }
   if (res.status >= 500) {
     throw new Error(
-      "\n✗ Next.js dev server at " + BASE_URL + " returned " + res.status + "\n" +
+      "\n✗ Next.js dev server at " + baseUrl + " returned " + res.status + "\n" +
       "  The server is up but failing. Check the dev server logs.\n"
     );
   }
@@ -83,58 +85,26 @@ async function loadPopupPage(context) {
   }
 }
 
-async function loadSettingsPage(context) {
+async function loadSettingsPage(context, baseUrl) {
   const page = await context.newPage();
-  let settingsHit = false;
-
-  await page.route(/\/api\/settings/, async (route) => {
-    settingsHit = true;
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(settingsFixture),
-    });
-  });
-
-  await page.goto(BASE_URL + "/settings");
+  await page.goto(baseUrl + "/settings");
   // "API key configured" only renders after fetch resolves and
   // hasExistingKey is set to true — a reliable signal both that
   // the route mock fired and that the page is hydrated.
   await page.waitForSelector("text=API key configured");
 
-  if (!settingsHit) {
-    throw new Error(
-      "Settings page did not request /api/settings — page structure may have changed."
-    );
-  }
-
   return page;
 }
 
-async function captureDashboard(context) {
+async function captureDashboard(context, baseUrl) {
   const page = await context.newPage();
-  let statsHit = false;
-
-  await page.route(/\/api\/stats/, async (route) => {
-    statsHit = true;
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(statsFixture),
-    });
-  });
 
   try {
-    await openStableScreenshotPage(page, BASE_URL + "/");
+    await openStableScreenshotPage(page, baseUrl + "/");
     await page.waitForSelector("h1:has-text('Dashboard')");
     await page.waitForSelector("text=Total Applied");
 
-    if (!statsHit) {
-      throw new Error(
-        "Dashboard did not request /api/stats — page structure may have changed."
-      );
-    }
-
+    await waitForDashboardReady(page);
     await waitForScreenshotReady(page);
     await page.screenshot({
       path: path.join(OUT_DIR, "01-dashboard.png"),
@@ -147,16 +117,15 @@ async function captureDashboard(context) {
   console.log("✓ 01-dashboard.png");
 }
 
-async function captureSettingsResume(context) {
-  const page = await loadSettingsPage(context);
+async function captureSettingsResume(context, baseUrl) {
+  const page = await loadSettingsPage(context, baseUrl);
 
   try {
-    const clip = await page.evaluate(() => {
-      const resumeH2 = [...document.querySelectorAll("h2")]
-        .find((h) => h.textContent.trim() === "Resume");
-      const card = resumeH2.closest("div.bg-gray-900");
+    const resumeHeading = page.getByRole("heading", { name: "Resume", exact: true });
+    const clip = await resumeHeading.evaluate((heading) => {
+      const card = heading.closest(".settings-card");
       const cardBox = card.getBoundingClientRect();
-      const h2Box = resumeH2.getBoundingClientRect();
+      const h2Box = heading.getBoundingClientRect();
       const pad = 24;
       const topInPage = h2Box.top + window.scrollY - pad;
       const cardBottomInPage = cardBox.bottom + window.scrollY + pad;
@@ -265,19 +234,17 @@ async function captureKeywordAnalysis(context) {
   console.log("✓ 04-keyword-analysis.png");
 }
 
-async function captureSettingsLlm(context) {
-  const page = await loadSettingsPage(context);
+async function captureSettingsLlm(context, baseUrl) {
+  const page = await loadSettingsPage(context, baseUrl);
 
   try {
-    const clip = await page.evaluate(() => {
-      const llmH2 = [...document.querySelectorAll("h2")]
-        .find((h) => h.textContent.trim() === "LLM Provider");
-      const card = llmH2.closest("div.bg-gray-900");
+    const llmHeading = page.getByRole("heading", { name: "LLM Provider", exact: true });
+    const clip = await llmHeading.evaluate((heading) => {
+      const card = heading.closest(".settings-card");
       const cardBox = card.getBoundingClientRect();
-      const h2Box = llmH2.getBoundingClientRect();
-      // find the next h2 (Profile URLs) — stop the clip just above it
-      const profileH2 = [...document.querySelectorAll("h2")]
-        .find((h) => h.textContent.trim() === "Profile URLs");
+      const h2Box = heading.getBoundingClientRect();
+      const profileH2 = [...card.querySelectorAll("h2")]
+        .find((candidate) => candidate.textContent.trim() === "Profile URLs");
       const profileBox = profileH2.getBoundingClientRect();
       const pad = 24;
       return {
@@ -404,9 +371,20 @@ async function captureExtensionConnected(context) {
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
 
+  let baseUrl = "http://localhost:3000";
+  let accessToken;
+
   if (SETUP_ONLY === false) {
-    loadAndValidateStartupEnv(true);
-    await assertDevServerUp();
+    if (LOCAL_MODE) {
+      const managed = readLocalConfig({ configDir: path.join(REPO_ROOT, ".jobtracker") });
+      baseUrl = assertLocalCaptureBaseUrl(managed.config.APP_BASE_URL);
+      accessToken = managed.config.APP_ACCESS_TOKEN;
+    } else {
+      loadAndValidateStartupEnv(true);
+      baseUrl = assertLocalCaptureBaseUrl(process.env.APP_BASE_URL || baseUrl);
+      accessToken = process.env.APP_ACCESS_TOKEN;
+    }
+    await assertDevServerUp(baseUrl);
   }
 
   const browser = await launchBrowser();
@@ -417,15 +395,16 @@ async function main() {
     setupContextOptions: SETUP_SCREENSHOT_CONTEXT_OPTIONS,
     authenticateAppContext: (context) =>
       authenticateScreenshotContext(context, {
-        baseUrl: BASE_URL,
-        accessToken: process.env.APP_ACCESS_TOKEN,
+        baseUrl,
+        accessToken,
       }),
+    installAppApiPolicy: installSyntheticApiPolicy,
     captureAppScreenshots: async (context) => {
-      await captureDashboard(context);
-      await captureSettingsResume(context);
+      await captureDashboard(context, baseUrl);
+      await captureSettingsResume(context, baseUrl);
       await captureExtensionPopup(context);
       await captureKeywordAnalysis(context);
-      await captureSettingsLlm(context);
+      await captureSettingsLlm(context, baseUrl);
     },
     installSetupNetworkPolicy: installScreenshotNetworkPolicy,
     captureSetupScreenshots: async (context) => {

@@ -8,6 +8,7 @@ const workflowUrl = pathToFileURL(
 
 const runner = `
 import {
+  assertLocalCaptureBaseUrl,
   authenticateScreenshotContext,
   runScreenshotWorkflow,
 } from ${JSON.stringify(workflowUrl)};
@@ -17,7 +18,27 @@ for await (const chunk of process.stdin) chunks.push(chunk);
 const scenario = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 const events = [];
 
-if (scenario.kind === "authenticate") {
+if (scenario.kind === "origin") {
+  let value = null;
+  let error = null;
+  try { value = assertLocalCaptureBaseUrl(scenario.url); } catch (cause) { error = cause.message; }
+  process.stdout.write(JSON.stringify({ value, error }));
+} else if (scenario.kind === "dashboard-ready") {
+  const workflow = await import(${JSON.stringify(workflowUrl)});
+  const events = [];
+  let mounted = false;
+  const page = {
+    async waitForSelector(selector, options) {
+      events.push({ type: "wait", selector, options });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      mounted = true;
+      events.push({ type: "form-mounted" });
+    },
+  };
+  await workflow.waitForDashboardReady(page);
+  events.push({ type: mounted ? "capture-after-form" : "capture-before-form" });
+  process.stdout.write(JSON.stringify({ events, error: null }));
+} else if (scenario.kind === "authenticate") {
   const context = {
     request: {
       async post(url, options) {
@@ -85,8 +106,13 @@ if (scenario.kind === "authenticate") {
       authenticateAppContext: async (context) => {
         events.push("authenticate:" + context.name);
       },
+      installAppApiPolicy: async (context) => {
+        events.push("install-app-policy:" + context.name);
+        return { assertOnlySyntheticApiRequests() { events.push("assert-app-policy:" + context.name); } };
+      },
       captureAppScreenshots: async (context) => {
         events.push("capture-app:" + context.name);
+        if (scenario.rejectAppCapture) throw new Error("app capture failed");
       },
       installSetupNetworkPolicy: async (context) => {
         events.push("install-policy:" + context.name);
@@ -115,6 +141,7 @@ type WorkflowScenario = {
   setupOnly: boolean;
   rejectClose?: "app" | "setup";
   rejectSetupCapture?: boolean;
+  rejectAppCapture?: boolean;
 };
 
 type AuthenticateScenario = {
@@ -123,9 +150,16 @@ type AuthenticateScenario = {
   status: number;
 };
 
+type OriginScenario = { kind: "origin"; url: string };
+type DashboardReadyScenario = { kind: "dashboard-ready" };
+
 function runScenario(
-  scenario: WorkflowScenario | AuthenticateScenario,
-): { events: Array<string | Record<string, unknown>>; error: string | null } {
+  scenario: WorkflowScenario | AuthenticateScenario | OriginScenario | DashboardReadyScenario,
+): {
+  events: Array<string | Record<string, unknown>>;
+  error: string | null;
+  value?: string | null;
+} {
   const result = spawnSync(
     process.execPath,
     ["--input-type=module", "--eval", runner],
@@ -136,13 +170,33 @@ function runScenario(
   );
 
   expect(result.status).toBe(0);
-  return JSON.parse(result.stdout) as {
-    events: Array<string | Record<string, unknown>>;
-    error: string | null;
+  const parsed = JSON.parse(result.stdout) as {
+    events?: Array<string | Record<string, unknown>>;
+    error?: string | null;
+    value?: string | null;
+  };
+  return {
+    events: parsed.events ?? [],
+    error: parsed.error ?? null,
+    value: parsed.value,
   };
 }
 
 describe("screenshot workflow orchestration", () => {
+  test("waits for the dynamically loaded dashboard application form before capture", () => {
+    const result = runScenario({ kind: "dashboard-ready" });
+
+    expect(result.events).toEqual([
+      {
+        type: "wait",
+        selector: "#add-application-panel #url-input",
+        options: { state: "visible" },
+      },
+      { type: "form-mounted" },
+      { type: "capture-after-form" },
+    ]);
+  });
+
   test("authenticates app captures before using a separate offline setup context", () => {
     const result = runScenario({ kind: "workflow", setupOnly: false });
 
@@ -160,7 +214,9 @@ describe("screenshot workflow orchestration", () => {
         },
       },
       "authenticate:app",
+      "install-app-policy:app",
       "capture-app:app",
+      "assert-app-policy:app",
       {
         type: "new-context",
         name: "setup",
@@ -225,11 +281,19 @@ describe("screenshot workflow orchestration", () => {
 
     expect(result.error).toBe("setup capture failed");
     expect(result.events).toContain("assert-policy:setup");
+    expect(result.events).toContain("assert-app-policy:app");
     expect(result.events.slice(-3)).toEqual([
       "close:setup",
       "close:app",
       "close:browser",
     ]);
+  });
+
+  test("asserts the app API policy even when app captures fail", () => {
+    const result = runScenario({ kind: "workflow", setupOnly: false, rejectAppCapture: true });
+
+    expect(result.error).toBe("app capture failed");
+    expect(result.events).toContain("assert-app-policy:app");
   });
 });
 
@@ -259,5 +323,30 @@ describe("screenshot session authentication", () => {
       "Could not create the local screenshot session (HTTP 401).",
     );
     expect(result.error).not.toContain("test-only-access-token-fixture");
+  });
+});
+
+describe("screenshot capture origin", () => {
+  test.each(["http://localhost:3000", "http://127.0.0.1:3107"])(
+    "accepts literal local HTTP origins (%s)", (origin) => {
+      const result = runScenario({ kind: "origin", url: origin });
+      expect(result.error).toBeNull();
+      expect(result.value).toBe(origin);
+    },
+  );
+
+  test.each([
+    "https://127.0.0.1:3000",
+    "http://example.invalid",
+    "http://localhost.evil.invalid",
+    "http://127.1:3107",
+    "http://2130706433:3107",
+    "http://0x7f000001:3107",
+    "http://0177.0.0.1:3107",
+    "http://user:pass@localhost:3000",
+    "http://localhost:3000/path",
+  ])("rejects non-local or non-origin capture URLs (%s)", (origin) => {
+    const result = runScenario({ kind: "origin", url: origin });
+    expect(result.error).toContain("Screenshot captures require a local HTTP origin");
   });
 });

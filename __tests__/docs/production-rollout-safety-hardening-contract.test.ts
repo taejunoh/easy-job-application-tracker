@@ -371,13 +371,13 @@ function executableShellLines(document: string, commandPattern: RegExp): string[
     .filter((line) => executableShellLine(line, commandPattern));
 }
 
-function readmeMaintenanceSection(): string {
-  const readme = readFileSync(join(root, "README.md"), "utf8");
-  const start = readme.indexOf("### Production identity maintenance");
-  const end = readme.indexOf("## Development and Verification", start);
+function deploymentMaintenanceOverview(): string {
+  const deployment = readFileSync(join(root, "docs/setup/deployment.md"), "utf8");
+  const start = deployment.indexOf("## Production identity maintenance overview");
+  const end = deployment.indexOf("\n## ", start + 1);
   expect(start).not.toBe(-1);
-  expect(end).toBeGreaterThan(start);
-  return readme.slice(start, end);
+  expect(end).toBe(-1);
+  return deployment.slice(start);
 }
 
 function expectOrderedMatches(source: string, requirements: RegExp[]): void {
@@ -643,7 +643,7 @@ describe("production rollout staged-candidate binding documentation contract", (
   it("keeps non-runbook documents design-level and fixes Settings wording", () => {
     const files = [
       {
-        file: "README.md",
+        file: "docs/setup/deployment.md",
         statusTerms: [],
       },
       {
@@ -901,9 +901,11 @@ describe("production rollout staged-candidate binding documentation contract", (
     ]);
   });
 
-  it("keeps the README maintenance section and historical plan non-executable", () => {
-    expect(fencedShellBlocks(readmeMaintenanceSection())).toEqual([]);
-    expect(readmeMaintenanceSection()).not.toMatch(
+  it("keeps README linked to the non-executable maintenance overview", () => {
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+    expect(readme).toContain("[Deployment and operations overview](docs/setup/deployment.md)");
+    expect(fencedShellBlocks(deploymentMaintenanceOverview())).toEqual([]);
+    expect(deploymentMaintenanceOverview()).not.toMatch(
       /\bgh\s+(?:workflow\s+run|run\s+(?:list|view|watch|download|cancel|rerun))\b/iu,
     );
     const plan = readFileSync(

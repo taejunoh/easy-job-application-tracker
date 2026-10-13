@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-
 import {
   loadLatestApplications,
   updateApplicationStatus,
@@ -34,18 +31,6 @@ describe("application filter requests", () => {
 
     requestedFilters.push(committedFilter);
     expect(requestedFilters).toEqual(["B"]);
-  });
-
-  it("routes status refresh through render state instead of a passive ref", () => {
-    const source = readFileSync(
-      join(process.cwd(), "src/app/applications/page.tsx"),
-      "utf8",
-    );
-
-    expect(source).toContain("const [refreshRevision, setRefreshRevision]");
-    expect(source).toContain("setRefreshRevision((revision) => revision + 1)");
-    expect(source).toContain("[refreshApplications, refreshRevision]");
-    expect(source).not.toContain("activeRefresh");
   });
 
   it("does not let an older success replace the newest results", async () => {

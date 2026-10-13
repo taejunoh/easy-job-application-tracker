@@ -855,10 +855,11 @@ describe("quarantine lifecycle core", () => {
         }, {}, 30_000) as unknown as {
           ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean;
           evidenceStable: boolean; externalReads: number; foreignIntact: boolean;
+          descendantSwapPerformed: boolean;
         };
         expect(result).toEqual(expect.objectContaining({
           ok: false, callbackInvoked: 0, durableStable: true, endpointsStable: true,
-          evidenceStable: true, externalReads: 0, foreignIntact: true,
+          evidenceStable: true, externalReads: 0, foreignIntact: true, descendantSwapPerformed: true,
         }));
       } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
     },
@@ -945,6 +946,30 @@ describe("quarantine lifecycle core", () => {
       } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
     },
   );
+
+  it("leaves the generated root sibling untouched when restore fs is only instrumented", () => {
+    const prepared = prepareQuarantinedFixture({ generatedNestedDirectory: true });
+    try {
+      const result = invokeQuarantineWorker("core-restore-matrix", {
+        repoRoot: prepared.fixture.repoRoot,
+        quarantineRoot: prepared.fixture.quarantineRoot,
+        transactionId: prepared.transactionId,
+        row: "intent-pre",
+        preState: "QUARANTINED",
+        instrumentRestoreFs: true,
+      }, {}, 30_000) as unknown as {
+        ok: boolean; callbackInvoked: number; durableStable: boolean; endpointsStable: boolean;
+        evidenceStable: boolean; externalReads: number; externalDirReads: number; externalFileReads: number;
+        foreignIntact: boolean; descendantSwapPerformed: boolean;
+      };
+      expect(result).toEqual(expect.objectContaining({
+        ok: true, callbackInvoked: 1, durableStable: true, endpointsStable: true,
+        evidenceStable: true, externalReads: 0, externalDirReads: 0, externalFileReads: 0,
+        foreignIntact: true, descendantSwapPerformed: false,
+      }));
+      expect(readFileSync(join(prepared.runRoot, "payload/generated/.next/build"), "utf8")).toBe("ignored");
+    } finally { rmSync(prepared.fixture.base, { recursive: true, force: true }); }
+  });
 
   it.each(["before-source-open", "after-source-open-before-read"])(
     "rejects a nested source copy ancestor swap at %s before source bytes are read",

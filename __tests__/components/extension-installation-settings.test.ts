@@ -1,33 +1,17 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { createElement, useReducer } from "react";
-import * as React from "react";
-import { renderToStaticMarkup } from "react-dom/server";
+/** @jest-environment jsdom */
+
+import { createElement } from "react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import "@testing-library/jest-dom";
 
 import {
   ExtensionInstallations,
-  PairingCodePanel,
   createExtensionPairingCode,
-  pairingSecretReducer,
   revokeExtensionInstallation,
 } from "@/components/ExtensionInstallations";
+import type { ClientApi } from "@/lib/client-api";
 
-const source = readFileSync(
-  join(process.cwd(), "src/components/ExtensionInstallations.tsx"),
-  "utf8",
-);
 const ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
-
-jest.mock("react", () => {
-  const actual = jest.requireActual<typeof import("react")>("react");
-  return {
-    ...actual,
-    useCallback: jest.fn((callback) => callback),
-    useEffect: jest.fn(),
-    useReducer: jest.fn(),
-    useState: jest.fn((initial) => [initial, jest.fn()]),
-  };
-});
 
 describe("ExtensionInstallations", () => {
   it("creates a one-time code for the selected configured origin", async () => {
@@ -57,80 +41,27 @@ describe("ExtensionInstallations", () => {
     });
   });
 
-  it("renders the once-only secret and removes it after the dismiss state transition", () => {
-    const secret = "jt_pair_v1.selector.secret";
-    const issued = pairingSecretReducer(null, {
-      type: "issued",
-      code: secret,
-      expiresAt: "2026-08-13T12:10:00.000Z",
+  it("renders the management section with opaque ids and clears a live pairing secret on dismiss", async () => {
+    const secret = "jt_pair_v1.selector.live-secret";
+    const api = jest.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/extension/installations") {
+        return Promise.resolve({
+          installations: [{ id: "018f9f72-f2e9-7c29-a6fc-001122334499", origin: ORIGIN, createdAt: "2026-08-13T12:00:00.000Z", expiresAt: "2026-08-13T13:00:00.000Z", lastUsedAt: null, revokedAt: null }],
+          configuredOrigins: [ORIGIN],
+        });
+      }
+      if (init?.method === "POST") return Promise.resolve({ code: secret, expiresAt: "2026-08-13T12:10:00.000Z" });
+      return Promise.resolve({});
     });
-    const visible = renderToStaticMarkup(
-      createElement(PairingCodePanel, {
-        secret: issued,
-        onDismiss: jest.fn(),
-      }),
-    );
 
-    expect(visible).toContain("Shown once.");
-    expect(visible).toContain(secret);
-    expect(visible).toContain('aria-label="Dismiss pairing code"');
+    render(createElement(ExtensionInstallations, { api: api as ClientApi }));
+    const section = await screen.findByRole("region", { name: "Chrome extension installations" });
+    expect(section).toHaveAttribute("id", "extension-installations");
+    expect(await within(section).findByText(/018f9f72-f2e9-7c29-a6fc-001122334499/)).toBeInTheDocument();
 
-    const dismissed = pairingSecretReducer(issued, { type: "dismissed" });
-    const hidden = renderToStaticMarkup(
-      createElement(PairingCodePanel, {
-        secret: dismissed,
-        onDismiss: jest.fn(),
-      }),
-    );
-    expect(hidden).not.toContain(secret);
-    expect(hidden).toBe("");
-    expect(source).not.toMatch(/localStorage|sessionStorage/u);
-  });
-
-  it("wires the rendered Settings dismiss control to remove the live secret", () => {
-    const dispatch = jest.fn();
-    const secret = {
-      code: "jt_pair_v1.selector.live-secret",
-      expiresAt: "2026-08-13T12:10:00.000Z",
-    };
-    (useReducer as jest.Mock).mockReturnValue([secret, dispatch]);
-
-    const rendered = ExtensionInstallations({
-      api: jest.fn(),
-      origins: [ORIGIN],
-    });
-    const html = renderToStaticMarkup(rendered);
-    expect(html).toContain(secret.code);
-
-    const panel = findElementByType(rendered, PairingCodePanel);
-    expect(panel).not.toBeNull();
-    panel?.props.onDismiss();
-    expect(dispatch).toHaveBeenCalledWith({ type: "dismissed" });
-  });
-
-  it("renders opaque installation ids in the deep-linked management section", () => {
-    expect(source).toContain('id="extension-installations"');
-    expect(source).toContain("installation.id");
-    expect(source).toContain("Installation ID");
+    fireEvent.click(within(section).getByRole("button", { name: "Create pairing code" }));
+    expect(await within(section).findByText(secret)).toBeInTheDocument();
+    fireEvent.click(within(section).getByRole("button", { name: "Dismiss pairing code" }));
+    await waitFor(() => expect(within(section).queryByText(secret)).not.toBeInTheDocument());
   });
 });
-
-function findElementByType(
-  value: React.ReactNode,
-  type: React.ElementType,
-): React.ReactElement<{ onDismiss(): void }> | null {
-  if (!React.isValidElement(value)) return null;
-  const element = value as React.ReactElement<{
-    children?: React.ReactNode;
-    onDismiss?(): void;
-  }>;
-  if (element.type === type && element.props.onDismiss) {
-    return element as React.ReactElement<{ onDismiss(): void }>;
-  }
-  return React.Children.toArray(element.props.children).reduce<React.ReactElement<{
-    onDismiss(): void;
-  }> | null>(
-    (found, child) => found ?? findElementByType(child, type),
-    null,
-  );
-}

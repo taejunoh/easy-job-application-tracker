@@ -1,0 +1,27 @@
+name: Fresh Docker onboarding
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  onboarding:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.22.2
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps --only-shell chromium
+      - run: npm run test:onboarding:docker
+      - name: Verify interrupted onboarding cleanup
+        run: RUN_LOCAL_ONBOARDING_SIGNAL_INTEGRATION=1 npm test -- --runInBand __tests__/scripts/verify-local-onboarding.test.ts
+      - name: Verify Docker build context isolation
+        run: RUN_LOCAL_DOCKER_CONTEXT_INTEGRATION=1 npm test -- --runInBand __tests__/scripts/local-docker-context.integration.test.ts

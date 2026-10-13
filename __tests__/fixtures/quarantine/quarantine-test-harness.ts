@@ -1418,7 +1418,7 @@ try {
     const restoreId = "restore-123e4567-e89b-42d3-a456-426614174000";
     const {
       row, preState, corruption, ancestorSwap, descendantSwap, treeSwapPhase, sourceSwapPhase,
-      queuedAncestorSwapPhase, sourceAncestorSwapPhase, copyPath,
+      queuedAncestorSwapPhase, sourceAncestorSwapPhase, copyPath, instrumentRestoreFs,
       ...restoreRequest
     } = request;
     const append = async (capability, event, payload) => withJournalLock({ capability }, (heldLock) =>
@@ -1589,9 +1589,10 @@ try {
     let heldDirStreamCloses = 0;
     let verifiedFileCloses = 0;
     let verifiedChildFileCloses = 0;
+    let descendantSwapPerformed = false;
     let foreignSentinel;
     let coreFs;
-    if (ancestorSwap !== undefined || descendantSwap !== undefined || treeSwapPhase !== undefined || sourceSwapPhase !== undefined ||
+    if (instrumentRestoreFs === true || ancestorSwap !== undefined || descendantSwap !== undefined || treeSwapPhase !== undefined || sourceSwapPhase !== undefined ||
         queuedAncestorSwapPhase !== undefined || sourceAncestorSwapPhase !== undefined) {
       const nested = join(request.repoRoot, "nested");
       const foreign = join(request.quarantineRoot, ancestorSwap === undefined ? "foreign-descendant" : "foreign-ancestor");
@@ -1666,9 +1667,10 @@ try {
         }
         const result = await Reflect.apply(originalLstat, implementations, [path, ...args]);
         if (path === source && sourceSwapPhase === "after-lstat-before-open") swapSource();
-        if (path === descendant && ++descendantReads === 1) {
+        if (descendantSwap !== undefined && path === descendant && ++descendantReads === 1) {
           renameSync(descendant, descendant + ".original");
           symlinkSync(descendantSwap === "directory" ? foreign : foreignSentinel, descendant);
+          descendantSwapPerformed = true;
           beforeEndpoints = JSON.stringify(Object.fromEntries(Object.entries(endpointPaths).map(([key, value]) => [key, existsSync(value) ? lstatSync(value).ino : null])));
           beforeEvidence = restoreEvidenceSnapshot({
             runRoot: join(request.quarantineRoot, request.transactionId),
@@ -1764,6 +1766,7 @@ try {
       externalFileReads,
       heldChildFileReads,
       heldSourceFileReads,
+      descendantSwapPerformed,
       verifiedDirectoryHandleCloses,
       heldDirStreamCloses,
       verifiedFileCloses,

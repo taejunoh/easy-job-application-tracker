@@ -12,6 +12,7 @@
  *   corsAllowedOrigins: readonly string[],
  *   applicationIdentityWritesEnabled: boolean,
  *   applicationWritesEnabled: boolean,
+ *   validationManualEntryEnabled: boolean,
  * }>} ServerEnv
  */
 
@@ -54,12 +55,19 @@ function parseServerEnv(source, nodeEnv) {
     "APP_ACCESS_TOKEN",
     required(source, "APP_ACCESS_TOKEN"),
   );
+  const localDockerHttpEnabled = parseOptionalBinaryFlag(
+    source,
+    "LOCAL_DOCKER_HTTP_ENABLED",
+  );
   const appBaseUrl = required(source, "APP_BASE_URL");
-  const appOrigin = parseAppOrigin(appBaseUrl, nodeEnv);
+  const appOrigin = localDockerHttpEnabled
+    ? parseLocalDockerOrigin(appBaseUrl)
+    : parseAppOrigin(appBaseUrl, nodeEnv);
   const corsAllowedOrigins = parseCorsOrigins(
     required(source, "CORS_ALLOWED_ORIGINS"),
     appOrigin,
     nodeEnv,
+    localDockerHttpEnabled,
   );
   const applicationIdentityWritesEnabled = parseOptionalBinaryFlag(
     source,
@@ -68,6 +76,10 @@ function parseServerEnv(source, nodeEnv) {
   const applicationWritesEnabled = parseOptionalBinaryFlag(
     source,
     "APPLICATION_WRITES_ENABLED",
+  );
+  const validationManualEntryEnabled = parseOptionalBinaryFlag(
+    source,
+    "VALIDATION_MANUAL_ENTRY_ENABLED",
   );
 
   return Object.freeze({
@@ -79,7 +91,21 @@ function parseServerEnv(source, nodeEnv) {
     corsAllowedOrigins,
     applicationIdentityWritesEnabled,
     applicationWritesEnabled,
+    validationManualEntryEnabled,
   });
+}
+
+/** @param {string} value @returns {string} */
+function parseLocalDockerOrigin(value) {
+  // Check the original authority, not URL.hostname: WHATWG normalizes IP aliases.
+  if (!/^http:\/\/(localhost|127\.0\.0\.1)(?::[1-9][0-9]{0,4})?$/u.test(value)) {
+    invalid("APP_BASE_URL", "must be a literal HTTP localhost or 127.0.0.1 origin in local Docker mode");
+  }
+  try {
+    return new URL(value).origin;
+  } catch {
+    invalid("APP_BASE_URL", "must be a valid local Docker origin");
+  }
 }
 
 /** @param {ServerEnvSource} source @param {string} name @returns {boolean} */
@@ -216,16 +242,30 @@ function parseAppOrigin(value, nodeEnv) {
  * @param {string} value
  * @param {string} appOrigin
  * @param {ServerNodeEnv} nodeEnv
+ * @param {boolean} localDockerHttpEnabled
  * @returns {readonly string[]}
  */
-function parseCorsOrigins(value, appOrigin, nodeEnv) {
+function parseCorsOrigins(value, appOrigin, nodeEnv, localDockerHttpEnabled) {
   const name = "CORS_ALLOWED_ORIGINS";
   const entries = value.split(",").map((entry) => entry.trim());
   if (entries.length === 0 || entries.some((entry) => entry.length === 0)) {
     invalid(name, "must be a non-empty list of unique origins");
   }
 
-  const origins = entries.map((entry) => parseCorsOrigin(entry, nodeEnv));
+  const origins = entries.map((entry) => {
+    if (localDockerHttpEnabled) {
+      if (/^chrome-extension:\/\/[a-p]{32}$/u.test(entry)) return entry;
+      let localOrigin;
+      try { localOrigin = parseLocalDockerOrigin(entry); } catch {
+        invalid(name, "must contain only the same application origin and exact Chrome extension origins in local Docker mode");
+      }
+      if (localOrigin !== appOrigin) {
+        invalid(name, "must contain only the same application origin and exact Chrome extension origins in local Docker mode");
+      }
+      return localOrigin;
+    }
+    return parseCorsOrigin(entry, nodeEnv);
+  });
   const uniqueOrigins = new Set(origins);
   if (uniqueOrigins.size !== origins.length || !uniqueOrigins.has(appOrigin)) {
     invalid(name, "must contain the application origin exactly once");
