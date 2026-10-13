@@ -2,6 +2,8 @@
 
 Status: scoped local remediation verified. Full and production-classification audits report zero findings, and the unchanged audit gate passes with zero exceptions. No production deployment or main merge is approved by this record; updated-head remote CI must still be checked.
 
+This is the October 7 snapshot. Subsequently published advisories and compatible patch evidence are recorded in the [October 13 security follow-up](dependency-audit-2026-10-13.md); do not treat this historical zero-finding result as a live audit.
+
 ## Final scoped remediation and evidence
 
 Verified source: `1a360b6ea3f736440c87d4a31c2138e71236d66d`, including adapter fixes `1b9a911`, Docker artifact copy `b53ed8b` and policy review `df50982`.
