@@ -18,6 +18,7 @@
     "lint": "eslint",
     "test": "jest",
     "test:ci": "jest --runInBand",
+    "test:diagnostic-safety": "node --test scripts/lib/diagnostic-safety.node-test.mjs",
     "test:extension:e2e": "node scripts/extension-e2e.mjs",
     "test:extension:e2e:local": "node scripts/extension-e2e-local.mjs",
     "test:backup:docker": "RUN_BACKUP_DOCKER_INTEGRATION=1 jest --runInBand __tests__/scripts/create-snapshot-backup.docker.integration.test.ts",
