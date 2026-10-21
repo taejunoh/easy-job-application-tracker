@@ -46,6 +46,8 @@ async function killThenReleaseFixtureLock(
 ) {
   const trace = join(runRoot, `trace-${killAt.replaceAll(/[^A-Za-z0-9]/gu, "-")}.log`);
   const crashed = await spawnLifecycleChild(operation, options, { killAt, phaseTracePath: trace });
+  // A harness timeout also ends in SIGKILL; fail on it by name instead of on a trace mismatch.
+  expect(crashed.timedOut).toBe(false);
   expect(crashed.signal).toBe("SIGKILL");
   expect(existsSync(trace)).toBe(true);
   expect(readFileSync(trace, "utf8").split("\n").filter(Boolean)).toEqual(expectedTrace);
@@ -175,6 +177,7 @@ async function crashRestoreWithProof(
 ) {
   const trace = join(prepared.runRoot, `matrix-${killAt.replaceAll(/[^A-Za-z0-9]/gu, "-")}.log`);
   const crashed = await spawnLifecycleChild("restoreQuarantine", options, { killAt, phaseTracePath: trace });
+  expect(crashed.timedOut).toBe(false);
   expect(crashed.signal).toBe("SIGKILL");
   expect(readFileSync(trace, "utf8").split("\n").filter(Boolean).at(-1)).toBe(killAt);
   const lock = join(prepared.runRoot, "journal.lock");

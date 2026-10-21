@@ -457,6 +457,10 @@ describe("read-only quarantine reconciliation", () => {
     });
   });
 
+  // The async lifecycle tests below spawn harness workers (10 s cap) and lifecycle
+  // children (15 s cap each). Jest's 5 s default would fire before those caps, so they
+  // use the same 60 s budget as the equivalent tests in
+  // quarantine-restore-crash.integration.test.ts.
   it.each([
     ["resume", "after-event:RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
     ["rollback", "after-event:ROLLING_BACK", "ROLLING_BACK"],
@@ -495,7 +499,7 @@ describe("read-only quarantine reconciliation", () => {
       ok: true,
       result: { schemaVersion: 1, state, complete: false, nextAction: "recover_required" },
     });
-  });
+  }, 60_000);
 
   it.each([
     ["resume", "after-event:RECOVERY_REQUIRED", "RECOVERY_REQUIRED"],
@@ -521,7 +525,7 @@ describe("read-only quarantine reconciliation", () => {
       ok: true,
       result: { schemaVersion: 1, state, complete: false, nextAction: "recover_required" },
     });
-  });
+  }, 60_000);
 
   it("maps a journal-authenticated restore conflict without hiding it as success", async () => {
     const prepared = prepareQuarantinedFixture();
@@ -553,7 +557,7 @@ describe("read-only quarantine reconciliation", () => {
         nextAction: "investigate_conflict",
       },
     });
-  });
+  }, 60_000);
 
   it.each(["missing", "corrupt"] as const)(
     "fails closed when a conflict entry's protected payload is %s",
@@ -589,6 +593,7 @@ describe("read-only quarantine reconciliation", () => {
         code: "ERR_INTEGRITY",
       });
     },
+    60_000,
   );
 
   it.each(["missing", "corrupt"] as const)(
@@ -627,6 +632,7 @@ describe("read-only quarantine reconciliation", () => {
         code: "ERR_INTEGRITY",
       });
     },
+    60_000,
   );
 
   it("fails closed when a restore conflict coexists with unrelated missing evidence", async () => {
@@ -649,5 +655,5 @@ describe("read-only quarantine reconciliation", () => {
     rmSync(join(prepared.fixture.repoRoot, ".next"), { recursive: true, force: true });
 
     expect(reconcile(options)).toMatchObject({ ok: false, code: "ERR_INTEGRITY" });
-  });
+  }, 60_000);
 });

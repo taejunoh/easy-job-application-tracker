@@ -108,6 +108,10 @@ npx prisma migrate status
 npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
 ```
 
+`npm run test:ci` launches Playwright's Chromium headless shell in `__tests__/scripts/screenshot-context.integration.test.ts`. Install the build that matches the locked Playwright version once, and again after every Playwright upgrade: `npx playwright install --only-shell chromium` (CI runs the same command with `--with-deps`). A stale browser cache fails that suite with `browserType.launch: Executable doesn't exist`.
+
+Run `npm run test:ci` on an otherwise idle machine. The quarantine suites start many time-capped child processes and call fsync on every journal, inventory and payload file. On macOS, Node implements each fsync as `F_FULLFSYNC`, which flushes the whole drive cache, so its cost grows with other processes' disk writes. Running VMs, emulators or other test runs at the same time can push these suites past their caps even though they pass on an idle Mac and in CI.
+
 CI enforces the dependency-audit policy through `npm run check:audit`; do not bypass that gate when dependency checks fail.
 
 Changes to backup or restore behavior also require the guarded PostgreSQL 17 Docker integration check:
