@@ -94,6 +94,9 @@ jobs:
       - name: Run unit and database integration tests
         run: npm run test:ci
 
+      - name: Run diagnostic safety offline tests
+        run: npm run test:diagnostic-safety
+
       - name: Lint
         run: npm run lint
 

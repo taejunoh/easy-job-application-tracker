@@ -22,4 +22,4 @@ npm run test:diagnostic-safety
 node --test scripts/lib/diagnostic-safety.node-test.mjs
 ```
 
-이 `.node-test.mjs` 파일은 저장소 Jest 설정의 `**/__tests__/**/*.test.ts` 패턴에 포함되지 않고 CI에도 연결돼 있지 않으므로 명령을 명시해 실행합니다. 이 결과만으로 앱 전체 테스트 상태를 판단할 수 없습니다.
+이 `.node-test.mjs` 파일은 저장소 Jest 설정의 `**/__tests__/**/*.test.ts` 패턴에 포함되지 않으므로 별도 명령으로 실행합니다. CI `verify` 잡은 Jest 다음 단계에서 `npm run test:diagnostic-safety`를 실행합니다. 이 결과만으로 앱 전체 테스트 상태를 판단할 수 없습니다.
