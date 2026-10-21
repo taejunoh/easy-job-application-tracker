@@ -52,6 +52,8 @@ describe("deployment verification contract", () => {
         "node --import ./scripts/validate-startup-env-production.mjs node_modules/next/dist/bin/next start",
       typecheck: "next typegen && tsc --noEmit",
       "test:ci": "jest --runInBand",
+      "test:diagnostic-safety":
+        "node --test scripts/lib/diagnostic-safety.node-test.mjs",
       "check:audit": "node scripts/check-audit.mjs",
       "check:startup-env": "node scripts/verify-invalid-startup.mjs",
       "backfill:application-identities":
@@ -214,6 +216,10 @@ describe("deployment verification contract", () => {
       {
         name: "Run unit and database integration tests",
         run: "npm run test:ci",
+      },
+      {
+        name: "Run diagnostic safety offline tests",
+        run: "npm run test:diagnostic-safety",
       },
       { name: "Lint", run: "npm run lint" },
       { name: "Typecheck", run: "npm run typecheck" },
