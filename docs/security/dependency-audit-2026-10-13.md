@@ -1,5 +1,7 @@
 # Dependency security follow-up — 2026-10-13
 
+The next scheduled policy review is recorded in the [October 21 audit review](dependency-audit-2026-10-21.md).
+
 Status: compatible patch implementation verified locally; full new-head release verification and production deployment remain pending. This record does not claim a deployment has occurred.
 
 ## Findings and minimal patch
