@@ -8,7 +8,7 @@ JobTracker is a private, self-hosted web app for saving job applications, tracki
 
 The local setup runs the production Next.js app and PostgreSQL in Docker. It is intended for one person on their own computer, not as a public or multi-user server. Docker must be installed and its local daemon running.
 
-Prerequisites: Git, Node.js **22.22.2 or newer in the 22.x series** (`>=22.22.2 <23`), npm (included with Node.js), and Docker with Docker Compose.
+Prerequisites: Git, Node.js **22.23.4 or newer in the 22.x series** (`>=22.23.4 <23`), npm (included with Node.js), and Docker with Docker Compose.
 
 ```bash
 git clone https://github.com/taejunoh/easy-job-application-tracker.git

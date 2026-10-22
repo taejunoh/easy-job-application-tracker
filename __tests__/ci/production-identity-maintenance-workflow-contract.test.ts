@@ -230,7 +230,7 @@ describe("production identity maintenance workflow contract", () => {
     expect(uses.filter((value) => value.startsWith("actions/upload-artifact@")).length).toBe(2);
     expect(uses.every((value) => approvedUses.has(value))).toBe(true);
     expect(setupNode?.with).toMatchObject({
-      "node-version": "22.22.2",
+      "node-version": "22.23.4",
     });
     expect(guard?.env).toMatchObject({
       PHASE: "${{ inputs.phase }}",

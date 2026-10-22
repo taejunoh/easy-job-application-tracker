@@ -7,7 +7,7 @@ const defaultRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function supportsNode(version) {
   const match = /^(\d+)\.(\d+)\.(\d+)$/u.exec(version);
-  return match && Number(match[1]) === 22 && (Number(match[2]) > 22 || (Number(match[2]) === 22 && Number(match[3]) >= 2));
+  return match && Number(match[1]) === 22 && (Number(match[2]) > 23 || (Number(match[2]) === 23 && Number(match[3]) >= 4));
 }
 
 function isLocalEndpoint(endpoint) {
@@ -35,7 +35,7 @@ export async function runLocalCommand({
   stdout = value => process.stdout.write(`${value}\n`), stderr = value => process.stderr.write(`${value}\n`),
 } = {}) {
   try {
-    if (!supportsNode(nodeVersion)) throw new Error("Use Node.js >=22.22.2 and <23, then retry this command.");
+    if (!supportsNode(nodeVersion)) throw new Error("Use Node.js >=22.23.4 and <23, then retry this command.");
     const [command = "setup", ...options] = argv;
     if (!["setup", "start", "stop", "logs", "token", "extension"].includes(command)) throw new Error("Unknown local command.");
     let port;

@@ -291,7 +291,7 @@ describe("task-first README user guide", () => {
       "private, self-hosted web app",
       "one person",
       "Git",
-      ">=22.22.2 <23",
+      ">=22.23.4 <23",
       "Docker Compose",
       "daemon running",
       "npm run setup",

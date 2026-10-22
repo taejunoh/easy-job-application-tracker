@@ -96,7 +96,7 @@ describe("encrypted production backup workflow contract", () => {
         expect.objectContaining({
           name: "Set up Node.js",
           uses: `actions/setup-node@${SETUP_NODE_SHA}`,
-          with: { "node-version": "22.22.2", cache: "npm" },
+          with: { "node-version": "22.23.4", cache: "npm" },
         }),
         expect.objectContaining({
           name: "Create source backup and fingerprint",

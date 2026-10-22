@@ -125,7 +125,7 @@ describe("local CLI isolation", () => {
       let currentEndpoint = "unix:///verified/docker.sock";
       const targets = [], errors = [];
       const status = await runLocalCommand({ argv: ["setup"], configDir: input.configDir,
-        repoRoot: input.root, nodeVersion: "22.22.2",
+        repoRoot: input.root, nodeVersion: "22.23.4",
         env: { DOCKER_CONTEXT: "local", DOCKER_HOST: "unix:///other/docker.sock" },
         stdout: () => {}, stderr: value => errors.push(value),
         run: (command, args, options) => {
@@ -148,7 +148,7 @@ describe("local CLI isolation", () => {
     return run(`
       const calls = [], output = [], errors = [];
       const status = await runLocalCommand({ argv: input.argv ?? ["setup"], configDir: input.configDir,
-        repoRoot: input.repoRoot, nodeVersion: input.nodeVersion ?? "22.22.2", env: input.env ?? {},
+        repoRoot: input.repoRoot, nodeVersion: input.nodeVersion ?? "22.23.4", env: input.env ?? {},
         stdout: value => output.push(value), stderr: value => errors.push(value),
         run: (command, args, options) => {
           if (args[0] === "--host") args = args.slice(2);
@@ -195,7 +195,7 @@ describe("local CLI isolation", () => {
     }
   });
 
-  it.each(["21.9.0", "22.22.1", "23.0.0", "24.0.0"])("rejects unsupported Node %s before Docker or file creation", (nodeVersion) => {
+  it.each(["21.9.0", "22.22.1", "22.23.3", "23.0.0", "24.0.0"])("rejects unsupported Node %s before Docker or file creation", (nodeVersion) => {
     const { configDir } = fixture(); const result = cli(configDir, { nodeVersion });
     expect(result.status).toBe(1); expect(result.calls).toEqual([]); expect(result.errors.join()).toMatch(/22\.22\.2/);
   });

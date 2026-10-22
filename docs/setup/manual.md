@@ -1,6 +1,6 @@
 # Manual development setup
 
-This guide is for contributors who want to run the Next.js development server directly on their computer instead of using the Docker-based [local setup in the README](../../README.md#run-it-locally). It assumes Git, Node.js `>=22.22.2 <23`, npm, and PostgreSQL are installed. For hosted production, use the separate [deployment overview](deployment.md); do not use these development instructions as a production deployment procedure.
+This guide is for contributors who want to run the Next.js development server directly on their computer instead of using the Docker-based [local setup in the README](../../README.md#run-it-locally). It assumes Git, Node.js `>=22.23.4 <23`, npm, and PostgreSQL are installed. For hosted production, use the separate [deployment overview](deployment.md); do not use these development instructions as a production deployment procedure.
 
 ## Install dependencies
 
