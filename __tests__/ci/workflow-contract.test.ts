@@ -62,8 +62,8 @@ describe("deployment verification contract", () => {
         "RUN_BACKUP_DOCKER_INTEGRATION=1 jest --runInBand __tests__/scripts/create-snapshot-backup.docker.integration.test.ts",
     });
     expect(packageJson.dependencies).toMatchObject({
-      "@next/env": "16.3.8",
-      next: "16.3.8",
+      "@next/env": "16.4.3",
+      next: "16.4.3",
     });
     expect(packageJson.scripts?.["check:extension"]).toContain(
       "node --check extension/background.js",
