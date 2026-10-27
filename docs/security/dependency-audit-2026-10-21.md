@@ -1,5 +1,7 @@
 # Dependency audit review — 2026-10-21
 
+The next dependency security patch is recorded in the [October 26 dependency audit](dependency-audit-2026-10-26.md).
+
 Status: scheduled policy review. Full and production-classification audits of unchanged `main` source `d8c7954` report zero findings, so the policy review dates are renewed with zero exceptions. No dependency, lock or gate change was needed. This is an advisory-database snapshot, not a guarantee against unknown vulnerabilities.
 
 ## Evidence
