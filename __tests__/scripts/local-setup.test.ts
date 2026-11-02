@@ -197,7 +197,7 @@ describe("local CLI isolation", () => {
 
   it.each(["21.9.0", "22.22.1", "22.23.3", "23.0.0", "24.0.0"])("rejects unsupported Node %s before Docker or file creation", (nodeVersion) => {
     const { configDir } = fixture(); const result = cli(configDir, { nodeVersion });
-    expect(result.status).toBe(1); expect(result.calls).toEqual([]); expect(result.errors.join()).toMatch(/22\.22\.2/);
+    expect(result.status).toBe(1); expect(result.calls).toEqual([]); expect(result.errors.join()).toMatch(/22\.23\.4/);
   });
 
   it.each([
