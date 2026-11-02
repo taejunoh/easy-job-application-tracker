@@ -113,6 +113,83 @@ describe("npm audit exception policy", () => {
     );
   });
 
+  describe("cyclic wrapper references", () => {
+    const wrapper = (name: string, via: string[]) => ({
+      name,
+      severity: "moderate",
+      isDirect: false,
+      via,
+    });
+
+    function cyclicAudit(extra: Record<string, unknown> = {}) {
+      const audit = emptyAuditReport() as ReturnType<typeof emptyAuditReport> & {
+        vulnerabilities: Record<string, unknown>;
+      };
+      audit.vulnerabilities = {
+        "tool-a": wrapper("tool-a", ["tool-b", "leaf"]),
+        "tool-b": wrapper("tool-b", ["tool-a"]),
+        leaf: concreteVulnerability("leaf", "GHSA-gggg-hhhh-jjjj", "moderate"),
+        ...extra,
+      };
+      const count = Object.keys(audit.vulnerabilities).length;
+      audit.metadata.vulnerabilities.moderate = count;
+      audit.metadata.vulnerabilities.total = count;
+      return audit;
+    }
+
+    function cyclicPolicy(scope: string[]) {
+      return {
+        ...emptyPolicy(),
+        exceptions: [
+          {
+            id: "GHSA-gggg-hhhh-jjjj",
+            url: "https://github.com/advisories/GHSA-gggg-hhhh-jjjj",
+            severity: "moderate",
+            scope,
+            rationale: "Development toolchain only.",
+            remediation: "Remove when fixed upstream.",
+          },
+        ],
+      };
+    }
+
+    it("maps every package in a cycle to the advisory it reaches", () => {
+      const result = runGenerated(
+        cyclicAudit(),
+        cyclicPolicy(["leaf", "tool-a", "tool-b"]),
+      );
+
+      expect(result.status).toBe(0);
+    });
+
+    it("still rejects a cycle member missing from the exception scope", () => {
+      const result = runGenerated(cyclicAudit(), cyclicPolicy(["leaf", "tool-a"]));
+
+      expect(result.status).toBe(1);
+    });
+
+    it("still rejects a cycle that reaches no concrete advisory", () => {
+      const result = runGenerated(
+        cyclicAudit({
+          "orphan-a": wrapper("orphan-a", ["orphan-b"]),
+          "orphan-b": wrapper("orphan-b", ["orphan-a"]),
+        }),
+        cyclicPolicy(["leaf", "tool-a", "tool-b"]),
+      );
+
+      expect(result.status).toBe(1);
+    });
+
+    it("still rejects a reference to an unreported package", () => {
+      const result = runGenerated(
+        cyclicAudit({ dangling: wrapper("dangling", ["missing"]) }),
+        cyclicPolicy(["leaf", "tool-a", "tool-b"]),
+      );
+
+      expect(result.status).toBe(1);
+    });
+  });
+
   it.each(["moderate", "low"])(
     "rejects an unexpected %s advisory",
     (severity) => {
