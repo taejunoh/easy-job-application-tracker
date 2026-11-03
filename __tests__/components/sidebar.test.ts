@@ -1,5 +1,8 @@
 /** @jest-environment jsdom */
 
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { createElement } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
@@ -77,4 +80,11 @@ describe("endSession", () => {
     await expect(endSession(jest.fn().mockResolvedValue({ ok: false }))).resolves.toBe(false);
     await expect(endSession(jest.fn().mockRejectedValue(new Error("offline")))).resolves.toBe(false);
   });
+});
+
+it("keeps the desktop sidebar and its Sign out in view on long pages", () => {
+  const css = readFileSync(path.join(process.cwd(), "src/app/globals.css"), "utf8");
+  expect(css).toMatch(
+    /@media \(min-width: 769px\) \{ \.sidebar-rail \{[^}]*height: 100vh;[^}]*position: sticky; top: 0;/u,
+  );
 });

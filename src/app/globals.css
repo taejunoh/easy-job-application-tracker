@@ -38,6 +38,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .sidebar-signout:disabled { cursor: wait; opacity: 0.7; }
 .sidebar-signout-error { color: #ffd9d9; font-size: 0.8rem; margin: 0.5rem 0 0; }
 .mobile-menu-toggle { display: none !important; }
+@media (min-width: 769px) { .sidebar-rail { align-self: flex-start; height: 100vh; overflow-y: auto; position: sticky; top: 0; } }
 main.flex-1 { margin: 0 auto; max-width: 1120px; min-width: 0; width: 100%; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem; box-shadow: var(--shadow); }
 .page-header { margin-bottom: 1.25rem; }

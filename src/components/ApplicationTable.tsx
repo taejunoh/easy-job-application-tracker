@@ -161,7 +161,7 @@ export default function ApplicationTable({
                 <td className="application-cell" data-label="Location">
                   {normalizeLocation(application.location) || "-"}
                 </td>
-                <td className="application-cell" data-label="Type">
+                <td className="application-cell application-type-cell" data-label="Type">
                   {displayJobType(application) || "-"}
                 </td>
                 <td
@@ -185,7 +185,7 @@ export default function ApplicationTable({
         .applications-table th:nth-child(4) { width: 11%; }
         .applications-table th:nth-child(5) { width: 11%; }
         .applications-table th:nth-child(6) { width: 13%; }
-        .applications-table th:nth-child(7) { width: 8%; }
+        .applications-table th:nth-child(7) { width: 5.25rem; }
         .applications-table th:nth-child(8) { width: 11%; }
         .sort-button { align-items: center; background: transparent; border: 0; color: inherit; cursor: pointer; display: inline-flex; font: inherit; gap: 0.3rem; letter-spacing: inherit; min-height: 44px; padding: 0; text-align: left; text-transform: inherit; }
         .sort-button:hover { color: var(--primary); }
@@ -195,6 +195,7 @@ export default function ApplicationTable({
         .application-row { border-top: 1px solid var(--border); cursor: pointer; outline-offset: -3px; transition: background-color 120ms ease; }
         .application-row:hover, .application-row:focus-visible { background: #f7f8f4; }
         .application-cell { color: var(--muted); min-width: 0; overflow-wrap: anywhere; padding: 0.95rem 0.7rem; vertical-align: middle; }
+        .application-type-cell { overflow-wrap: normal; white-space: nowrap; }
         .application-title-cell, .application-company-cell { color: var(--text); font-weight: 650; }
         .application-title-link, .application-company-link { color: inherit; text-decoration: none; }
         .application-company-cell { overflow: hidden; overflow-wrap: normal; word-break: normal; }
@@ -210,7 +211,7 @@ export default function ApplicationTable({
         .application-status-cell select:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
         .application-date-cell time, .application-updated-cell time { white-space: nowrap; }
         .application-cell.has-next-step { color: var(--text); font-weight: 650; }
-        @media (min-width: 769px) { .application-company-link { min-height: 0; } }
+        @media (min-width: 769px) { .application-company-link { min-height: 0; } .applications-table-shell { overflow-x: auto; } .applications-table { min-width: 54rem; } }
         @media (max-width: 768px) {
           .applications-table-shell { background: transparent; border: 0; box-shadow: none; overflow: visible; }
           .applications-table, .applications-table tbody, .application-row, .application-cell { display: block; width: 100%; }
