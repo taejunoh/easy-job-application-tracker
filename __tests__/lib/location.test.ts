@@ -87,6 +87,23 @@ describe("normalizeLocation", () => {
     expect(normalizeLocation("n/a")).toBe("");
   });
 
+  it("cleans each location in a semicolon-separated list", () => {
+    expect(normalizeLocation("New York, NY ; San Francisco, California")).toBe(
+      "New York, NY; San Francisco, CA",
+    );
+    expect(normalizeLocation("New York, New York; Santa Monica, California")).toBe(
+      "New York, NY; Santa Monica, CA",
+    );
+    expect(normalizeLocation("Austin, Texas;")).toBe("Austin, TX");
+    expect(normalizeLocation(" ; n/a ; ")).toBe("");
+  });
+
+  it("does not split other multi-location text", () => {
+    expect(normalizeLocation("Mountain View, California San Francisco, California")).toBe(
+      "Mountain View, California San Francisco, California",
+    );
+  });
+
   it("keeps remote values that carry a region", () => {
     expect(normalizeLocation("Remote - USA")).toBe("Remote - USA");
     expect(normalizeLocation("US Remote")).toBe("US Remote");
@@ -105,6 +122,7 @@ describe("normalizeLocation", () => {
       "Remote Software Engineer (US)",
       "Available in 48 locations See allSee all",
       "San Francisco, CA, USA, N/A",
+      "New York, NY ; San Francisco, California",
     ]) {
       const once = normalizeLocation(input);
       expect(normalizeLocation(once)).toBe(once);
