@@ -176,44 +176,45 @@ function parseDate(value) {
 
 function mapConcreteAdvisories(vulnerabilities) {
   const advisories = new Map();
-  const packageAdvisories = new Map();
-  const resolving = new Set();
 
   function resolvePackage(name) {
-    if (packageAdvisories.has(name)) return packageAdvisories.get(name);
-    if (resolving.has(name) || !isRecord(vulnerabilities[name])) {
-      throw new Error("invalid wrapper reference");
-    }
-    resolving.add(name);
     const ids = new Set();
-    for (const via of vulnerabilities[name].via) {
-      if (typeof via === "string") {
-        for (const id of resolvePackage(via)) ids.add(id);
-        continue;
+    const visited = new Set();
+    const pending = [name];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (visited.has(current)) continue;
+      visited.add(current);
+      if (!isRecord(vulnerabilities[current])) {
+        throw new Error("invalid wrapper reference");
       }
-      if (!isRecord(via)) throw new Error("invalid advisory");
-      const id = advisoryId(via.url);
-      if (
-        via.name !== name ||
-        !severityNames.includes(via.severity) ||
-        !id
-      ) {
-        throw new Error("invalid advisory");
+      for (const via of vulnerabilities[current].via) {
+        if (typeof via === "string") {
+          pending.push(via);
+          continue;
+        }
+        if (!isRecord(via)) throw new Error("invalid advisory");
+        const id = advisoryId(via.url);
+        if (
+          via.name !== current ||
+          !severityNames.includes(via.severity) ||
+          !id
+        ) {
+          throw new Error("invalid advisory");
+        }
+        const existing = advisories.get(id);
+        const advisory = { id, url: via.url, severity: via.severity, scope: new Set() };
+        if (
+          existing &&
+          (existing.url !== advisory.url || existing.severity !== advisory.severity)
+        ) {
+          throw new Error("conflicting advisory");
+        }
+        if (!existing) advisories.set(id, advisory);
+        ids.add(id);
       }
-      const existing = advisories.get(id);
-      const advisory = { id, url: via.url, severity: via.severity, scope: new Set() };
-      if (
-        existing &&
-        (existing.url !== advisory.url || existing.severity !== advisory.severity)
-      ) {
-        throw new Error("conflicting advisory");
-      }
-      if (!existing) advisories.set(id, advisory);
-      ids.add(id);
     }
-    resolving.delete(name);
     if (ids.size === 0) throw new Error("unmapped vulnerability");
-    packageAdvisories.set(name, ids);
     return ids;
   }
 

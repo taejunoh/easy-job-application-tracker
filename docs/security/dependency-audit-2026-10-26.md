@@ -2,6 +2,8 @@
 
 Status: compatible patch implementation verified locally on branch `codex/security-patch-20261026`; pushed CI, new-head release verification and production deployment remain pending. Production deployment has NOT happened, and this record does not claim one.
 
+The next dependency audit decision is recorded in the [November 2 dependency audit](dependency-audit-2026-11-02.md).
+
 ## Findings and minimal patch
 
 A fresh audit on Node 22.23.4 of unchanged `main` source `da98d0a` reported five vulnerable packages. The full and production-classification (`--omit=dev`) graphs were identical: critical=1, high=2, moderate=2, with zero exceptions. The October 21 clean results remain historical snapshots, not current guarantees.
