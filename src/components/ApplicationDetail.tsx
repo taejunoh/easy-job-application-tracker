@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
+import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
 
 interface Application {
   id: string;
@@ -32,6 +33,8 @@ export default function ApplicationDetail({
 }: ApplicationDetailProps) {
   const router = useRouter();
   const api = useClientApi();
+  const writesStopped = useWritesStopped();
+  const stoppedTitle = readOnlyTitle(writesStopped);
   const [form, setForm] = useState({
     jobTitle: application.jobTitle,
     company: application.company,
@@ -72,6 +75,7 @@ export default function ApplicationDetail({
   }, [debouncedDescription, resumeText]);
 
   async function handleSave() {
+    if (writesStopped) return;
     setSaving(true);
     setSaved(false);
     setError("");
@@ -88,6 +92,7 @@ export default function ApplicationDetail({
   }
 
   async function handleDelete() {
+    if (writesStopped) return;
     setDeleting(true);
     setError("");
     try {
@@ -119,13 +124,13 @@ export default function ApplicationDetail({
           <div className="application-identity">
             <p className="eyebrow">Application record</p>
             <label htmlFor="application-job-title" className="field-label">Job title</label>
-            <input id="application-job-title" value={form.jobTitle} onChange={(e) => updateField("jobTitle", e.target.value)} className="detail-title-input" />
+            <input id="application-job-title" value={form.jobTitle} onChange={(e) => updateField("jobTitle", e.target.value)} readOnly={writesStopped} className="detail-title-input" />
             <label htmlFor="application-company" className="field-label">Company</label>
-            <input id="application-company" value={form.company} onChange={(e) => updateField("company", e.target.value)} className="detail-company-input" />
+            <input id="application-company" value={form.company} onChange={(e) => updateField("company", e.target.value)} readOnly={writesStopped} className="detail-company-input" />
           </div>
           <label htmlFor="application-status" className="status-field">
             <span className="input-label">Status</span>
-            <select id="application-status" value={form.status} onChange={(e) => updateField("status", e.target.value)} className="field status-select">
+            <select id="application-status" value={form.status} onChange={(e) => updateField("status", e.target.value)} disabled={writesStopped} className="field status-select">
               {STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           </label>
@@ -140,15 +145,15 @@ export default function ApplicationDetail({
             </div>
             <label htmlFor="application-location" className="field-label">
               <span className="input-label">Location</span>
-              <input id="application-location" value={form.location} onChange={(e) => updateField("location", e.target.value)} placeholder="e.g., San Francisco, CA" className="field" />
+              <input id="application-location" value={form.location} onChange={(e) => updateField("location", e.target.value)} readOnly={writesStopped} placeholder="e.g., San Francisco, CA" className="field" />
             </label>
             <label htmlFor="application-salary" className="field-label">
               <span className="input-label">Salary Range</span>
-              <input id="application-salary" value={form.salary} onChange={(e) => updateField("salary", e.target.value)} placeholder="e.g., $120k - $160k" className="field" />
+              <input id="application-salary" value={form.salary} onChange={(e) => updateField("salary", e.target.value)} readOnly={writesStopped} placeholder="e.g., $120k - $160k" className="field" />
             </label>
             <label htmlFor="application-job-type" className="field-label">
               <span className="input-label">Job Type</span>
-              <select id="application-job-type" value={form.jobType} onChange={(e) => updateField("jobType", e.target.value)} className="field">
+              <select id="application-job-type" value={form.jobType} onChange={(e) => updateField("jobType", e.target.value)} disabled={writesStopped} className="field">
                 {JOB_TYPES.map((t) => <option key={t} value={t}>{t || "Not specified"}</option>)}
               </select>
             </label>
@@ -159,7 +164,7 @@ export default function ApplicationDetail({
           <h2 id="description-heading" className="section-title">Job Description</h2>
           <p className="section-copy">Keep the original listing close while you prepare.</p>
           <label htmlFor="application-description" className="field-label sr-only">Job Description</label>
-          <textarea id="application-description" value={form.description} onChange={(e) => updateField("description", e.target.value)} placeholder="Paste the job description here..." rows={6} className="field detail-textarea" />
+          <textarea id="application-description" value={form.description} onChange={(e) => updateField("description", e.target.value)} readOnly={writesStopped} placeholder="Paste the job description here..." rows={6} className="field detail-textarea" />
         </section>
 
         {form.description && resumeText === "" && (
@@ -191,7 +196,7 @@ export default function ApplicationDetail({
         <section className="detail-section notes-section" aria-labelledby="notes-heading">
           <h2 id="notes-heading" className="section-title">Notes</h2>
           <label htmlFor="application-notes" className="field-label sr-only">Notes</label>
-          <textarea id="application-notes" value={form.notes} onChange={(e) => updateField("notes", e.target.value)} placeholder="Add notes about this application..." rows={4} className="field detail-textarea" />
+          <textarea id="application-notes" value={form.notes} onChange={(e) => updateField("notes", e.target.value)} readOnly={writesStopped} placeholder="Add notes about this application..." rows={4} className="field detail-textarea" />
         </section>
 
         <section className="detail-section source-section" aria-labelledby="source-heading">
@@ -201,14 +206,14 @@ export default function ApplicationDetail({
 
         <footer className="detail-actions">
           <div className="save-actions">
-            <button type="button" onClick={handleSave} disabled={saving} className="primary-button">{saving ? "Saving..." : "Save Changes"}</button>
+            <button type="button" onClick={handleSave} disabled={saving || writesStopped} title={stoppedTitle} className="primary-button">{saving ? "Saving..." : "Save Changes"}</button>
             {saved && <span role="status" className="saved-status">Saved</span>}
           </div>
           <div className="destructive-actions">
             <span className="destructive-label">Permanent action</span>
             {showDeleteConfirm ? (
-              <div className="delete-confirmation"><span>Are you sure?</span><button type="button" onClick={handleDelete} disabled={deleting} className="danger-button">{deleting ? "Deleting..." : "Yes, Delete"}</button><button type="button" onClick={() => setShowDeleteConfirm(false)} className="secondary-button">Cancel</button></div>
-            ) : <button type="button" onClick={() => setShowDeleteConfirm(true)} className="danger-link">Delete Application</button>}
+              <div className="delete-confirmation"><span>Are you sure?</span><button type="button" onClick={handleDelete} disabled={deleting || writesStopped} title={stoppedTitle} className="danger-button">{deleting ? "Deleting..." : "Yes, Delete"}</button><button type="button" onClick={() => setShowDeleteConfirm(false)} className="secondary-button">Cancel</button></div>
+            ) : <button type="button" onClick={() => setShowDeleteConfirm(true)} disabled={writesStopped} title={stoppedTitle} className="danger-link">Delete Application</button>}
           </div>
         </footer>
       </article>
@@ -270,6 +275,7 @@ const applicationDetailStyles = `
 .saved-status { color: #245e3a; font-size: 0.9rem; font-weight: 700; }
 .destructive-actions { align-items: flex-end; display: flex; flex-direction: column; gap: 0.25rem; }
 .destructive-label { color: var(--muted); font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.danger-link:disabled { color: var(--muted); cursor: not-allowed; text-decoration: none; }
 .danger-link { background: transparent; border: 0; color: var(--destructive); cursor: pointer; min-height: 44px; padding: 0.6rem 0; text-decoration: underline; }
 .danger-button { background: var(--destructive); border: 1px solid var(--destructive); color: #fff; font-weight: 700; }
 .secondary-button { background: var(--surface); border: 1px solid var(--border); color: var(--text); }

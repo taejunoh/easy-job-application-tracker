@@ -1,5 +1,6 @@
 import "server-only";
 
+import { normalizeLocation } from "@/lib/location";
 import {
   InvalidRequestError,
   RequestBodyTooLargeError,
@@ -112,7 +113,7 @@ export async function parseCreateApplicationRequest(
     description: nullableText(body.description, 100_000),
     notes: nullableText(body.notes, 20_000),
     salary: nullableText(body.salary, 512),
-    location: nullableText(body.location, 512),
+    location: normalizedNewLocation(body.location),
     jobType: nullableEnum(body.jobType, JOB_TYPES),
   });
 }
@@ -211,6 +212,14 @@ function nullableText(value: unknown, maxCodePoints: number): string | null {
   if (typeof value !== "string") invalid();
   const normalized = value.trim();
   if (codePointLength(normalized) > maxCodePoints) invalid();
+  return normalized.length === 0 ? null : normalized;
+}
+
+/** New saves store a tidy location; updates keep exactly what the user typed. */
+function normalizedNewLocation(value: unknown): string | null {
+  const location = nullableText(value, 512);
+  if (location === null) return null;
+  const normalized = normalizeLocation(location);
   return normalized.length === 0 ? null : normalized;
 }
 

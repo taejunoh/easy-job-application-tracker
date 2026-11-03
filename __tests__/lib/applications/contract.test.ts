@@ -43,6 +43,24 @@ describe("Application request contract", () => {
       expect(Object.isFrozen(parsed)).toBe(true);
     });
 
+    it("normalizes the location on new saves only", async () => {
+      const created = await parseCreateApplicationRequest(
+        jsonRequest({ ...VALID_CREATE, location: " New York City ,  New York " }),
+      );
+      expect(created.location).toBe("New York, NY");
+
+      const blank = await parseCreateApplicationRequest(
+        jsonRequest({ ...VALID_CREATE, location: "   " }),
+      );
+      expect(blank.location).toBeNull();
+
+      const updated = await parseUpdateApplicationRequest(
+        "018f9f72-f2e9-7c29-a6fc-001122334499",
+        jsonRequest({ location: " New York City ,  New York " }),
+      );
+      expect(updated.data.location).toBe("New York City ,  New York");
+    });
+
     it("applies create defaults without manufacturing an applied date", async () => {
       await expect(parseCreateApplicationRequest(jsonRequest(VALID_CREATE))).resolves.toEqual({
         url: VALID_CREATE.url,

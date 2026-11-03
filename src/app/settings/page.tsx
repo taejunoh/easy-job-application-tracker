@@ -6,6 +6,8 @@ import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
 import { RESUME_UPLOAD_FIELD } from "@/lib/resume/constants";
 import { ExtensionInstallations } from "@/components/ExtensionInstallations";
+import PageHeader from "@/components/PageHeader";
+import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
 
 const PROVIDERS = [
   { value: "openai", label: "OpenAI" },
@@ -15,6 +17,7 @@ const PROVIDERS = [
 
 export default function SettingsPage() {
   const api = useClientApi();
+  const writesStopped = useWritesStopped();
   const [provider, setProvider] = useState("openai");
   const [apiKey, setApiKey] = useState("");
   const [hasExistingKey, setHasExistingKey] = useState(false);
@@ -44,6 +47,7 @@ export default function SettingsPage() {
   }, [api]);
 
   async function handleSave() {
+    if (writesStopped) return;
     setSaving(true);
     setMessage("");
     setMessageIsError(false);
@@ -94,10 +98,7 @@ export default function SettingsPage() {
 
   return (
     <div className="settings-page">
-      <header className="page-header">
-        <p className="eyebrow">Workspace preferences</p>
-        <h1 className="page-title">Settings</h1>
-      </header>
+      <PageHeader eyebrow="Workspace preferences" title="Settings" />
 
       <div className="settings-card card">
         <h2 className="panel-heading">
@@ -153,8 +154,6 @@ export default function SettingsPage() {
           </div>
         )}
 
-        <hr className="border-gray-700 my-6" />
-
         <h2 className="panel-heading">
           Profile URLs
         </h2>
@@ -185,8 +184,6 @@ export default function SettingsPage() {
             className="field"
           />
         </div>
-
-        <hr className="border-gray-700 my-6" />
 
         <h2 className="panel-heading">
           Resume
@@ -245,7 +242,8 @@ export default function SettingsPage() {
         <div className="settings-actions">
           <button
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || writesStopped}
+            title={readOnlyTitle(writesStopped)}
             className="primary-button"
           >
             {saving ? "Saving..." : "Save Settings"}
@@ -283,10 +281,7 @@ const settingsStyles = `
 .settings-status { background: #f2f5f0; border: 1px solid var(--border); border-radius: 0.5rem; margin-top: 1rem; padding: 0.8rem; }
 .settings-status-value { color: var(--text); font-size: 0.9rem; }
 .status-ok { color: #245e3a; font-size: 0.8rem; margin-left: 0.5rem; }
-.settings-card .field { background: var(--surface); color: var(--text); }
-.settings-card .field::placeholder { color: var(--muted); opacity: 1; }
-.settings-card .secondary-button { background: var(--surface); border: 1px solid var(--border); color: var(--text); min-height: 44px; min-width: 44px; }
-.settings-visibility-button { flex: 0 0 44px; padding-left: 0.25rem; padding-right: 0.25rem; width: 44px; }
+.settings-visibility-button { flex: 0 0 auto; }
 .settings-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 1rem; }
 .upload-control { align-items: center; background: #eef4ef; border: 1px solid #b9cec3; border-radius: 0.5rem; color: var(--primary); cursor: pointer; display: inline-flex; font-size: 0.85rem; font-weight: 700; min-height: 44px; padding: 0.6rem 0.8rem; }
 .resume-textarea { line-height: 1.5; resize: vertical; }
