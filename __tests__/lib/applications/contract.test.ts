@@ -36,7 +36,7 @@ describe("Application request contract", () => {
         description: "description",
         notes: null,
         salary: null,
-        location: "New York",
+        location: "New York, NY",
         jobType: "Remote",
       });
       expect(Object.getPrototypeOf(parsed)).toBeNull();
