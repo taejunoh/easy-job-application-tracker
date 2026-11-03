@@ -72,12 +72,31 @@ const US_COUNTRY_NAMES = new Set([
 
 const NEW_YORK_CITY_NAMES = new Set(["new york", "new york city"]);
 
+/** Whole values that name the New York City area with no state segment. */
+const NEW_YORK_AREA_NAMES = new Set([
+  "new york",
+  "new york city",
+  "new york metropolitan area",
+  "new york city metropolitan area",
+  "greater new york city area",
+  "nyc",
+]);
+
+/** A job title captured as a location, for example "Remote Software Engineer (US)". */
+const REMOTE_JOB_TITLE = /^remote\b.*\b(?:engineer|developer)\b/iu;
+const LOCATION_COUNT_TEXT = /^available in \d+ locations\b/iu;
+const TRAILING_NOT_APPLICABLE = /(?:^|, )n\/a$/iu;
+
 /**
  * Cleans a location string for display:
  * - trims and collapses whitespace, removes space before commas, and puts one
  *   space after each comma;
- * - rewrites `New York City, New York` and `New York, New York` as
- *   `New York, NY`;
+ * - drops a trailing `N/A` segment left by job boards;
+ * - rewrites `New York City, New York`, `New York, New York`, and the bare New
+ *   York area names as `New York, NY`;
+ * - rewrites `remote` in any case, and a job title captured as a remote location,
+ *   as `Remote`;
+ * - rewrites scraped `Available in 48 locations` text as `Multiple Locations`;
  * - rewrites `City, FullStateName` (optionally followed by a United States
  *   country segment) to the state abbreviation. "Georgia" is only rewritten when
  *   a United States segment follows, because it is also a country.
@@ -92,7 +111,13 @@ export function normalizeLocation(value: string | null | undefined): string {
     .replace(/\s+/gu, " ")
     .replace(/ ,/gu, ",")
     .replace(/,(?=\S)/gu, ", ")
-    .trim();
+    .trim()
+    .replace(TRAILING_NOT_APPLICABLE, "");
+
+  const lowered = text.toLowerCase();
+  if (NEW_YORK_AREA_NAMES.has(lowered)) return "New York, NY";
+  if (lowered === "remote" || REMOTE_JOB_TITLE.test(text)) return "Remote";
+  if (LOCATION_COUNT_TEXT.test(text)) return "Multiple Locations";
 
   const parts = text.split(", ");
   if (parts.length < 2 || parts.length > 3) return text;

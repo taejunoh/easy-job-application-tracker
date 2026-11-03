@@ -26,9 +26,22 @@ describe("normalizeLocation", () => {
     }
   });
 
+  it("unifies the bare New York area names to New York, NY", () => {
+    for (const input of [
+      "New York",
+      "new york",
+      "New York City",
+      "NYC",
+      "New York Metropolitan Area",
+      "New York City Metropolitan Area",
+      "Greater New York City Area",
+    ]) {
+      expect(normalizeLocation(input)).toBe("New York, NY");
+    }
+  });
+
   it("does not rewrite New York in other contexts", () => {
-    expect(normalizeLocation("New York")).toBe("New York");
-    expect(normalizeLocation("New York City")).toBe("New York City");
+    expect(normalizeLocation("Manhattan, NY")).toBe("Manhattan, NY");
     expect(normalizeLocation("New York City, Texas")).toBe("New York City, TX");
     expect(normalizeLocation("Albany, New York")).toBe("Albany, NY");
   });
@@ -64,8 +77,35 @@ describe("normalizeLocation", () => {
     expect(normalizeLocation("Remote, United States")).toBe("Remote, United States");
   });
 
+  it("cleans values scraped from job boards", () => {
+    expect(normalizeLocation("remote")).toBe("Remote");
+    expect(normalizeLocation("REMOTE")).toBe("Remote");
+    expect(normalizeLocation("Remote Software Engineer (US)")).toBe("Remote");
+    expect(normalizeLocation("Remote Developer")).toBe("Remote");
+    expect(normalizeLocation("Available in 48 locations See allSee all")).toBe("Multiple Locations");
+    expect(normalizeLocation("San Francisco, CA, USA, N/A")).toBe("San Francisco, CA, USA");
+    expect(normalizeLocation("n/a")).toBe("");
+  });
+
+  it("keeps remote values that carry a region", () => {
+    expect(normalizeLocation("Remote - USA")).toBe("Remote - USA");
+    expect(normalizeLocation("US Remote")).toBe("US Remote");
+    expect(normalizeLocation("US (remote), Boston (hybrid) or New York (Hybrid)")).toBe(
+      "US (remote), Boston (hybrid) or New York (Hybrid)",
+    );
+  });
+
   it("is idempotent", () => {
-    for (const input of ["New York City, New York", "Austin , Texas , USA", "Tbilisi,Georgia", "  x  "]) {
+    for (const input of [
+      "New York City, New York",
+      "Austin , Texas , USA",
+      "Tbilisi,Georgia",
+      "  x  ",
+      "New York City Metropolitan Area",
+      "Remote Software Engineer (US)",
+      "Available in 48 locations See allSee all",
+      "San Francisco, CA, USA, N/A",
+    ]) {
       const once = normalizeLocation(input);
       expect(normalizeLocation(once)).toBe(once);
     }

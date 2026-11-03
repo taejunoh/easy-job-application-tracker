@@ -45,6 +45,25 @@ it("renders all application fields with semantic table headers", () => {
   );
 });
 
+it("keeps the job type on one line in a column wide enough for it", () => {
+  render(createElement(ApplicationTable, { applications: [application], onStatusChange: jest.fn() }));
+
+  const type = screen.getAllByRole("row")[1].querySelector('[data-label="Type"]');
+  expect(type).toHaveClass("application-type-cell");
+  const styles = document.querySelector("style")?.textContent ?? "";
+  expect(styles).toMatch(/\.application-type-cell \{[^}]*white-space: nowrap/u);
+  expect(styles).toMatch(/th:nth-child\(7\) \{ width: 5\.25rem; \}/u);
+});
+
+it("scrolls the table inside its card instead of overlapping columns on narrow desktops", () => {
+  render(createElement(ApplicationTable, { applications: [application], onStatusChange: jest.fn() }));
+
+  const styles = document.querySelector("style")?.textContent ?? "";
+  expect(styles).toMatch(
+    /@media \(min-width: 769px\) \{[^\n]*\.applications-table-shell \{ overflow-x: auto; \} \.applications-table \{ min-width: 54rem; \}/u,
+  );
+});
+
 it("navigates a row with click, Enter, or Space", () => {
   render(createElement(ApplicationTable, { applications: [application], onStatusChange: jest.fn() }));
   const row = screen.getAllByRole("row")[1];
