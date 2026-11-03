@@ -28,6 +28,39 @@ type PairingSecretAction =
   | Readonly<{ type: "issued"; code: string; expiresAt: string }>
   | Readonly<{ type: "dismissed" }>;
 
+const EXTENSION_ORIGIN_PATTERN = /^chrome-extension:\/\/([a-p]{32})$/u;
+
+export type ExtensionLabel = Readonly<{
+  /** Friendly name to show first. */
+  name: string;
+  /** The raw origin, kept as secondary text. */
+  origin: string;
+}>;
+
+/**
+ * Friendly label for an extension origin. Every configured extension origin is a
+ * JobTracker extension; when more than one origin is in play the end of the
+ * extension ID is added so they can be told apart. Unrecognised origins are
+ * shown as they are.
+ */
+export function extensionLabel(
+  origin: string,
+  knownOrigins: readonly string[],
+): ExtensionLabel {
+  const match = EXTENSION_ORIGIN_PATTERN.exec(origin);
+  if (match === null) return { name: origin, origin };
+  const distinct = new Set(
+    [...knownOrigins, origin].filter((candidate) =>
+      EXTENSION_ORIGIN_PATTERN.test(candidate),
+    ),
+  );
+  const name = "JobTracker Chrome extension";
+  return {
+    name: distinct.size > 1 ? `${name} (ID ending ${match[1].slice(-6)})` : name,
+    origin,
+  };
+}
+
 export function pairingSecretReducer(
   _state: PairingSecret | null,
   action: PairingSecretAction,
@@ -74,6 +107,11 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
   );
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+
+  const knownOrigins = [
+    ...configuredOrigins,
+    ...installations.map((installation) => installation.origin),
+  ];
 
   const refresh = useCallback(async () => {
     const response = await api<{
@@ -142,6 +180,11 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
       <p className="panel-copy">
         Create a ten-minute, one-time pairing code for a configured extension.
       </p>
+      <p className="panel-copy pairing-how-it-works">
+        To pair, copy the code, open the JobTracker extension popup, enter this
+        JobTracker URL and the code, then choose Connect. The code works once;
+        the extension then keeps its own credential, which you can revoke below.
+      </p>
 
       <div className="extension-controls">
         <label htmlFor="extension-origin" className="field-label">
@@ -154,7 +197,7 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
           >
             {configuredOrigins.map((configuredOrigin) => (
               <option key={configuredOrigin} value={configuredOrigin}>
-                {configuredOrigin}
+                {extensionLabel(configuredOrigin, knownOrigins).name}
               </option>
             ))}
           </select>
@@ -170,6 +213,12 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
         </button>
       </div>
 
+      {origin !== "" && (
+        <p className="extension-origin-hint">
+          Origin: <code>{origin}</code>
+        </p>
+      )}
+
       <PairingCodePanel
         secret={pairingSecret}
         onDismiss={() => dispatchPairingSecret({ type: "dismissed" })}
@@ -181,7 +230,12 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
         <ul className="space-y-2">
           {installations.map((installation) => (
             <li key={installation.id} className="installation-item">
-              <div className="installation-origin">{installation.origin}</div>
+              <div className="installation-name">
+                {extensionLabel(installation.origin, knownOrigins).name}
+              </div>
+              <div className="installation-origin">
+                Origin <code>{installation.origin}</code>
+              </div>
               <div className="installation-id">
                 Installation ID <code>{installation.id}</code>
               </div>
@@ -221,9 +275,10 @@ const extensionInstallationsStyles = `
 .pairing-secret { color: var(--primary); display: block; font-size: 0.9rem; overflow-wrap: anywhere; }
 .pairing-dismiss { margin-top: 0.65rem; }
 .installation-item { background: #f7f8f4; border: 1px solid var(--border); border-radius: 0.5rem; list-style: none; margin-top: 0.65rem; padding: 0.85rem; }
-.installation-origin, .installation-id, .installation-status { overflow-wrap: anywhere; }
-.installation-origin { color: var(--text); font-size: 0.9rem; font-weight: 700; }
-.installation-id, .installation-status { color: var(--muted); font-size: 0.78rem; margin-top: 0.35rem; }
+.installation-name, .installation-origin, .installation-id, .installation-status, .extension-origin-hint { overflow-wrap: anywhere; }
+.installation-name { color: var(--text); font-size: 0.9rem; font-weight: 700; }
+.installation-origin, .installation-id, .installation-status { color: var(--muted); font-size: 0.78rem; margin-top: 0.35rem; }
+.extension-origin-hint { color: var(--muted); font-size: 0.75rem; margin: 0.5rem 0 0; }
 .extension-installations .danger-link { font-size: 0.8rem; min-height: 44px; }
 .extension-installations .inline-alert { margin-top: 0.8rem; padding: 0.65rem 0.8rem; }
 @media (max-width: 560px) { .extension-controls { grid-template-columns: 1fr; } .extension-installations .primary-button { width: 100%; } }

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
 const navItems = [
@@ -10,14 +10,38 @@ const navItems = [
   { href: "/settings", label: "Settings" },
 ];
 
+/** Clears the browser session cookie via the existing DELETE /api/auth/session route. */
+export async function endSession(fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  try {
+    const response = await fetchImpl("/api/auth/session", { method: "DELETE" });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 export default function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState("");
   const triggerRef = useRef<HTMLButtonElement>(null);
 
   function closeMenu() {
     setMenuOpen(false);
     triggerRef.current?.focus();
+  }
+
+  async function handleSignOut() {
+    setSigningOut(true);
+    setSignOutError("");
+    if (await endSession()) {
+      router.replace("/connect");
+      return;
+    }
+    setSignOutError("Sign out failed. Try again.");
+    setSigningOut(false);
   }
 
   useEffect(() => {
@@ -74,6 +98,19 @@ export default function Sidebar() {
           );
         })}
       </nav>
+      <div className={`sidebar-footer ${menuOpen ? "is-open" : "is-collapsed"}`}>
+        <button
+          type="button"
+          className="sidebar-signout"
+          disabled={signingOut}
+          onClick={handleSignOut}
+        >
+          {signingOut ? "Signing out..." : "Sign out"}
+        </button>
+        {signOutError && (
+          <p role="alert" className="sidebar-signout-error">{signOutError}</p>
+        )}
+      </div>
     </aside>
   );
 }

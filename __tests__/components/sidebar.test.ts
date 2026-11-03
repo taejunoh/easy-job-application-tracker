@@ -1,14 +1,16 @@
 /** @jest-environment jsdom */
 
 import { createElement } from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
-import Sidebar from "@/components/Sidebar";
+import Sidebar, { endSession } from "@/components/Sidebar";
 
 const pathname = "/applications/abc";
+const replace = jest.fn();
 
 jest.mock("next/navigation", () => ({
   usePathname: () => pathname,
+  useRouter: () => ({ replace }),
 }));
 
 jest.mock("next/link", () => ({
@@ -18,6 +20,10 @@ jest.mock("next/link", () => ({
 }));
 
 describe("Sidebar", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
   it("marks the matching route as current without a decorative stripe", () => {
     render(createElement(Sidebar));
 
@@ -40,5 +46,35 @@ describe("Sidebar", () => {
     fireEvent.keyDown(document, { key: "Escape" });
     expect(trigger).toHaveAttribute("aria-expanded", "false");
     expect(trigger).toHaveFocus();
+  });
+
+  it("offers a visible Sign out control that clears the session and returns to /connect", async () => {
+    const fetchMock = jest.fn().mockResolvedValue({ ok: true });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    render(createElement(Sidebar));
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("/connect"));
+    expect(fetchMock).toHaveBeenCalledWith("/api/auth/session", { method: "DELETE" });
+  });
+
+  it("stays on the page and reports a failed sign out", async () => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: false }) as unknown as typeof fetch;
+    render(createElement(Sidebar));
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sign out failed");
+    expect(replace).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeEnabled();
+  });
+});
+
+describe("endSession", () => {
+  it("returns true only for an ok response and false for network errors", async () => {
+    await expect(endSession(jest.fn().mockResolvedValue({ ok: true }))).resolves.toBe(true);
+    await expect(endSession(jest.fn().mockResolvedValue({ ok: false }))).resolves.toBe(false);
+    await expect(endSession(jest.fn().mockRejectedValue(new Error("offline")))).resolves.toBe(false);
   });
 });
