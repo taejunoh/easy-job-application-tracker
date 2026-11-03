@@ -2,7 +2,8 @@
 
 import { useRouter } from "next/navigation";
 
-import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
+import StatusEditor from "@/components/StatusEditor";
+import { READ_ONLY_MESSAGE, useWritesStopped } from "@/components/WriteState";
 
 interface Application {
   id: string;
@@ -18,8 +19,6 @@ interface ApplicationTableProps {
   applications: Application[];
   onStatusChange: (id: string, status: string) => void;
 }
-
-const STATUSES = ["Applied", "Interview", "Offer", "Rejected"];
 
 export default function ApplicationTable({
   applications,
@@ -57,7 +56,6 @@ export default function ApplicationTable({
         </thead>
         <tbody>
           {applications.map((application) => {
-            const statusId = `application-status-${application.id}`;
             const detailHref = `/applications/${application.id}`;
             const date = new Date(application.appliedDate);
 
@@ -102,26 +100,13 @@ export default function ApplicationTable({
                   </a>
                 </td>
                 <td className="application-cell application-status-cell" data-label="Status">
-                  <label className="sr-only" htmlFor={statusId} />
-                  <select
-                    id={statusId}
-                    value={application.status}
-                    aria-label={`Status for ${application.jobTitle}`}
-                    disabled={writesStopped}
-                    title={readOnlyTitle(writesStopped)}
-                    onClick={(event) => event.stopPropagation()}
-                    onKeyDown={(event) => event.stopPropagation()}
-                    onChange={(event) => {
-                      event.stopPropagation();
-                      onStatusChange(application.id, event.target.value);
-                    }}
-                  >
-                    {STATUSES.map((status) => (
-                      <option key={status} value={status}>
-                        {status}
-                      </option>
-                    ))}
-                  </select>
+                  <StatusEditor
+                    id={application.id}
+                    jobTitle={application.jobTitle}
+                    status={application.status}
+                    onChange={onStatusChange}
+                    readOnlyReason={writesStopped ? READ_ONLY_MESSAGE : undefined}
+                  />
                 </td>
                 <td className="application-cell application-date-cell" data-label="Date Applied">
                   <time dateTime={application.appliedDate}>{date.toLocaleDateString()}</time>
@@ -155,6 +140,9 @@ export default function ApplicationTable({
         .application-title-link:hover, .application-company-link:hover { color: var(--primary); text-decoration: underline; text-underline-offset: 0.18em; }
         .application-title-link { font-weight: 750; }
         .application-status-cell { min-width: 144px; }
+        .status-edit-button { align-items: center; background: transparent; border: 0; border-radius: 999px; cursor: pointer; display: inline-flex; gap: 0.25rem; padding: 0; }
+        .status-edit-button:hover .status-edit-caret { color: var(--primary); }
+        .status-edit-caret { color: var(--muted); font-size: 0.75rem; }
         .application-status-cell select { background: #e9f3ed; border: 1px solid #b9cec3; border-radius: 999px; color: var(--primary); cursor: pointer; min-height: 44px; padding: 0.3rem 1.7rem 0.3rem 0.65rem; width: 100%; }
         .application-status-cell select { min-width: 116px; }
         .application-status-cell select:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }

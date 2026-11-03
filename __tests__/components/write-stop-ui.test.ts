@@ -115,12 +115,16 @@ describe("controls whose routes are blocked by the write stop", () => {
     expect(screen.getByRole("button", { name: /Back to Applications/ })).toBeEnabled();
   });
 
-  it("disables the status control in the applications list", () => {
+  it("shows the status as a plain badge, not an editor, in the applications list", () => {
     render(stopped(createElement(ApplicationTable, {
       applications: [{ ...application, location: null, jobType: null }],
       onStatusChange: jest.fn(),
     })));
-    expect(screen.getByLabelText("Status for Platform Engineer")).toBeDisabled();
+    const row = screen.getAllByRole("row")[1];
+    expect(within(row).queryByRole("button", { name: /Status for/ })).not.toBeInTheDocument();
+    expect(within(row).queryByRole("combobox")).not.toBeInTheDocument();
+    expect(row.querySelector(".status-applied")).toHaveTextContent("Applied");
+    expect(row.querySelector(`[title="${READ_ONLY_MESSAGE}"]`)).not.toBeNull();
   });
 
   it("disables pairing and revoke but keeps the origin picker", async () => {
