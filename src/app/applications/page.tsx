@@ -1,9 +1,16 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { Suspense, useEffect, useMemo, useState, useCallback, useRef } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import ApplicationTable from "@/components/ApplicationTable";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
+import {
+  ATTENTION_PARAM,
+  STALE_AFTER_DAYS,
+  filterStaleApplications,
+  parseAttentionFilter,
+} from "@/lib/attention";
 
 interface Application {
   id: string;
@@ -19,10 +26,22 @@ const STATUSES = ["All", "Applied", "Interview", "Offer", "Rejected"];
 const JOB_TYPES = ["All", "Remote", "Hybrid", "Onsite"];
 
 export default function ApplicationsPage() {
+  return (
+    <Suspense fallback={null}>
+      <ApplicationsView />
+    </Suspense>
+  );
+}
+
+function ApplicationsView() {
   const api = useClientApi();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const attention = parseAttentionFilter(searchParams.get(ATTENTION_PARAM));
   const [applications, setApplications] = useState<Application[]>([]);
   const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("All");
+  const [statusFilter, setStatusFilter] = useState(() => initialStatus(searchParams.get("status")));
+  const [now] = useState(() => new Date());
   const [jobTypeFilter, setJobTypeFilter] = useState("All");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -34,10 +53,23 @@ export default function ApplicationsPage() {
     const params = new URLSearchParams();
     if (search) params.set("search", search);
     if (statusFilter !== "All") params.set("status", statusFilter);
+    else if (attention) params.set("status", "Applied");
     if (jobTypeFilter !== "All") params.set("jobType", jobTypeFilter);
 
     return api<Application[]>(`/api/applications?${params}`);
-  }, [api, search, statusFilter, jobTypeFilter]);
+  }, [api, search, statusFilter, jobTypeFilter, attention]);
+
+  const visibleApplications = useMemo(
+    () => (attention ? filterStaleApplications(applications, now) : applications),
+    [applications, attention, now],
+  );
+
+  function clearAttentionFilter() {
+    const next = new URLSearchParams(searchParams.toString());
+    next.delete(ATTENTION_PARAM);
+    const query = next.toString();
+    router.replace(query ? `/applications?${query}` : "/applications");
+  }
 
   const refreshApplications = useCallback(async () => {
     await loadLatestApplications(
@@ -124,6 +156,17 @@ export default function ApplicationsPage() {
         </label>
       </div>
 
+      {attention && (
+        <div className="attention-filter" role="status">
+          <span>
+            Showing stale applications: still Applied after {STALE_AFTER_DAYS}+ days.
+          </span>
+          <button type="button" className="secondary-button" onClick={clearAttentionFilter}>
+            Clear filter
+          </button>
+        </div>
+      )}
+
       {error && (
         <div role="alert" className="inline-alert mb-4">
           {error}
@@ -133,7 +176,7 @@ export default function ApplicationsPage() {
       {loading && <p className="loading-state" role="status">Loading applications…</p>}
 
       <ApplicationTable
-        applications={applications}
+        applications={visibleApplications}
         onStatusChange={handleStatusChange}
       />
       <style>{`
@@ -141,6 +184,7 @@ export default function ApplicationsPage() {
         .applications-toolbar .field { background: var(--surface); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); padding: 0.55rem 0.7rem; width: 100%; }
         .applications-toolbar .field::placeholder { color: var(--muted); opacity: 1; }
         .applications-toolbar .field:focus-visible { border-color: var(--primary); outline: 3px solid var(--primary); outline-offset: 2px; }
+        .attention-filter { align-items: center; background: #fbf0df; border: 1px solid #d9ad6d; border-radius: 0.5rem; color: #81551d; display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: space-between; margin-bottom: 1rem; padding: 0.5rem 0.5rem 0.5rem 1rem; }
         @media (max-width: 768px) {
           .applications-toolbar { grid-template-columns: 1fr; }
         }
@@ -180,6 +224,10 @@ export async function loadLatestApplications<T>(
   } finally {
     if (requestId === sequence.current) setLoading(false);
   }
+}
+
+function initialStatus(value: string | null): string {
+  return value !== null && STATUSES.includes(value) ? value : "All";
 }
 
 function errorMessage(error: unknown, fallback: string): string {

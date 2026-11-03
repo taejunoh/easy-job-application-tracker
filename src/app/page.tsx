@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import StatCard from "@/components/StatCard";
 import StatusBadge from "@/components/StatusBadge";
 import { useClientApi } from "@/hooks/use-client-api";
+import { buildAttentionItems, countStaleApplications } from "@/lib/attention";
 
 interface Stats {
   total: number;
@@ -22,6 +23,12 @@ interface Stats {
   }>;
 }
 
+const ATTENTION_COLORS = {
+  stale: "metric-stale",
+  interview: "metric-interview",
+  offer: "metric-offer",
+} as const;
+
 const statusItems = [
   { label: "Applied", key: "applied" as const },
   { label: "Interview", key: "interview" as const },
@@ -32,6 +39,7 @@ const statusItems = [
 export default function DashboardPage() {
   const api = useClientApi();
   const [stats, setStats] = useState<Stats | null>(null);
+  const [staleCount, setStaleCount] = useState<number | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -43,6 +51,19 @@ export default function DashboardPage() {
       .catch((failure: unknown) => {
         setError(errorMessage(failure, "Failed to load dashboard."));
       });
+  }, [api]);
+
+  useEffect(() => {
+    // /api/stats has a fixed shape, so stale applications are counted from the list.
+    api<Array<{ status: string; appliedDate: string }>>("/api/applications?status=Applied")
+      .then((applications) => {
+        setStaleCount(
+          Array.isArray(applications)
+            ? countStaleApplications(applications, new Date())
+            : null,
+        );
+      })
+      .catch(() => setStaleCount(null));
   }, [api]);
 
   if (!stats) {
@@ -62,8 +83,20 @@ export default function DashboardPage() {
         <p className="eyebrow">Active pipeline</p>
         <h2 id="pipeline-heading" className="section-title">What needs your attention</h2>
         <div className="metric-grid metric-grid-primary">
-          <StatCard label="Interviewing" value={stats.interview} color="metric-interview" />
-          <StatCard label="Offers" value={stats.offer} color="metric-offer" />
+          {buildAttentionItems({
+            stale: staleCount,
+            interview: stats.interview,
+            offer: stats.offer,
+          }).map((item) => (
+            <StatCard
+              key={item.key}
+              label={item.label}
+              hint={item.hint}
+              value={item.count}
+              color={ATTENTION_COLORS[item.key]}
+              href={item.count === null ? undefined : item.href}
+            />
+          ))}
         </div>
       </section>
 
