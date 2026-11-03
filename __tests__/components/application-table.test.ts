@@ -128,3 +128,56 @@ it("gives first-application guidance that points to the shell action and a job U
   expect(screen.getByText(/Add application button above/i)).toBeInTheDocument();
   expect(screen.getByText(/first job URL/i)).toBeInTheDocument();
 });
+
+describe("data display cleanup", () => {
+  const messy = {
+    ...application,
+    id: "app-2",
+    company: "Acme Labs International",
+    location: "  New York City ,  New York ",
+    jobType: null,
+  };
+
+  it("normalizes the displayed location without changing the input", () => {
+    const input = { ...messy };
+    render(createElement(ApplicationTable, { applications: [input], onStatusChange: jest.fn() }));
+    const row = screen.getAllByRole("row")[1];
+
+    expect(row).toHaveTextContent("New York, NY");
+    expect(row).not.toHaveTextContent("New York City");
+    expect(input.location).toBe("  New York City ,  New York ");
+  });
+
+  it("shows Remote in the Type column when the type is empty and the location is remote", () => {
+    render(createElement(ApplicationTable, {
+      applications: [{ ...messy, location: "Remote - US" }],
+      onStatusChange: jest.fn(),
+    }));
+    expect(within(screen.getAllByRole("row")[1]).getByText("Remote", { selector: "td" })).toBeInTheDocument();
+  });
+
+  it("keeps a stored job type and shows a dash when nothing indicates a type", () => {
+    render(createElement(ApplicationTable, {
+      applications: [
+        { ...messy, id: "a", location: "Remote", jobType: "Hybrid" },
+        { ...messy, id: "b", location: "Austin, Texas", jobType: null },
+      ],
+      onStatusChange: jest.fn(),
+    }));
+    const typeCell = (rowIndex: number) =>
+      screen.getAllByRole("row")[rowIndex].querySelector('[data-label="Type"]');
+    const types = [typeCell(1)?.textContent, typeCell(2)?.textContent].sort();
+    expect(types).toEqual(["-", "Hybrid"]);
+  });
+
+  it("wraps company names only at word boundaries and exposes the full name", () => {
+    const { container } = render(createElement(ApplicationTable, { applications: [messy], onStatusChange: jest.fn() }));
+    const link = screen.getByRole("link", { name: "Acme Labs International" });
+    expect(link).toHaveAttribute("title", "Acme Labs International");
+    expect(link.textContent).toBe("Acme Labs International");
+
+    const css = container.querySelector("style")?.textContent ?? "";
+    expect(css).toMatch(/\.application-company-link \{[^}]*overflow-wrap: normal/u);
+    expect(css).not.toMatch(/\.application-company-(?:link|cell) \{[^}]*overflow-wrap: (?:anywhere|break-word)/u);
+  });
+});

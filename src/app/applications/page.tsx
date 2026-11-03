@@ -6,6 +6,7 @@ import ApplicationTable from "@/components/ApplicationTable";
 import PageHeader from "@/components/PageHeader";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
+import { displayJobType } from "@/lib/location";
 import {
   ATTENTION_PARAM,
   STALE_AFTER_DAYS,
@@ -55,15 +56,21 @@ function ApplicationsView() {
     if (search) params.set("search", search);
     if (statusFilter !== "All") params.set("status", statusFilter);
     else if (attention) params.set("status", "Applied");
-    if (jobTypeFilter !== "All") params.set("jobType", jobTypeFilter);
+    // Remote also matches rows with no stored type whose location says remote,
+    // which the server cannot filter on, so that case filters on the client.
+    if (jobTypeFilter !== "All" && jobTypeFilter !== "Remote") {
+      params.set("jobType", jobTypeFilter);
+    }
 
     return api<Application[]>(`/api/applications?${params}`);
   }, [api, search, statusFilter, jobTypeFilter, attention]);
 
-  const visibleApplications = useMemo(
-    () => (attention ? filterStaleApplications(applications, now) : applications),
-    [applications, attention, now],
-  );
+  const visibleApplications = useMemo(() => {
+    const byAttention = attention ? filterStaleApplications(applications, now) : applications;
+    return jobTypeFilter === "Remote"
+      ? byAttention.filter((application) => displayJobType(application) === "Remote")
+      : byAttention;
+  }, [applications, attention, now, jobTypeFilter]);
 
   function clearAttentionFilter() {
     const next = new URLSearchParams(searchParams.toString());

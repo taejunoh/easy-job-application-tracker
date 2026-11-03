@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 
 import StatusEditor from "@/components/StatusEditor";
 import { READ_ONLY_MESSAGE, useWritesStopped } from "@/components/WriteState";
+import { displayJobType, normalizeLocation } from "@/lib/location";
 
 interface Application {
   id: string;
@@ -89,6 +90,7 @@ export default function ApplicationTable({
                 <td className="application-cell application-company-cell" data-label="Company">
                   <a
                     className="application-company-link"
+                    title={application.company}
                     href={detailHref}
                     onClick={(event) => {
                       event.preventDefault();
@@ -112,10 +114,10 @@ export default function ApplicationTable({
                   <time dateTime={application.appliedDate}>{date.toLocaleDateString()}</time>
                 </td>
                 <td className="application-cell" data-label="Location">
-                  {application.location || "-"}
+                  {normalizeLocation(application.location) || "-"}
                 </td>
                 <td className="application-cell" data-label="Type">
-                  {application.jobType || "-"}
+                  {displayJobType(application) || "-"}
                 </td>
               </tr>
             );
@@ -137,6 +139,8 @@ export default function ApplicationTable({
         .application-cell { color: var(--muted); min-width: 0; overflow-wrap: anywhere; padding: 0.95rem 0.9rem; }
         .application-title-cell, .application-company-cell { color: var(--text); font-weight: 650; }
         .application-title-link, .application-company-link { color: inherit; text-decoration: none; }
+        .application-company-cell { overflow: hidden; overflow-wrap: normal; word-break: normal; }
+        .application-company-link { display: block; hyphens: manual; overflow: hidden; overflow-wrap: normal; text-overflow: ellipsis; }
         .application-title-link:hover, .application-company-link:hover { color: var(--primary); text-decoration: underline; text-underline-offset: 0.18em; }
         .application-title-link { font-weight: 750; }
         .application-status-cell { min-width: 144px; }
