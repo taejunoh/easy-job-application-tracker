@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import PageHeader from "@/components/PageHeader";
 import StatCard from "@/components/StatCard";
 import StatusBadge from "@/components/StatusBadge";
 import { useClientApi } from "@/hooks/use-client-api";
@@ -28,13 +29,6 @@ const ATTENTION_COLORS = {
   interview: "metric-interview",
   offer: "metric-offer",
 } as const;
-
-const statusItems = [
-  { label: "Applied", key: "applied" as const },
-  { label: "Interview", key: "interview" as const },
-  { label: "Offer", key: "offer" as const },
-  { label: "Rejected", key: "rejected" as const },
-];
 
 export default function DashboardPage() {
   const api = useClientApi();
@@ -102,23 +96,11 @@ export default function DashboardPage() {
 
       <section aria-label="Supporting statistics" className="supporting-stats">
         <div className="metric-grid metric-grid-supporting">
-          <StatCard label="Total Applied" value={stats.total} color="metric-applied" />
+          <StatCard label="Total" value={stats.total} color="metric-total" />
+          <StatCard label="Applied" value={stats.applied} color="metric-applied" />
           <StatCard label="Rejected" value={stats.rejected} color="metric-rejected" />
           <StatCard label="This Week" value={stats.weeklyCount} color="metric-week" />
           <StatCard label="This Month" value={stats.monthlyCount} color="metric-month" />
-        </div>
-      </section>
-
-      <section className="status-summary-section" aria-labelledby="status-summary-heading">
-        <p className="eyebrow">At a glance</p>
-        <h2 id="status-summary-heading" className="section-title">Status summary</h2>
-        <div className="status-summary card">
-          {statusItems.map(({ label, key }) => (
-            <div className="status-summary-item" key={key}>
-              <StatusBadge status={label} />
-              <strong className="status-summary-count">{stats[key]}</strong>
-            </div>
-          ))}
         </div>
       </section>
 
@@ -155,11 +137,11 @@ export default function DashboardPage() {
 
 function DashboardHeader() {
   return (
-    <header className="page-header">
-      <p className="eyebrow">Your work in motion</p>
-      <h1 className="page-title">Dashboard</h1>
-      <p className="page-subtitle">Keep a clear record of every opportunity.</p>
-    </header>
+    <PageHeader
+      eyebrow="Your work in motion"
+      title="Dashboard"
+      subtitle="Keep a clear record of every opportunity."
+    />
   );
 }
 

@@ -3,6 +3,7 @@
 import { Suspense, useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import ApplicationTable from "@/components/ApplicationTable";
+import PageHeader from "@/components/PageHeader";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
 import {
@@ -117,11 +118,11 @@ function ApplicationsView() {
 
   return (
     <div className="applications-page" aria-busy={loading}>
-      <header className="page-header">
-        <p className="eyebrow">Your opportunity log</p>
-        <h1 className="page-title">Applications</h1>
-        <p className="page-subtitle">Keep every application, conversation, and next step in view.</p>
-      </header>
+      <PageHeader
+        eyebrow="Your opportunity log"
+        title="Applications"
+        subtitle="Keep every application, conversation, and next step in view."
+      />
 
       <div className="applications-toolbar card">
         <label className="filter-field filter-search">

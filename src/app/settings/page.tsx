@@ -6,6 +6,7 @@ import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
 import { RESUME_UPLOAD_FIELD } from "@/lib/resume/constants";
 import { ExtensionInstallations } from "@/components/ExtensionInstallations";
+import PageHeader from "@/components/PageHeader";
 import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
 
 const PROVIDERS = [
@@ -97,10 +98,7 @@ export default function SettingsPage() {
 
   return (
     <div className="settings-page">
-      <header className="page-header">
-        <p className="eyebrow">Workspace preferences</p>
-        <h1 className="page-title">Settings</h1>
-      </header>
+      <PageHeader eyebrow="Workspace preferences" title="Settings" />
 
       <div className="settings-card card">
         <h2 className="panel-heading">

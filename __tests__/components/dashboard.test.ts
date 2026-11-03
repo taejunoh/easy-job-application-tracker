@@ -23,7 +23,7 @@ beforeEach(() => {
   jest.mocked(useClientApi).mockReturnValue(api);
 });
 
-it("renders all six metrics, four status counts, and recent application fields", async () => {
+it("renders each metric once, plus recent application fields", async () => {
   mockApi({
     total: 8, applied: 4, interview: 2, offer: 1, rejected: 1,
     weeklyCount: 3, monthlyCount: 6,
@@ -31,16 +31,31 @@ it("renders all six metrics, four status counts, and recent application fields",
   });
   render(createElement(DashboardPage));
 
-  await waitFor(() => expect(screen.getByText("Total Applied", { selector: ".stat-label" })).toBeInTheDocument());
-  for (const label of ["Total Applied", "Stale applications", "Interviewing", "Offers", "Rejected", "This Week", "This Month"]) {
-    expect(screen.getByText(label, { selector: ".stat-label" })).toBeInTheDocument();
-  }
-  const summary = screen.getByRole("region", { name: "Status summary" });
-  for (const label of ["Applied", "Interview", "Offer", "Rejected"]) {
-    expect(within(summary).getByText(label, { selector: "[data-status-label]" })).toBeInTheDocument();
-  }
+  await waitFor(() => expect(screen.getByText("Total", { selector: ".stat-label" })).toBeInTheDocument());
+  const labels = Array.from(document.querySelectorAll(".stat-label")).map((node) => node.textContent);
+  expect(labels).toEqual([
+    "Stale applications", "Interviewing", "Offers",
+    "Total", "Applied", "Rejected", "This Week", "This Month",
+  ]);
+  expect(screen.queryByText("Total Applied")).not.toBeInTheDocument();
+  expect(screen.queryByRole("region", { name: "Status summary" })).not.toBeInTheDocument();
   expect(screen.getByText("Staff Engineer")).toBeInTheDocument();
   expect(screen.getByText("Acme")).toBeInTheDocument();
+});
+
+it("shows the Interview, Offer, and Rejected numbers exactly once", async () => {
+  mockApi({
+    total: 111, applied: 44, interview: 22, offer: 33, rejected: 55,
+    weeklyCount: 66, monthlyCount: 77, recentApplications: [],
+  });
+  render(createElement(DashboardPage));
+  await screen.findByRole("region", { name: "What needs your attention" });
+
+  const values = Array.from(document.querySelectorAll(".stat-value")).map((node) => node.textContent);
+  for (const count of ["22", "33", "55"]) {
+    expect(values.filter((value) => value === count)).toHaveLength(1);
+    expect(screen.getAllByText(count)).toHaveLength(1);
+  }
 });
 
 it("keeps an alert for stats errors", async () => {
