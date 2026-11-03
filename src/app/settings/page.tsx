@@ -156,8 +156,6 @@ export default function SettingsPage() {
           </div>
         )}
 
-        <hr className="border-gray-700 my-6" />
-
         <h2 className="panel-heading">
           Profile URLs
         </h2>
@@ -188,8 +186,6 @@ export default function SettingsPage() {
             className="field"
           />
         </div>
-
-        <hr className="border-gray-700 my-6" />
 
         <h2 className="panel-heading">
           Resume
@@ -287,10 +283,7 @@ const settingsStyles = `
 .settings-status { background: #f2f5f0; border: 1px solid var(--border); border-radius: 0.5rem; margin-top: 1rem; padding: 0.8rem; }
 .settings-status-value { color: var(--text); font-size: 0.9rem; }
 .status-ok { color: #245e3a; font-size: 0.8rem; margin-left: 0.5rem; }
-.settings-card .field { background: var(--surface); color: var(--text); }
-.settings-card .field::placeholder { color: var(--muted); opacity: 1; }
-.settings-card .secondary-button { background: var(--surface); border: 1px solid var(--border); color: var(--text); min-height: 44px; min-width: 44px; }
-.settings-visibility-button { flex: 0 0 44px; padding-left: 0.25rem; padding-right: 0.25rem; width: 44px; }
+.settings-visibility-button { flex: 0 0 auto; }
 .settings-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 1rem; }
 .upload-control { align-items: center; background: #eef4ef; border: 1px solid #b9cec3; border-radius: 0.5rem; color: var(--primary); cursor: pointer; display: inline-flex; font-size: 0.85rem; font-weight: 700; min-height: 44px; padding: 0.6rem 0.8rem; }
 .resume-textarea { line-height: 1.5; resize: vertical; }
