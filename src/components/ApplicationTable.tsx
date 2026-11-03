@@ -2,6 +2,8 @@
 
 import { useRouter } from "next/navigation";
 
+import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
+
 interface Application {
   id: string;
   jobTitle: string;
@@ -24,6 +26,7 @@ export default function ApplicationTable({
   onStatusChange,
 }: ApplicationTableProps) {
   const router = useRouter();
+  const writesStopped = useWritesStopped();
 
   if (applications.length === 0) {
     return (
@@ -104,6 +107,8 @@ export default function ApplicationTable({
                     id={statusId}
                     value={application.status}
                     aria-label={`Status for ${application.jobTitle}`}
+                    disabled={writesStopped}
+                    title={readOnlyTitle(writesStopped)}
                     onClick={(event) => event.stopPropagation()}
                     onKeyDown={(event) => event.stopPropagation()}
                     onChange={(event) => {

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
 
 import type { ClientApi } from "@/lib/client-api";
+import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
 
 type Installation = Readonly<{
   id: string;
@@ -63,6 +64,7 @@ export function PairingCodePanel({
 }
 
 export function ExtensionInstallations({ api, origins = [] }: Props) {
+  const writesStopped = useWritesStopped();
   const [installations, setInstallations] = useState<readonly Installation[]>([]);
   const [configuredOrigins, setConfiguredOrigins] = useState(origins);
   const [origin, setOrigin] = useState(origins[0] ?? "");
@@ -96,6 +98,7 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
   }, [refresh]);
 
   async function createPairingCode() {
+    if (writesStopped) return;
     setBusy(true);
     setMessage("");
     dispatchPairingSecret({ type: "dismissed" });
@@ -114,6 +117,7 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
   }
 
   async function revoke(id: string) {
+    if (writesStopped) return;
     setBusy(true);
     setMessage("");
     try {
@@ -157,7 +161,8 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
         </label>
         <button
           type="button"
-          disabled={busy || origin === ""}
+          disabled={busy || writesStopped || origin === ""}
+          title={readOnlyTitle(writesStopped)}
           onClick={createPairingCode}
           className="primary-button"
         >
@@ -188,7 +193,8 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
               {!installation.revokedAt && (
                 <button
                   type="button"
-                  disabled={busy}
+                  disabled={busy || writesStopped}
+                  title={readOnlyTitle(writesStopped)}
                   onClick={() => revoke(installation.id)}
                   className="danger-link"
                 >

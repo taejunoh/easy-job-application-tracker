@@ -6,6 +6,7 @@ import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
 import { RESUME_UPLOAD_FIELD } from "@/lib/resume/constants";
 import { ExtensionInstallations } from "@/components/ExtensionInstallations";
+import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
 
 const PROVIDERS = [
   { value: "openai", label: "OpenAI" },
@@ -15,6 +16,7 @@ const PROVIDERS = [
 
 export default function SettingsPage() {
   const api = useClientApi();
+  const writesStopped = useWritesStopped();
   const [provider, setProvider] = useState("openai");
   const [apiKey, setApiKey] = useState("");
   const [hasExistingKey, setHasExistingKey] = useState(false);
@@ -44,6 +46,7 @@ export default function SettingsPage() {
   }, [api]);
 
   async function handleSave() {
+    if (writesStopped) return;
     setSaving(true);
     setMessage("");
     setMessageIsError(false);
@@ -245,7 +248,8 @@ export default function SettingsPage() {
         <div className="settings-actions">
           <button
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || writesStopped}
+            title={readOnlyTitle(writesStopped)}
             className="primary-button"
           >
             {saving ? "Saving..." : "Save Settings"}

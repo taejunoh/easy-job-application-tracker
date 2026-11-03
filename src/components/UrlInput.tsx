@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
+import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
 
 type InputMode = "url" | "text" | "manual";
 
@@ -20,6 +21,8 @@ interface UrlInputProps {
 
 export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) {
   const api = useClientApi();
+  const writesStopped = useWritesStopped();
+  const stoppedTitle = readOnlyTitle(writesStopped);
   const [mode, setMode] = useState<InputMode>("url");
   const [url, setUrl] = useState("");
   const [text, setText] = useState("");
@@ -38,7 +41,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
 
   async function handleExtractUrl(e: React.FormEvent) {
     e.preventDefault();
-    if (!url.trim()) return;
+    if (writesStopped || !url.trim()) return;
 
     setLoading(true);
     setError("");
@@ -62,7 +65,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
 
   async function handleExtractText(e: React.FormEvent) {
     e.preventDefault();
-    if (!text.trim()) return;
+    if (writesStopped || !text.trim()) return;
 
     setLoading(true);
     setError("");
@@ -85,6 +88,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
   }
 
   async function handleSave() {
+    if (writesStopped) return;
     if (!editTitle.trim() || !editCompany.trim()) {
       setError("Job title and company are required");
       return;
@@ -134,7 +138,7 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
 
   async function handleManualSave(e: React.FormEvent) {
     e.preventDefault();
-    if (loading || savingRef.current) return;
+    if (writesStopped || loading || savingRef.current) return;
 
     const application = {
       url: manualUrl.trim(),
@@ -288,7 +292,8 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           </label>
           <button
             type="submit"
-            disabled={loading || !url.trim()}
+            disabled={writesStopped || loading || !url.trim()}
+            title={stoppedTitle}
             className="primary-button px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? "Extracting..." : "+ Add"}
@@ -310,7 +315,8 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
             </label>
             <button
               type="submit"
-              disabled={loading || !text.trim()}
+              disabled={writesStopped || loading || !text.trim()}
+              title={stoppedTitle}
               className="primary-button px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {loading ? "Extracting..." : "Extract"}
@@ -371,7 +377,8 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           </div>
           <button
             type="submit"
-            disabled={loading}
+            disabled={writesStopped || loading}
+            title={stoppedTitle}
             className="primary-button px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? "Saving..." : "Save Application"}
@@ -416,7 +423,8 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           <div className="flex items-center gap-2">
             <button
               onClick={handleSave}
-              disabled={loading}
+              disabled={writesStopped || loading}
+              title={stoppedTitle}
               className="primary-button px-3 py-1.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:opacity-50"
             >
               {loading ? "Saving..." : "Save Application"}
@@ -431,6 +439,11 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
         </div>
       )}
 
+      {writesStopped && (
+        <p className="read-only-note">
+          Adding applications is unavailable while changes are disabled.
+        </p>
+      )}
       {error && (
         <div role="alert" className="mt-2 text-red-400 text-xs">{error}</div>
       )}
