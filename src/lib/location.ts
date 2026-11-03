@@ -101,12 +101,22 @@ const TRAILING_NOT_APPLICABLE = /(?:^|, )n\/a$/iu;
  *   country segment) to the state abbreviation. "Georgia" is only rewritten when
  *   a United States segment follows, because it is also a country.
  *
- * Anything else is returned unchanged apart from the whitespace cleanup. A
- * missing value yields an empty string.
+ * Locations joined by semicolons are cleaned one by one. Anything else is
+ * returned unchanged apart from the whitespace cleanup. A missing value yields
+ * an empty string.
  */
 export function normalizeLocation(value: string | null | undefined): string {
   if (typeof value !== "string") return "";
+  if (!value.includes(";")) return normalizeSingleLocation(value);
 
+  return value
+    .split(";")
+    .map(normalizeSingleLocation)
+    .filter((location) => location !== "")
+    .join("; ");
+}
+
+function normalizeSingleLocation(value: string): string {
   const text = value
     .replace(/\s+/gu, " ")
     .replace(/ ,/gu, ",")
