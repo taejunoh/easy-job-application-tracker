@@ -20,6 +20,7 @@ interface Application {
   company: string;
   status: string;
   appliedDate: string;
+  updatedAt?: string | null;
   location: string | null;
   jobType: string | null;
 }

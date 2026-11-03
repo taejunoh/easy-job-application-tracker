@@ -25,11 +25,11 @@ beforeEach(() => {
   jest.clearAllMocks();
 });
 
-it("renders all six application fields with semantic table headers", () => {
+it("renders all application fields with semantic table headers", () => {
   render(createElement(ApplicationTable, { applications: [application], onStatusChange: jest.fn() }));
 
   expect(screen.getByRole("table")).toBeInTheDocument();
-  for (const heading of ["Job Title", "Company", "Status", "Date Applied", "Location", "Type"]) {
+  for (const heading of ["Job Title", "Company", "Status", "Date Applied", "Last updated", "Location", "Type", "Next step"]) {
     expect(screen.getByRole("columnheader", { name: heading })).toBeInTheDocument();
   }
 
@@ -179,5 +179,76 @@ describe("data display cleanup", () => {
     const css = container.querySelector("style")?.textContent ?? "";
     expect(css).toMatch(/\.application-company-link \{[^}]*overflow-wrap: normal/u);
     expect(css).not.toMatch(/\.application-company-(?:link|cell) \{[^}]*overflow-wrap: (?:anywhere|break-word)/u);
+  });
+});
+
+describe("findability", () => {
+  const daysAgo = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+  const rows = [
+    { ...application, id: "r1", jobTitle: "Beta Role", company: "Zed", status: "Interview", appliedDate: daysAgo(5), updatedAt: "2026-10-30T10:00:00.000Z" },
+    { ...application, id: "r2", jobTitle: "Alpha Role", company: "Acme", status: "Applied", appliedDate: daysAgo(60), updatedAt: "2026-09-01T10:00:00.000Z" },
+    { ...application, id: "r3", jobTitle: "Gamma Role", company: "Mid", status: "Offer", appliedDate: daysAgo(20) },
+    { ...application, id: "r4", jobTitle: "Delta Role", company: "Old", status: "Rejected", appliedDate: daysAgo(90), updatedAt: null },
+  ];
+  const titles = () =>
+    screen.getAllByRole("row").slice(1).map((row) => row.querySelector(".application-title-link")?.textContent);
+
+  it("starts newest first and exposes aria-sort on each sortable header", () => {
+    render(createElement(ApplicationTable, { applications: rows, onStatusChange: jest.fn() }));
+
+    expect(titles()).toEqual(["Beta Role", "Gamma Role", "Alpha Role", "Delta Role"]);
+    expect(screen.getByRole("columnheader", { name: "Date Applied" })).toHaveAttribute("aria-sort", "descending");
+    for (const name of ["Job Title", "Company", "Status"]) {
+      expect(screen.getByRole("columnheader", { name })).toHaveAttribute("aria-sort", "none");
+    }
+    for (const name of ["Last updated", "Location", "Type", "Next step"]) {
+      expect(screen.getByRole("columnheader", { name })).not.toHaveAttribute("aria-sort");
+    }
+  });
+
+  it("sorts by a header button, toggles direction, and updates aria-sort", () => {
+    render(createElement(ApplicationTable, { applications: rows, onStatusChange: jest.fn() }));
+
+    fireEvent.click(within(screen.getByRole("columnheader", { name: "Job Title" })).getByRole("button"));
+    expect(titles()).toEqual(["Alpha Role", "Beta Role", "Delta Role", "Gamma Role"]);
+    expect(screen.getByRole("columnheader", { name: "Job Title" })).toHaveAttribute("aria-sort", "ascending");
+    expect(screen.getByRole("columnheader", { name: "Date Applied" })).toHaveAttribute("aria-sort", "none");
+
+    fireEvent.click(within(screen.getByRole("columnheader", { name: "Job Title" })).getByRole("button"));
+    expect(titles()).toEqual(["Gamma Role", "Delta Role", "Beta Role", "Alpha Role"]);
+    expect(screen.getByRole("columnheader", { name: "Job Title" })).toHaveAttribute("aria-sort", "descending");
+
+    fireEvent.click(within(screen.getByRole("columnheader", { name: "Company" })).getByRole("button"));
+    expect(titles()).toEqual(["Alpha Role", "Gamma Role", "Delta Role", "Beta Role"]);
+
+    fireEvent.click(within(screen.getByRole("columnheader", { name: "Status" })).getByRole("button"));
+    expect(titles()).toEqual(["Alpha Role", "Beta Role", "Gamma Role", "Delta Role"]);
+  });
+
+  it("re-sorts when the incoming rows change", () => {
+    const { rerender } = render(createElement(ApplicationTable, { applications: rows, onStatusChange: jest.fn() }));
+    fireEvent.click(within(screen.getByRole("columnheader", { name: "Company" })).getByRole("button"));
+    rerender(createElement(ApplicationTable, { applications: rows.slice(0, 2), onStatusChange: jest.fn() }));
+    expect(titles()).toEqual(["Alpha Role", "Beta Role"]);
+  });
+
+  it("shows last updated from updatedAt and a dash when it is missing", () => {
+    render(createElement(ApplicationTable, { applications: rows, onStatusChange: jest.fn() }));
+    const cell = (index: number) => screen.getAllByRole("row")[index].querySelector('[data-label="Last updated"]');
+
+    expect(cell(1)?.querySelector("time")).toHaveAttribute("datetime", "2026-10-30T10:00:00.000Z");
+    expect(cell(2)?.textContent).toBe("-");
+    expect(cell(3)?.querySelector("time")).toHaveAttribute("datetime", "2026-09-01T10:00:00.000Z");
+    expect(cell(4)?.textContent).toBe("-");
+  });
+
+  it("derives the next step from status and age", () => {
+    render(createElement(ApplicationTable, { applications: rows, onStatusChange: jest.fn() }));
+    const step = (index: number) => screen.getAllByRole("row")[index].querySelector('[data-label="Next step"]')?.textContent;
+
+    expect(step(1)).toBe("Prepare");
+    expect(step(2)).toBe("Decide");
+    expect(step(3)).toBe("Follow up");
+    expect(step(4)).toBe("-");
   });
 });

@@ -1,9 +1,19 @@
 "use client";
 
+import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import StatusEditor from "@/components/StatusEditor";
 import { READ_ONLY_MESSAGE, useWritesStopped } from "@/components/WriteState";
+import {
+  DEFAULT_SORT,
+  ariaSortFor,
+  nextSortState,
+  nextStep,
+  sortApplications,
+  type SortKey,
+  type SortState,
+} from "@/lib/application-list";
 import { displayJobType, normalizeLocation } from "@/lib/location";
 
 interface Application {
@@ -12,9 +22,17 @@ interface Application {
   company: string;
   status: string;
   appliedDate: string;
+  updatedAt?: string | null;
   location: string | null;
   jobType: string | null;
 }
+
+const SORTABLE_COLUMNS: ReadonlyArray<{ key: SortKey; label: string }> = [
+  { key: "jobTitle", label: "Job Title" },
+  { key: "company", label: "Company" },
+  { key: "status", label: "Status" },
+  { key: "appliedDate", label: "Date Applied" },
+];
 
 interface ApplicationTableProps {
   applications: Application[];
@@ -27,6 +45,9 @@ export default function ApplicationTable({
 }: ApplicationTableProps) {
   const router = useRouter();
   const writesStopped = useWritesStopped();
+  const [sort, setSort] = useState<SortState>(DEFAULT_SORT);
+  const [now] = useState(() => new Date());
+  const sorted = useMemo(() => sortApplications(applications, sort), [applications, sort]);
 
   if (applications.length === 0) {
     return (
@@ -47,18 +68,35 @@ export default function ApplicationTable({
         <caption className="sr-only">Your job applications</caption>
         <thead>
           <tr>
-            <th scope="col">Job Title</th>
-            <th scope="col">Company</th>
-            <th scope="col">Status</th>
-            <th scope="col">Date Applied</th>
+            {SORTABLE_COLUMNS.map(({ key, label }) => {
+              const ariaSort = ariaSortFor(sort, key);
+              return (
+                <th key={key} scope="col" aria-sort={ariaSort}>
+                  <button
+                    type="button"
+                    className="sort-button"
+                    onClick={() => setSort((current) => nextSortState(current, key))}
+                  >
+                    {label}
+                    <span aria-hidden="true" className="sort-indicator">
+                      {ariaSort === "ascending" ? "▲" : ariaSort === "descending" ? "▼" : "↕"}
+                    </span>
+                  </button>
+                </th>
+              );
+            })}
+            <th scope="col">Last updated</th>
             <th scope="col">Location</th>
             <th scope="col">Type</th>
+            <th scope="col">Next step</th>
           </tr>
         </thead>
         <tbody>
-          {applications.map((application) => {
+          {sorted.map((application) => {
             const detailHref = `/applications/${application.id}`;
             const date = new Date(application.appliedDate);
+            const updated = application.updatedAt ? new Date(application.updatedAt) : null;
+            const step = nextStep(application, now);
 
             return (
               <tr
@@ -113,11 +151,24 @@ export default function ApplicationTable({
                 <td className="application-cell application-date-cell" data-label="Date Applied">
                   <time dateTime={application.appliedDate}>{date.toLocaleDateString()}</time>
                 </td>
+                <td className="application-cell application-updated-cell" data-label="Last updated">
+                  {updated && Number.isFinite(updated.getTime()) ? (
+                    <time dateTime={application.updatedAt ?? undefined}>{updated.toLocaleDateString()}</time>
+                  ) : (
+                    "-"
+                  )}
+                </td>
                 <td className="application-cell" data-label="Location">
                   {normalizeLocation(application.location) || "-"}
                 </td>
                 <td className="application-cell" data-label="Type">
                   {displayJobType(application) || "-"}
+                </td>
+                <td
+                  className={`application-cell application-next-step-cell${step === "-" ? "" : " has-next-step"}`}
+                  data-label="Next step"
+                >
+                  {step}
                 </td>
               </tr>
             );
@@ -127,16 +178,23 @@ export default function ApplicationTable({
       <style>{`
         .applications-table-shell { overflow: hidden; }
         .applications-table { border-collapse: collapse; color: var(--text); font-size: 0.9rem; table-layout: fixed; width: 100%; }
-        .applications-table th { background: #f0f2ec; color: var(--muted); font-size: 0.72rem; letter-spacing: 0.08em; padding: 0.8rem 0.9rem; text-align: left; text-transform: uppercase; }
-        .applications-table th:nth-child(1) { width: 22%; }
-        .applications-table th:nth-child(2) { width: 18%; }
-        .applications-table th:nth-child(3) { width: 20%; }
-        .applications-table th:nth-child(4) { width: 15%; }
-        .applications-table th:nth-child(5) { width: 15%; }
-        .applications-table th:nth-child(6) { width: 10%; }
+        .applications-table th { background: #f0f2ec; color: var(--muted); font-size: 0.72rem; letter-spacing: 0.08em; padding: 0.8rem 0.7rem; text-align: left; text-transform: uppercase; }
+        .applications-table th:nth-child(1) { width: 20%; }
+        .applications-table th:nth-child(2) { width: 14%; }
+        .applications-table th:nth-child(3) { width: 12%; }
+        .applications-table th:nth-child(4) { width: 11%; }
+        .applications-table th:nth-child(5) { width: 11%; }
+        .applications-table th:nth-child(6) { width: 13%; }
+        .applications-table th:nth-child(7) { width: 8%; }
+        .applications-table th:nth-child(8) { width: 11%; }
+        .sort-button { align-items: center; background: transparent; border: 0; color: inherit; cursor: pointer; display: inline-flex; font: inherit; gap: 0.3rem; letter-spacing: inherit; min-height: 44px; padding: 0; text-align: left; text-transform: inherit; }
+        .sort-button:hover { color: var(--primary); }
+        .sort-indicator { font-size: 0.65rem; opacity: 0.6; }
+        th[aria-sort="ascending"] .sort-indicator, th[aria-sort="descending"] .sort-indicator { color: var(--primary); opacity: 1; }
+        th[aria-sort="ascending"], th[aria-sort="descending"] { color: var(--primary); }
         .application-row { border-top: 1px solid var(--border); cursor: pointer; outline-offset: -3px; transition: background-color 120ms ease; }
         .application-row:hover, .application-row:focus-visible { background: #f7f8f4; }
-        .application-cell { color: var(--muted); min-width: 0; overflow-wrap: anywhere; padding: 0.95rem 0.9rem; }
+        .application-cell { color: var(--muted); min-width: 0; overflow-wrap: anywhere; padding: 0.95rem 0.7rem; }
         .application-title-cell, .application-company-cell { color: var(--text); font-weight: 650; }
         .application-title-link, .application-company-link { color: inherit; text-decoration: none; }
         .application-company-cell { overflow: hidden; overflow-wrap: normal; word-break: normal; }
@@ -150,7 +208,8 @@ export default function ApplicationTable({
         .application-status-cell select { background: #e9f3ed; border: 1px solid #b9cec3; border-radius: 999px; color: var(--primary); cursor: pointer; min-height: 44px; padding: 0.3rem 1.7rem 0.3rem 0.65rem; width: 100%; }
         .application-status-cell select { min-width: 116px; }
         .application-status-cell select:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
-        .application-date-cell time { white-space: nowrap; }
+        .application-date-cell time, .application-updated-cell time { white-space: nowrap; }
+        .application-cell.has-next-step { color: var(--text); font-weight: 650; }
         @media (max-width: 768px) {
           .applications-table-shell { background: transparent; border: 0; box-shadow: none; overflow: visible; }
           .applications-table, .applications-table tbody, .application-row, .application-cell { display: block; width: 100%; }
