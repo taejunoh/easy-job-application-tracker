@@ -279,7 +279,8 @@ const extensionInstallationsStyles = `
 .installation-name { color: var(--text); font-size: 0.9rem; font-weight: 700; }
 .installation-origin, .installation-id, .installation-status { color: var(--muted); font-size: 0.78rem; margin-top: 0.35rem; }
 .extension-origin-hint { color: var(--muted); font-size: 0.75rem; margin: 0.5rem 0 0; }
-.extension-installations .danger-link { font-size: 0.8rem; min-height: 44px; }
+.extension-installations .danger-link { background: none; border: none; color: var(--destructive); cursor: pointer; font-size: 0.8rem; min-height: 44px; padding: 0; text-decoration: underline; }
+.extension-installations .danger-link:disabled { color: var(--muted); cursor: not-allowed; text-decoration: none; }
 .extension-installations .inline-alert { margin-top: 0.8rem; padding: 0.65rem 0.8rem; }
 @media (max-width: 560px) { .extension-controls { grid-template-columns: 1fr; } .extension-installations .primary-button { width: 100%; } }
 `;
