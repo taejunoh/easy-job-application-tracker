@@ -276,7 +276,7 @@ const extensionInstallationsStyles = `
 .pairing-dismiss { margin-top: 0.65rem; }
 .installation-item { background: #f7f8f4; border: 1px solid var(--border); border-radius: 0.5rem; list-style: none; margin-top: 0.65rem; padding: 0.85rem; }
 .installation-name, .installation-origin, .installation-id, .installation-status, .extension-origin-hint { overflow-wrap: anywhere; }
-.installation-name { color: var(--text); font-size: 0.9rem; font-weight: 700; }
+.installation-name { color: var(--text); font-size: 0.9rem; font-weight: 600; }
 .installation-origin, .installation-id, .installation-status { color: var(--muted); font-size: 0.78rem; margin-top: 0.35rem; }
 .extension-origin-hint { color: var(--muted); font-size: 0.75rem; margin: 0.5rem 0 0; }
 .extension-installations .danger-link { background: none; border: none; color: var(--destructive); cursor: pointer; font-size: 0.8rem; min-height: 44px; padding: 0; text-decoration: underline; }

@@ -283,7 +283,7 @@ const settingsStyles = `
 .status-ok { color: #245e3a; font-size: 0.8rem; margin-left: 0.5rem; }
 .settings-visibility-button { flex: 0 0 auto; }
 .settings-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 1rem; }
-.upload-control { align-items: center; background: #eef4ef; border: 1px solid #b9cec3; border-radius: 0.5rem; color: var(--primary); cursor: pointer; display: inline-flex; font-size: 0.85rem; font-weight: 700; min-height: 44px; padding: 0.6rem 0.8rem; }
+.upload-control { align-items: center; background: #eef4ef; border: 1px solid #b9cec3; border-radius: 0.5rem; color: var(--primary); cursor: pointer; display: inline-flex; font-size: 0.85rem; font-weight: 600; min-height: 44px; padding: 0.6rem 0.8rem; }
 .resume-textarea { line-height: 1.5; resize: vertical; }
 `;
 
