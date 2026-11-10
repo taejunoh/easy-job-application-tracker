@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
+import { normalizeLocation } from "@/lib/location";
 import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
 
 interface Application {
@@ -46,6 +47,7 @@ export default function ApplicationDetail({
     jobType: application.jobType || "",
   });
   const [saving, setSaving] = useState(false);
+  const [locationFocused, setLocationFocused] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
@@ -145,7 +147,7 @@ export default function ApplicationDetail({
             </div>
             <label htmlFor="application-location" className="field-label">
               <span className="input-label">Location</span>
-              <input id="application-location" value={form.location} onChange={(e) => updateField("location", e.target.value)} readOnly={writesStopped} placeholder="e.g., San Francisco, CA" className="field" />
+              <input id="application-location" value={locationFocused && !writesStopped ? form.location : normalizeLocation(form.location)} onFocus={() => setLocationFocused(true)} onBlur={() => setLocationFocused(false)} onChange={(e) => updateField("location", e.target.value)} readOnly={writesStopped} placeholder="e.g., San Francisco, CA" className="field" />
             </label>
             <label htmlFor="application-salary" className="field-label">
               <span className="input-label">Salary Range</span>
