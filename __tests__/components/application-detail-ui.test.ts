@@ -42,7 +42,7 @@ beforeEach(() => {
     if (path === "/api/settings?includeResume=true") {
       return Promise.resolve({ resumeText: "TypeScript React" });
     }
-    if (init?.method === "PATCH") return Promise.resolve({});
+    if (init?.method === "PATCH") return Promise.resolve({ ...application, ...JSON.parse(String(init.body)) });
     if (init?.method === "DELETE") return Promise.resolve({});
     return Promise.resolve({});
   });
@@ -70,6 +70,10 @@ it("presents a labeled hierarchy before metadata and separate content sections",
 it("displays a normalized location while preserving the stored value on unrelated saves", async () => {
   render(createElement(ApplicationDetail, { application: rawNewYorkApplication }));
 
+  const dispatch = api.getMockImplementation()!;
+  api.mockImplementation((path: string, init?: RequestInit) => init?.method === "PATCH"
+    ? Promise.resolve({ ...rawNewYorkApplication, ...JSON.parse(String(init.body)) })
+    : dispatch(path, init));
   const location = screen.getByLabelText("Location");
   expect(location).toHaveValue("New York, NY");
   fireEvent.focus(location);
@@ -84,11 +88,7 @@ it("displays a normalized location while preserving the stored value on unrelate
     `/api/applications/${application.id}`,
     expect.objectContaining({
       method: "PATCH",
-      body: JSON.stringify({
-        ...applicationBody(),
-        company: "Updated Systems",
-        location: "New York City Metropolitan Area",
-      }),
+      body: JSON.stringify({ company: "Updated Systems" }),
     }),
   ));
   expect(await screen.findByText("Saved")).toBeInTheDocument();
@@ -110,7 +110,7 @@ it("saves a location when the user explicitly edits it", async () => {
     `/api/applications/${application.id}`,
     expect.objectContaining({
       method: "PATCH",
-      body: JSON.stringify({ ...applicationBody(), location: "Boston, Massachusetts" }),
+      body: JSON.stringify({ location: "Boston, Massachusetts" }),
     }),
   ));
 });
@@ -175,22 +175,25 @@ it("keeps the original high, medium, and low keyword score thresholds", async ()
   }
 });
 
-it("shows saving then Saved and sends the existing PATCH body", async () => {
-  let resolveSave: (() => void) | undefined;
+it("shows saving then Saved and reflects the normalized PATCH response", async () => {
+  let resolveSave: ((record: typeof application) => void) | undefined;
   api.mockImplementation((path: string, init?: RequestInit) => {
     if (path === "/api/settings?includeResume=true") return Promise.resolve({ resumeText: "" });
-    if (init?.method === "PATCH") return new Promise<void>((resolve) => { resolveSave = resolve; });
+    if (init?.method === "PATCH") return new Promise<typeof application>((resolve) => { resolveSave = resolve; });
     return Promise.resolve({});
   });
   render(createElement(ApplicationDetail, { application }));
+  expect(screen.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("Company"), { target: { value: " New company " } });
   fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
   expect(await screen.findByRole("button", { name: "Saving..." })).toBeDisabled();
   expect(api).toHaveBeenCalledWith(`/api/applications/${application.id}`, expect.objectContaining({
     method: "PATCH",
-    body: JSON.stringify(applicationBody()),
+    body: JSON.stringify({ company: " New company " }),
   }));
-  await act(async () => resolveSave?.());
+  await act(async () => resolveSave?.({ ...application, company: "New company" }));
   expect(await screen.findByText("Saved")).toBeInTheDocument();
+  expect(screen.getByLabelText("Company")).toHaveValue("New company");
 });
 
 it("confirms deletion and navigates only after the DELETE resolves", async () => {
@@ -208,16 +211,3 @@ it("confirms deletion and navigates only after the DELETE resolves", async () =>
   await act(async () => resolveDelete?.());
   await waitFor(() => expect(push).toHaveBeenCalledWith("/applications"));
 });
-
-function applicationBody() {
-  return {
-    jobTitle: application.jobTitle,
-    company: application.company,
-    status: application.status,
-    description: application.description,
-    notes: application.notes,
-    salary: application.salary,
-    location: application.location,
-    jobType: application.jobType,
-  };
-}

@@ -18,6 +18,8 @@ model Application {
   salary        String?
   location      String?
   jobType       String?
+  nextStep      String?       @db.VarChar(120)
+  nextStepDate  String?       @db.VarChar(10)
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
   identityKey   String?       @unique

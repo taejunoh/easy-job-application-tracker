@@ -1,70 +1,88 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
-import { normalizeLocation } from "@/lib/location";
+import { displayJobType, normalizeLocation } from "@/lib/location";
 import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
 
-interface Application {
-  id: string;
-  url: string;
-  jobTitle: string;
-  company: string;
-  status: string;
-  appliedDate: string;
-  description: string | null;
-  notes: string | null;
-  salary: string | null;
-  location: string | null;
-  jobType: string | null;
-}
+import StatusBadge from "@/components/StatusBadge";
+import { STATUSES } from "@/components/StatusEditor";
+import { nextStep } from "@/lib/application-list";
+import { utcDate } from "@/lib/application-calendar";
+import type { ApplicationRecord } from "@/lib/application-record";
 
-const STATUSES = ["Applied", "Interview", "Offer", "Rejected"];
 const JOB_TYPES = ["", "Remote", "Hybrid", "Onsite"];
 
 interface ApplicationDetailProps {
-  application: Application;
+  application: ApplicationRecord;
+  embedded?: boolean;
+  onSaved?: (application: ApplicationRecord) => void;
+  onDeleted?: () => void;
+  onDraftStateChange?: (state: { dirty: boolean; busy: boolean }) => void;
 }
 
 export default function ApplicationDetail({
   application,
+  embedded = false,
+  onSaved,
+  onDeleted,
+  onDraftStateChange,
 }: ApplicationDetailProps) {
   const router = useRouter();
   const api = useClientApi();
   const writesStopped = useWritesStopped();
   const stoppedTitle = readOnlyTitle(writesStopped);
-  const [form, setForm] = useState({
-    jobTitle: application.jobTitle,
-    company: application.company,
-    status: application.status,
-    description: application.description || "",
-    notes: application.notes || "",
-    salary: application.salary || "",
-    location: application.location || "",
-    jobType: application.jobType || "",
-  });
+  const [editing, setEditing] = useState(!embedded);
+  const [standaloneSaved, setStandaloneSaved] = useState<Record<string, string> | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const original = standaloneSaved ?? detailFields(application);
+  const form = { ...original, ...draft };
   const [saving, setSaving] = useState(false);
+  const titleInput = useRef<HTMLInputElement>(null);
+  const editButton = useRef<HTMLButtonElement>(null);
+  const restoreEditFocus = useRef(false);
   const [locationFocused, setLocationFocused] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
+  const busy = saving || deleting;
+  const locked = writesStopped || busy;
+  const dirty = Object.keys(draft).length > 0;
+
+  useEffect(() => {
+    onDraftStateChange?.({ dirty, busy });
+  }, [dirty, busy, onDraftStateChange]);
+
+  useEffect(() => {
+    if (!embedded) return;
+    if (editing) titleInput.current?.focus();
+    else if (restoreEditFocus.current) {
+      restoreEditFocus.current = false;
+      editButton.current?.focus();
+    }
+  }, [editing, embedded]);
 
   const [saved, setSaved] = useState(false);
   const [resumeText, setResumeText] = useState<string | null>(null);
   const [showAnalysis, setShowAnalysis] = useState(false);
   const [debouncedDescription, setDebouncedDescription] = useState(form.description);
 
+  const hasDescription = Boolean(form.description);
   useEffect(() => {
+    if (!hasDescription) return;
+    let active = true;
     api<{ resumeText?: string | null }>("/api/settings?includeResume=true")
-      .then((data) => setResumeText(data.resumeText || ""))
+      .then((data) => { if (active) setResumeText(data.resumeText || ""); })
       .catch((failure: unknown) => {
+        if (!active) return;
         setResumeText("");
         setError(errorMessage(failure, "Failed to load resume settings."));
       });
-  }, [api]);
+    return () => { active = false; };
+  }, [api, hasDescription]);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedDescription(form.description), 300);
@@ -77,15 +95,26 @@ export default function ApplicationDetail({
   }, [debouncedDescription, resumeText]);
 
   async function handleSave() {
-    if (writesStopped) return;
+    if (locked || !dirty) return;
     setSaving(true);
     setSaved(false);
     setError("");
     try {
-      await saveApplicationChanges(api, () => {
-        setSaved(true);
-        setTimeout(() => setSaved(false), 2000);
-      }, application.id, form);
+      const savedRecord = await saveApplicationChanges(
+        api,
+        () => setSaved(true),
+        application.id,
+        draft,
+      );
+      if (embedded) {
+        onSaved?.(savedRecord);
+        restoreEditFocus.current = true;
+        setShowDeleteConfirm(false);
+        setEditing(false);
+      } else {
+        setStandaloneSaved(detailFields(savedRecord));
+      }
+      setDraft({});
     } catch (failure) {
       setError(errorMessage(failure, "Failed to save application."));
     } finally {
@@ -94,15 +123,14 @@ export default function ApplicationDetail({
   }
 
   async function handleDelete() {
-    if (writesStopped) return;
+    if (locked) return;
     setDeleting(true);
     setError("");
     try {
-      await deleteApplication(
-        api,
-        (href) => router.push(href),
-        application.id,
-      );
+      await deleteApplication(api, (href) => {
+        if (onDeleted) onDeleted();
+        else router.push(href);
+      }, application.id);
     } catch (failure) {
       setError(errorMessage(failure, "Failed to delete application."));
       setDeleting(false);
@@ -110,65 +138,26 @@ export default function ApplicationDetail({
   }
 
   function updateField(field: string, value: string) {
-    setForm((prev) => ({ ...prev, [field]: value }));
+    setSaved(false);
+    setDraft((previous) => {
+      const next = { ...previous };
+      if (value === original[field]) delete next[field];
+      else next[field] = value;
+      return next;
+    });
   }
 
-  return (
-    <div className="application-detail">
-      <button type="button" onClick={() => router.push("/applications")} className="back-link">
-        &larr; Back to Applications
-      </button>
+  function cancelEdit() {
+    if (dirty && !window.confirm("Discard unsaved application changes?")) return;
+    setDraft({});
+    setError("");
+    setShowDeleteConfirm(false);
+    restoreEditFocus.current = true;
+    setEditing(false);
+  }
 
-      {error && <div role="alert" className="inline-alert">{error}</div>}
-
-      <article className="application-detail-card">
-        <header className="application-detail-header">
-          <div className="application-identity">
-            <p className="eyebrow">Application record</p>
-            <label htmlFor="application-job-title" className="field-label">Job title</label>
-            <input id="application-job-title" value={form.jobTitle} onChange={(e) => updateField("jobTitle", e.target.value)} readOnly={writesStopped} className="detail-title-input" />
-            <label htmlFor="application-company" className="field-label">Company</label>
-            <input id="application-company" value={form.company} onChange={(e) => updateField("company", e.target.value)} readOnly={writesStopped} className="detail-company-input" />
-          </div>
-          <label htmlFor="application-status" className="status-field">
-            <span className="input-label">Status</span>
-            <select id="application-status" value={form.status} onChange={(e) => updateField("status", e.target.value)} disabled={writesStopped} className="field status-select">
-              {STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
-          </label>
-        </header>
-
-        <section className="metadata-section" aria-labelledby="metadata-heading">
-          <h2 id="metadata-heading" className="section-title">Application details</h2>
-          <div className="metadata-grid">
-            <div className="metadata-item">
-              <span className="input-label">Date Applied</span>
-              <time dateTime={application.appliedDate}>{new Date(application.appliedDate).toLocaleDateString()}</time>
-            </div>
-            <label htmlFor="application-location" className="field-label">
-              <span className="input-label">Location</span>
-              <input id="application-location" value={locationFocused && !writesStopped ? form.location : normalizeLocation(form.location)} onFocus={() => setLocationFocused(true)} onBlur={() => setLocationFocused(false)} onChange={(e) => updateField("location", e.target.value)} readOnly={writesStopped} placeholder="e.g., San Francisco, CA" className="field" />
-            </label>
-            <label htmlFor="application-salary" className="field-label">
-              <span className="input-label">Salary Range</span>
-              <input id="application-salary" value={form.salary} onChange={(e) => updateField("salary", e.target.value)} readOnly={writesStopped} placeholder="e.g., $120k - $160k" className="field" />
-            </label>
-            <label htmlFor="application-job-type" className="field-label">
-              <span className="input-label">Job Type</span>
-              <select id="application-job-type" value={form.jobType} onChange={(e) => updateField("jobType", e.target.value)} disabled={writesStopped} className="field">
-                {JOB_TYPES.map((t) => <option key={t} value={t}>{t || "Not specified"}</option>)}
-              </select>
-            </label>
-          </div>
-        </section>
-
-        <section className="detail-section description-section" aria-labelledby="description-heading">
-          <h2 id="description-heading" className="section-title">Job Description</h2>
-          <p className="section-copy">Keep the original listing close while you prepare.</p>
-          <label htmlFor="application-description" className="field-label sr-only">Job Description</label>
-          <textarea id="application-description" value={form.description} onChange={(e) => updateField("description", e.target.value)} readOnly={writesStopped} placeholder="Paste the job description here..." rows={6} className="field detail-textarea" />
-        </section>
-
+  const analysis = (
+    <>
         {form.description && resumeText === "" && (
           <div className="resume-guidance" role="note">
             Add your resume in <a href="/settings" className="text-link" onClick={(event) => { event.preventDefault(); router.push("/settings"); }}>Settings</a> to see keyword match analysis.
@@ -195,10 +184,137 @@ export default function ApplicationDetail({
           </section>
         )}
 
+    </>
+  );
+
+  if (embedded && !editing) {
+    const suggested = nextStep(application, new Date());
+    const label = application.nextStep || (suggested === "-" ? "No next step set" : suggested);
+    return (
+      <article className="record-overview">
+        {error && <div role="alert" className="inline-alert">{error}</div>}
+        <StatusBadge status={application.status} />
+        <h2>{application.company}</h2>
+        <p className="record-role">{application.jobTitle}</p>
+        <dl className="record-facts">
+          <div><dt>Location</dt><dd>{normalizeLocation(application.location) || "—"}</dd></div>
+          <div><dt>Job type</dt><dd>{displayJobType(application) || "—"}</dd></div>
+          <div><dt>Applied</dt><dd><RecordDate date={application.appliedDate} /></dd></div>
+          {application.salary && <div><dt>Salary</dt><dd>{application.salary}</dd></div>}
+        </dl>
+        <section className="record-next-step" aria-label="Next step">
+          <h3>Next step</h3>
+          <strong>{label}</strong>
+          <p>{application.nextStepDate
+            ? <time dateTime={application.nextStepDate}>{civilDateFormat.format(utcDate(application.nextStepDate))}</time>
+            : "No date scheduled"}</p>
+        </section>
+        <section className="record-section" aria-label="Activity">
+          <h3>Activity</h3>
+          <dl className="record-activity">
+            {application.updatedAt && application.updatedAt !== application.appliedDate && (
+              <div><dt>Last updated</dt><dd><RecordDate date={application.updatedAt} /></dd></div>
+            )}
+            <div><dt>Applied</dt><dd><RecordDate date={application.appliedDate} /></dd></div>
+          </dl>
+        </section>
+        <section className="record-section">
+          <h3>Notes</h3>
+          <p>{application.notes || "No notes yet."}</p>
+        </section>
+        {application.description && (
+          <details className="record-section record-description">
+            <summary>Job Description</summary>
+            <p>{application.description}</p>
+          </details>
+        )}
+        {analysis}
+        <div className="record-links">
+          {application.url && <a href={application.url} target="_blank" rel="noopener noreferrer">Source listing ↗</a>}
+          {!writesStopped && <button ref={editButton} type="button" className="secondary-button" onClick={() => { setSaved(false); setEditing(true); }}>Edit application</button>}
+          {saved && <span role="status" className="saved-status">Saved</span>}
+        </div>
+        <style>{applicationDetailStyles}</style>
+      </article>
+    );
+  }
+
+  return (
+    <div className={`application-detail${embedded ? " application-detail-embedded" : ""}`}>
+      {!embedded && <button type="button" onClick={() => router.push("/applications")} className="back-link">
+        &larr; Back to Applications
+      </button>}
+
+      {error && <div role="alert" className="inline-alert">{error}</div>}
+
+      <article className="application-detail-card">
+        <header className="application-detail-header">
+          <div className="application-identity">
+            <p className="eyebrow">Application record</p>
+            <label htmlFor="application-job-title" className="field-label">Job title</label>
+            <input ref={titleInput} id="application-job-title" value={form.jobTitle} onChange={(e) => updateField("jobTitle", e.target.value)} readOnly={locked} className="detail-title-input" />
+            <label htmlFor="application-company" className="field-label">Company</label>
+            <input id="application-company" value={form.company} onChange={(e) => updateField("company", e.target.value)} readOnly={locked} className="detail-company-input" />
+          </div>
+          <label htmlFor="application-status" className="status-field">
+            <span className="input-label">Status</span>
+            <select id="application-status" value={form.status} onChange={(e) => updateField("status", e.target.value)} disabled={locked} className="field status-select">
+              {STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </label>
+        </header>
+
+        <section className="metadata-section" aria-labelledby="metadata-heading">
+          <h2 id="metadata-heading" className="section-title">Application details</h2>
+          <div className="metadata-grid">
+            <div className="metadata-item">
+              <span className="input-label">Date Applied</span>
+              <time dateTime={application.appliedDate}>{new Date(application.appliedDate).toLocaleDateString()}</time>
+            </div>
+            <label htmlFor="application-location" className="field-label">
+              <span className="input-label">Location</span>
+              <input id="application-location" value={locationFocused && !locked ? form.location : normalizeLocation(form.location)} onFocus={() => setLocationFocused(true)} onBlur={() => setLocationFocused(false)} onChange={(e) => updateField("location", e.target.value)} readOnly={locked} placeholder="e.g., San Francisco, CA" className="field" />
+            </label>
+            <label htmlFor="application-salary" className="field-label">
+              <span className="input-label">Salary Range</span>
+              <input id="application-salary" value={form.salary} onChange={(e) => updateField("salary", e.target.value)} readOnly={locked} placeholder="e.g., $120k - $160k" className="field" />
+            </label>
+            <label htmlFor="application-job-type" className="field-label">
+              <span className="input-label">Job Type</span>
+              <select id="application-job-type" value={form.jobType} onChange={(e) => updateField("jobType", e.target.value)} disabled={locked} className="field">
+                {JOB_TYPES.map((t) => <option key={t} value={t}>{t || "Not specified"}</option>)}
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section className="detail-section schedule-fields" aria-labelledby="schedule-heading">
+          <h2 id="schedule-heading" className="section-title">Schedule</h2>
+          <div className="metadata-grid">
+            <label className="field-label">
+              <span className="input-label">Next step</span>
+              <input value={form.nextStep} onChange={(event) => updateField("nextStep", event.target.value)} readOnly={locked} maxLength={120} placeholder="e.g., Send portfolio" className="field" />
+            </label>
+            <label className="field-label">
+              <span className="input-label">Next step date</span>
+              <input type="date" value={form.nextStepDate} onChange={(event) => updateField("nextStepDate", event.target.value)} readOnly={locked} min="0001-01-01" max="9999-12-31" className="field" />
+            </label>
+          </div>
+        </section>
+
+        <section className="detail-section description-section" aria-labelledby="description-heading">
+          <h2 id="description-heading" className="section-title">Job Description</h2>
+          <p className="section-copy">Keep the original listing close while you prepare.</p>
+          <label htmlFor="application-description" className="field-label sr-only">Job Description</label>
+          <textarea id="application-description" value={form.description} onChange={(e) => updateField("description", e.target.value)} readOnly={locked} placeholder="Paste the job description here..." rows={6} className="field detail-textarea" />
+        </section>
+
+        {analysis}
+
         <section className="detail-section notes-section" aria-labelledby="notes-heading">
           <h2 id="notes-heading" className="section-title">Notes</h2>
           <label htmlFor="application-notes" className="field-label sr-only">Notes</label>
-          <textarea id="application-notes" value={form.notes} onChange={(e) => updateField("notes", e.target.value)} readOnly={writesStopped} placeholder="Add notes about this application..." rows={4} className="field detail-textarea" />
+          <textarea id="application-notes" value={form.notes} onChange={(e) => updateField("notes", e.target.value)} readOnly={locked} placeholder="Add notes about this application..." rows={4} className="field detail-textarea" />
         </section>
 
         <section className="detail-section source-section" aria-labelledby="source-heading">
@@ -208,14 +324,15 @@ export default function ApplicationDetail({
 
         <footer className="detail-actions">
           <div className="save-actions">
-            <button type="button" onClick={handleSave} disabled={saving || writesStopped} title={stoppedTitle} className="primary-button">{saving ? "Saving..." : "Save Changes"}</button>
+            <button type="button" onClick={handleSave} disabled={locked || !dirty} title={stoppedTitle} className="primary-button">{saving ? "Saving..." : "Save Changes"}</button>
+            {embedded && <button type="button" className="secondary-button" onClick={cancelEdit} disabled={busy}>Cancel edit</button>}
             {saved && <span role="status" className="saved-status">Saved</span>}
           </div>
           <div className="destructive-actions">
             <span className="destructive-label">Permanent action</span>
             {showDeleteConfirm ? (
-              <div className="delete-confirmation"><span>Are you sure?</span><button type="button" onClick={handleDelete} disabled={deleting || writesStopped} title={stoppedTitle} className="danger-button">{deleting ? "Deleting..." : "Yes, Delete"}</button><button type="button" onClick={() => setShowDeleteConfirm(false)} className="secondary-button">Cancel</button></div>
-            ) : <button type="button" onClick={() => setShowDeleteConfirm(true)} disabled={writesStopped} title={stoppedTitle} className="danger-link">Delete Application</button>}
+              <div className="delete-confirmation"><span>Are you sure?</span><button type="button" onClick={handleDelete} disabled={locked} title={stoppedTitle} className="danger-button">{deleting ? "Deleting..." : "Yes, Delete"}</button><button type="button" onClick={() => setShowDeleteConfirm(false)} className="secondary-button">Cancel</button></div>
+            ) : <button type="button" onClick={() => setShowDeleteConfirm(true)} disabled={locked} title={stoppedTitle} className="danger-link">Delete Application</button>}
           </div>
         </footer>
       </article>
@@ -233,17 +350,17 @@ const applicationDetailStyles = `
 .application-identity .field-label { margin-top: 0.6rem; }
 .field-label { color: var(--muted); display: block; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; min-width: 0; text-transform: uppercase; }
 .detail-title-input, .detail-company-input { background: transparent; border: 0; border-bottom: 1px solid transparent; color: var(--text); display: block; min-width: 0; outline: 0; padding: 0.2rem 0; width: 100%; }
-.detail-title-input { font-family: Georgia, "Times New Roman", serif; font-size: clamp(1.7rem, 4vw, 2.4rem); font-weight: 600; letter-spacing: -0.03em; }
+.detail-title-input { font-family: var(--font-sans); font-size: clamp(1.7rem, 4vw, 2.4rem); font-weight: 600; letter-spacing: -0.03em; }
 .detail-company-input { color: var(--muted); font-size: 1rem; margin-top: 0.1rem; }
 .detail-title-input:hover, .detail-company-input:hover, .detail-title-input:focus, .detail-company-input:focus { border-color: var(--primary); }
 .status-field { flex: 0 0 min(11rem, 35%); min-width: 8.5rem; }
-.input-label { color: var(--muted); display: block; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; margin-bottom: 0.35rem; text-transform: uppercase; }
-.field { background: var(--surface); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); min-width: 0; padding: 0.6rem 0.7rem; width: 100%; }
-.field:focus { border-color: var(--primary); outline: 3px solid color-mix(in srgb, var(--primary) 35%, transparent); outline-offset: 1px; }
+.application-detail .input-label { color: var(--muted); display: block; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; margin-bottom: 0.35rem; text-transform: uppercase; }
+.application-detail .field { background: var(--surface); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); min-width: 0; padding: 0.6rem 0.7rem; width: 100%; }
+.application-detail .field:focus { border-color: var(--primary); outline: 3px solid color-mix(in srgb, var(--primary) 35%, transparent); outline-offset: 1px; }
 .metadata-section { border-bottom: 1px solid var(--border); padding: 1.5rem 0; }
 .metadata-grid { display: grid; gap: 1rem; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 0.9rem; }
 .metadata-item time { color: var(--text); display: block; padding: 0.65rem 0; }
-.section-title { color: var(--primary); font-family: Georgia, "Times New Roman", serif; font-size: 1.35rem; font-weight: 600; margin: 0; }
+.application-detail .section-title, .record-overview .section-title { margin: 0; }
 .detail-section { border-bottom: 1px solid var(--border); min-width: 0; padding: 1.5rem 0; }
 .section-copy { color: var(--muted); font-size: 0.85rem; line-height: 1.5; margin: 0.4rem 0 0.8rem; }
 .detail-textarea { display: block; line-height: 1.55; resize: vertical; }
@@ -271,8 +388,7 @@ const applicationDetailStyles = `
 .source-link { display: block; font-size: 0.9rem; line-height: 1.5; margin-top: 0.7rem; overflow-wrap: anywhere; }
 .detail-actions { align-items: flex-end; display: flex; gap: 1rem; justify-content: space-between; padding-top: 1.5rem; }
 .save-actions, .delete-confirmation { align-items: center; display: flex; flex-wrap: wrap; gap: 0.6rem; }
-.primary-button, .danger-button, .secondary-button { border-radius: 0.5rem; cursor: pointer; min-height: 44px; padding: 0.6rem 1rem; }
-.primary-button { background: var(--primary); border: 1px solid var(--primary); color: #fff; font-weight: 700; }
+.application-detail :is(.primary-button, .danger-button, .secondary-button) { border-radius: 0.5rem; cursor: pointer; min-height: 44px; padding: 0.6rem 1rem; }
 .primary-button:disabled, .danger-button:disabled { cursor: wait; opacity: 0.6; }
 .saved-status { color: #245e3a; font-size: 0.9rem; font-weight: 700; }
 .destructive-actions { align-items: flex-end; display: flex; flex-direction: column; gap: 0.25rem; }
@@ -280,7 +396,6 @@ const applicationDetailStyles = `
 .danger-link:disabled { color: var(--muted); cursor: not-allowed; text-decoration: none; }
 .danger-link { background: transparent; border: 0; color: var(--destructive); cursor: pointer; min-height: 44px; padding: 0.6rem 0; text-decoration: underline; }
 .danger-button { background: var(--destructive); border: 1px solid var(--destructive); color: #fff; font-weight: 700; }
-.secondary-button { background: var(--surface); border: 1px solid var(--border); color: var(--text); }
 .delete-confirmation > span { color: var(--muted); font-size: 0.85rem; }
 @media (max-width: 768px) { .application-detail-header, .detail-actions { flex-direction: column; } .status-field { flex-basis: auto; min-width: 0; width: 100%; } .metadata-grid { grid-template-columns: 1fr; } .destructive-actions { align-items: flex-start; width: 100%; } }
 `;
@@ -290,13 +405,14 @@ export async function saveApplicationChanges(
   markSaved: () => void,
   id: string,
   form: Record<string, string>,
-): Promise<void> {
-  await api(`/api/applications/${id}`, {
+): Promise<ApplicationRecord> {
+  const application = await api<ApplicationRecord>(`/api/applications/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(serializeApplicationChanges(form)),
   });
   markSaved();
+  return application;
 }
 
 export function serializeApplicationChanges(
@@ -308,6 +424,8 @@ export function serializeApplicationChanges(
     "salary",
     "location",
     "jobType",
+    "nextStep",
+    "nextStepDate",
   ]);
   return Object.fromEntries(
     Object.entries(form).map(([key, value]) => [
@@ -324,6 +442,29 @@ export async function deleteApplication(
 ): Promise<void> {
   await api(`/api/applications/${id}`, { method: "DELETE" });
   navigate("/applications");
+}
+
+const civilDateFormat = new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeZone: "UTC" });
+const localDateFormat = new Intl.DateTimeFormat("en-US", { dateStyle: "medium" });
+
+function RecordDate({ date }: { date: string }) {
+  const value = new Date(date);
+  return <time className="workspace-mono" dateTime={date}>{localDateFormat.format(value)}</time>;
+}
+
+function detailFields(application: ApplicationRecord): Record<string, string> {
+  return {
+    jobTitle: application.jobTitle,
+    company: application.company,
+    status: application.status,
+    description: application.description || "",
+    notes: application.notes || "",
+    salary: application.salary || "",
+    location: application.location || "",
+    jobType: application.jobType || "",
+    nextStep: application.nextStep || "",
+    nextStepDate: application.nextStepDate || "",
+  };
 }
 
 function errorMessage(error: unknown, fallback: string): string {

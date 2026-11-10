@@ -1,5 +1,6 @@
 import "server-only";
 
+import { isCivilDate } from "@/lib/application-calendar";
 import { normalizeLocation } from "@/lib/location";
 import {
   InvalidRequestError,
@@ -41,6 +42,8 @@ const UPDATE_KEYS = new Set([
   "salary",
   "location",
   "jobType",
+  "nextStep",
+  "nextStepDate",
 ]);
 const LIST_KEYS = new Set(["status", "jobType", "search", "sortBy", "sortOrder"]);
 
@@ -71,6 +74,8 @@ export type UpdateApplicationData = Readonly<{
   salary?: string | null;
   location?: string | null;
   jobType?: JobType | null;
+  nextStep?: string | null;
+  nextStepDate?: string | null;
 }>;
 
 export type UpdateApplicationInput = Readonly<{
@@ -137,6 +142,12 @@ export async function parseUpdateApplicationRequest(
   if ("salary" in body) data.salary = nullableText(body.salary, 512);
   if ("location" in body) data.location = nullableText(body.location, 512);
   if ("jobType" in body) data.jobType = nullableEnum(body.jobType, JOB_TYPES);
+  if ("nextStep" in body) data.nextStep = nullableText(body.nextStep, 120);
+  if ("nextStepDate" in body) {
+    const date = body.nextStepDate;
+    if (date !== null && !isCivilDate(date)) invalid();
+    data.nextStepDate = date;
+  }
 
   return immutable({ id, data: Object.freeze(data) as UpdateApplicationData });
 }
