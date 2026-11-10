@@ -5,6 +5,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import "@testing-library/jest-dom";
 
 import ApplicationDetail from "@/components/ApplicationDetail";
+import { WritesStoppedProvider } from "@/components/WriteState";
 import { useClientApi } from "@/hooks/use-client-api";
 
 jest.mock("@/hooks/use-client-api", () => ({ useClientApi: jest.fn() }));
@@ -29,6 +30,11 @@ const application = {
 };
 
 const api = jest.fn();
+
+const rawNewYorkApplication = {
+  ...application,
+  location: "New York City Metropolitan Area",
+};
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -59,6 +65,67 @@ it("presents a labeled hierarchy before metadata and separate content sections",
   expect(screen.getByLabelText("Job title").compareDocumentPosition(screen.getByText("Date Applied")))
     .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   expect(screen.getByRole("link", { name: application.url })).toHaveClass("source-link");
+});
+
+it("displays a normalized location while preserving the stored value on unrelated saves", async () => {
+  render(createElement(ApplicationDetail, { application: rawNewYorkApplication }));
+
+  const location = screen.getByLabelText("Location");
+  expect(location).toHaveValue("New York, NY");
+  fireEvent.focus(location);
+  expect(location).toHaveValue("New York City Metropolitan Area");
+  fireEvent.blur(location);
+  expect(location).toHaveValue("New York, NY");
+
+  fireEvent.change(screen.getByLabelText("Company"), { target: { value: "Updated Systems" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
+
+  await waitFor(() => expect(api).toHaveBeenCalledWith(
+    `/api/applications/${application.id}`,
+    expect.objectContaining({
+      method: "PATCH",
+      body: JSON.stringify({
+        ...applicationBody(),
+        company: "Updated Systems",
+        location: "New York City Metropolitan Area",
+      }),
+    }),
+  ));
+  expect(await screen.findByText("Saved")).toBeInTheDocument();
+  expect(location).toHaveValue("New York, NY");
+});
+
+it("saves a location when the user explicitly edits it", async () => {
+  render(createElement(ApplicationDetail, { application: rawNewYorkApplication }));
+
+  const location = screen.getByLabelText("Location");
+  fireEvent.focus(location);
+  fireEvent.change(location, { target: { value: "Boston, Massachusetts" } });
+  expect(location).toHaveValue("Boston, Massachusetts");
+  fireEvent.blur(location);
+  expect(location).toHaveValue("Boston, MA");
+  fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
+
+  await waitFor(() => expect(api).toHaveBeenCalledWith(
+    `/api/applications/${application.id}`,
+    expect.objectContaining({
+      method: "PATCH",
+      body: JSON.stringify({ ...applicationBody(), location: "Boston, Massachusetts" }),
+    }),
+  ));
+});
+
+it("keeps normalized location display in read-only mode after focus", () => {
+  render(createElement(
+    WritesStoppedProvider,
+    { value: true },
+    createElement(ApplicationDetail, { application: rawNewYorkApplication }),
+  ));
+
+  const location = screen.getByLabelText("Location");
+  expect(location).toHaveValue("New York, NY");
+  fireEvent.focus(location);
+  expect(location).toHaveValue("New York, NY");
 });
 
 it("keeps keyword percentage and matched/missing details behind a toggle", async () => {
