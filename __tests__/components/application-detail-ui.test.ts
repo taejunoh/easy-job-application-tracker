@@ -67,6 +67,43 @@ it("presents a labeled hierarchy before metadata and separate content sections",
   expect(screen.getByRole("link", { name: application.url })).toHaveClass("source-link");
 });
 
+it("saves the complete single-line job title after a pasted newline", async () => {
+  const jobTitle = "Senior Product Engineer, Infrastructure and Developer Experience, Distributed Systems";
+  render(createElement(ApplicationDetail, { application: { ...application, jobTitle } }));
+
+  const title = screen.getByLabelText("Job title");
+  expect(title.tagName).toBe("TEXTAREA");
+  expect(title).toHaveValue(jobTitle);
+
+  const pastedTitle = `${jobTitle}\n(Platform Team)`;
+  fireEvent.change(title, { target: { value: pastedTitle } });
+  expect(title).toHaveValue(`${jobTitle} (Platform Team)`);
+  fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
+
+  await waitFor(() => expect(api).toHaveBeenCalledWith(
+    `/api/applications/${application.id}`,
+    expect.objectContaining({
+      method: "PATCH",
+      body: JSON.stringify({ jobTitle: `${jobTitle} (Platform Team)` }),
+    }),
+  ));
+});
+
+it("focuses the wrapped title after entering embedded edit mode and preserves IME Enter", async () => {
+  const jobTitle = "Senior Product Engineer, Infrastructure and Developer Experience, Distributed Systems";
+  render(createElement(ApplicationDetail, { application: { ...application, jobTitle }, embedded: true }));
+
+  expect(screen.queryByLabelText("Job title")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Edit application" }));
+
+  const title = await screen.findByLabelText("Job title");
+  expect(title.tagName).toBe("TEXTAREA");
+  expect(title).toHaveValue(jobTitle);
+  expect(document.activeElement).toBe(title);
+  const imeEnter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, isComposing: true });
+  expect(title.dispatchEvent(imeEnter)).toBe(true);
+});
+
 it("displays a normalized location while preserving the stored value on unrelated saves", async () => {
   render(createElement(ApplicationDetail, { application: rawNewYorkApplication }));
 

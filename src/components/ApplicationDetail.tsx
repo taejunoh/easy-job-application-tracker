@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { analyzeKeywordMatch } from "@/lib/keyword-matcher";
 import { useClientApi } from "@/hooks/use-client-api";
@@ -41,7 +41,7 @@ export default function ApplicationDetail({
   const original = standaloneSaved ?? detailFields(application);
   const form = { ...original, ...draft };
   const [saving, setSaving] = useState(false);
-  const titleInput = useRef<HTMLInputElement>(null);
+  const titleInput = useRef<HTMLTextAreaElement>(null);
   const editButton = useRef<HTMLButtonElement>(null);
   const restoreEditFocus = useRef(false);
   const [locationFocused, setLocationFocused] = useState(false);
@@ -64,6 +64,27 @@ export default function ApplicationDetail({
       editButton.current?.focus();
     }
   }, [editing, embedded]);
+
+  useLayoutEffect(() => {
+    const title = titleInput.current;
+    if (!title) return;
+
+    const resize = () => {
+      title.style.height = "auto";
+      title.style.height = `${title.scrollHeight + 1}px`;
+    };
+    resize();
+
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(resize);
+    observer?.observe(title.parentElement ?? title);
+    window.addEventListener("resize", resize);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", resize);
+    };
+  }, [editing, embedded, form.jobTitle]);
 
   const [saved, setSaved] = useState(false);
   const [resumeText, setResumeText] = useState<string | null>(null);
@@ -252,7 +273,7 @@ export default function ApplicationDetail({
           <div className="application-identity">
             <p className="eyebrow">Application record</p>
             <label htmlFor="application-job-title" className="field-label">Job title</label>
-            <input ref={titleInput} id="application-job-title" value={form.jobTitle} onChange={(e) => updateField("jobTitle", e.target.value)} readOnly={locked} className="detail-title-input" />
+            <textarea ref={titleInput} id="application-job-title" value={form.jobTitle} onChange={(e) => updateField("jobTitle", e.target.value.replace(/\r\n?/g, "\n").replace(/\n+/g, " "))} onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) e.preventDefault(); }} readOnly={locked} rows={1} wrap="soft" className="detail-title-input" />
             <label htmlFor="application-company" className="field-label">Company</label>
             <input id="application-company" value={form.company} onChange={(e) => updateField("company", e.target.value)} readOnly={locked} className="detail-company-input" />
           </div>
@@ -346,11 +367,11 @@ const applicationDetailStyles = `
 .back-link { background: transparent; border: 0; color: var(--muted); cursor: pointer; display: inline-flex; margin-bottom: 1rem; padding: 0.5rem 0; }
 .application-detail-card { background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem; box-shadow: var(--shadow); min-width: 0; padding: clamp(1rem, 3vw, 2rem); }
 .application-detail-header { align-items: flex-start; border-bottom: 1px solid var(--border); display: flex; gap: 1.5rem; justify-content: space-between; padding-bottom: 1.5rem; }
-.application-identity { min-width: 0; }
+.application-identity { flex: 1 1 auto; min-width: 0; width: 100%; }
 .application-identity .field-label { margin-top: 0.6rem; }
 .field-label { color: var(--muted); display: block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.08em; min-width: 0; text-transform: uppercase; }
 .detail-title-input, .detail-company-input { background: transparent; border: 0; border-bottom: 1px solid transparent; color: var(--text); display: block; min-width: 0; outline: 0; padding: 0.2rem 0; width: 100%; }
-.detail-title-input { font-family: var(--font-sans); font-size: clamp(1.7rem, 4vw, 2.4rem); font-weight: 600; letter-spacing: -0.03em; }
+.detail-title-input { box-sizing: border-box; font-family: var(--font-sans); font-size: clamp(1.7rem, 4vw, 2.4rem); font-weight: 600; letter-spacing: -0.03em; line-height: 1.15; overflow: hidden; overflow-wrap: anywhere; resize: none; }
 .detail-company-input { color: var(--muted); font-size: 1rem; margin-top: 0.1rem; }
 .detail-title-input:hover, .detail-company-input:hover, .detail-title-input:focus, .detail-company-input:focus { border-color: var(--primary); }
 .status-field { flex: 0 0 min(11rem, 35%); min-width: 8.5rem; }
