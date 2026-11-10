@@ -148,7 +148,7 @@ describe("deployment verification contract", () => {
       group: "${{ github.workflow }}-${{ github.ref }}",
       "cancel-in-progress": true,
     });
-    expect(job["runs-on"]).toBe("ubuntu-latest");
+    expect(job["runs-on"]).toBe("ubuntu-24.04");
     expect(job["timeout-minutes"]).toBe(40);
     expect(job.services).toEqual({
       postgres: {
@@ -252,7 +252,7 @@ describe("deployment verification contract", () => {
     const job = workflow.jobs["extension-e2e"];
 
     expect(job).toBeDefined();
-    expect(job["runs-on"]).toBe("ubuntu-latest");
+    expect(job["runs-on"]).toBe("ubuntu-24.04");
     expect(job["timeout-minutes"]).toBe(25);
     expect(job.services).toEqual({
       postgres: {

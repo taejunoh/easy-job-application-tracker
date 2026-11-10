@@ -1,5 +1,16 @@
 import { createProvider } from "@/lib/extract/llm-provider";
 
+const mockGoogleGenerateContent = jest.fn();
+const mockGetGenerativeModel = jest.fn(() => ({
+  generateContent: mockGoogleGenerateContent,
+}));
+
+jest.mock("@google/generative-ai", () => ({
+  GoogleGenerativeAI: jest.fn().mockImplementation(() => ({
+    getGenerativeModel: mockGetGenerativeModel,
+  })),
+}));
+
 const mockAnthropicCreate = jest.fn();
 
 jest.mock("@anthropic-ai/sdk", () => ({
@@ -11,6 +22,8 @@ jest.mock("@anthropic-ai/sdk", () => ({
 
 describe("createProvider", () => {
   beforeEach(() => {
+    mockGoogleGenerateContent.mockReset();
+    mockGetGenerativeModel.mockClear();
     mockAnthropicCreate.mockReset();
   });
 
@@ -24,6 +37,24 @@ describe("createProvider", () => {
     const provider = createProvider("gemini", "test-key");
     expect(provider).toBeDefined();
     expect(provider.extract).toBeDefined();
+  });
+
+  it("extracts job details using a supported Gemini model", async () => {
+    mockGoogleGenerateContent.mockResolvedValueOnce({
+      response: {
+        text: () => '{"jobTitle":"Staff Engineer","company":"Acme"}',
+      },
+    });
+    const provider = createProvider("gemini", "test-key");
+
+    await expect(provider.extract("role:Staff Engineer at Acme")).resolves.toEqual({
+      jobTitle: "Staff Engineer",
+      company: "Acme",
+    });
+    expect(mockGoogleGenerateContent).toHaveBeenCalledWith(
+      expect.stringMatching(/Job posting text:\nrole:Staff Engineer at Acme$/u),
+    );
+    expect(mockGetGenerativeModel).toHaveBeenCalledWith({ model: "gemini-3.6-flash" });
   });
 
   it("creates an anthropic provider", () => {

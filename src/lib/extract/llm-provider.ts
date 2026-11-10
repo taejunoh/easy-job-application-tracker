@@ -51,7 +51,7 @@ class GeminiProvider implements LLMProvider {
   }
 
   async extract(text: string): Promise<ExtractResult> {
-    const model = this.client.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const model = this.client.getGenerativeModel({ model: "gemini-3.6-flash" });
     const result = await model.generateContent(PROMPT + text.slice(0, 4000));
     return parseResponse(result.response.text());
   }
