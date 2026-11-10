@@ -3,7 +3,7 @@
 .workspace-tabs { align-items: end; border-bottom: 1px solid var(--border); display: flex; gap: 0.8rem; padding: 0 1rem; }
 .workspace-tabs button { align-items: center; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; display: inline-flex; font-size: 0.84rem; font-weight: 600; gap: 0.45rem; padding: 0 0.45rem; }
 .workspace-tabs button span { font: 600 0.93rem/1 var(--font-mono); }
-.workspace-tabs button[aria-selected="true"] { border-bottom-color: var(--primary); color: var(--primary); font-weight: 740; }
+.workspace-tabs button[aria-selected="true"] { border-bottom-color: var(--primary); color: var(--primary); font-weight: 600; }
 .applications-toolbar { align-items: end; display: grid; gap: 0.75rem; grid-template-columns: minmax(0, 22rem) minmax(0, 9rem) minmax(0, 9rem); padding: 0.7rem 1rem; }
 .applications-toolbar .input-label { font-size: 0.72rem; }
 .applications-toolbar .field { border-radius: 4px; font-size: 0.84rem; min-height: 36px; padding: 0.35rem 0.5rem; }
@@ -14,14 +14,14 @@
 [data-record-open="true"] .workspace-layout { grid-template-columns: minmax(0, 1fr) minmax(17rem, 23rem); }
 .workspace-views { container: application-view / inline-size; min-width: 0; padding: 0.9rem 1rem 1.2rem; }
 .workspace-view-heading, .workspace-calendar-toolbar { align-items: center; display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: space-between; margin-bottom: 0.7rem; }
-.workspace-view-heading h2, .workspace-calendar-toolbar h2 { font-size: 0.88rem; font-weight: 740; margin: 0; }
+.workspace-view-heading h2, .workspace-calendar-toolbar h2 { font-size: 0.88rem; font-weight: 600; margin: 0; }
 .workspace-view-note { color: var(--muted); font-size: 0.76rem; margin: 0; }
 .workspace-loading { margin-bottom: 0.45rem; }
 .workspace-mono { color: var(--muted); font: 500 0.72rem/1.35 var(--font-mono); }
 .applications-empty { border-radius: 3px; box-shadow: none; font-size: 0.86rem; }
 .applications-table-shell { min-width: 0; }
 .applications-table { border-collapse: collapse; font-size: 0.83rem; table-layout: fixed; text-align: left; width: 100%; }
-.applications-table th { background: var(--canvas); border-block: 1px solid var(--border); color: var(--muted); font-size: 0.72rem; font-weight: 650; padding: 0.15rem 0.5rem; }
+.applications-table th { background: var(--canvas); border-block: 1px solid var(--border); color: var(--muted); font-size: 0.72rem; font-weight: 600; padding: 0.15rem 0.5rem; }
 .applications-table .application-column-company { width: 18%; }
 .applications-table .application-column-jobTitle { width: 22%; }
 .applications-table .application-column-status { width: 7rem; }
@@ -35,7 +35,7 @@
 .application-row:hover, .application-row:focus-within { background: var(--canvas); }
 .application-row[data-selected="true"] { background: var(--selected); }
 .application-cell { color: var(--muted); min-width: 0; overflow-wrap: anywhere; padding: 0.35rem 0.5rem; vertical-align: middle; }
-.application-title-cell, .application-company-cell { color: var(--text); font-weight: 690; }
+.application-title-cell, .application-company-cell { color: var(--text); font-weight: 600; }
 .application-company-cell { overflow-wrap: normal; }
 .application-company-identity { display: inline-block; max-width: calc(100% - 2rem); vertical-align: middle; }
 .application-company-link { display: block; overflow: hidden; overflow-wrap: normal; text-overflow: ellipsis; white-space: nowrap; }
@@ -43,7 +43,7 @@
 .application-title-link:hover, .application-company-link:hover { color: var(--primary); text-decoration: underline; text-underline-offset: 0.16em; }
 .workspace-initial { align-items: center; background: var(--canvas); border: 1px solid var(--border); color: var(--muted); display: inline-flex; font: 600 0.69rem/1 var(--font-mono); height: 24px; justify-content: center; margin-right: 0.4rem; vertical-align: middle; width: 24px; }
 .application-date-cell time, .application-updated-cell time { font: 500 0.72rem/1.35 var(--font-mono); white-space: nowrap; }
-.application-cell.has-next-step { color: var(--text); font-weight: 650; }
+.application-cell.has-next-step { color: var(--text); font-weight: 600; }
 .application-status-cell { white-space: nowrap; }
 .status-edit-button { align-items: center; border-radius: 3px; cursor: pointer; display: inline-flex; gap: 0.25rem; min-height: 38px; }
 .status-edit-caret { color: var(--muted); font-size: 0.75rem; }
@@ -76,10 +76,10 @@
 .workspace-record-bar { align-items: center; display: flex; gap: 0.5rem; justify-content: space-between; margin-bottom: 0.55rem; }
 .workspace-record-bar .workspace-record-close { border-radius: 3px; font-size: 0.73rem; min-height: 32px; padding: 0.25rem 0.5rem; }
 .workspace-record-back-label { display: none; }
-.record-overview h2 { font-size: 1.4rem; font-weight: 750; letter-spacing: -0.035em; line-height: 1.15; margin: 0.25rem 0 0; overflow-wrap: anywhere; }
+.record-overview h2 { font-size: 1.4rem; font-weight: 600; letter-spacing: -0.035em; line-height: 1.15; margin: 0.25rem 0 0; overflow-wrap: anywhere; }
 .record-role { color: var(--muted); font-size: 0.85rem; margin: 0.2rem 0 0; overflow-wrap: anywhere; }
 .record-facts { display: grid; font-size: 0.76rem; gap: 0.45rem; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0.75rem 0; }
-.record-facts dt, .record-activity dt, .record-overview h3, .record-description summary { color: var(--muted); font-size: 0.72rem; font-weight: 700; }
+.record-facts dt, .record-activity dt, .record-overview h3, .record-description summary { color: var(--muted); font-size: 0.72rem; font-weight: 600; }
 .record-facts dd { margin: 0.12rem 0 0; overflow-wrap: anywhere; }
 .record-next-step { background: var(--selected); border-left: 2px solid var(--primary); padding: 0.45rem 0.65rem; }
 .record-next-step strong { display: block; font-size: 0.85rem; overflow-wrap: anywhere; }
