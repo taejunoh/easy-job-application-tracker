@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useApplicationChanges } from "@/components/ApplicationChanges";
 import PageHeader from "@/components/PageHeader";
 import StatCard from "@/components/StatCard";
 import StatusBadge from "@/components/StatusBadge";
@@ -32,33 +33,40 @@ const ATTENTION_COLORS = {
 
 export default function DashboardPage() {
   const api = useClientApi();
+  const { revision } = useApplicationChanges();
   const [stats, setStats] = useState<Stats | null>(null);
   const [staleCount, setStaleCount] = useState<number | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
+    let active = true;
     api<Stats>("/api/stats")
       .then((data) => {
+        if (!active) return;
         setStats(data);
         setError("");
       })
       .catch((failure: unknown) => {
-        setError(errorMessage(failure, "Failed to load dashboard."));
+        if (active) setError(errorMessage(failure, "Failed to load dashboard."));
       });
-  }, [api]);
+    return () => { active = false; };
+  }, [api, revision]);
 
   useEffect(() => {
+    let active = true;
     // /api/stats has a fixed shape, so stale applications are counted from the list.
     api<Array<{ status: string; appliedDate: string }>>("/api/applications?status=Applied")
       .then((applications) => {
+        if (!active) return;
         setStaleCount(
           Array.isArray(applications)
             ? countStaleApplications(applications, new Date())
             : null,
         );
       })
-      .catch(() => setStaleCount(null));
-  }, [api]);
+      .catch(() => { if (active) setStaleCount(null); });
+    return () => { active = false; };
+  }, [api, revision]);
 
   if (!stats) {
     return (

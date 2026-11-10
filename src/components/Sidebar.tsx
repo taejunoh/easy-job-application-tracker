@@ -54,9 +54,9 @@ export default function Sidebar() {
   }, [menuOpen]);
 
   return (
-    <aside className="w-56 min-h-screen bg-gray-900 border-r border-gray-800 flex flex-col p-4 sidebar-rail">
+    <header className="sidebar-rail">
       <div className="sidebar-brand-row">
-        <div className="text-lg font-bold text-blue-400 sidebar-brand">JobTracker</div>
+        <div className="sidebar-brand"><span aria-hidden="true">J/</span>JobTracker</div>
         <button
           ref={triggerRef}
           type="button"
@@ -71,7 +71,7 @@ export default function Sidebar() {
       </div>
       <nav
         id="primary-navigation"
-        className={`flex flex-col gap-1 sidebar-nav ${menuOpen ? "is-open" : "is-collapsed"}`}
+        className={`sidebar-nav ${menuOpen ? "is-open" : "is-collapsed"}`}
         onKeyDown={(event) => {
           if (event.key === "Escape") closeMenu();
         }}
@@ -87,11 +87,7 @@ export default function Sidebar() {
               href={item.href}
               aria-current={isActive ? "page" : undefined}
               onClick={() => setMenuOpen(false)}
-              className={`px-3 py-2 rounded text-sm ${
-                isActive
-                  ? "bg-gray-800 text-white sidebar-link-active"
-                  : "text-gray-400 hover:text-gray-200 hover:bg-gray-800/50"
-              }`}
+              className={isActive ? "sidebar-link-active" : undefined}
             >
               {item.label}
             </Link>
@@ -111,6 +107,6 @@ export default function Sidebar() {
           <p role="alert" className="sidebar-signout-error">{signOutError}</p>
         )}
       </div>
-    </aside>
+    </header>
   );
 }

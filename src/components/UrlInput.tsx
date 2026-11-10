@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useClientApi } from "@/hooks/use-client-api";
 import type { ClientApi } from "@/lib/client-api";
+import { useApplicationChanges } from "@/components/ApplicationChanges";
 import { readOnlyTitle, useWritesStopped } from "@/components/WriteState";
 
 type InputMode = "url" | "text" | "manual";
@@ -21,6 +22,7 @@ interface UrlInputProps {
 
 export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) {
   const api = useClientApi();
+  const { notify } = useApplicationChanges();
   const writesStopped = useWritesStopped();
   const stoppedTitle = readOnlyTitle(writesStopped);
   const [mode, setMode] = useState<InputMode>("url");
@@ -116,7 +118,8 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           setExtracted(null);
           setEditTitle("");
           setEditCompany("");
-          router.refresh();
+          if (notify) notify();
+          else router.refresh();
         },
         {
           url: applicationUrl,
@@ -169,7 +172,8 @@ export default function UrlInput({ manualEntryEnabled = false }: UrlInputProps) 
           setExtracted(null);
           setEditTitle("");
           setEditCompany("");
-          router.refresh();
+          if (notify) notify();
+          else router.refresh();
         },
         application,
       );

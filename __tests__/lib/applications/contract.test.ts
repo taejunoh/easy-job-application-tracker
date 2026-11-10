@@ -154,6 +154,24 @@ describe("Application request contract", () => {
   describe("PATCH", () => {
     const id = "018f9f72-f2e9-7c29-a6fc-001122334455";
 
+    it("sets and clears the optional next step without turning it into an instant", async () => {
+      await expect(parseUpdateApplicationRequest(id, jsonRequest({
+        nextStep: "  Send portfolio  ",
+        nextStepDate: "2028-02-29",
+      }))).resolves.toEqual({ id, data: { nextStep: "Send portfolio", nextStepDate: "2028-02-29" } });
+      await expect(parseUpdateApplicationRequest(id, jsonRequest({
+        nextStep: null,
+        nextStepDate: null,
+      }))).resolves.toEqual({ id, data: { nextStep: null, nextStepDate: null } });
+    });
+
+    it.each(["2026-02-29", "2028-04-31", "2028-2-29", "0000-01-01", "2028-02-29T00:00:00Z", "", 20280229])(
+      "rejects invalid civil date %s",
+      async (nextStepDate) => {
+        await expectInvalid(parseUpdateApplicationRequest(id, jsonRequest({ nextStepDate })));
+      },
+    );
+
     it("normalizes only supplied mutable fields", async () => {
       const parsed = await parseUpdateApplicationRequest(
         id,

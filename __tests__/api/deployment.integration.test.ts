@@ -220,7 +220,7 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
         method: "PATCH",
         origin: APP_ORIGIN,
         auth: "root",
-        json: { status: "Interview", notes: "CI fixture" },
+        json: { status: "Interview", notes: "CI fixture", nextStep: "Send portfolio", nextStepDate: "2028-02-29" },
       }),
       detailContext(created.id),
     );
@@ -229,15 +229,21 @@ describeDatabase("hosted deployment against PostgreSQL", () => {
       id: created.id,
       status: "Interview",
       notes: "CI fixture",
+      nextStep: "Send portfolio",
+      nextStepDate: "2028-02-29",
     });
+    const scheduledList = await applications.GET(request("/api/applications", { auth: "root" }));
+    await expect(scheduledList.json()).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: created.id, nextStep: "Send portfolio", nextStepDate: "2028-02-29" }),
+    ]));
 
     const statsResponse = await stats.GET(
       request("/api/stats", { auth: "root" }),
     );
-    await expect(statsResponse.json()).resolves.toMatchObject({
-      total: 1,
-      interview: 1,
-    });
+    const statsPayload = await statsResponse.json();
+    expect(statsPayload).toMatchObject({ total: 1, interview: 1 });
+    expect(statsPayload.recentApplications[0]).not.toHaveProperty("nextStep");
+    expect(statsPayload.recentApplications[0]).not.toHaveProperty("nextStepDate");
 
     const deletedResponse = await applicationDetail.DELETE(
       request(`/api/applications/${created.id}`, {

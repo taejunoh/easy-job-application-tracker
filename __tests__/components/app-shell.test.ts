@@ -35,7 +35,6 @@ describe("AppShell", () => {
     expect(markup).toContain('<main id="connect-content">Connect</main>');
     expect(markup).not.toContain("SIDEBAR_SENTINEL");
     expect(markup).not.toContain("URL_INPUT_SENTINEL");
-    expect(markup).not.toContain('class="flex min-h-screen"');
     expect(countMainLandmarks(markup)).toBe(1);
   });
 
@@ -52,9 +51,7 @@ describe("AppShell", () => {
 
     expect(markup).toContain("SIDEBAR_SENTINEL");
     expect(markup).toContain("URL_INPUT_SENTINEL");
-    expect(markup).toContain('class="flex min-h-screen"');
-    expect(markup).toContain('<main class="flex-1 p-6">');
-    expect(markup).toContain('<section id="page-content">Dashboard</section>');
+    expect(markup).toMatch(/<main[^>]*>.*<section id="page-content">Dashboard<\/section>.*<\/main>/u);
     expect(countMainLandmarks(markup)).toBe(1);
   });
 

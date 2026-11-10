@@ -4,19 +4,7 @@ import { useEffect, useState, use } from "react";
 import ApplicationDetail from "@/components/ApplicationDetail";
 import { useClientApi } from "@/hooks/use-client-api";
 
-interface Application {
-  id: string;
-  url: string;
-  jobTitle: string;
-  company: string;
-  status: string;
-  appliedDate: string;
-  description: string | null;
-  notes: string | null;
-  salary: string | null;
-  location: string | null;
-  jobType: string | null;
-}
+import type { ApplicationRecord } from "@/lib/application-record";
 
 export default function ApplicationDetailPage({
   params,
@@ -25,11 +13,11 @@ export default function ApplicationDetailPage({
 }) {
   const { id } = use(params);
   const api = useClientApi();
-  const [application, setApplication] = useState<Application | null>(null);
+  const [application, setApplication] = useState<ApplicationRecord | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    api<Application>(`/api/applications/${id}`)
+    api<ApplicationRecord>(`/api/applications/${id}`)
       .then(setApplication)
       .catch((failure: unknown) => {
         setError(
@@ -48,5 +36,5 @@ export default function ApplicationDetailPage({
     return <div className="text-gray-400">Loading...</div>;
   }
 
-  return <ApplicationDetail application={application} />;
+  return <ApplicationDetail key={application.id} application={application} />;
 }

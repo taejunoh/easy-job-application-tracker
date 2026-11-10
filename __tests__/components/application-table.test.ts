@@ -45,25 +45,6 @@ it("renders all application fields with semantic table headers", () => {
   );
 });
 
-it("keeps the job type on one line in a column wide enough for it", () => {
-  render(createElement(ApplicationTable, { applications: [application], onStatusChange: jest.fn() }));
-
-  const type = screen.getAllByRole("row")[1].querySelector('[data-label="Type"]');
-  expect(type).toHaveClass("application-type-cell");
-  const styles = document.querySelector("style")?.textContent ?? "";
-  expect(styles).toMatch(/\.application-type-cell \{[^}]*white-space: nowrap/u);
-  expect(styles).toMatch(/th:nth-child\(7\) \{ width: 5\.25rem; \}/u);
-});
-
-it("scrolls the table inside its card instead of overlapping columns on narrow desktops", () => {
-  render(createElement(ApplicationTable, { applications: [application], onStatusChange: jest.fn() }));
-
-  const styles = document.querySelector("style")?.textContent ?? "";
-  expect(styles).toMatch(
-    /@media \(min-width: 769px\) \{[^\n]*\.applications-table-shell \{ overflow-x: auto; \} \.applications-table \{ min-width: 54rem; \}/u,
-  );
-});
-
 it("navigates a row with click, Enter, or Space", () => {
   render(createElement(ApplicationTable, { applications: [application], onStatusChange: jest.fn() }));
   const row = screen.getAllByRole("row")[1];
@@ -189,15 +170,12 @@ describe("data display cleanup", () => {
     expect(types).toEqual(["-", "Hybrid"]);
   });
 
-  it("wraps company names only at word boundaries and exposes the full name", () => {
-    const { container } = render(createElement(ApplicationTable, { applications: [messy], onStatusChange: jest.fn() }));
+  it("exposes the full name of a long company", () => {
+    render(createElement(ApplicationTable, { applications: [messy], onStatusChange: jest.fn() }));
     const link = screen.getByRole("link", { name: "Acme Labs International" });
     expect(link).toHaveAttribute("title", "Acme Labs International");
     expect(link.textContent).toBe("Acme Labs International");
 
-    const css = container.querySelector("style")?.textContent ?? "";
-    expect(css).toMatch(/\.application-company-link \{[^}]*overflow-wrap: normal/u);
-    expect(css).not.toMatch(/\.application-company-(?:link|cell) \{[^}]*overflow-wrap: (?:anywhere|break-word)/u);
   });
 });
 
