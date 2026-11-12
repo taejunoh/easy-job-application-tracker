@@ -123,11 +123,14 @@
   .applications-table .application-column-company, .applications-table .application-column-jobTitle { width: auto; }
   .applications-table .application-column-status { width: 6.1rem; }
   .applications-table .application-column-appliedDate { width: 5.5rem; }
+  .applications-table .application-company-cell .workspace-initial { display: none; }
+  .applications-table .application-company-cell .application-company-identity { display: block; max-width: none; }
+  .application-company-link { overflow: visible; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
 }
 @container application-view (max-width: 390px) {
   .applications-table .application-column-appliedDate, .applications-table .application-date-cell { display: none; }
-  .workspace-initial { display: none; }
-  .application-company-identity { display: block; max-width: none; }
+  .applications-table .application-company-cell .workspace-initial { display: none; }
+  .applications-table .application-company-cell .application-company-identity { display: block; max-width: none; }
   .workspace-lane { padding: 0.4rem; }
 }
 @media (max-width: 768px) {
