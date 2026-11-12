@@ -2,7 +2,15 @@
 
 JobTracker is a private, self-hosted web app for saving job applications, tracking their status, and comparing job descriptions with your resume. Its optional Chrome extension can capture a job posting from the tab you are viewing.
 
-![JobTracker dashboard](docs/screenshots/01-dashboard.png)
+![Fictional sample of the JobTracker Applications workspace with the list and application record open](docs/screenshots/02-applications-workspace.png)
+
+*Synthetic sample data; no personal application data is shown.*
+
+## Track applications
+
+The **Applications** workspace has three views. **List** shows sortable application records, including status, dates, location, and next step; you can change a status directly in the list. **Board** groups applications by status. **Calendar** shows scheduled next steps by week, with controls to move between weeks or return to today. Search by job title or company, and filter by status or job type; the same filters apply across the views.
+
+Open a record from any view to see its details, notes, source listing, and next step. Choose **Edit application** to update its status, next step, or next-step date. A dated next step appears in the Calendar view. On narrow screens, the navigation becomes a menu, workspace controls reflow, and long company names and job titles wrap to stay readable.
 
 ## Run it locally
 
@@ -37,7 +45,7 @@ If URL extraction cannot provide enough information, **Paste Text** requires bot
 
 The Dashboard's **Add application** card is open by default; on other pages, use **+ Add application** to open it. Drafts survive navigation within the app, but not a browser refresh.
 
-On narrow screens (768px wide or less), navigation becomes an inline menu and application rows become cards.
+On narrow screens (768px wide or less), navigation becomes a menu and the Applications workspace reflows its filters and record detail for the smaller viewport.
 
 ## Keep your local data
 
