@@ -85,18 +85,18 @@ describe("deployment verification contract", () => {
     );
 
     expect(readFileSync(join(root, ".nvmrc"), "utf8").trim()).toBe(
-      "22.23.4",
+      "22.23.5",
     );
     expect(readFileSync(join(root, ".node-version"), "utf8").trim()).toBe(
-      "22.23.4",
+      "22.23.5",
     );
     expect(packageJson).toMatchObject({
-      engines: { node: ">=22.23.4 <23" },
+      engines: { node: ">=22.23.5 <23" },
     });
     expect(packageLock.packages?.[""]?.engines).toEqual({
-      node: ">=22.23.4 <23",
+      node: ">=22.23.5 <23",
     });
-    expect(workflowSource).toContain('node-version: "22.23.4"');
+    expect(workflowSource).toContain('node-version: "22.23.5"');
   });
 
   it("documents the only startup commands that enforce pre-listen validation", () => {
@@ -186,7 +186,7 @@ describe("deployment verification contract", () => {
       {
         name: "Set up Node.js",
         uses: `actions/setup-node@${SETUP_NODE_SHA}`,
-        with: { "node-version": "22.23.4", cache: "npm" },
+        with: { "node-version": "22.23.5", cache: "npm" },
       },
       {
         name: "Capture PostgreSQL service address",
@@ -292,7 +292,7 @@ describe("deployment verification contract", () => {
       {
         name: "Set up Node.js",
         uses: `actions/setup-node@${SETUP_NODE_SHA}`,
-        with: { "node-version": "22.23.4", cache: "npm" },
+        with: { "node-version": "22.23.5", cache: "npm" },
       },
       {
         name: "Capture PostgreSQL service address",
@@ -349,7 +349,7 @@ describe("deployment verification contract", () => {
       {
         name: "Set up Node.js",
         uses: `actions/setup-node@${SETUP_NODE_SHA}`,
-        with: { "node-version": "22.23.4", cache: "npm" },
+        with: { "node-version": "22.23.5", cache: "npm" },
       },
       { name: "Install dependencies", run: "npm ci" },
       {

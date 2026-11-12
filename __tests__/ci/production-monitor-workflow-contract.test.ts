@@ -68,7 +68,7 @@ describe("production monitor workflow contract", () => {
       {
         name: "Set up Node.js",
         uses: `actions/setup-node@${SETUP_NODE_SHA}`,
-        with: { "node-version": "22.23.4" },
+        with: { "node-version": "22.23.5" },
       },
       {
         name: "Check authenticated production stats",

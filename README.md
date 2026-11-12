@@ -16,7 +16,7 @@ Open a record from any view to see its details, notes, source listing, and next 
 
 The local setup runs the production Next.js app and PostgreSQL in Docker. It is intended for one person on their own computer, not as a public or multi-user server. Docker must be installed and its local daemon running.
 
-Prerequisites: Git, Node.js **22.23.4 or newer in the 22.x series** (`>=22.23.4 <23`), npm (included with Node.js), and Docker with Docker Compose.
+Prerequisites: Git, Node.js **22.23.5 or newer in the 22.x series** (`>=22.23.5 <23`), npm (included with Node.js), and Docker with Docker Compose.
 
 ```bash
 git clone https://github.com/taejunoh/easy-job-application-tracker.git
