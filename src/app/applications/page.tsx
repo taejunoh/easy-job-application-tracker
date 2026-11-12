@@ -217,23 +217,27 @@ function ApplicationsView() {
           </label>
           <label className="filter-field">
             <span className="input-label">Status</span>
-            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="field">
-              {STATUSES.map((s) => (
-                <option key={s} value={s}>
-                  {s === "All" ? "All statuses" : s}
-                </option>
-              ))}
-            </select>
+            <span className="filter-select-control">
+              <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="field">
+                {STATUSES.map((s) => (
+                  <option key={s} value={s}>
+                    {s === "All" ? "All statuses" : s}
+                  </option>
+                ))}
+              </select>
+            </span>
           </label>
           <label className="filter-field">
             <span className="input-label">Job type</span>
-            <select value={jobTypeFilter} onChange={(e) => setJobTypeFilter(e.target.value)} className="field">
-              {JOB_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t === "All" ? "All types" : t}
-                </option>
-              ))}
-            </select>
+            <span className="filter-select-control">
+              <select value={jobTypeFilter} onChange={(e) => setJobTypeFilter(e.target.value)} className="field">
+                {JOB_TYPES.map((t) => (
+                  <option key={t} value={t}>
+                    {t === "All" ? "All types" : t}
+                  </option>
+                ))}
+              </select>
+            </span>
           </label>
         </div>
 
