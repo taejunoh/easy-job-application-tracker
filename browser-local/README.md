@@ -1,6 +1,12 @@
 # Easy Job browser edition
 
-Easy Job is a browser-only job application tracker. Enter applications manually, switch between list, board, and calendar views, and compare a saved resume with a pasted job description. The tracker runs from static files. It requires no database, account, API keys, browser extension, or AI service.
+Easy Job is a browser-only job application tracker. Enter applications manually, switch between list, board, and calendar views, and compare a saved resume with a pasted job description. The tracker runs from static files. Manual tracking requires no database, account, API keys, browser extension, or AI service.
+
+## Optional AI extraction
+
+You can use a personal Gemini API key to extract a company and job title from text you explicitly paste. The app sends that posting text to Google only when you request extraction; it does not send your saved résumé, notes, or other applications. Review the result before applying it, and save the application separately. The key is not stored by the app or included in backups; it is used in the browser while the request runs. Browser code or extensions could still expose a key, so use a dedicated restricted key and avoid confidential or personal information. Google's free and paid plans have different data-use terms, limits, and possible charges: check [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) and [terms](https://ai.google.dev/gemini-api/terms) before use.
+
+You can alternatively paste structured results produced by another AI service without entering its API key into this app. You choose what to send when using that external service; check its terms and review the result before saving.
 
 ## Run locally
 
