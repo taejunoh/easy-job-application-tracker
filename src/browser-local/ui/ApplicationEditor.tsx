@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { localCivilDate } from "../../lib/application-calendar";
 import { analyzeKeywordMatch } from "../../lib/keyword-matcher";
 import { DuplicateJobUrlError, LocalBackupCapacityError, LocalDataChangedError, LOCAL_JOB_TYPES, LOCAL_STATUSES, type LocalApplication, type LocalApplicationInput } from "../storage";
+import GeminiExtract from "./GeminiExtract";
 
 export default function ApplicationEditor({ application, resumeText, onSave, onDelete, onClose }: {
   application: LocalApplication | null;
@@ -11,6 +12,9 @@ export default function ApplicationEditor({ application, resumeText, onSave, onD
   onClose: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const company = useRef<HTMLInputElement>(null);
+  const jobTitle = useRef<HTMLInputElement>(null);
+  const [closing, setClosing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
@@ -22,6 +26,7 @@ export default function ApplicationEditor({ application, resumeText, onSave, onD
   }, []);
 
   function close() {
+    setClosing(true);
     dialog.current?.close();
     onClose();
   }
@@ -109,10 +114,15 @@ export default function ApplicationEditor({ application, resumeText, onSave, onD
           <h2 id="bl-editor-title">{application ? "Edit application" : "Add application"}</h2>
           <button className="bl-button" type="button" onClick={close} disabled={busy}>Close</button>
         </header>
+        {!closing && !busy && !deleting && <GeminiExtract onApply={(fields) => {
+          if (company.current && fields.company) company.current.value = fields.company;
+          if (jobTitle.current && fields.jobTitle) jobTitle.current.value = fields.jobTitle;
+          (fields.company ? company.current : jobTitle.current)?.focus();
+        }} />}
         <form onSubmit={submit}>
           <fieldset disabled={busy || deleting} className="bl-form-grid">
-            <label>Company<input name="company" required maxLength={256} defaultValue={application?.company} /></label>
-            <label>Job title<input name="jobTitle" required maxLength={256} defaultValue={application?.jobTitle} /></label>
+            <label>Company<input ref={company} name="company" required maxLength={256} defaultValue={application?.company} /></label>
+            <label>Job title<input ref={jobTitle} name="jobTitle" required maxLength={256} defaultValue={application?.jobTitle} /></label>
             <label className="bl-wide">Posting URL<input name="url" required type="url" maxLength={2048} defaultValue={application?.url} /></label>
             <label>Status
               <select name="status" defaultValue={application?.status ?? "Applied"}>
