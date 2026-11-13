@@ -26,10 +26,10 @@ describe("supported direct dependency versions", () => {
   it("pins the supported Anthropic, Next, Prisma, Undici, Node type, and PostCSS releases", () => {
     expect(packageJson.dependencies).toMatchObject({
       "@anthropic-ai/sdk": "0.111.0",
-      "@next/env": "16.4.3",
+      "@next/env": "16.4.5",
       "@prisma/adapter-pg": "7.9.1",
       "@prisma/client": "7.9.1",
-      next: "16.4.3",
+      next: "16.4.5",
       undici: "7.30.1",
     });
     expect(packageJson.devDependencies).toMatchObject({
@@ -44,12 +44,12 @@ describe("supported direct dependency versions", () => {
     const rootPackage = packageLock.packages[""];
     const expected = {
       "@anthropic-ai/sdk": "0.111.0",
-      "@next/env": "16.4.3",
+      "@next/env": "16.4.5",
       "@prisma/adapter-pg": "7.9.1",
       "@prisma/client": "7.9.1",
       "@types/node": "22.20.1",
       "eslint-config-next": "16.3.6",
-      next: "16.4.3",
+      next: "16.4.5",
       postcss: "8.5.26",
       prisma: "7.9.1",
       undici: "7.30.1",
@@ -64,11 +64,11 @@ describe("supported direct dependency versions", () => {
   });
 
   it("keeps patched Next runtime separate from the reviewed lint consumer", () => {
-    expect(packageJson.dependencies.next).toBe("16.4.3");
-    expect(packageJson.dependencies["@next/env"]).toBe("16.4.3");
+    expect(packageJson.dependencies.next).toBe("16.4.5");
+    expect(packageJson.dependencies["@next/env"]).toBe("16.4.5");
     expect(packageJson.devDependencies["eslint-config-next"]).toBe("16.3.6");
-    expect(packageLock.packages["node_modules/next"]?.version).toBe("16.4.3");
-    expect(packageLock.packages["node_modules/@next/env"]?.version).toBe("16.4.3");
+    expect(packageLock.packages["node_modules/next"]?.version).toBe("16.4.5");
+    expect(packageLock.packages["node_modules/@next/env"]?.version).toBe("16.4.5");
     expect(packageLock.packages["node_modules/eslint-config-next"]?.version).toBe(
       "16.3.6",
     );
