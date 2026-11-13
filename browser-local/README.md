@@ -25,6 +25,12 @@ npm run preview
 
 Preview the production build using the URL Vite prints. Publish the full contents of `browser-local/dist/` to any HTTPS static host. Keep the asset directories alongside `index.html`. Relative asset URLs support hosting under a path such as `/jobs/`. No API routes or server-side configuration are needed. Use a dedicated hostname to isolate this tracker's browser storage from other applications. Serve the files over HTTP or HTTPS, since browser module and worker loading require an origin.
 
+### Cloudflare Pages
+
+The public browser edition is hosted at `https://easy-job-application-tracker.pages.dev/` as a Direct Upload project. The Cloudflare workflow builds and tests this app and deploys the static output after changes reach `main`; pull requests do not deploy it. It uses no production database. This project uses Cloudflare's free static hosting; consult Cloudflare's current limits before increasing deployment frequency or adding paid features.
+
+To enable the workflow, a repository administrator must store `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as GitHub Actions secrets. Create a dedicated Cloudflare token with Account → Cloudflare Pages → Edit permission restricted to the intended Cloudflare account, and keep the token private. Cloudflare's Pages Edit permission is account-scoped, so protect it accordingly. The token is used by GitHub Actions, not included in the app or its backups. Follow [Cloudflare's Direct Upload CI guide](https://developers.cloudflare.com/pages/how-to/use-direct-upload-with-continuous-integration/) for the current setup steps. After merging the workflow, verify a successful run and the public site; a failed deployment leaves the previous site available. The workflow can also be run manually from `main`.
+
 ### GitHub Pages
 
 The **Browser-local Pages** workflow is prepared for manual publication from `main`. It builds this standalone app and publishes only `browser-local/dist/`; it does not use the production database or change the existing Vercel application. Merging the workflow does not publish the site.
