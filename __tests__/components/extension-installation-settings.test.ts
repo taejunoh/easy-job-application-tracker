@@ -1,7 +1,7 @@
 /** @jest-environment jsdom */
 
 import { createElement } from "react";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 
 import {
@@ -92,6 +92,22 @@ describe("ExtensionInstallations", () => {
     const section = await screen.findByRole("region", { name: "Chrome extension installations" });
 
     expect(within(section).getByText(/enter this JobTracker URL and the code, then choose Connect/)).toBeInTheDocument();
+  });
+
+  it("ignores a failed list request after the API instance changes", async () => {
+    let rejectPrevious!: (error: Error) => void;
+    const previous = new Promise<never>((_, reject) => {
+      rejectPrevious = reject;
+    });
+    const firstApi = jest.fn().mockReturnValue(previous);
+    const nextApi = jest.fn().mockResolvedValue({ installations: [], configuredOrigins: [ORIGIN] });
+    const { rerender } = render(createElement(ExtensionInstallations, { api: firstApi as ClientApi }));
+    expect(firstApi).toHaveBeenCalledTimes(1);
+    rerender(createElement(ExtensionInstallations, { api: nextApi as ClientApi }));
+    expect(await screen.findByRole("option", { name: "JobTracker Chrome extension" })).toHaveValue(ORIGIN);
+
+    await act(async () => rejectPrevious(new Error("Previous request failed")));
+    expect(screen.queryByText("Failed to load extension installations.")).not.toBeInTheDocument();
   });
 });
 
