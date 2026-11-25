@@ -30,11 +30,11 @@ export function filterApplications<T extends SearchableApplication>(
   });
 }
 
-type DatedApplication = { id: string; appliedDate: string; createdAt: string };
+type DatedApplication = { id: string; appliedDate: string | null; createdAt: string };
 
 export function sortApplications<T extends DatedApplication>(applications: readonly T[]): T[] {
   return [...applications].sort((left, right) =>
-    right.appliedDate.localeCompare(left.appliedDate)
+    (right.appliedDate ?? "").localeCompare(left.appliedDate ?? "")
     || right.createdAt.localeCompare(left.createdAt)
     || left.id.localeCompare(right.id));
 }

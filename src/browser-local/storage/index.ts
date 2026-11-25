@@ -1,3 +1,4 @@
+import { csvDuplicates } from "../csv";
 import {
   applicationWithInput,
   checkedApplication,
@@ -5,6 +6,7 @@ import {
   checkedSettings,
   checkedTimestamp,
   EMPTY_SETTINGS,
+  makeApplication,
   normalizeJobUrl,
   type LocalApplication,
   type LocalApplicationInput,
@@ -205,8 +207,9 @@ function finishBackupSizedWrite<T>(context: TransactionContext<T>, result: T): v
 }
 
 function assertUniqueUrl(records: LocalApplication[], application: LocalApplication): void {
+  if (!application.url) return;
   const canonicalUrl = normalizeJobUrl(application.url);
-  if (records.some((record) => record.id !== application.id && normalizeJobUrl(record.url) === canonicalUrl)) {
+  if (records.some((record) => record.id !== application.id && record.url && normalizeJobUrl(record.url) === canonicalUrl)) {
     throw new DuplicateJobUrlError();
   }
 }
@@ -225,31 +228,28 @@ export function createLocalTrackerStorage() {
       });
     },
 
+    async importApplications(inputs: LocalApplicationInput[]): Promise<number> {
+      if (inputs.length > 5000) throw new Error("Import at most 5,000 applications at a time.");
+      const records = inputs.map(makeApplication);
+      return transact("readwrite", (context) => {
+        const { applications, onResult, setResult } = context;
+        onResult(applications.getAll(), (existing) => {
+          const duplicates = csvDuplicates(existing.map(checkedApplication));
+          let added = 0;
+          for (const record of records) {
+            if (duplicates.has(record)) continue;
+            applications.add(record);
+            duplicates.add(record);
+            added++;
+          }
+          if (added) finishBackupSizedWrite(context, added);
+          else setResult(0);
+        });
+      });
+    },
+
     async createApplication(input: LocalApplicationInput): Promise<LocalApplication> {
-      const timestamp = new Date().toISOString();
-      const application = applicationWithInput({
-        id: crypto.randomUUID(),
-        url: "",
-        jobTitle: "",
-        company: "",
-        status: "Applied",
-        appliedDate: timestamp,
-        description: null,
-        notes: null,
-        salary: null,
-        location: null,
-        jobType: null,
-        nextStep: null,
-        nextStepDate: null,
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        identityKey: null,
-        canonicalUrl: null,
-        duplicateOfId: null,
-        identityState: "legacy_unresolved",
-      }, input);
-      const canonicalUrl = normalizeJobUrl(application.url);
-      application.canonicalUrl = canonicalUrl.length <= 2048 ? canonicalUrl : null;
+      const application = makeApplication(input);
 
       return transact("readwrite", (context) => {
         const { applications, onResult } = context;
@@ -286,8 +286,8 @@ export function createLocalTrackerStorage() {
           onResult(applications.getAll(), (records) => {
             assertUniqueUrl(records, application);
             application.identityKey = null;
-            const canonicalUrl = normalizeJobUrl(application.url);
-            application.canonicalUrl = canonicalUrl.length <= 2048 ? canonicalUrl : null;
+            const canonicalUrl = application.url ? normalizeJobUrl(application.url) : "";
+            application.canonicalUrl = canonicalUrl && canonicalUrl.length <= 2048 ? canonicalUrl : null;
             application.duplicateOfId = null;
             application.identityState = "legacy_unresolved";
             save();

@@ -4,6 +4,8 @@ import {
   type LocalApplication, type LocalApplicationInput, type LocalSettings,
 } from "../storage";
 import ApplicationEditor from "./ApplicationEditor";
+import CsvPanel from "./CsvPanel";
+import FollowUps from "./FollowUps";
 import { ApplicationBoard, ApplicationCalendar, ApplicationList, VIEWS, type View } from "./ApplicationViews";
 import { BackupPanel, ResumePanel } from "./SettingsPanels";
 import { filterApplications, sortApplications } from "./model";
@@ -100,13 +102,14 @@ export default function BrowserLocalApp({ storage }: { storage: TrackerStorage }
             {section === "Applications" && (
               <>
                 <div className="bl-stats" aria-label="Application totals">
-                  <div className="bl-stat"><span>Total applications</span><strong>{applications.length}</strong></div>
+                  <div className="bl-stat"><span>Total applications</span><strong>{applications.filter((item) => item.status !== "Saved").length}</strong></div>
                   {LOCAL_STATUSES.map((status) => (
                     <div className="bl-stat" key={status} data-status={status}>
                       <span>{status}</span><strong>{applications.filter((item) => item.status === status).length}</strong>
                     </div>
                   ))}
                 </div>
+                <FollowUps applications={applications} onEdit={setEditor} />
                 <section className="bl-panel bl-applications" aria-label="Application records">
                   <div className="bl-tools">
                     <div className="bl-view-switch" role="group" aria-label="Application view">
@@ -152,14 +155,19 @@ export default function BrowserLocalApp({ storage }: { storage: TrackerStorage }
               setSettings(next);
               setNotice("Résumé saved in this browser.");
             }} />}
-            {section === "Backup" && <BackupPanel storage={storage} onRestore={() => {
+            {section === "Backup" && <><BackupPanel storage={storage} onRestore={() => {
               setStatusFilter("");
               setJobTypeFilter("");
               setSearch("");
               setNotice("Backup restored.");
               setSettings(null);
               setLoadAttempt((attempt) => attempt + 1);
-            }} />}
+            }} />
+              <CsvPanel storage={storage} onImported={(count) => {
+                setLoadAttempt((attempt) => attempt + 1);
+                setNotice(`Added ${count} ${count === 1 ? "application" : "applications"} from CSV. Records already in this browser were skipped.`);
+              }} />
+            </>}
             {editor !== undefined && <ApplicationEditor
               application={editor} resumeText={settings.resumeText}
               onSave={saveApplication} onDelete={deleteApplication} onClose={() => setEditor(undefined)}

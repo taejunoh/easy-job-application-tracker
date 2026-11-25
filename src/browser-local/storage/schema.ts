@@ -1,6 +1,6 @@
-import { isCivilDate } from "../../lib/application-calendar";
+import { isCivilDate, localCivilDate } from "../../lib/application-calendar";
 
-export const LOCAL_STATUSES = ["Applied", "Interview", "Offer", "Rejected"] as const;
+export const LOCAL_STATUSES = ["Saved", "Applied", "Interview", "Offer", "Rejected"] as const;
 export const LOCAL_JOB_TYPES = ["Remote", "Hybrid", "Onsite"] as const;
 
 export type LocalStatus = (typeof LOCAL_STATUSES)[number];
@@ -12,7 +12,7 @@ export type LocalApplication = {
   jobTitle: string;
   company: string;
   status: string;
-  appliedDate: string;
+  appliedDate: string | null;
   description: string | null;
   notes: string | null;
   salary: string | null;
@@ -28,7 +28,8 @@ export type LocalApplication = {
   identityState: string;
 };
 
-export type LocalApplicationInput = Pick<LocalApplication, "url" | "jobTitle" | "company">
+export type LocalApplicationInput = Pick<LocalApplication, "jobTitle" | "company">
+  & Partial<Pick<LocalApplication, "url">>
   & Partial<Pick<LocalApplication, "status" | "appliedDate" | "description" | "notes"
     | "salary" | "location" | "jobType" | "nextStep" | "nextStepDate">>;
 
@@ -128,13 +129,22 @@ export function checkedApplication(value: unknown): LocalApplication {
     throw new Error("Invalid next step date.");
   }
 
+  const status = checkedText(data.status, 64, "status", true);
+  const url = checkedUrl(data.url, "job URL", true);
+  const appliedDate = data.appliedDate === null
+    ? null
+    : checkedAppliedDate(data.appliedDate);
+  if ((status === "Saved") !== (appliedDate === null)) {
+    throw new Error("Saved applications must not have an applied date.");
+  }
+
   return {
     id: checkedText(data.id, 256, "application ID", true),
-    url: checkedUrl(data.url, "job URL"),
+    url,
     jobTitle: checkedText(data.jobTitle, 256, "job title", true),
     company: checkedText(data.company, 256, "company", true),
-    status: checkedText(data.status, 64, "status", true),
-    appliedDate: checkedAppliedDate(data.appliedDate),
+    status,
+    appliedDate,
     description: nullableText(data.description, 100_000, "description"),
     notes: nullableText(data.notes, 20_000, "notes"),
     salary: nullableText(data.salary, 512, "salary"),
@@ -170,7 +180,44 @@ export function applicationWithInput(application: LocalApplication, input: unkno
     !LOCAL_JOB_TYPES.some((jobType) => jobType === fields.jobType)) {
     throw new Error("Invalid job type.");
   }
-  return checkedApplication({ ...application, ...fields });
+  const status = Object.hasOwn(fields, "status") ? fields.status : application.status;
+  const appliedDate = Object.hasOwn(fields, "appliedDate")
+    ? fields.appliedDate
+    : status === "Saved"
+      ? null
+      : application.appliedDate ?? localCivilDate(new Date());
+  return checkedApplication({ ...application, ...fields, status, appliedDate });
+}
+
+/** Construct a validated application record for regular and batch import flows. */
+export function makeApplication(input: LocalApplicationInput): LocalApplication {
+  const timestamp = new Date().toISOString();
+  const application = applicationWithInput({
+    id: crypto.randomUUID(),
+    url: "",
+    jobTitle: "",
+    company: "",
+    status: "Applied",
+    appliedDate: timestamp,
+    description: null,
+    notes: null,
+    salary: null,
+    location: null,
+    jobType: null,
+    nextStep: null,
+    nextStepDate: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    identityKey: null,
+    canonicalUrl: null,
+    duplicateOfId: null,
+    identityState: "legacy_unresolved",
+  }, input);
+  if (application.url) {
+    const canonicalUrl = normalizeJobUrl(application.url);
+    application.canonicalUrl = canonicalUrl.length <= 2048 ? canonicalUrl : null;
+  }
+  return application;
 }
 
 export function normalizeJobUrl(value: string): string {

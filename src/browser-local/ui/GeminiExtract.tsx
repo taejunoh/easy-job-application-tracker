@@ -5,10 +5,18 @@ type ExtractedFields = Awaited<ReturnType<typeof extractJobDetails>>;
 
 const MAX_RESULT_LENGTH = 4_096;
 const MAX_FIELD_LENGTH = 256;
+const OTHER_AI_PROMPT = `From the public job posting below, identify the company and job title. Use only information stated in the posting; use null for any unknown field. Return exactly one JSON object with string or null values for company and jobTitle. You may return raw JSON or a single fenced JSON code block. Do not include explanations or other fields.
+
+Job posting:
+[Paste the public job posting here]`;
 
 function readPastedFields(text: string): ExtractedFields {
   if (text.length > MAX_RESULT_LENGTH) throw new Error();
-  const value: unknown = JSON.parse(text);
+  const trimmed = text.trim();
+  const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(trimmed);
+  const json = fenced ? fenced[1] : trimmed;
+  if (json.includes("```")) throw new Error();
+  const value: unknown = JSON.parse(json);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
 
   const readField = (name: "company" | "jobTitle") => {
@@ -32,6 +40,7 @@ function ExtractPanel({ mode, id, onApply }: {
   const request = useRef<AbortController | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [copyStatus, setCopyStatus] = useState("");
   const [result, setResult] = useState<ExtractedFields | null>(null);
 
   useLayoutEffect(() => {
@@ -105,6 +114,17 @@ function ExtractPanel({ mode, id, onApply }: {
     }
   }
 
+  async function copyPrompt() {
+    setCopyStatus("");
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error();
+      await navigator.clipboard.writeText(OTHER_AI_PROMPT);
+      setCopyStatus("Prompt copied. Paste it into your AI, then paste its result here.");
+    } catch {
+      setCopyStatus("Clipboard access is unavailable. Select and copy the prompt above.");
+    }
+  }
+
   const usingGemini = mode === "gemini";
   return (
     <div id={id} className="bl-ai-fields">
@@ -128,8 +148,14 @@ function ExtractPanel({ mode, id, onApply }: {
         </>
       ) : (
         <>
-          <p className="bl-muted">Ask your AI to extract the company and job title from the public posting and return only JSON in this format. Use null for unknown fields.</p>
-          <code>{'{"company": "Company name", "jobTitle": "Job title"}'}</code>
+          <p className="bl-muted">Copy this plain-text prompt into the AI you choose. Nothing is sent automatically. Then paste its response below.</p>
+          <label>Prompt to copy
+            <textarea rows={5} readOnly value={OTHER_AI_PROMPT} onFocus={(event) => event.currentTarget.select()} />
+          </label>
+          <div>
+            <button type="button" className="bl-button" onClick={copyPrompt}>Copy prompt</button>
+          </div>
+          {copyStatus && <p className="bl-muted" role="status">{copyStatus}</p>}
           <label>AI result JSON
             <textarea ref={sourceInput} rows={3} maxLength={MAX_RESULT_LENGTH} onChange={resetReview} />
           </label>
