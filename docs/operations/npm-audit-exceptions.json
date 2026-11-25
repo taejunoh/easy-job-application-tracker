@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "reviewedOn": "2026-11-02",
-  "reviewBy": "2026-11-21",
+  "reviewedOn": "2026-11-25",
+  "reviewBy": "2026-12-16",
   "exceptions": [
     {
       "id": "GHSA-g3hv-75wg-m249",
@@ -20,7 +20,6 @@
         "@typescript-eslint/utils",
         "babel-jest",
         "babel-plugin-istanbul",
-        "eslint-config-next",
         "glob",
         "jest",
         "jest-circus",
@@ -32,11 +31,10 @@
         "jest-snapshot",
         "minimatch",
         "test-exclude",
-        "ts-jest",
         "typescript-eslint"
       ],
-      "rationale": "minimatch is reached only through the ESLint and Jest development toolchains, which match patterns from repository configuration rather than user input. The production audit graph is clean and application code does not import it. ESLint 9 and its plugins pin the 3.x line, and npm proposes unsupported downgrades of eslint and jest.",
-      "remediation": "Remove this exception when supported ESLint, plugin and Jest releases resolve minimatch 11.0.1 or newer; do not override across major versions."
+      "rationale": "Vulnerable minimatch versions are reached through the TypeScript ESLint and Jest development toolchains. These tools match patterns from repository configuration. The production audit reports no findings.",
+      "remediation": "Remove this exception once supported versions of TypeScript ESLint and Jest resolve patched minimatch versions."
     },
     {
       "id": "GHSA-3g3m-2fjr-6pw4",
@@ -59,26 +57,10 @@
         "jest-runner",
         "jest-runtime",
         "jest-snapshot",
-        "test-exclude",
-        "ts-jest"
+        "test-exclude"
       ],
-      "rationale": "glob is reached only through the Jest toolchain, which walks repository paths during local and CI test runs. The production audit graph is clean and application code does not import it. Jest 30.5.2, the latest release, still requires glob ^13.0.6, and npm proposes an unsupported downgrade to Jest 25.",
-      "remediation": "Upgrade Jest and test-exclude when supported releases resolve glob 14.0.2 or newer, then remove this exception; do not override Jest internals."
-    },
-    {
-      "id": "GHSA-gcqx-w48m-w2h4",
-      "url": "https://github.com/advisories/GHSA-gcqx-w48m-w2h4",
-      "severity": "low",
-      "scope": [
-        "@jest/core",
-        "deepmerge",
-        "jest",
-        "jest-cli",
-        "jest-config",
-        "ts-jest"
-      ],
-      "rationale": "deepmerge is reached only through jest-config, which merges repository test configuration rather than untrusted input. The production audit graph is clean and application code does not import it. The advisory lists no patched version.",
-      "remediation": "Remove this exception when deepmerge publishes a patched release that Jest resolves, or when Jest drops the dependency."
+      "rationale": "Affected glob versions are reached through the Jest development toolchain, which walks repository paths during local and CI tests. Jest 30.5.2 uses glob 13, and test-exclude uses glob 10. The production audit reports no findings.",
+      "remediation": "Remove this exception once supported versions of Jest and test-exclude resolve patched glob versions."
     }
   ]
 }
