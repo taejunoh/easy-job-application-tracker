@@ -19,6 +19,7 @@ export default function ApplicationEditor({ application, resumeText, onSave, onD
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
   const [description, setDescription] = useState(application?.description ?? "");
+  const [status, setStatus] = useState(application?.status ?? "Saved");
   const [match, setMatch] = useState<ReturnType<typeof analyzeKeywordMatch> | null>(null);
 
   useEffect(() => {
@@ -36,12 +37,22 @@ export default function ApplicationEditor({ application, resumeText, onSave, onD
     const data = new FormData(event.currentTarget);
     const field = (name: string) => String(data.get(name) ?? "").trim();
     const optional = (name: string) => field(name) || null;
+    const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
+    const intent = submitter?.value;
+    const saved = !intent && field("status") === "Saved";
+    const applied = intent === "applied";
+    const nextStatus = saved ? "Saved" : applied ? "Applied" : field("status");
+    const appliedDate = saved
+      ? null
+      : applied
+        ? application?.appliedDate?.slice(0, 10) ?? localCivilDate(new Date())
+        : field("appliedDate") || undefined;
     const input: LocalApplicationInput = {
       company: field("company"),
       jobTitle: field("jobTitle"),
       url: field("url"),
-      status: field("status"),
-      appliedDate: field("appliedDate"),
+      status: nextStatus,
+      ...(appliedDate === undefined ? {} : { appliedDate }),
       description: optional("description"),
       notes: optional("notes"),
       salary: optional("salary"),
@@ -54,20 +65,22 @@ export default function ApplicationEditor({ application, resumeText, onSave, onD
       setError("Enter a company and job title.");
       return;
     }
-    let url: URL;
-    try {
-      url = new URL(input.url);
-    } catch {
-      setError("Enter a valid posting URL beginning with https:// or http://.");
-      return;
-    }
-    if (url.protocol !== "https:" && url.protocol !== "http:") {
-      setError("Enter a valid posting URL beginning with https:// or http://.");
-      return;
-    }
-    if (url.username || url.password) {
-      setError("Use a posting URL without credentials.");
-      return;
+    if (input.url) {
+      let url: URL;
+      try {
+        url = new URL(input.url);
+      } catch {
+        setError("Enter a valid posting URL beginning with https:// or http://.");
+        return;
+      }
+      if (url.protocol !== "https:" && url.protocol !== "http:") {
+        setError("Enter a valid posting URL beginning with https:// or http://.");
+        return;
+      }
+      if (url.username || url.password) {
+        setError("Use a posting URL without credentials.");
+        return;
+      }
     }
     setError("");
     setBusy(true);
@@ -123,15 +136,15 @@ export default function ApplicationEditor({ application, resumeText, onSave, onD
           <fieldset disabled={busy || deleting} className="bl-form-grid">
             <label>Company<input ref={company} name="company" required maxLength={256} defaultValue={application?.company} /></label>
             <label>Job title<input ref={jobTitle} name="jobTitle" required maxLength={256} defaultValue={application?.jobTitle} /></label>
-            <label className="bl-wide">Posting URL<input name="url" required type="url" maxLength={2048} defaultValue={application?.url} /></label>
+            <label className="bl-wide">Posting URL <span className="bl-muted">(optional)</span><input name="url" type="url" maxLength={2048} defaultValue={application?.url} /></label>
             <label>Status
-              <select name="status" defaultValue={application?.status ?? "Applied"}>
+              <select name="status" value={status} onChange={(event) => setStatus(event.target.value)}>
                 {application && !LOCAL_STATUSES.some((status) => status === application.status) &&
                   <option>{application.status}</option>}
                 {LOCAL_STATUSES.map((status) => <option key={status}>{status}</option>)}
               </select>
             </label>
-            <label>Date applied<input name="appliedDate" required type="date" defaultValue={application?.appliedDate.slice(0, 10) ?? localCivilDate(new Date())} /></label>
+            {status !== "Saved" && <label>Date applied<input name="appliedDate" required type="date" defaultValue={application?.appliedDate?.slice(0, 10) ?? localCivilDate(new Date())} /></label>}
             <label>Location<input name="location" maxLength={512} defaultValue={application?.location ?? ""} /></label>
             <label>Job type
               <select name="jobType" defaultValue={application?.jobType ?? ""}>
@@ -178,7 +191,11 @@ export default function ApplicationEditor({ application, resumeText, onSave, onD
           ) : (
             <footer className="bl-actions bl-dialog-actions">
               {application && <button type="button" className="bl-button bl-danger" disabled={busy} onClick={() => setDeleting(true)}>Delete…</button>}
-              <button className="bl-button bl-primary" disabled={busy} type="submit">{busy ? "Saving…" : "Save application"}</button>
+              <button className="bl-button bl-primary" disabled={busy} type="submit">
+                {busy ? "Saving…" : application ? "Save changes" : status === "Saved" ? "Save for later" : "Save application"}
+              </button>
+              {(!application || application.status === "Saved") &&
+                <button className="bl-button" disabled={busy} type="submit" value="applied">{busy ? "Saving…" : "Mark as applied"}</button>}
             </footer>
           )}
         </form>

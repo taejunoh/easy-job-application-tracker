@@ -33,6 +33,31 @@ test("persists applications, date edits, and settings across storage instances",
   assert.deepEqual(await storage.listApplications(), []);
 });
 
+test("quick saves without a URL have no applied date and can be marked applied once", async () => {
+  const storage = createLocalTrackerStorage();
+  const saved = await storage.createApplication({ company: "Example", jobTitle: "Engineer", status: "Saved" });
+  assert.equal(saved.url, "");
+  assert.equal(saved.appliedDate, null);
+
+  const applied = await storage.updateApplication(saved.id, { status: "Applied" }, saved.updatedAt);
+  assert.match(applied.appliedDate, /^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/);
+  const markedAgain = await storage.updateApplication(applied.id, { status: "Applied" }, applied.updatedAt);
+  assert.equal(markedAgain.appliedDate, applied.appliedDate);
+
+  const backup = await storage.exportBackup();
+  const other = createLocalTrackerStorage();
+  await other.restoreBackup(await other.previewBackup(backup));
+  assert.deepEqual(await other.listApplications(), [markedAgain]);
+});
+
+test("allows multiple URL-less records but still rejects duplicate actual URLs", async () => {
+  const storage = createLocalTrackerStorage();
+  await storage.createApplication({ company: "Example", jobTitle: "Engineer", status: "Saved" });
+  await storage.createApplication({ company: "Example", jobTitle: "Designer", status: "Saved" });
+  await storage.createApplication({ ...job, status: "Saved" });
+  await assert.rejects(storage.createApplication({ ...job, status: "Saved" }), DuplicateJobUrlError);
+});
+
 test("rejects concurrent duplicate URLs and stale application and settings writes", async () => {
   const first = createLocalTrackerStorage();
   const second = createLocalTrackerStorage();

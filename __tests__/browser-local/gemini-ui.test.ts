@@ -97,7 +97,7 @@ test("a failed request clears the key and displays a fixed error message", async
   expect(key.value).toBe("");
 });
 
-test("pasted results are reviewed locally and preserve fields absent from the result", () => {
+test("pasted results are reviewed locally and preserve fields absent from the result", async () => {
   render(createElement(EditorHarness));
   const company = screen.getByLabelText("Company") as HTMLInputElement;
   const title = screen.getByLabelText("Job title") as HTMLInputElement;
@@ -121,6 +121,65 @@ test("pasted results are reviewed locally and preserve fields absent from the re
   expect(title.value).toBe("Data Analyst");
   expect(mockExtract).not.toHaveBeenCalled();
   expect(onSave).not.toHaveBeenCalled();
+
+  fireEvent.change(screen.getByLabelText(/Posting URL/), { target: { value: "https://example.com/jobs/123" } });
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Save for later" })));
+  expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+    company: "Existing Co.",
+    jobTitle: "Data Analyst",
+    url: "https://example.com/jobs/123",
+  }));
+});
+
+test("another AI prompt can be copied without sending content or saving", async () => {
+  const writeText = jest.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText },
+  });
+  render(createElement(EditorHarness));
+
+  fireEvent.click(screen.getByRole("button", { name: "Use another AI (optional)" }));
+  const prompt = screen.getByLabelText("Prompt to copy") as HTMLTextAreaElement;
+  expect(prompt.readOnly).toBe(true);
+  expect(prompt.value).toMatch(/company/);
+  expect(prompt.value).toMatch(/jobTitle/);
+  fireEvent.click(screen.getByRole("button", { name: "Copy prompt" }));
+
+  await screen.findByText(/Prompt copied/);
+  expect(writeText).toHaveBeenCalledWith(prompt.value);
+  expect(mockExtract).not.toHaveBeenCalled();
+  expect(onSave).not.toHaveBeenCalled();
+});
+
+test("another AI accepts one fenced JSON object for review", () => {
+  render(createElement(EditorHarness));
+  fireEvent.click(screen.getByRole("button", { name: "Use another AI (optional)" }));
+  fireEvent.change(screen.getByLabelText("AI result JSON"), {
+    target: { value: '```json\n{"company":"Fenced Co.","jobTitle":"Analyst"}\n```' },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Review pasted result" }));
+
+  expect(screen.getByText("Fenced Co.")).toBeTruthy();
+  expect(screen.getByText("Analyst")).toBeTruthy();
+  expect(mockExtract).not.toHaveBeenCalled();
+  expect(onSave).not.toHaveBeenCalled();
+});
+
+test("another AI rejects prose or multiple fenced JSON blocks", () => {
+  render(createElement(EditorHarness));
+  fireEvent.click(screen.getByRole("button", { name: "Use another AI (optional)" }));
+  const result = screen.getByLabelText("AI result JSON");
+
+  fireEvent.change(result, { target: { value: 'Here is the result: {"company":"Wrapped Co."}' } });
+  fireEvent.click(screen.getByRole("button", { name: "Review pasted result" }));
+  expect(screen.getByRole("alert").textContent).toMatch(/valid JSON/);
+
+  fireEvent.change(result, { target: { value: '```json\n{"company":"First"}\n```\n```json\n{"company":"Second"}\n```' } });
+  fireEvent.click(screen.getByRole("button", { name: "Review pasted result" }));
+  expect(screen.getByRole("alert").textContent).toMatch(/valid JSON/);
+  expect(screen.queryByText("First")).toBeNull();
+  expect(screen.queryByText("Second")).toBeNull();
 });
 
 test("collapsing Gemini wipes an unsent key", () => {

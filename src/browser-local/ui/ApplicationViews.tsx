@@ -41,7 +41,9 @@ export function ApplicationList({ applications, onEdit }: ViewProps) {
             </th>
             <td><Status status={application.status} /></td>
             <td>{[application.location, application.jobType].filter(Boolean).join(" · ") || "—"}</td>
-            <td><time dateTime={application.appliedDate}>{dateLabel.format(new Date(application.appliedDate))}</time></td>
+            <td>{application.appliedDate
+              ? <time dateTime={application.appliedDate}>{dateLabel.format(new Date(application.appliedDate))}</time>
+              : "—"}</td>
             <td>
               {application.nextStep ?? (!application.nextStepDate && "—")}
               {application.nextStepDate && <time className="bl-date" dateTime={application.nextStepDate}>{dateLabel.format(utcDate(application.nextStepDate))}</time>}
