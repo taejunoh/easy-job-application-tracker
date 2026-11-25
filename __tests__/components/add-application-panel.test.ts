@@ -48,5 +48,13 @@ describe("AddApplicationPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /add application/i }));
     expect(screen.getByDisplayValue("Role")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Acme")).toBeInTheDocument();
+
+    pathname = "/";
+    rerender(createElement(AppShell, null, createElement("p", null, "Dashboard")));
+    expect(screen.getByRole("region", { name: "Add application" })).toBeVisible();
+    pathname = "/applications";
+    rerender(createElement(AppShell, null, createElement("p", null, "Page")));
+    fireEvent.click(screen.getByRole("button", { name: "+ Add application" }));
+    expect(screen.getByDisplayValue("Role")).toBeVisible();
   });
 });

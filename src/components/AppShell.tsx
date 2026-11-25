@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 
 import { ApplicationChangesContext } from "@/components/ApplicationChanges";
 import Sidebar from "@/components/Sidebar";
@@ -25,14 +25,14 @@ export default function AppShell({
 }: AppShellProps) {
   const pathname = usePathname();
   const isDashboard = pathname === "/";
-  const [panelOpen, setPanelOpen] = useState(isDashboard);
+  const [panelOpenOutsideDashboard, setPanelOpenOutsideDashboard] = useState(false);
+  const panelOpen = isDashboard || panelOpenOutsideDashboard;
+  if (isDashboard && panelOpenOutsideDashboard) {
+    setPanelOpenOutsideDashboard(false);
+  }
   const [revision, setRevision] = useState(0);
   const notify = useCallback(() => setRevision((current) => current + 1), []);
   const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null);
-
-  useEffect(() => {
-    setPanelOpen(isDashboard);
-  }, [isDashboard]);
 
   if (pathname === "/connect") {
     return children;
@@ -58,7 +58,7 @@ export default function AppShell({
                     className="primary-button shell-add-toggle"
                     aria-expanded={panelOpen}
                     aria-controls="add-application-panel"
-                    onClick={() => setPanelOpen((current) => !current)}
+                    onClick={() => setPanelOpenOutsideDashboard((current) => !current)}
                   >
                     {panelOpen ? "Close add application" : "+ Add application"}
                   </button>
@@ -66,7 +66,7 @@ export default function AppShell({
               )}
               <AddApplicationPanel
                 open={panelOpen}
-                onClose={isDashboard ? undefined : () => setPanelOpen(false)}
+                onClose={isDashboard ? undefined : () => setPanelOpenOutsideDashboard(false)}
                 manualEntryEnabled={manualEntryEnabled}
               />
               {children}

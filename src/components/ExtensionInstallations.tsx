@@ -14,6 +14,15 @@ type Installation = Readonly<{
   revokedAt: string | null;
 }>;
 
+type InstallationList = Readonly<{
+  installations: readonly Installation[];
+  configuredOrigins?: readonly string[];
+}>;
+
+async function fetchInstallationList(api: ClientApi) {
+  return api<InstallationList>("/api/extension/installations");
+}
+
 type Props = Readonly<{
   api: ClientApi;
   origins?: readonly string[];
@@ -113,27 +122,28 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
     ...installations.map((installation) => installation.origin),
   ];
 
-  const refresh = useCallback(async () => {
-    const response = await api<{
-      installations: readonly Installation[];
-      configuredOrigins?: readonly string[];
-    }>(
-      "/api/extension/installations",
-    );
-    setInstallations(response.installations);
-    if (response.configuredOrigins) {
-      setConfiguredOrigins(response.configuredOrigins);
+  const applyInstallations = useCallback(({ installations, configuredOrigins }: InstallationList) => {
+    setInstallations(installations);
+    if (configuredOrigins) {
+      setConfiguredOrigins(configuredOrigins);
       setOrigin((selected) =>
-        response.configuredOrigins!.includes(selected)
-          ? selected
-          : (response.configuredOrigins![0] ?? ""),
+        configuredOrigins.includes(selected) ? selected : (configuredOrigins[0] ?? ""),
       );
     }
-  }, [api]);
+  }, []);
 
   useEffect(() => {
-    refresh().catch(() => setMessage("Failed to load extension installations."));
-  }, [refresh]);
+    let ignore = false;
+    void fetchInstallationList(api).then(
+      (response) => {
+        if (!ignore) applyInstallations(response);
+      },
+      () => {
+        if (!ignore) setMessage("Failed to load extension installations.");
+      },
+    );
+    return () => { ignore = true; };
+  }, [api, applyInstallations]);
 
   async function createPairingCode() {
     if (writesStopped) return;
@@ -160,7 +170,7 @@ export function ExtensionInstallations({ api, origins = [] }: Props) {
     setMessage("");
     try {
       await revokeExtensionInstallation(api, id);
-      await refresh();
+      applyInstallations(await fetchInstallationList(api));
     } catch {
       setMessage("Failed to revoke extension installation.");
     } finally {
